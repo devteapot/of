@@ -1,6 +1,6 @@
 # V1 Game Design
 
-Status: agreed direction, ready for a risk-first vertical slice. Values explicitly marked **provisional** are expected to change through playtesting.
+Status: implemented V1 gameplay baseline, ready for playtesting. Values explicitly marked **provisional** are expected to change through playtesting.
 
 ## Vision
 

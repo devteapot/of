@@ -1,0 +1,16 @@
+[package]
+name = "match-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless real-server smoke harness for the V1 match module"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hex-core.workspace = true
+match-bindings = { path = "../../crates/match-bindings" }
+spacetimedb-sdk.workspace = true
+
+[lints]
+workspace = true

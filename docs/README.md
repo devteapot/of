@@ -6,6 +6,8 @@ This directory is the source of truth for the game decisions made before impleme
 
 - [V1 game design](./v1-game-design.md) — player experience, rules, interaction experiments, provisional tuning, and acceptance criteria.
 - [Technical architecture](./technical-architecture.md) — Bevy and SpacetimeDB boundaries, simulation and data flow, scalability, testing, and the implementation sequence.
+- [V1 implementation guide](./implementation.md) — executable components, runtime topology, operational flow, evidence, and known limits.
+- [Graybox UI direction](./v1-ui-direction.md) — implemented interaction states, controls, HUD hierarchy, overlays, and playtest risks.
 - [Future ideas](./future-ideas.md) — explicitly deferred mechanics and research topics that should not be forgotten or treated as V1 commitments.
 
 ## Document status

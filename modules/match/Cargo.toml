@@ -1,0 +1,16 @@
+[package]
+name = "match-module"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hex-core = { path = "../../crates/hex-core" }
+spacetimedb = "=2.7.1"
+worldgen = { path = "../../crates/worldgen" }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,9 @@
+/target/
+**/target/
+.DS_Store
+*.log
+*.token
+/.spacetime-data/
+/.match-e2e-tokens/
+/screenshots/
+/maps/generated/

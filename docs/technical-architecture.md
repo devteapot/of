@@ -1,6 +1,6 @@
 # Technical Architecture
 
-Status: V1 architecture baseline
+Status: implemented V1 architecture baseline
 Last updated: 2026-08-02
 
 This document records the architecture commitments for the first playable version of the game. It deliberately separates those commitments from scaling questions that must be answered with measurements. Gameplay details live elsewhere; this document focuses on authority, state flow, code boundaries, rendering, persistence, and delivery order.
@@ -15,23 +15,40 @@ This document records the architecture commitments for the first playable versio
 - One visible terrain hex is one authoritative gameplay cell. Terrain is static during a V1 match and is stored and rendered in chunks.
 - Troops are conserved aggregate strength, not individual infantry entities. Transfers and combat operate on active orders and active front edges rather than scanning every cell.
 - Authoritative calculations use integers or explicit fixed-point values with stable iteration order. Floating point is reserved for client presentation.
-- Generated SpacetimeDB bindings define the client/server wire contract and are never edited by hand.
-- V1 supports configurable map dimensions. The nominal load target is approximately 192 x 192 cells, with smaller development maps and a 256 x 256 stretch target.
+- Generated SpacetimeDB bindings define the client/server wire contract. Files
+  below `match-bindings/src/module_bindings` are generated and never edited by
+  hand; the crate's small handwritten wrapper only exports them and scopes
+  lints for generated code.
+- V1 ships deterministic 64 x 64, 128 x 128, and 192 x 192 presets through one
+  dimension-independent map contract. A 256 x 256 fixture remains an unbuilt
+  stretch/load target rather than a supported V1 preset.
 - Initial visuals are procedural graybox geometry with clear ownership, elevation, selection, route, and troop-density feedback.
 
 ## Version and pinning policy
 
-At the time of this decision, Bevy 0.19 is the selected Bevy baseline. The local machine has SpacetimeDB CLI and library 2.0.1 installed, which is behind the current 2.x release line. These numbers are planning inputs, not yet a tested compatibility matrix; the compatibility spike must select and pin an exact current SpacetimeDB toolchain rather than trusting a version written in this document indefinitely.
+The implemented and tested V1 toolchain is pinned to:
 
-Before scaffolding gameplay code, run a small compatibility spike that:
+- Rust 1.95.0, edition 2024;
+- Bevy 0.19.0;
+- SpacetimeDB CLI, module SDK, client SDK, and binding generator 2.7.1.
 
-1. upgrades or deliberately retains the SpacetimeDB CLI;
-2. compiles and publishes a minimal Rust match module;
-3. generates Rust client bindings from that module;
-4. connects a Bevy 0.19 native client and receives a subscription update;
-5. checks the client crate for `wasm32-unknown-unknown` without claiming browser support prematurely.
+The compatibility gate now builds and publishes the Rust module to a local
+SpacetimeDB host, generates Rust client bindings, connects native clients, and
+receives authoritative subscription updates. Exact versions live in
+`rust-toolchain.toml`, both Cargo manifests, and both lockfiles. The helper
+scripts reject a mismatched CLI or Rust compiler before publishing or
+regenerating the wire contract.
 
-After that spike, pin the tested Rust toolchain and exact compatible crate versions in `rust-toolchain.toml`, workspace dependency declarations, and `Cargo.lock`. Keep the SpacetimeDB CLI, module SDK, client SDK, and binding generator on a tested compatible set. Upgrade Bevy or SpacetimeDB intentionally on a dedicated branch, regenerate bindings, run migrations if required, and repeat native, WASM-compile, reconnect, and load tests.
+The browser remains a later delivery target. Bevy supports web builds, but the
+native V1 transport persists credentials through the filesystem and has not yet
+been adapted or qualified for browsers. A future web pass must provide a
+browser credential store and re-run compile, graphics, networking, reconnect,
+download-size, and representative-map performance checks before browser support
+is claimed.
+
+Upgrade Bevy or SpacetimeDB intentionally on a dedicated branch, regenerate
+bindings, run migrations if required, and repeat native, web-compile,
+reconnect, and load tests.
 
 Useful release references:
 
@@ -61,7 +78,9 @@ This architecture does not copy OpenFront's client-side lockstep or client-major
 
 ### First playable version
 
-Publish the match module manually as one development database, for example `match-dev`. It hosts exactly one two-player match at a time. This avoids building a lobby before the transfer and conquest loop has been validated.
+Publish the match module manually as one development database, `of-match-dev` by
+default. It hosts exactly one two-player match at a time. This avoids building a
+lobby before the transfer and conquest loop has been validated.
 
 ### Concurrent matches
 
@@ -75,9 +94,9 @@ A logical database per match gives independent state, scheduling, subscriptions,
 
 The match result is small and may be copied to the lobby after completion. The completed match state should become read-only before archival. Do not update a live match to a new module version unless a tested, compatible migration path exists.
 
-## Proposed Cargo workspace
+## Implemented Cargo workspace
 
-The initial repository layout should be close to:
+The V1 repository layout is:
 
 ```text
 Cargo.toml
@@ -87,33 +106,40 @@ crates/
   hex-core/             # Pure deterministic coordinates and game rules
   match-bindings/       # Generated SpacetimeDB Rust client bindings
   game-client/          # Bevy application and platform adapters
+  worldgen/             # Deterministic curated-map generation
 modules/
   match/                # SpacetimeDB schema, reducers, and scheduling
 tools/
   mapgen/               # Offline generation, validation, and baking
-  load-client/          # Headless scripted clients and load scenarios
-assets/
+  match-e2e/             # Two-identity real-server acceptance smoke
 maps/
 docs/
+scripts/
 ```
 
 `hex-core` must not depend on Bevy or SpacetimeDB. It owns value types and pure functions for axial/cube coordinates, neighbors, distance, chunk addressing, elevation traversal, connectivity, capacity and edge rules, route-cost primitives, combat math, conquest accounting, and deterministic seeded decisions. Both the module and client may depend on it. Client use is for previews, visualization, and tests, never client authority.
 
 The SpacetimeDB module owns schema-facing wrappers, database queries, identity checks, reducers, transactions, indexes, active-set scheduling, and conversion to and from `hex-core` types. The Bevy client owns ECS presentation types and conversion from generated bindings.
 
-Generate `match-bindings` from the published or locally built match module schema. Generated files carry a prominent generated marker, are not manually edited, and are either committed or reproducibly generated before build. CI must regenerate them and fail on an unexpected diff so schema drift is visible.
+Generate `match-bindings/src/module_bindings` from the locally built match module
+schema. Generated files carry a prominent generated marker, are committed, and
+are never manually edited. CI regenerates the bindings and fails on an
+unexpected diff so schema drift is visible.
 
 ## Authoritative command and state flow
 
 Clients send intentions such as:
 
 - join or reclaim a player slot;
-- select a spawn/start position when the mode requires it;
-- issue, retarget, cancel, or reprioritize an aggregate transfer;
-- commit troops to an enemy destination or active border;
-- acknowledge readiness or request a rematch.
+- set the player's global mobilization target;
+- issue or cancel an aggregate source-to-destination transfer;
+- issue a one-shot Balance or oriented Front-load redistribution order;
+- commit troops to a friendly destination, enemy destination, or active border.
 
-An intention contains a stable player-scoped command ID. Its reducer verifies connection identity, player slot, match phase, source ownership, available strength, destination validity, and rule-specific constraints in one transaction. Accepted intentions create or change authoritative orders. Rejected intentions return a reason suitable for UI display without changing game state.
+Spawn selection, retargeting, reprioritization, readiness controls, and rematches
+are not part of the V1 reducer surface.
+
+An intention contains a stable player-scoped command ID. Its reducer verifies connection identity, player slot, match phase, source ownership, available strength, destination validity, and rule-specific constraints in one transaction. Accepted intentions create or change authoritative orders. Rejected gameplay intentions create only an idempotent receipt with a UI-suitable reason; they do not partially mutate gameplay state.
 
 The client never sends a resulting troop count, ownership result, casualty value, arrival time, or victory result. It may predict a path and ETA, but the reducer computes or validates the authoritative route and cost. Visual interpolation is allowed; speculative gameplay state must be clearly replaceable by the next subscription update.
 
@@ -147,7 +173,11 @@ The V1 model distinguishes:
 
 These share a common strength scale but remain separate values. A city may later increase staging capacity, a road may increase throughput, and a mountain pass may constrain throughput and frontage without conflating all three effects.
 
-An aggregate transfer order stores its owner, sources, destinations, committed amount, route or routing policy, priority, and status. Active flow state stores scalar queues at relevant cells or edges. On each logical step, approved movement is bounded by:
+An aggregate transfer order stores its owner, sources, destinations, requested
+and committed amounts, progress totals, kind, orientation, and status. Transit
+packets store deterministic fixed routes and scalar queues. V1 has no order
+priorities or mid-route replanning. On each logical step, approved movement is
+bounded by:
 
 ```text
 min(queued strength, edge throughput * step duration, destination free capacity)
@@ -159,11 +189,17 @@ Hostile forces do not coexist in a V1 cell. Combat occurs on active hostile edge
 
 ### Scheduled and active-set processing
 
-Use SpacetimeDB scheduling to wake the match simulation only while delayed work exists. Maintain explicit indexed active sets for transfer edges and combat fronts. A wake reducer processes a bounded fixed logical step for those rows, commits results transactionally, and schedules the next wake only if work remains.
+V1 uses one private SpacetimeDB schedule row per running match. A wake reducer
+processes a fixed 250 ms logical step, commits it transactionally, and schedules
+the next wake while the match remains running. Movement and combat iterate
+active transit packets and the contested edges derived from them; the
+provisional one-second population step scans habitable cell state. Pausing the
+cadence when a running match is idle is a later measured optimization.
 
-The initial implementation may use one match-level wake row rather than one scheduled row per troop batch. The important commitments are:
+The important commitments are:
 
-- no full-map scan per simulation step;
+- no full-map scan on the movement/combat path; the provisional population scan
+  runs only on its slower cadence;
 - no update at the Bevy render rate;
 - no scheduler row per individual strength unit;
 - fixed logical deltas for deterministic rules;
@@ -175,9 +211,15 @@ Uncontested movement can later be collapsed into scheduled arrival events when d
 
 Maps are generated offline from a versioned generator and seed, validated, inspected, and baked into a curated library. Each map has a manifest containing dimensions or bounds, generator version, seed, content hash, spawn candidates, capturable-land mask, and environment metadata. The conquest denominator is fixed from the capturable mask at match initialization.
 
-Authoritative terrain data includes stable cell ID, axial coordinate, integer elevation, passability, terrain kind, and relevant edge features such as rivers or fixed crossings. V1 terrain does not mutate.
+Authoritative V1 terrain data includes stable cell ID, axial coordinate, integer
+elevation, passability, terrain kind, capturability, habitability, and chunk
+coordinate. V1 terrain does not mutate. Rivers, fixed crossings, and other
+per-edge map features require a later versioned edge-data contract.
 
-Partition static and dynamic cell data by a deterministic axial chunk coordinate. Chunk dimensions are configurable and benchmarked; do not embed an assumed `16 x 16` or `32 x 32` size into IDs or rules. The same partition is useful for:
+Static terrain rows carry a deterministic chunk coordinate; dynamic rows remain
+keyed by stable cell ID and map back through terrain. V1 pins 16 x 16 chunks,
+while cell identity and gameplay rules remain independent of that choice. The
+same partition is useful for:
 
 - loading and subscriptions;
 - compact server queries and change tracking;
@@ -189,7 +231,8 @@ The map format must not assume a square world. Initial performance fixtures shou
 
 - 128 x 128 bounds: 16,384 cells before masking, useful for rapid iteration;
 - 192 x 192 bounds: 36,864 cells before masking, nominal V1 target;
-- 256 x 256 bounds: 65,536 cells before masking, initial stretch target.
+- 256 x 256 bounds: 65,536 cells before masking, a future stretch fixture that
+  is not currently exposed as a match preset.
 
 V1 may subscribe both players to the complete map because there is no fog of war. The protocol and renderer should nevertheless retain chunk keys so larger maps can move to interest subscriptions or region summaries without changing cell identity.
 
@@ -222,7 +265,9 @@ Troop-density shading is presentation only. Clamp and interpolate it client-side
 
 Picking should resolve pointer rays to chunks and deterministic hex coordinates instead of creating a physics collider for every cell. Height-aware picking must choose the visible top surface in stepped terrain. Selection is represented as compact cell sets or ranges, with direct source selection and destination painting as the first transfer interaction to test. The UX is expected to iterate; the server intent model should not depend on one specific gesture.
 
-Native-only filesystem, windowing, and startup behavior belongs in platform modules. Asset lookup, time, networking integration, and settings need browser-compatible interfaces where reasonable. Add a WASM compile check early, but optimize and ship native first.
+Native-only filesystem, windowing, and startup behavior belongs behind narrow
+boundaries where practical. A WASM compile gate is deferred with browser
+delivery; native is the only implemented V1 target.
 
 ## Reconnect and recovery
 
@@ -234,9 +279,19 @@ Keep these identities distinct even though V1 is two human players:
 
 A reconnect reducer reclaims an existing player slot using authenticated identity and explicit match rules. Disconnection does not delete troops, cancel orders, transfer ownership, or imply immediate defeat. Any timeout or surrender behavior belongs to the game mode, not the transport layer.
 
-On reconnect, the client discards speculative presentation state, rebuilds from a fresh authoritative subscription snapshot, then resumes interpolation of active orders and fronts. Stable command IDs let it safely retry commands whose result was not observed. UI-only preferences may remain local; no gameplay-critical state may exist only in Bevy.
+On reconnect, the client discards speculative presentation state, rebuilds from
+a fresh authoritative subscription snapshot, then resumes active orders and
+fronts. The server makes a repeated stable command ID idempotent. The V1 client
+does not automatically retry an outcome it did not observe; it reports that
+uncertainty, rebuilds authoritative state, and advances beyond all observed
+command IDs. UI-only preferences may remain local; no gameplay-critical state
+may exist only in Bevy.
 
-All simulation progress needed after a process restart is stored in tables: logical step, active orders, active edges/fronts, queued strength, next wake intent, match phase, and seed state. Recovery recreates a missing wake and resumes logical time in bounded steps. Test duplicate wake delivery and reducer retry behavior so they cannot apply a transfer twice.
+Simulation progress needed after a host restart is stored in tables: logical
+step, active orders, transit routes and queues, fronts, the scheduled wake,
+match phase, and map seed. The persisted scheduled row resumes the fixed logical
+cadence. Explicit repair of a missing schedule row and duplicate-wake fault
+injection remain reliability-hardening work.
 
 ## Testing and performance gates
 
@@ -255,9 +310,16 @@ High-value invariants include:
 
 ### Module and client integration
 
-Run reducer tests with two scripted human clients, not a gameplay AI. Cover join, command rejection, simultaneous orders, congestion, combat, victory, disconnect during a command, reconnect, duplicate command submission, scheduled wake recovery, and completed-match immutability.
+The V1 headless two-identity smoke covers join, match start, subscription,
+idempotent command receipts, a real spatial transfer, progression, and
+token-based reconnect. Command rejection, simultaneous hostile orders, full
+Conquest completion, schedule fault injection, and completed-match immutability
+remain integration-test extensions; pure rule tests cover their deterministic
+building blocks where applicable.
 
-Run a native end-to-end smoke test with two Bevy or headless clients against a fresh local match database. Add a WASM compile test once the compatibility spike succeeds. Generated-binding CI must detect stale output.
+Run the headless smoke against a fresh local match database. A native Bevy launch
+and two-window connection smoke complement it. Generated-binding CI detects
+stale output; WASM remains outside the native V1 gate.
 
 ### Initial load targets
 
@@ -289,14 +351,14 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
 
 ## Vertical-slice delivery order
 
-1. **Compatibility gate:** pin the tested Rust, Bevy, SpacetimeDB, and code-generation toolchain; prove native connection, generated bindings, and a WASM client compile.
+1. **Compatibility gate:** pin the tested Rust, Bevy, SpacetimeDB, and code-generation toolchain; prove native connection and generated bindings. Browser/WASM compatibility is a later gate.
 2. **Workspace skeleton:** create `hex-core`, match module, generated-bindings crate, Bevy client, map tool, formatting/lint/test CI, and one tiny deterministic fixture map.
 3. **Network walking skeleton:** manually publish one match database; connect two native clients; claim two player slots; mutate one test cell through a validated reducer and subscription.
 4. **Map interaction slice:** load authoritative chunked terrain, render stepped graybox hexes, implement camera and height-aware picking, and select source and destination areas.
 5. **Troop-flow slice:** add cell capacity, one aggregate transfer order, authoritative routing/validation, scheduled active-set movement, congestion, density shading, route preview, and ETA feedback.
 6. **Conflict slice:** add hostile edges, combat frontage, capture, elevation modifiers, disconnected components, and the Conquest win condition at 80% of capturable land.
 7. **Reliability slice:** add command idempotency, reconnect/reclaim, snapshot rebuild, scheduler recovery, deterministic replay fixtures, and completed-match handling.
-8. **Scale slice:** run 128, 192, and 256 fixtures; optimize chunks, indexes, dirty propagation, active processing, and subscriptions until the stated gates pass.
+8. **Scale slice:** validate the 128 and 192 presets; retain 256, high-order-count traces, profiling, and soak gates as post-slice performance work.
 9. **Playable V1 pass:** curate several generated maps, improve legibility and transfer UX, add match setup/result screens, and use the asset workflow only where graybox presentation blocks evaluation.
 
 Each stage should leave a playable or executable end-to-end path. Do not build the lobby/orchestrator, production art pipeline, or speculative unit systems before the two-client troop-flow slice is measurable and understandable.

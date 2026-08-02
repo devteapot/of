@@ -34,7 +34,14 @@ Cities could become spatial sources of population, economic output, and recruitm
 
 ### Civilian economy and the burden of mobilization
 
-Recruiting soldiers could remove people from the civilian economy, while maintaining armies could consume food, wages, equipment, or productive capacity. This creates a meaningful choice between immediate military strength and long-term growth. The burden should be understandable and gradual, not a hidden punishment for using the primary game mechanic.
+The intended post-V1 economy must make soldiers an active weight on economic
+capacity, not merely civilians who no longer produce. Recruitment removes labor
+from the civilian economy, while maintaining armies should consume a legible
+combination of food, wages, equipment, or productive capacity. The exact
+resource model remains open, but the strategic requirement is fixed: choosing
+more manpower now must carry an ongoing economic burden and trade against
+long-term growth. That burden should be understandable and gradual, not a
+hidden punishment for using the primary game mechanic.
 
 **Depends on:** a validated match economy, population accounting, explicit soldier upkeep, and balance tools that prevent an early mobilization advantage from becoming irreversible.
 

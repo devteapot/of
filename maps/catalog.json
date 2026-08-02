@@ -1,0 +1,35 @@
+{
+  "generator_version": 1,
+  "maps": [
+    {
+      "name": "dev-stepped-island",
+      "preset": "Dev",
+      "width": 64,
+      "height": 64,
+      "seed": 265511937,
+      "content_hash": "3b9b9767ada36223",
+      "capturable_cells": 2395,
+      "ground_cells": 2456
+    },
+    {
+      "name": "playtest-stepped-island",
+      "preset": "Playtest",
+      "width": 128,
+      "height": 128,
+      "seed": 4195428354,
+      "content_hash": "894c50e9e590ddb9",
+      "capturable_cells": 9657,
+      "ground_cells": 9874
+    },
+    {
+      "name": "validation-stepped-island",
+      "preset": "Validation",
+      "width": 192,
+      "height": 192,
+      "seed": 4195455491,
+      "content_hash": "40a19e2ad4608010",
+      "capturable_cells": 21484,
+      "ground_cells": 21953
+    }
+  ]
+}

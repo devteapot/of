@@ -1,0 +1,16 @@
+[package]
+name = "worldgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic curated-map generation for the hex RTS"
+
+[dependencies]
+hex-core = { workspace = true, features = ["serde"] }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

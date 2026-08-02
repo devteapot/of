@@ -1,0 +1,183 @@
+use hex_core::{Axial, ConquestRule, TerrainKind};
+use spacetimedb::{ReducerContext, Table};
+use worldgen::{generate, validate};
+
+use crate::schema::{
+    CellState, CellTerrain, MapPreset, MatchConfig, MatchPhase, MatchState, NEUTRAL_PLAYER,
+    PLAYER_ONE, PLAYER_TWO, SINGLETON_ID, TerrainClass,
+};
+use crate::schema::{cell_state, cell_terrain, match_config, match_state};
+
+pub fn default_config() -> MatchConfig {
+    let preset = MapPreset::Dev64;
+    MatchConfig {
+        singleton_id: SINGLETON_ID,
+        map_preset: preset,
+        map_seed: preset.seed(),
+        map_width: preset.side(),
+        map_height: preset.side(),
+        map_q_min: -(i32::from(preset.side()) / 2),
+        map_r_min: -(i32::from(preset.side()) / 2),
+        chunk_size: 16,
+        logical_step_ms: 250,
+        population_step_interval: 4,
+        base_military_capacity: 100,
+        base_edge_throughput_per_second: 20,
+        base_combat_frontage: 25,
+        max_elevation_step: 1,
+        uphill_attack_bps: 7_500,
+        combat_lethality_bps: 1_500,
+        civilian_growth_bps: 100,
+        mobilization_per_population_step: 2,
+        conquest_threshold_bps: 8_000,
+        map_hash: 0,
+        spawn_one_cell: 0,
+        spawn_two_cell: 0,
+    }
+}
+
+pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Result<(), String> {
+    clear_map(ctx);
+    let side = preset.side();
+    let generated = generate(
+        match preset {
+            MapPreset::Dev64 => "dev-stepped-island",
+            MapPreset::Playtest128 => "playtest-stepped-island",
+            MapPreset::Validation192 => "validation-stepped-island",
+        },
+        side,
+        side,
+        seed,
+    );
+    validate(&generated).map_err(|error| format!("generated map is invalid: {error}"))?;
+    let manifest = &generated.manifest;
+    let width = manifest.width;
+    let height = manifest.height;
+    let spawn_one_cell = cell_id_for_manifest(manifest, manifest.spawn_cells[0])?;
+    let spawn_two_cell = cell_id_for_manifest(manifest, manifest.spawn_cells[1])?;
+    let capturable = u64::from(manifest.capturable_land);
+    let mut controlled_one = 0_u64;
+    let mut controlled_two = 0_u64;
+    for cell in generated.cells.cells() {
+        let coordinate = cell.coordinate;
+        let cell_id = cell_id_for_manifest(manifest, coordinate)?;
+        let terrain = match cell.terrain {
+            TerrainKind::Water => TerrainClass::Water,
+            TerrainKind::Plains => TerrainClass::Plains,
+            TerrainKind::Hills => TerrainClass::Hills,
+            TerrainKind::Mountain => TerrainClass::Mountain,
+        };
+        let owner = u8::try_from(cell.owner.unwrap_or_default())
+            .map_err(|_| "world generator emitted an unsupported owner")?;
+        if cell.capturable && owner == PLAYER_ONE {
+            controlled_one += 1;
+        } else if cell.capturable && owner == PLAYER_TWO {
+            controlled_two += 1;
+        }
+        let column = coordinate.q - manifest.q_min;
+        let row = coordinate.r - manifest.r_min;
+        ctx.db.cell_terrain().insert(CellTerrain {
+            cell_id,
+            q: coordinate.q,
+            r: coordinate.r,
+            chunk_q: i16::try_from(column.div_euclid(16)).map_err(|_| "chunk q overflow")?,
+            chunk_r: i16::try_from(row.div_euclid(16)).map_err(|_| "chunk r overflow")?,
+            terrain,
+            elevation: cell.elevation,
+            passable: cell.terrain.ground_passable(),
+            capturable: cell.capturable,
+            habitable: cell.habitable,
+        });
+        ctx.db.cell_state().insert(CellState {
+            cell_id,
+            owner_player_id: owner,
+            civilians: cell.civilian_population,
+            civilian_capacity: cell.civilian_capacity,
+            infantry: cell.force(),
+            military_capacity: cell.military_capacity,
+            last_changed_step: 0,
+        });
+    }
+
+    let rule = ConquestRule::new(capturable, 8_000)
+        .map_err(|error| format!("invalid conquest map: {error:?}"))?;
+    let mut config = default_config();
+    config.map_preset = preset;
+    config.map_seed = seed;
+    config.map_width = width;
+    config.map_height = height;
+    config.map_q_min = manifest.q_min;
+    config.map_r_min = manifest.r_min;
+    config.map_hash = manifest.content_hash;
+    config.spawn_one_cell = spawn_one_cell;
+    config.spawn_two_cell = spawn_two_cell;
+    ctx.db.match_config().insert(config);
+    ctx.db.match_state().insert(MatchState {
+        singleton_id: SINGLETON_ID,
+        phase: MatchPhase::Lobby,
+        logical_step: 0,
+        capturable_cells: capturable,
+        required_control: rule.required_control(),
+        player_one_controlled: controlled_one,
+        player_two_controlled: controlled_two,
+        winner_player_id: NEUTRAL_PLAYER,
+        started_at_us: 0,
+        completed_at_us: 0,
+    });
+    Ok(())
+}
+
+fn clear_map(ctx: &ReducerContext) {
+    let terrain_ids: Vec<_> = ctx
+        .db
+        .cell_terrain()
+        .iter()
+        .map(|row| row.cell_id)
+        .collect();
+    for cell_id in terrain_ids {
+        ctx.db.cell_terrain().cell_id().delete(cell_id);
+    }
+    let state_ids: Vec<_> = ctx.db.cell_state().iter().map(|row| row.cell_id).collect();
+    for cell_id in state_ids {
+        ctx.db.cell_state().cell_id().delete(cell_id);
+    }
+    ctx.db.match_config().singleton_id().delete(SINGLETON_ID);
+    ctx.db.match_state().singleton_id().delete(SINGLETON_ID);
+}
+
+fn cell_id_for_manifest(
+    manifest: &worldgen::MapManifest,
+    coordinate: Axial,
+) -> Result<u32, String> {
+    let column = coordinate.q - manifest.q_min;
+    let row = coordinate.r - manifest.r_min;
+    if column < 0
+        || row < 0
+        || column >= i32::from(manifest.width)
+        || row >= i32::from(manifest.height)
+    {
+        return Err("world generator emitted an out-of-bounds coordinate".into());
+    }
+    Ok((row as u32) * u32::from(manifest.width) + column as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_have_the_locked_dimensions() {
+        assert_eq!(MapPreset::Dev64.side(), 64);
+        assert_eq!(MapPreset::Playtest128.side(), 128);
+        assert_eq!(MapPreset::Validation192.side(), 192);
+    }
+
+    #[test]
+    fn presets_expose_stable_seeds() {
+        assert_ne!(MapPreset::Dev64.seed(), MapPreset::Playtest128.seed());
+        assert_ne!(
+            MapPreset::Playtest128.seed(),
+            MapPreset::Validation192.seed()
+        );
+    }
+}

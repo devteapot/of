@@ -1,0 +1,20 @@
+[package]
+name = "game-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Native Bevy client for the hex RTS"
+
+[[bin]]
+name = "game-client"
+path = "src/main.rs"
+
+[dependencies]
+bevy = { workspace = true, features = ["3d", "ui", "x11"] }
+clap.workspace = true
+hex-core = { workspace = true }
+match-bindings = { path = "../match-bindings" }
+spacetimedb-sdk.workspace = true
+
+[lints]
+workspace = true
