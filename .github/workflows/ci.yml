@@ -19,6 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux client build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libudev-dev libwayland-dev libxkbcommon-dev
+
       - name: Install pinned Rust toolchain
         run: rustup show
 
