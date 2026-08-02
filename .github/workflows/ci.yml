@@ -30,9 +30,18 @@ jobs:
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           workspaces: |
             . -> target
             modules/match -> modules/match/target
+
+      - name: Install pinned SpacetimeDB CLI
+        run: |
+          curl -sSf https://install.spacetimedb.com | sh -s -- --yes
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          spacetime version install 2.7.1 --use --yes
+          ./scripts/check-toolchain.sh
 
       - name: Check formatting
         run: |
@@ -50,14 +59,6 @@ jobs:
 
       - name: Lint authoritative module
         run: cargo clippy --manifest-path modules/match/Cargo.toml --all-targets -- -D warnings
-
-      - name: Install pinned SpacetimeDB CLI
-        run: |
-          curl -sSf https://install.spacetimedb.com | sh
-          export PATH="$HOME/.local/bin:$PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          spacetime version install 2.7.1 --use --yes
-          ./scripts/check-toolchain.sh
 
       - name: Build SpacetimeDB module
         run: spacetime build --module-path modules/match
