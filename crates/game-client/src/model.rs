@@ -12,7 +12,8 @@ pub const PLAYER_TWO: u32 = 2;
 #[allow(dead_code)]
 pub enum ConnectionState {
     Connected,
-    Reconnecting,
+    Syncing,
+    ClaimedOffline,
     Open,
     Offline,
 }
@@ -21,9 +22,48 @@ impl ConnectionState {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Connected => "CONNECTED",
-            Self::Reconnecting => "RECONNECTING",
+            Self::Syncing => "SYNCING",
+            Self::ClaimedOffline => "CLAIMED OFFLINE",
             Self::Open => "OPEN SLOT",
             Self::Offline => "OFFLINE FIXTURE",
+        }
+    }
+}
+
+/// Whether this process may currently issue authoritative match commands.
+///
+/// This is intentionally separate from [`ConnectionState`]: the latter
+/// describes the two persisted player slots, while a newly connected identity
+/// may be subscribed as an unbound observer because both slots belong to other
+/// identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityState {
+    Offline,
+    Connecting,
+    Ready,
+    SlotUnavailable { reason: String },
+    ConnectionUnavailable { reason: String },
+}
+
+impl AuthorityState {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Offline => "OFFLINE",
+            Self::Connecting => "CONNECTING",
+            Self::Ready => "READY",
+            Self::SlotUnavailable { .. } => "SLOT UNAVAILABLE",
+            Self::ConnectionUnavailable { .. } => "CONNECTION UNAVAILABLE",
+        }
+    }
+
+    pub fn command_block_reason(&self) -> String {
+        match self {
+            Self::SlotUnavailable { reason } => format!("Player slot unavailable: {reason}"),
+            Self::ConnectionUnavailable { reason } => {
+                format!("Authoritative connection unavailable: {reason}")
+            }
+            Self::Offline => "Offline authority does not use the online transport".to_owned(),
+            Self::Connecting | Self::Ready => "Authoritative match is still connecting".to_owned(),
         }
     }
 }
@@ -117,6 +157,7 @@ pub struct Toast {
 pub struct MatchView {
     pub cells: BTreeMap<Axial, CellView>,
     pub local_player: u32,
+    pub authority: AuthorityState,
     pub connection: [ConnectionState; 2],
     pub phase: MatchPhase,
     pub conquest_threshold_bps: u32,
@@ -140,7 +181,8 @@ impl MatchView {
         Self {
             cells: BTreeMap::new(),
             local_player: u32::from(preferred_player),
-            connection: [ConnectionState::Reconnecting, ConnectionState::Reconnecting],
+            authority: AuthorityState::Connecting,
+            connection: [ConnectionState::Syncing, ConnectionState::Syncing],
             phase: MatchPhase::Lobby,
             conquest_threshold_bps: 8_000,
             authoritative_control: None,
@@ -257,6 +299,7 @@ impl MatchView {
         Self {
             cells,
             local_player: PLAYER_ONE,
+            authority: AuthorityState::Offline,
             connection: [ConnectionState::Offline, ConnectionState::Offline],
             phase: MatchPhase::Running,
             conquest_threshold_bps: 8_000,

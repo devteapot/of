@@ -85,8 +85,7 @@ pub fn camera_controls(
         f32::from(keyboard.pressed(KeyCode::KeyE)) - f32::from(keyboard.pressed(KeyCode::KeyQ));
     rig.yaw += rotation_axis * 1.25 * time.delta_secs();
 
-    let forward = Vec3::new(-rig.yaw.sin(), 0.0, -rig.yaw.cos()).normalize_or_zero();
-    let right = Vec3::new(forward.z, 0.0, -forward.x);
+    let (forward, right) = planar_camera_axes(rig.yaw);
     let mut keyboard_pan = Vec3::ZERO;
     if keyboard.pressed(KeyCode::KeyW) {
         keyboard_pan += forward;
@@ -137,4 +136,38 @@ fn rig_transform(rig: &CameraRig) -> Transform {
         rig.yaw.cos() * horizontal,
     );
     Transform::from_translation(rig.focus + offset).looking_at(rig.focus, Vec3::Y)
+}
+
+fn planar_camera_axes(yaw: f32) -> (Vec3, Vec3) {
+    let forward = Vec3::new(-yaw.sin(), 0.0, -yaw.cos()).normalize_or_zero();
+    let right = forward.cross(Vec3::Y).normalize_or_zero();
+    (forward, right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPSILON: f32 = 1.0e-6;
+
+    #[test]
+    fn camera_at_zero_yaw_uses_positive_x_as_screen_right() {
+        let (forward, right) = planar_camera_axes(0.0);
+
+        assert!((forward - Vec3::NEG_Z).length() < EPSILON);
+        assert!((right - Vec3::X).length() < EPSILON);
+    }
+
+    #[test]
+    fn default_camera_axes_are_orthonormal_and_face_the_expected_diagonal() {
+        let rig = CameraRig::default();
+        let (forward, right) = planar_camera_axes(rig.yaw);
+        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+
+        assert!((forward - Vec3::new(diagonal, 0.0, -diagonal)).length() < EPSILON);
+        assert!((right - Vec3::new(diagonal, 0.0, diagonal)).length() < EPSILON);
+        assert!(forward.dot(right).abs() < EPSILON);
+        assert!((forward.length() - 1.0).abs() < EPSILON);
+        assert!((right.length() - 1.0).abs() < EPSILON);
+    }
 }

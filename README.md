@@ -62,12 +62,17 @@ Use separate terminals from the repository root.
    ./scripts/start-local-server.sh
    ```
 
-2. Build and publish a fresh development module, then regenerate its typed
-   client bindings:
+2. Build and publish a fresh development match, then regenerate its typed
+   client bindings. This command permanently deletes and recreates only the
+   local `of-match-dev` database; the explicit confirmation argument is
+   required:
 
    ```bash
-   ./scripts/publish-local.sh
+   ./scripts/publish-local.sh --fresh --confirm-delete-of-match-dev
    ```
+
+   For later module updates that must preserve an in-progress match, use
+   `./scripts/publish-local.sh` without arguments instead.
 
 3. Before either player joins, optionally choose a map preset. The development
    map is already the default:
@@ -92,7 +97,10 @@ Use separate terminals from the repository root.
 
 The match begins when both slots are claimed. Profile tokens are stored below
 the ignored `.spacetime-data/` directory; reuse the same profile to reclaim a
-slot after reconnecting. The defaults are `http://127.0.0.1:3000` and
+slot after reconnecting. If a different identity tries to enter a fully claimed
+match, the client remains an unbound observer and reports the exact slot error;
+start a fresh match with the reset command above rather than stealing a
+disconnected identity. The defaults are `http://127.0.0.1:3000` and
 `of-match-dev` and can be overridden with `OF_HOST` and `OF_DATABASE` (or the
 `--host` and `--database` arguments).
 
@@ -116,6 +124,7 @@ slot after reconnecting. The defaults are `http://127.0.0.1:3000` and
 | Home | Frame the map |
 | `M` + arrow keys | Adjust mobilization target |
 | `?` | Toggle help |
+| `F3` | Toggle the performance overlay |
 
 ## Verification
 
@@ -130,10 +139,13 @@ cargo clippy --manifest-path modules/match/Cargo.toml --all-targets -- -D warnin
 spacetime build --module-path modules/match
 ```
 
-After publishing a local database, the headless smoke tool exercises two
-identities against the real server:
+The headless smoke tool defaults to the isolated `of-match-e2e` database so it
+cannot claim the interactive `of-match-dev` player slots. Freshly publish that
+test database before running it; this deletes only prior E2E state:
 
 ```bash
+spacetime publish --server local --module-path modules/match \
+  --delete-data=always --yes of-match-e2e
 cargo run -p match-e2e
 ```
 

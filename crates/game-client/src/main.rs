@@ -19,6 +19,7 @@ mod model;
 mod network;
 mod online;
 mod overlays;
+mod performance;
 mod terrain;
 
 use bevy::{prelude::*, window::WindowResolution};
@@ -31,6 +32,7 @@ use model::{MatchView, update_transient_state};
 use network::{NetworkBoundaryPlugin, NetworkSet, OfflineTransportPlugin, apply_server_updates};
 use online::{OnlineSyncSet, OnlineTransportPlugin};
 use overlays::OverlayPlugin;
+use performance::PerformanceOverlayPlugin;
 use terrain::{spawn_terrain, sync_terrain_chunks};
 
 fn main() {
@@ -57,6 +59,7 @@ fn main() {
             GameInteractionPlugin,
             OverlayPlugin,
             HudPlugin,
+            PerformanceOverlayPlugin,
         ))
         .insert_resource(ClearColor(Color::srgb(0.018, 0.025, 0.031)))
         .insert_resource(GlobalAmbientLight {

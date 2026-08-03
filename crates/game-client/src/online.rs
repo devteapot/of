@@ -28,7 +28,10 @@ use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 use crate::{
     config::ClientConfig,
     geometry::{HEX_RADIUS, chunk_of},
-    model::{ActiveFlow, ActiveFront, CellView, ConnectionState, MatchPhase, MatchView, ToastKind},
+    model::{
+        ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, MatchPhase, MatchView,
+        ToastKind,
+    },
     network::{ClientIntent, NetworkSet, RedistributionPreset, ServerUpdate},
 };
 
@@ -266,6 +269,7 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     transport.failed_generation = None;
     transport.subscription_ready = false;
     transport.command_ids_ready = false;
+    view.authority = AuthorityState::Connecting;
 
     let token_path = transport.config.token_path();
     let token = match load_token(&token_path) {
@@ -369,6 +373,9 @@ fn disable_invalid_host(transport: &mut OnlineTransport, view: &mut MatchView, r
     transport.connection_disabled = true;
     transport.subscription_ready = false;
     transport.command_ids_ready = false;
+    view.authority = AuthorityState::ConnectionUnavailable {
+        reason: format!("invalid host: {reason}"),
+    };
     "Invalid SpacetimeDB host · restart with a valid --host".clone_into(&mut view.latest_result);
     view.push_log(format!(
         "Invalid SpacetimeDB host {:?}: {reason}",
@@ -425,7 +432,7 @@ fn send_online_intents(
         if !transport.subscription_ready || !transport.command_ids_ready {
             updates.write(ServerUpdate::Rejected {
                 command_id: None,
-                reason: "Authoritative match is still connecting".to_owned(),
+                reason: view.authority.command_block_reason(),
                 relevant_cell: None,
             });
             continue;
@@ -710,6 +717,7 @@ fn apply_lifecycle_event(
 ) {
     match event {
         LifecycleEvent::Connected { generation } if lifecycle_is_current(transport, generation) => {
+            view.authority = AuthorityState::Connecting;
             "Connected · subscribing to authoritative tables…".clone_into(&mut view.latest_result);
         }
         LifecycleEvent::Subscribed { generation }
@@ -718,13 +726,13 @@ fn apply_lifecycle_event(
             transport.reconnect_attempt = 0;
             transport.reconnect_delay_seconds = 0.0;
             transport.subscription_ready = true;
+            view.authority = AuthorityState::Connecting;
             "Authoritative snapshot applied · joining match…".clone_into(&mut view.latest_result);
         }
         LifecycleEvent::JoinFailed { generation, reason }
             if lifecycle_is_current(transport, generation) =>
         {
-            view.push_log(format!("Join failed: {reason}"));
-            view.show_toast("Unable to join a player slot", ToastKind::Rejection);
+            mark_join_failed(transport, view, reason);
         }
         LifecycleEvent::ConnectionFailed { generation, reason } => {
             handle_connection_loss(
@@ -767,6 +775,21 @@ fn apply_lifecycle_event(
     }
 }
 
+fn mark_join_failed(transport: &mut OnlineTransport, view: &mut MatchView, reason: String) {
+    transport.bound_player = None;
+    transport.command_ids_ready = false;
+    view.authority = AuthorityState::SlotUnavailable {
+        reason: reason.clone(),
+    };
+    let authority_label = view.authority.label();
+    view.latest_result = format!("{authority_label} · {reason}");
+    view.push_log(view.latest_result.clone());
+    view.show_toast(
+        format!("Player slot unavailable: {reason}"),
+        ToastKind::Rejection,
+    );
+}
+
 fn lifecycle_is_current(transport: &OnlineTransport, generation: u64) -> bool {
     generation == transport.active_generation && transport.failed_generation != Some(generation)
 }
@@ -787,6 +810,7 @@ fn handle_connection_loss(
     transport.subscription_ready = false;
     transport.command_ids_ready = false;
     transport.bound_player = None;
+    view.authority = AuthorityState::Connecting;
     if let Some(connection) = transport.connection.take() {
         let _ = connection.disconnect();
     }
@@ -805,7 +829,7 @@ fn handle_connection_loss(
     }
 
     transport.schedule_reconnect();
-    view.connection = [ConnectionState::Reconnecting, ConnectionState::Reconnecting];
+    view.connection = [ConnectionState::Syncing, ConnectionState::Syncing];
     view.latest_result = format!(
         "Connection lost · retrying in {:.1}s",
         transport.reconnect_delay_seconds
@@ -913,13 +937,13 @@ fn update_players(
         view.connection[usize::from(player_id - 1)] = players
             .iter()
             .find(|slot| slot.player_id == player_id)
-            .map_or(ConnectionState::Reconnecting, |slot| {
+            .map_or(ConnectionState::Syncing, |slot| {
                 if slot.identity.is_none() {
                     ConnectionState::Open
                 } else if slot.connected {
                     ConnectionState::Connected
                 } else {
-                    ConnectionState::Reconnecting
+                    ConnectionState::ClaimedOffline
                 }
             });
     }
@@ -932,6 +956,11 @@ fn update_players(
         if transport.bound_player != Some(slot.player_id) {
             transport.bound_player = Some(slot.player_id);
             transport.command_ids_ready = false;
+            view.authority = AuthorityState::Ready;
+            view.latest_result = format!(
+                "Authoritative controls ready · bound to Player {}",
+                slot.player_id
+            );
         }
     }
 }
@@ -1238,6 +1267,10 @@ mod tests {
         assert!(transport.connection_disabled);
         assert!(transport.connection.is_none());
         assert!(!transport.subscription_ready);
+        assert!(matches!(
+            view.authority,
+            AuthorityState::ConnectionUnavailable { .. }
+        ));
     }
 
     #[test]
@@ -1251,6 +1284,79 @@ mod tests {
 
         assert!(transport.connection_disabled);
         assert!(transport.connection.is_none());
+    }
+
+    #[test]
+    fn join_failure_is_terminal_and_preserves_the_authoritative_reason() {
+        let mut transport = OnlineTransport::new(test_config());
+        transport.subscription_ready = true;
+        transport.command_ids_ready = true;
+        transport.bound_player = Some(1);
+        let mut view = MatchView::connecting(1);
+
+        mark_join_failed(
+            &mut transport,
+            &mut view,
+            "both player slots are already claimed".to_owned(),
+        );
+
+        assert!(transport.subscription_ready);
+        assert!(!transport.command_ids_ready);
+        assert_eq!(transport.bound_player, None);
+        assert_eq!(
+            view.authority,
+            AuthorityState::SlotUnavailable {
+                reason: "both player slots are already claimed".to_owned()
+            }
+        );
+        assert_eq!(
+            view.authority.command_block_reason(),
+            "Player slot unavailable: both player slots are already claimed"
+        );
+        assert_eq!(
+            view.latest_result,
+            "SLOT UNAVAILABLE · both player slots are already claimed"
+        );
+    }
+
+    #[test]
+    fn slot_status_distinguishes_unknown_open_and_claimed_offline() {
+        let mut transport = OnlineTransport::new(test_config());
+        let mut view = MatchView::connecting(1);
+
+        update_players(&mut transport, &mut view, None, &[]);
+        assert_eq!(view.connection, [ConnectionState::Syncing; 2]);
+
+        let players = [
+            PlayerSlot {
+                player_id: 1,
+                identity: None,
+                display_name: String::new(),
+                connected: false,
+                has_reconnected: false,
+                reconnect_count: 0,
+                ready: false,
+                joined_at_us: 0,
+                last_seen_at_us: 0,
+            },
+            PlayerSlot {
+                player_id: 2,
+                identity: Some(spacetimedb_sdk::Identity::ZERO),
+                display_name: "Previous player".to_owned(),
+                connected: false,
+                has_reconnected: true,
+                reconnect_count: 1,
+                ready: true,
+                joined_at_us: 1,
+                last_seen_at_us: 2,
+            },
+        ];
+        update_players(&mut transport, &mut view, None, &players);
+
+        assert_eq!(view.connection[0], ConnectionState::Open);
+        assert_eq!(view.connection[1], ConnectionState::ClaimedOffline);
+        assert_eq!(view.connection[0].label(), "OPEN SLOT");
+        assert_eq!(view.connection[1].label(), "CLAIMED OFFLINE");
     }
 
     #[test]

@@ -387,7 +387,7 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
         help.spawn(section_title("FIELD MANUAL  //  ? TO CLOSE"));
         help.spawn((
             Text::new(
-                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts.\n\nTRANSFER\nPress T, then paint friendly arrival or hostile staging hexes. [ and ] change the requested share. Enter confirms. Troops follow a real route; they do not teleport.\n\nREDISTRIBUTE\nB previews an even target density. Hold F and drag over the map to orient front-load. The pale nested outlines are proposed density, not troops that already moved.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. It affects future recruitment only; lowering it does not demobilize existing soldiers.",
+                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts.\n\nTRANSFER\nPress T, then paint friendly arrival or hostile staging hexes. [ and ] change the requested share. Enter confirms. Troops follow a real route; they do not teleport.\n\nREDISTRIBUTE\nB previews an even target density. Hold F and drag over the map to orient front-load. The pale nested outlines are proposed density, not troops that already moved.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. It affects future recruitment only; lowering it does not demobilize existing soldiers.",
             ),
             TextFont::from_font_size(12.0),
             TextColor(TEXT),
@@ -499,9 +499,9 @@ fn update_hud(
         set_text(
             &mut top,
             format!(
-                "PLAYER {}  /  SLOT {}     ◆ P1 {:<13}     P1  {:>5.1}%     {}     P2  {:>5.1}%     ◇ P2 {:<13}",
+                "LOCAL P{}  ·  AUTH {:<22}     ◆ P1 {:<15}     P1  {:>5.1}%     {}     P2  {:>5.1}%     ◇ P2 {:<15}",
                 view.local_player,
-                view.local_player,
+                view.authority.label(),
                 view.connection[0].label(),
                 p1,
                 view.phase.label(view.conquest_threshold_bps),

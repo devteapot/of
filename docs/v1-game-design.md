@@ -141,6 +141,62 @@ The server distributes the requested strength across reachable destinations up t
 
 The exact selection gestures, amount controls, path presentation, and confirmation flow are provisional and should be iterated in playtests.
 
+### Next experiment: all-front neutral expansion
+
+The target-based transfer is intentionally precise, but it is probably too
+deliberate to be the only way to cross the large amount of unclaimed land at
+the beginning of a match. The next gameplay experiment should add a fast
+**Expand** action alongside transfers rather than replacing them.
+
+An Expand activation is a one-shot pulse over every traversable edge from the
+player's territory into neutral, unoccupied land:
+
+- it never attacks or crosses into enemy-owned territory;
+- every disconnected component expands using only the infantry physically
+  present on its own frontier;
+- each frontier hex commits a player-selected share of its movable infantry,
+  while retaining a provisional local reserve;
+- a source facing several neutral edges divides its commitment instead of
+  duplicating it;
+- cliffs, water, full destinations, and other impassable edges are excluded;
+- issuing another pulse while one is active should adjust or renew the
+  commitment, not stack click-speed bonuses.
+
+The pulse creates expansion fronts, not instant ownership changes. Each front
+accumulates capture progress from its committed local infantry. Effective
+progress is bounded by edge throughput/frontage and modified by terrain and
+elevation, so additional infantry creates more momentum only until the local
+edge is saturated. When a neutral cell is captured, occupying infantry must be
+able to enter it and a small garrison is left behind. Remaining committed
+strength may continue into the next neutral edge. The wave therefore slows as
+it widens, crosses difficult terrain, fills capacity, or spends strength
+holding newly captured ground.
+
+This keeps spatial conservation intact: "momentum" is an observable consequence
+of local committed troops and geography, not a second army value or a global
+expansion currency. If both players reach the same neutral cell, the first
+front to complete capture progress claims it. An exact same-step tie leaves the
+cell neutral and stops both pulses there until a targeted order resolves the
+contest, avoiding an arbitrary player-slot priority. Any later arrival that
+finds enemy ownership also stops as an expansion pulse and leaves explicit
+attack rules to resolve the conflict.
+
+The first UX prototype should make Expand a single action with an adjustable
+commitment percentage and an immediate frontier/momentum visualization. Whether
+that action ultimately uses a keyboard shortcut, a HUD button, or a contextual
+left-click is deliberately open because ordinary left-drag currently owns
+region selection.
+
+This produces three useful levels of control:
+
+1. **Expand** for quick, neutral-only growth across all local fronts.
+2. **Transfer and redistribution** for moving real strength between regions.
+3. **Targeted attack** for deliberately crossing an enemy border.
+
+The experiment belongs close to V1 because it changes the cadence of the core
+loop. Its exact capture threshold, reserve, continuation, and input gesture are
+playtest values rather than locked rules.
+
 ### One-shot redistribution
 
 A redistribution order applies a target density pattern to selected owned hexes. Surplus strength moves toward deficits through the ordinary route, throughput, and capacity rules; redistribution is never instantaneous.
@@ -252,6 +308,8 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
 ## Questions for Playtesting, Not Pre-production Blockers
 
 - Does direct source-to-destination movement feel natural, or should persistent target-density orders eventually become primary?
+- Does an all-front Expand pulse make the opening flow naturally without
+  removing the value of spatial logistics or rewarding click spam?
 - Which selection gestures make irregular source and destination regions easy to express?
 - Is the local civilian-to-military mobilization model understandable before an explicit economy is introduced?
 - Do capacity, throughput, and frontage create clear bottlenecks rather than frustrating queues?

@@ -20,6 +20,13 @@ The same owned-region selection feeds transfers and both redistribution presets.
 - `Redistribute { cells, preset, direction }`
 - `SetMobilization { target }`
 
+The next gameplay experiment adds `Expand { commitment }`: a neutral-only,
+all-front pulse whose committed infantry remains local and whose expansion
+speed is constrained by terrain and edge limits. It is intentionally separate
+from targeted transfers and hostile attacks. Its final gesture is not locked;
+the current left-drag selection must remain available while the prototype is
+evaluated.
+
 ### Camera
 
 - Middle-mouse drag or `Space + left drag`: pan.

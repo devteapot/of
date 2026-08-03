@@ -34,8 +34,9 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:3000")]
     host: String,
 
-    /// Published match database name or identity.
-    #[arg(long, default_value = "of-match-dev")]
+    /// Published match database name or identity. The default is deliberately
+    /// isolated from the interactive development match.
+    #[arg(long, default_value = "of-match-e2e")]
     database: String,
 
     /// Directory for the two ignored identity token profiles.
