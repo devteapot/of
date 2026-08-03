@@ -111,6 +111,12 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 | Left drag | Paint cells |
 | Shift + left drag | Add to the current region |
 | Control + left drag | Remove from the current region |
+| `[` / `]` while selecting | Shrink or grow both brush axes |
+| Shift + `[` / `]` | Change brush width only |
+| Control + `[` / `]` | Change brush height only |
+| `C` | Select the connected owned cluster under the cursor |
+| Shift / Control + `C` | Add or remove that cluster |
+| Control/Command + `A` | Select all locally owned hexes |
 | `T` | Enter destination painting for a transfer |
 | `[` / `]` | Lower or raise transfer percentage |
 | `B` | Preview Balance over the selected region |

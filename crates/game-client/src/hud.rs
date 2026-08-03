@@ -10,6 +10,7 @@ use bevy::{
 
 use crate::{
     interaction::{InteractionState, OrderMode, UiAction},
+    map_view::map_view_status_bundle,
     model::{MatchView, ToastKind},
     network::{ClientIntent, NetworkSet},
 };
@@ -45,6 +46,16 @@ struct MobilizationThumb;
 
 #[derive(Component)]
 struct HudActionButton(UiAction);
+
+#[derive(Default)]
+struct SelectionTotalsCache {
+    initialized: bool,
+    source_revision: u64,
+    logical_step: u64,
+    chunk_index_revision: u64,
+    cell_state_revision: u64,
+    totals: (u64, u64, u64),
+}
 
 pub struct HudPlugin;
 
@@ -136,6 +147,8 @@ fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
     ))
     .with_children(|panel| {
         panel.spawn(section_title("TACTICAL CONTROL  //  AUTHORITY"));
+        panel.spawn(map_view_status_bundle());
+        panel.spawn(divider());
         panel.spawn((
             InspectorText,
             Text::new("INSPECTOR\nHover a visible hex"),
@@ -181,7 +194,7 @@ fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
             });
         panel.spawn((
             Text::new(
-                "MAP KEY\noutline + ticks  source\ninner outline       destination\n× marker            blocked\nopposing chevrons   combat",
+                "MAP KEY\nouter perimeter     source\ninner perimeter     destination\n× marker            blocked\nopposing chevrons   combat",
             ),
             TextFont::from_font_size(10.5),
             TextColor(MUTED),
@@ -327,7 +340,7 @@ fn spawn_onboarding(root: &mut ChildSpawnerCommands) {
     .with_children(|hint| {
         hint.spawn((
             Text::new(
-                "LMB paint owned hexes  ·  T move  ·  B balance  ·  F drag front-load  ·  Esc cancel  ·  ? help",
+                "LMB paint  ·  [ / ] brush  ·  C cluster  ·  Ctrl/Cmd+A all  ·  T move  ·  B balance  ·  F front-load  ·  ? help",
             ),
             TextFont::from_font_size(11.0),
             TextColor(MUTED),
@@ -387,7 +400,7 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
         help.spawn(section_title("FIELD MANUAL  //  ? TO CLOSE"));
         help.spawn((
             Text::new(
-                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them.\n\nTRANSFER\nPress T, then paint friendly arrival or hostile staging hexes. [ and ] change the requested share. Enter confirms. Troops follow a real route; they do not teleport.\n\nREDISTRIBUTE\nB previews an even target density. Hold F and drag over the map to orient front-load. The pale nested outlines are proposed density, not troops that already moved.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. It affects future recruitment only; lowering it does not demobilize existing soldiers.",
+                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts. In source mode, [ / ] resize both brush axes, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters.\n\nTRANSFER\nPress T, then paint friendly arrival or hostile staging hexes. Plain [ and ] change the requested share; modified brackets still resize the brush. Enter confirms. Troops follow a real route; they do not teleport.\n\nREDISTRIBUTE\nB previews an even target density. Hold F and drag over the map to orient front-load. The pale nested outlines are proposed density, not troops that already moved.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. It affects future recruitment only; lowering it does not demobilize existing soldiers.",
             ),
             TextFont::from_font_size(12.0),
             TextColor(TEXT),
@@ -491,6 +504,7 @@ fn update_hud(
         Single<&mut Node, With<HelpPanel>>,
     )>,
     slider: Single<(Entity, &SliderValue), With<MobilizationSlider>>,
+    mut selection_totals: Local<SelectionTotalsCache>,
 ) {
     let p1 = view.conquest_percent(1);
     let p2 = view.conquest_percent(2);
@@ -542,7 +556,20 @@ fn update_hud(
         );
     }
 
-    let (strength, capacity, civilians) = view.selected_totals(&interaction.sources);
+    if !selection_totals.initialized
+        || selection_totals.source_revision != interaction.source_revision
+        || selection_totals.logical_step != view.logical_step
+        || selection_totals.chunk_index_revision != view.chunk_index_revision
+        || selection_totals.cell_state_revision != view.cell_state_revision
+    {
+        selection_totals.totals = view.selected_totals(&interaction.sources);
+        selection_totals.source_revision = interaction.source_revision;
+        selection_totals.logical_step = view.logical_step;
+        selection_totals.chunk_index_revision = view.chunk_index_revision;
+        selection_totals.cell_state_revision = view.cell_state_revision;
+        selection_totals.initialized = true;
+    }
+    let (strength, capacity, civilians) = selection_totals.totals;
     let occupancy = if capacity == 0 {
         0.0
     } else {
@@ -553,12 +580,24 @@ fn update_hud(
         |(from, to)| format!("{},{} → {},{}", from.q, from.r, to.q, to.r),
     );
     let context_hint = match interaction.mode {
-        OrderMode::Idle => "LMB paint · Shift add · Ctrl subtract",
-        OrderMode::Transfer => "Paint destinations · Enter to stage movement",
-        OrderMode::BalancePreview => "Nested outlines show target density",
-        OrderMode::FrontLoadOrient { .. } => "Keep F held · move pointer · release to preview",
-        OrderMode::FrontLoadPreview { .. } => "Arrow shows orientation · Enter to confirm",
-        OrderMode::Submitting { .. } => "Waiting for authoritative response…",
+        OrderMode::Idle => format!(
+            "BRUSH {}x{} · [/] both · Shift width · Ctrl height",
+            interaction.brush.width(),
+            interaction.brush.height()
+        ),
+        OrderMode::Transfer => format!(
+            "DEST BRUSH {}x{} · plain [/] changes share",
+            interaction.brush.width(),
+            interaction.brush.height()
+        ),
+        OrderMode::BalancePreview => "Nested outlines show target density".to_owned(),
+        OrderMode::FrontLoadOrient { .. } => {
+            "Keep F held · move pointer · release to preview".to_owned()
+        }
+        OrderMode::FrontLoadPreview { .. } => {
+            "Arrow shows orientation · Enter to confirm".to_owned()
+        }
+        OrderMode::Submitting { .. } => "Waiting for authoritative response…".to_owned(),
     };
     {
         let mut order = texts.p2();

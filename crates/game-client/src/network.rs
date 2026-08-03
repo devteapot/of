@@ -11,7 +11,9 @@ use hex_core::Axial;
 
 use crate::{
     geometry::axial_to_plane,
-    model::{ActiveFlow, ActiveFront, MatchPhase, MatchView, ToastKind, find_route},
+    model::{
+        ActiveFlow, ActiveFront, MatchPhase, MatchView, ToastKind, reachability_to_destinations,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,19 +205,31 @@ fn resolve_transfer(
     }) {
         return rejection("Destination is water or impassable", Some(*invalid));
     }
-    let Some(route) = find_route(view, sources, destinations) else {
+    let primary = *destinations.first().expect("validated destination");
+    let primary_set = BTreeSet::from([primary]);
+    let reverse = reachability_to_destinations(view, &primary_set);
+    let reachable_sources = reverse
+        .reachable_sources(sources)
+        .into_iter()
+        .filter(|source| *source != primary)
+        .collect::<BTreeSet<_>>();
+    let Some(route) = reverse.route_from_any(&reachable_sources) else {
         return rejection(
             "No traversable route; cliff or water blocks the corridor",
-            destinations.first().copied(),
+            Some(primary),
         );
     };
 
     let percent = u64::from(amount_percent.clamp(10, 100));
-    let requested: u64 = sources
+    let requested_by_source = reachable_sources
         .iter()
         .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| cell.infantry * percent / 100)
-        .sum();
+        .map(|cell| (cell.coordinate, cell.infantry * percent / 100))
+        .collect::<BTreeMap<_, _>>();
+    let requested = requested_by_source
+        .values()
+        .copied()
+        .fold(0_u64, u64::saturating_add);
     if requested == 0 {
         return rejection(
             "Selected sources have no movable infantry",
@@ -223,16 +237,53 @@ fn resolve_transfer(
         );
     }
 
-    let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
-    for source in sources {
-        let cell = view.cell(*source).expect("validated source");
-        let moved = cell.infantry * percent / 100;
-        changed.insert(*source, (cell.owner, cell.infantry.saturating_sub(moved)));
-    }
-
-    let primary = *destinations.first().expect("validated destination");
     let destination = view.cell(primary).expect("validated destination");
     let attacking = destination.owner != Some(view.local_player);
+    let moved = if attacking {
+        requested
+    } else {
+        requested.min(destination.free_capacity())
+    };
+    if moved == 0 {
+        return rejection("Destination has no free military capacity", Some(primary));
+    }
+
+    // Offline commands resolve immediately, so there is no authoritative queue
+    // that can safely own strength above the destination's free capacity. Debit
+    // exactly the accepted amount, spread proportionally and deterministically
+    // across the sorted reachable sources; every unaccepted soldier stays put.
+    let mut moved_by_source = BTreeMap::new();
+    let mut allocated = 0_u64;
+    for (coordinate, available) in &requested_by_source {
+        let share = if moved == requested {
+            *available
+        } else {
+            (u128::from(*available) * u128::from(moved) / u128::from(requested)) as u64
+        };
+        moved_by_source.insert(*coordinate, share);
+        allocated = allocated.saturating_add(share);
+    }
+    let mut remainder = moved.saturating_sub(allocated);
+    for (coordinate, available) in &requested_by_source {
+        if remainder == 0 {
+            break;
+        }
+        let share = moved_by_source
+            .get_mut(coordinate)
+            .expect("source allocation was initialized");
+        if *share < *available {
+            *share += 1;
+            remainder -= 1;
+        }
+    }
+    debug_assert_eq!(remainder, 0);
+
+    let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
+    for (source, strength) in moved_by_source {
+        let cell = view.cell(source).expect("validated source");
+        changed.insert(source, (cell.owner, cell.infantry.saturating_sub(strength)));
+    }
+
     let mut front = None;
     let summary;
     if attacking {
@@ -259,18 +310,15 @@ fn resolve_transfer(
             });
         }
     } else {
-        let free = destination.free_capacity();
-        let arriving = requested.min(free);
-        changed.insert(
-            primary,
-            (destination.owner, destination.infantry + arriving),
-        );
-        let queued = requested.saturating_sub(arriving);
-        summary = if queued > 0 {
-            format!("Transfer accepted · {arriving} arriving · {queued} queued at bottleneck")
+        changed.insert(primary, (destination.owner, destination.infantry + moved));
+        let retained = requested.saturating_sub(moved);
+        summary = if retained > 0 {
+            format!(
+                "Transfer accepted · {moved} infantry · {retained} retained at sources (capacity limit)"
+            )
         } else {
             format!(
-                "Transfer accepted · {arriving} infantry · ETA ≈ {}s",
+                "Transfer accepted · {moved} infantry · ETA ≈ {}s",
                 route.len() * 2
             )
         };
@@ -289,7 +337,7 @@ fn resolve_transfer(
             .collect(),
         flow: Some(ActiveFlow {
             route,
-            strength: requested,
+            strength: moved,
             attacking,
             age: 0.0,
             lifetime: 10.0,
@@ -395,5 +443,133 @@ fn rejection(reason: impl Into<String>, relevant_cell: Option<Axial>) -> ServerU
         command_id: None,
         reason: reason.into(),
         relevant_cell,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::CellView;
+    use hex_core::TerrainKind;
+
+    fn cell(coordinate: Axial, infantry: u64) -> CellView {
+        CellView {
+            coordinate,
+            terrain: TerrainKind::Plains,
+            elevation: 0,
+            owner: Some(1),
+            civilians: 0,
+            infantry,
+            military_capacity: 100,
+            blocked: false,
+        }
+    }
+
+    fn disconnected_transfer_view() -> MatchView {
+        let mut view = MatchView::connecting(1);
+        for cell in [
+            cell(Axial::ZERO, 10),
+            cell(Axial::new(10, 0), 20),
+            cell(Axial::new(11, 0), 0),
+        ] {
+            view.cells.insert(cell.coordinate, cell);
+        }
+        view.rebuild_chunk_index();
+        view
+    }
+
+    #[test]
+    fn offline_transfer_uses_only_sources_that_reach_the_primary_destination() {
+        let view = disconnected_transfer_view();
+        let isolated = Axial::ZERO;
+        let reachable = Axial::new(10, 0);
+        let destination = Axial::new(11, 0);
+        let update = resolve_transfer(
+            &view,
+            &BTreeSet::from([isolated, reachable]),
+            &BTreeSet::from([destination]),
+            100,
+        );
+
+        let ServerUpdate::Accepted { patches, flow, .. } = update else {
+            panic!("reachable source should produce an accepted transfer");
+        };
+        assert!(!patches.iter().any(|patch| patch.coordinate == isolated));
+        assert_eq!(
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == reachable)
+                .map(|patch| patch.infantry),
+            Some(0)
+        );
+        assert_eq!(
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == destination)
+                .map(|patch| patch.infantry),
+            Some(20)
+        );
+        let flow = flow.expect("accepted transfer flow");
+        assert_eq!(flow.strength, 20);
+        assert_eq!(flow.route, vec![reachable, destination]);
+    }
+
+    #[test]
+    fn offline_transfer_rejects_when_no_source_reaches_the_primary_destination() {
+        let view = disconnected_transfer_view();
+        let update = resolve_transfer(
+            &view,
+            &BTreeSet::from([Axial::ZERO]),
+            &BTreeSet::from([Axial::new(11, 0)]),
+            100,
+        );
+
+        assert!(matches!(update, ServerUpdate::Rejected { .. }));
+    }
+
+    #[test]
+    fn offline_friendly_transfer_retains_strength_that_exceeds_capacity() {
+        let first = Axial::ZERO;
+        let second = Axial::new(1, 0);
+        let destination = Axial::new(2, 0);
+        let mut view = MatchView::connecting(1);
+        for cell in [cell(first, 60), cell(second, 40), cell(destination, 90)] {
+            view.cells.insert(cell.coordinate, cell);
+        }
+        view.rebuild_chunk_index();
+
+        let update = resolve_transfer(
+            &view,
+            &BTreeSet::from([first, second]),
+            &BTreeSet::from([destination]),
+            100,
+        );
+        let ServerUpdate::Accepted {
+            summary,
+            patches,
+            flow,
+            ..
+        } = update
+        else {
+            panic!("capacity-limited friendly transfer should be accepted");
+        };
+
+        let infantry_after = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+                .expect("every changed cell has a patch")
+        };
+        assert_eq!(infantry_after(first), 54);
+        assert_eq!(infantry_after(second), 36);
+        assert_eq!(infantry_after(destination), 100);
+        assert_eq!(
+            infantry_after(first) + infantry_after(second) + infantry_after(destination),
+            190,
+            "friendly transfer must conserve infantry"
+        );
+        assert!(summary.contains("90 retained at sources"));
+        assert_eq!(flow.expect("accepted transfer flow").strength, 10);
     }
 }

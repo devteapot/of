@@ -878,6 +878,9 @@ fn update_cells(
     states: &[CellState],
     mode: MapViewMode,
 ) {
+    if !states.is_empty() {
+        view.mark_cell_state_changed();
+    }
     for state in states {
         let Some(coordinate) = transport.id_to_coordinate.get(&state.cell_id).copied() else {
             continue;

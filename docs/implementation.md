@@ -119,6 +119,13 @@ UI node or draw call per cell. Farther out, the vertex-color heatmap carries the
 information without trying to draw text for every cell. The label LOD is
 viewport-derived and displays the complete readable visible set or hides it,
 rather than silently sampling cells when a fixed budget is exceeded.
+In Civilians mode, a second single-mesh batch draws thin quads across exposed
+edges of six-connected populated land, with most of each strip kept on the
+populated hex top. Its scan is limited to visible render chunks and its edge
+budget is likewise complete-or-hidden; it does not create a UI element,
+material, entity, or gizmo for every populated cell. Camera, projection,
+visible-chunk, and cell-state signatures skip both value and perimeter scans on
+unchanged frames.
 
 Rendering work is organized by an 8 x 8 client-side spatial index. This is
 deliberately independent of the module's 16 x 16 storage/subscription chunks so
@@ -126,11 +133,19 @@ the renderer can tune culling granularity without changing authoritative cell
 identity. Initial render-chunk creation is amortized, state changes replace
 only the affected vertex-color attributes, visible dirty chunks are
 prioritized, and hidden chunks converge under a bounded per-frame budget.
-The value batch and blocked overlays inspect visible render-chunk cells rather
-than scanning the whole map. This keeps presentation work tied primarily to
-the viewport, but world-scale maps will still require the documented
-chunk-interest subscriptions or regional summaries so the client does not
-retain every authoritative cell in memory.
+The value batch, population outline, blocked overlay, and selected-region
+perimeters inspect visible render-chunk cells rather than scanning the whole
+map. Selection painting supports a centered odd-sized rectangular brush up to
+31 x 31 cells, connected local-owned components, and all-local-owned selection.
+Large selections are materialized once in V1, but their per-frame outline work
+is viewport-bounded and emits only exposed edges. Order previews are keyed by
+selection and cell-state revisions, and a transfer classifies all selected
+sources and destinations with constant-count multi-source graph traversals
+rather than one route search per selected cell. This keeps presentation work
+tied primarily to the viewport and real state changes. World-scale maps will
+still require symbolic region selections plus chunk-interest subscriptions or
+regional summaries so the client does not retain or transmit every
+authoritative cell.
 
 Input produces `ClientIntent`. The online transport maps coordinates to
 authoritative cell IDs, invokes reducers, pumps SpacetimeDB frames, and rebuilds

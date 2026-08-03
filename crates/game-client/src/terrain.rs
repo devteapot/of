@@ -13,7 +13,7 @@ use bevy::{
 use hex_core::{Axial, ChunkCoord, TerrainKind};
 
 use crate::{
-    geometry::{COLUMN_FLOOR, cell_top, corner, world_center},
+    geometry::{COLUMN_FLOOR, cell_top, corner, edge_index_for_direction, world_center},
     map_view::{MapViewMode, normalized_cell_value},
     model::{CellView, MatchView, PLAYER_ONE, PLAYER_TWO},
 };
@@ -488,7 +488,7 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
         );
     }
 
-    for (edge, neighbor_coord) in cell.coordinate.neighbors().into_iter().enumerate() {
+    for (direction, neighbor_coord) in cell.coordinate.neighbors().into_iter().enumerate() {
         let neighbor_top = view.cell(neighbor_coord).map_or(COLUMN_FLOOR, |neighbor| {
             cell_top(neighbor.elevation, neighbor.is_water())
         });
@@ -501,6 +501,7 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
             continue;
         }
 
+        let edge = edge_index_for_direction(direction);
         let next = (edge + 1) % 6;
         let top_a = corner(center, edge, top_y);
         let top_b = corner(center, next, top_y);

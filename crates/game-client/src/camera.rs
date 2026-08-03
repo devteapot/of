@@ -87,6 +87,12 @@ pub fn camera_controls(
 
     let (forward, right) = planar_camera_axes(rig.yaw);
     let mut keyboard_pan = Vec3::ZERO;
+    let command_modifier = keyboard.any_pressed([
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+        KeyCode::SuperLeft,
+        KeyCode::SuperRight,
+    ]);
     if keyboard.pressed(KeyCode::KeyW) {
         keyboard_pan += forward;
     }
@@ -96,7 +102,7 @@ pub fn camera_controls(
     if keyboard.pressed(KeyCode::KeyD) {
         keyboard_pan += right;
     }
-    if keyboard.pressed(KeyCode::KeyA) {
+    if keyboard.pressed(KeyCode::KeyA) && !command_modifier {
         keyboard_pan -= right;
     }
 

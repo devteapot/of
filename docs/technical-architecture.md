@@ -274,10 +274,27 @@ state update can replace only color attributes. Recolor visible dirty chunks
 first and let hidden chunks converge under bounded per-frame budgets. Exact
 cell totals use one texture-atlas-backed world-space mesh with viewport-derived
 complete-set LOD; do not create one text/UI entity or material per gameplay
-cell. Keep overlays separable so a future art direction does not require
-changing simulation state.
+cell. The Civilians view similarly batches the exposed edges of connected
+populated land into one viewport-bounded mesh. Camera, projection,
+visible-chunk, topology, and cell-state signatures must short-circuit unchanged
+presentation frames before scanning individual cells. Keep overlays separable
+so a future art direction does not require changing simulation state.
 
-Picking should resolve pointer rays to chunks and deterministic hex coordinates instead of creating a physics collider for every cell. Height-aware picking must choose the visible top surface in stepped terrain. Selection is represented as compact cell sets or ranges, with direct source selection and destination painting as the first transfer interaction to test. The UX is expected to iterate; the server intent model should not depend on one specific gesture.
+Picking should resolve pointer rays to chunks and deterministic hex coordinates
+instead of creating a physics collider for every cell. Height-aware picking
+must choose the visible top surface in stepped terrain. The current client
+materializes selected cells, supports a centered rectangular brush, connected
+owned-component selection, and all-owned selection, while drawing only exposed
+edges from visible render chunks. Truly world-scale selection must move to
+symbolic chunk masks or region selectors that the authority revalidates rather
+than serializing millions of cell IDs. The UX is expected to iterate; the
+server intent model should not depend on one specific gesture.
+
+Bulk selections must not multiply pathfinding work. Transfer previews use
+deterministic multi-source forward and reverse reachability, cache results by
+selection and authoritative cell-state revisions, and classify all endpoints
+from a constant number of graph traversals. Every authority adapter must debit
+only source components that can actually reach the accepted destination.
 
 Native-only filesystem, windowing, and startup behavior belongs behind narrow
 boundaries where practical. A WASM compile gate is deferred with browser

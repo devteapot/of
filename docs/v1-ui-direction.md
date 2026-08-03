@@ -27,13 +27,15 @@ from targeted transfers and hostile attacks. Its final gesture is not locked;
 the current left-drag selection must remain available while the prototype is
 evaluated.
 
-The corresponding focused command is `PushFront { edges, direction,
-commitment }`. `X` activates Expand All without changing the cell selection;
-`P` highlights neutral-facing border segments. Clicking chooses a natural
-segment, dragging along the perimeter chooses a contiguous subsection, and an
-outward drag supplies a six-direction continuation heading. The client submits
-exact directed edge keys rather than a visual segment ID, so a changing border
-cannot silently retarget the command.
+The corresponding focused command is `PushFront { sources, edges, direction,
+commitment }`. `X` activates Expand All without changing the cell selection.
+Push Front uses the ordinary connected owned-cell selection: cells on its
+neutral-facing boundary define one contiguous front, and the selection may be
+painted backward into owned territory to include its reinforcement pool and
+routes. Pressing and dragging `P` outward supplies a six-direction continuation
+heading and filters out the selection's back and side edges. The client previews
+and submits exact source cells and directed edge keys rather than a visual
+segment ID, so a changing border cannot silently retarget the command.
 
 ### Camera
 
@@ -46,6 +48,11 @@ cannot silently retarget the command.
 
 - Left click or drag paints owned source hexes.
 - `Shift + left`: add; `Control + left`: subtract.
+- In source-selection mode, `[` / `]` resize both brush axes, `Shift` modifies
+  only width, and `Control` modifies only height. The brush uses odd dimensions
+  so it remains centered on the hovered hex.
+- `C` selects the hovered six-connected owned cluster; Shift adds that cluster
+  and Control removes it. `Control/Command + A` selects every owned hex.
 - `T` locks the source selection and enters destination painting.
 - Left click or drag paints destination land; friendly destinations mean arrival, while neutral/enemy destinations mean staging and attack.
 - `[` / `]` changes requested strength by ten percentage points; the provisional default is 50%.
@@ -65,7 +72,9 @@ The global mobilization target remains visible in the bottom bar. The caption sa
 ## HUD hierarchy
 
 - Top strip: player identity/slot, both connection states, both conquest percentages, and match phase.
-- Small upper-right inspector: coordinate, terrain, elevation, owner, civilians, infantry, military capacity, and occupancy.
+- Upper-right tactical panel: compact map-view status followed by coordinate,
+  terrain, elevation, owner, civilians, infantry, military capacity, and
+  occupancy.
 - Contextual right-side order panel: mode, selection totals, amount, reachable/excluded counts, estimated ETA, bottleneck, Confirm, and Cancel.
 - Bottom strip: mobilization target, active flow/front counts, and latest command result.
 - Transient bottom-center toast: authoritative rejection or important match event.
@@ -83,10 +92,11 @@ texture atlas, batched into one world-space mesh over the visible hex tops—not
 individual Bevy UI elements. Height and shaded column sides convey elevation.
 These overlays remain separate:
 
-- hover: thin white ring;
-- source: solid outer outline with corner ticks;
-- friendly destination: dashed inner outline with inward chevrons;
-- hostile/neutral destination: dashed outline with attack ticks;
+- hover: thin white perimeter around the current brush footprint;
+- source: solid exposed perimeter around each selected component;
+- friendly destination: inner exposed perimeter;
+- hostile/neutral destination: exposed perimeter with attack ticks;
+- populated land: one batched external cluster perimeter in Civilians view;
 - preview route: desaturated dashed arrows;
 - committed flow: solid animated arrows, thickness proportional to flow;
 - excluded/blocked: diagonal cross or hatch;

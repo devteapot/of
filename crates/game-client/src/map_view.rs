@@ -18,7 +18,7 @@ use bevy::{
 use hex_core::Axial;
 
 use crate::{
-    camera::GameCamera,
+    camera::{CameraRig, GameCamera},
     geometry::world_center,
     model::{CellView, MatchView},
     terrain::TerrainChunk,
@@ -46,8 +46,6 @@ const GLYPHS: [char; 13] = [
 
 const SOLDIER_TEXT: Color = Color::srgb(0.72, 0.96, 1.0);
 const CIVILIAN_TEXT: Color = Color::srgb(1.0, 0.86, 0.56);
-const VIEW_PANEL: Color = Color::srgba(0.035, 0.052, 0.064, 0.94);
-const VIEW_LINE: Color = Color::srgba(0.42, 0.58, 0.65, 0.48);
 
 #[derive(Resource, Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) enum MapViewMode {
@@ -120,7 +118,7 @@ pub(crate) fn normalized_cell_value(mode: MapViewMode, cell: &CellView) -> Optio
 }
 
 #[derive(Component)]
-struct MapViewStatus;
+pub(crate) struct MapViewStatus;
 
 #[derive(Component)]
 struct MapValueBatch;
@@ -129,7 +127,24 @@ struct MapValueBatch;
 struct MapValueBatchAssets {
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
+    input_signature: Option<u64>,
     signature: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PresentationInput<'a> {
+    layer_tag: u8,
+    mode: MapViewMode,
+    world_from_view: Mat4,
+    clip_from_view: Mat4,
+    focus: Vec3,
+    window_logical_size: Vec2,
+    window_physical_size: UVec2,
+    window_scale_factor: f32,
+    logical_viewport: Option<Rect>,
+    cell_state_revision: u64,
+    chunk_index_revision: u64,
+    visible_chunks: &'a [Entity],
 }
 
 #[derive(Resource, Debug, Default)]
@@ -201,7 +216,7 @@ impl Plugin for MapViewPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MapViewMode>()
             .init_resource::<MapViewDiagnostics>()
-            .add_systems(Startup, (spawn_map_view_status, spawn_map_value_batch))
+            .add_systems(Startup, spawn_map_value_batch)
             .add_systems(Update, (switch_map_view, update_map_view_status).chain())
             .add_systems(
                 PostUpdate,
@@ -212,28 +227,15 @@ impl Plugin for MapViewPlugin {
     }
 }
 
-fn spawn_map_view_status(mut commands: Commands) {
-    commands.spawn((
+pub(crate) fn map_view_status_bundle() -> impl Bundle {
+    (
         Name::new("Map view status"),
         MapViewStatus,
-        Text::new(
-            "VIEW  //  SOLDIERS · ABSOLUTE STRENGTH 0–100+    1 OVERVIEW · 2 SOLDIERS · 3 CIVILIANS · V CYCLE",
-        ),
+        Text::new("MAP VIEW  //  SOLDIERS\nABSOLUTE STRENGTH 0-100+ | 1/2/3 SELECT | V CYCLE"),
         TextFont::from_font_size(10.5),
         TextColor(SOLDIER_TEXT),
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(14),
-            bottom: px(94),
-            padding: UiRect::axes(px(10), px(6)),
-            border: UiRect::all(px(1)),
-            ..default()
-        },
-        BackgroundColor(VIEW_PANEL),
-        BorderColor::all(VIEW_LINE),
-        GlobalZIndex(21),
         Pickable::IGNORE,
-    ));
+    )
 }
 
 fn spawn_map_value_batch(
@@ -275,6 +277,7 @@ fn spawn_map_value_batch(
     commands.insert_resource(MapValueBatchAssets {
         mesh,
         material,
+        input_signature: None,
         signature: 0,
     });
 }
@@ -308,7 +311,7 @@ fn update_map_view_status(
     }
     let (mut text, mut text_color) = status.into_inner();
     **text = format!(
-        "VIEW  //  {} · {}    1 OVERVIEW · 2 SOLDIERS · 3 CIVILIANS · V CYCLE",
+        "MAP VIEW  //  {}\n{} | 1/2/3 SELECT | V CYCLE",
         mode.label(),
         mode.legend()
     );
@@ -317,7 +320,7 @@ fn update_map_view_status(
 
 #[allow(clippy::too_many_arguments)]
 fn update_map_value_batch(
-    camera: Single<(&Camera, &GlobalTransform, &VisibleEntities), With<GameCamera>>,
+    camera: Single<(&Camera, &GlobalTransform, &CameraRig, &VisibleEntities), With<GameCamera>>,
     window: Single<&Window>,
     view: Res<MatchView>,
     mode: Res<MapViewMode>,
@@ -327,15 +330,32 @@ fn update_map_value_batch(
     mut batch: ResMut<MapValueBatchAssets>,
     mut diagnostics: ResMut<MapViewDiagnostics>,
 ) {
-    let (camera, camera_transform, visible) = *camera;
-    let visible_chunks = visible
+    let (camera, camera_transform, camera_rig, visible) = *camera;
+    let mut visible_chunks = visible
         .iter(TypeId::of::<Mesh3d>())
-        .filter_map(|entity| chunks.get(*entity).ok())
+        .filter(|entity| chunks.contains(**entity))
+        .copied()
         .collect::<Vec<_>>();
+    visible_chunks.sort_unstable();
     diagnostics.visible_chunks = visible_chunks.len();
 
+    let input_signature = presentation_input_signature(
+        0x51,
+        *mode,
+        camera,
+        camera_transform,
+        camera_rig,
+        &window,
+        &view,
+        &visible_chunks,
+    );
+    if batch.input_signature == Some(input_signature) {
+        return;
+    }
+    batch.input_signature = Some(input_signature);
+
     let viewport = Vec2::new(window.width(), window.height());
-    let spacing = projected_cell_spacing(camera, camera_transform);
+    let spacing = projected_hex_spacing(camera, camera_transform, camera_rig.focus);
     let required_spacing = minimum_complete_label_spacing(viewport);
     if *mode == MapViewMode::Overview || spacing < required_spacing {
         diagnostics.active_labels = 0;
@@ -344,7 +364,10 @@ fn update_map_value_batch(
     }
 
     let mut candidates = Vec::new();
-    for chunk in visible_chunks {
+    for entity in visible_chunks {
+        let Ok(chunk) = chunks.get(entity) else {
+            continue;
+        };
         for coordinate in &chunk.cells {
             let Some(cell) = view.cell(*coordinate).filter(|cell| cell.is_land()) else {
                 continue;
@@ -451,20 +474,86 @@ fn label_signature(mode: MapViewMode, candidates: &[LabelCandidate], right: Vec3
     hasher.finish()
 }
 
-fn projected_cell_spacing(camera: &Camera, camera_transform: &GlobalTransform) -> f32 {
-    let origin = world_center(Axial::ZERO, 0, false);
-    let Ok(origin) = camera.world_to_viewport(camera_transform, origin) else {
+pub(crate) fn projected_hex_spacing(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    focus: Vec3,
+) -> f32 {
+    let Ok(projected_focus) = camera.world_to_viewport(camera_transform, focus) else {
         return 0.0;
     };
-    Axial::DIRECTIONS
+    let origin = world_center(Axial::ZERO, 0, false);
+    let spacing = Axial::DIRECTIONS
         .into_iter()
         .filter_map(|coordinate| {
+            let neighbor_offset = world_center(coordinate, 0, false) - origin;
             camera
-                .world_to_viewport(camera_transform, world_center(coordinate, 0, false))
+                .world_to_viewport(camera_transform, focus + neighbor_offset)
                 .ok()
-                .map(|neighbor| origin.distance(neighbor))
+                .map(|neighbor| projected_focus.distance(neighbor))
         })
-        .fold(f32::INFINITY, f32::min)
+        .fold(f32::INFINITY, f32::min);
+    if spacing.is_finite() { spacing } else { 0.0 }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn presentation_input_signature(
+    layer_tag: u8,
+    mode: MapViewMode,
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    camera_rig: &CameraRig,
+    window: &Window,
+    view: &MatchView,
+    visible_chunks: &[Entity],
+) -> u64 {
+    presentation_input_signature_from_parts(PresentationInput {
+        layer_tag,
+        mode,
+        world_from_view: camera_transform.to_matrix(),
+        clip_from_view: camera.clip_from_view(),
+        focus: camera_rig.focus,
+        window_logical_size: Vec2::new(window.width(), window.height()),
+        window_physical_size: UVec2::new(window.physical_width(), window.physical_height()),
+        window_scale_factor: window.scale_factor(),
+        logical_viewport: camera.logical_viewport_rect(),
+        cell_state_revision: view.cell_state_revision,
+        chunk_index_revision: view.chunk_index_revision,
+        visible_chunks,
+    })
+}
+
+fn presentation_input_signature_from_parts(input: PresentationInput<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    input.layer_tag.hash(&mut hasher);
+    input.mode.hash(&mut hasher);
+    for value in input
+        .world_from_view
+        .to_cols_array()
+        .into_iter()
+        .chain(input.clip_from_view.to_cols_array())
+        .chain(input.focus.to_array())
+        .chain(input.window_logical_size.to_array())
+    {
+        value.to_bits().hash(&mut hasher);
+    }
+    input.window_physical_size.to_array().hash(&mut hasher);
+    input.window_scale_factor.to_bits().hash(&mut hasher);
+    input
+        .logical_viewport
+        .map(|viewport| {
+            [
+                viewport.min.x.to_bits(),
+                viewport.min.y.to_bits(),
+                viewport.max.x.to_bits(),
+                viewport.max.y.to_bits(),
+            ]
+        })
+        .hash(&mut hasher);
+    input.cell_state_revision.hash(&mut hasher);
+    input.chunk_index_revision.hash(&mut hasher);
+    input.visible_chunks.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn minimum_complete_label_spacing(viewport: Vec2) -> f32 {
@@ -732,6 +821,79 @@ mod tests {
         let large = minimum_complete_label_spacing(Vec2::new(3_840.0, 2_160.0));
         assert!(small >= MIN_LABEL_SPACING_PX);
         assert!(large > small);
+    }
+
+    #[test]
+    fn presentation_cache_tracks_every_pre_scan_input() {
+        let chunks = [
+            Entity::from_raw_u32(7).expect("valid test entity"),
+            Entity::from_raw_u32(9).expect("valid test entity"),
+        ];
+        let base = PresentationInput {
+            layer_tag: 0x51,
+            mode: MapViewMode::Civilians,
+            world_from_view: Mat4::IDENTITY,
+            clip_from_view: Mat4::orthographic_rh(-4.0, 4.0, -3.0, 3.0, 0.1, 100.0),
+            focus: Vec3::new(12.0, 0.45, -8.0),
+            window_logical_size: Vec2::new(1_280.0, 720.0),
+            window_physical_size: UVec2::new(2_560, 1_440),
+            window_scale_factor: 2.0,
+            logical_viewport: Some(Rect::from_corners(Vec2::ZERO, Vec2::new(1_280.0, 720.0))),
+            cell_state_revision: 17,
+            chunk_index_revision: 3,
+            visible_chunks: &chunks,
+        };
+        let signature = presentation_input_signature_from_parts(base);
+        assert_eq!(
+            signature,
+            presentation_input_signature_from_parts(base),
+            "a stationary frame must hit the pre-scan cache"
+        );
+
+        let mut changed = base;
+        changed.world_from_view = Mat4::from_translation(Vec3::X);
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.clip_from_view = Mat4::orthographic_rh(-8.0, 8.0, -6.0, 6.0, 0.1, 100.0);
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.focus.x += 1.0;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.window_logical_size.x += 1.0;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.window_physical_size.x += 1;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.window_scale_factor = 1.5;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.logical_viewport = None;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.cell_state_revision += 1;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.chunk_index_revision += 1;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        let fewer_chunks = &chunks[..1];
+        changed = base;
+        changed.visible_chunks = fewer_chunks;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.layer_tag = 0x52;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
     }
 
     #[test]

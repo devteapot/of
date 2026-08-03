@@ -61,9 +61,12 @@ fn spawn_performance_overlay(mut commands: Commands) {
             Node {
                 display: Display::None,
                 position_type: PositionType::Absolute,
-                left: px(14),
+                // The help panel occupies x=72..522 at the same vertical
+                // band; keep diagnostics in the adjacent HUD slot so both
+                // toggles remain readable when enabled together.
+                left: px(536),
                 top: px(70),
-                min_width: px(236),
+                width: px(390),
                 padding: UiRect::all(px(10)),
                 border: UiRect::all(px(1)),
                 ..default()

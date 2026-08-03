@@ -21,6 +21,7 @@ mod network;
 mod online;
 mod overlays;
 mod performance;
+mod population_outline;
 mod terrain;
 
 use bevy::{prelude::*, window::WindowResolution};
@@ -35,6 +36,7 @@ use network::{NetworkBoundaryPlugin, NetworkSet, OfflineTransportPlugin, apply_s
 use online::{OnlineSyncSet, OnlineTransportPlugin};
 use overlays::OverlayPlugin;
 use performance::PerformanceOverlayPlugin;
+use population_outline::PopulationOutlinePlugin;
 use terrain::{spawn_terrain, sync_terrain_chunks};
 
 fn main() {
@@ -60,6 +62,7 @@ fn main() {
             NetworkBoundaryPlugin,
             GameInteractionPlugin,
             MapViewPlugin,
+            PopulationOutlinePlugin,
             OverlayPlugin,
             HudPlugin,
             PerformanceOverlayPlugin,

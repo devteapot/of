@@ -39,6 +39,15 @@ pub fn corner(center: Vec3, index: usize, y: f32) -> Vec3 {
     )
 }
 
+/// Maps an [`Axial::DIRECTIONS`] index to the matching geometric hex edge.
+///
+/// Axial directions are ordered clockwise, while [`corner`] advances
+/// counter-clockwise. Edge zero (between corners zero and one) is the one
+/// exception where both sequences begin at the same positive-q side.
+pub(crate) const fn edge_index_for_direction(direction_index: usize) -> usize {
+    (6 - direction_index % 6) % 6
+}
+
 pub fn chunk_of(coord: Axial) -> ChunkCoord {
     coord
         .chunk_address(CHUNK_SIZE)
@@ -58,6 +67,24 @@ mod tests {
             .map(|neighbor| axial_to_plane(neighbor).distance(origin));
         for distance in distances {
             assert!((distance - HEX_RADIUS * 3.0_f32.sqrt()).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn each_direction_maps_to_the_edge_facing_its_neighbor() {
+        let center = world_center(Axial::ZERO, 0, false);
+        for (direction_index, neighbor) in Axial::DIRECTIONS.into_iter().enumerate() {
+            let edge = edge_index_for_direction(direction_index);
+            let edge_midpoint =
+                (corner(center, edge, center.y) + corner(center, (edge + 1) % 6, center.y)) * 0.5;
+            let neighbor_center = world_center(neighbor, 0, false);
+            let edge_direction = (edge_midpoint - center).normalize_or_zero();
+            let neighbor_direction = (neighbor_center - center).normalize_or_zero();
+
+            assert!(
+                edge_direction.dot(neighbor_direction) > 0.999,
+                "direction {direction_index} mapped to edge {edge}"
+            );
         }
     }
 }

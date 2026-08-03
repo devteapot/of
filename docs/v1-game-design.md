@@ -204,32 +204,34 @@ directed frontier edges:
 
 - **Expand All** (`X` in the first prototype) immediately seeds every valid
   owned-to-neutral frontier edge using the remembered commitment percentage.
-- **Push Front** (`P`) lets the player select a contiguous portion of the
-  neutral frontier and give it a forward heading before committing it.
+- **Push Front** (`P`) uses the ordinary selected owned region. The part of
+  that region touching neutral territory defines the front, while cells painted
+  backward from that border define the reinforcement pool and corridor.
 
-The stable unit of intent is an edge
-`(owned source cell, adjacent neutral target cell)`, not a destination cell or
-a transient visual segment ID. The client derives natural selectable segments
-by walking the ownership perimeter in the fixed six-direction axial order. A
-segment is a maximal contiguous run of passable, capturable, unoccupied neutral
-edges. Enemy borders, water, cliffs, blocked cells, and map boundaries split
-segments. Closed loops use a deterministic display seam so the same unchanged
-border is presented consistently.
+The player does not switch to a separate edge-selection tool. They paint a
+connected source region with the normal selector, beginning at a contiguous
+neutral-facing border and continuing as far backward into owned territory as
+desired. The adjustable brush and connected-cluster helpers make broad or deep
+source regions practical. The preview derives the region's exposed directed
+edges `(selected owned source cell, adjacent neutral target cell)`. Enemy
+borders, water, cliffs, blocked cells, and map boundaries cannot become neutral
+expansion edges.
 
 The first Push Front interaction should be:
 
-1. Press `P` to highlight neutral-facing perimeter segments.
-2. Click a highlighted segment to select the natural segment, or drag along
-   the border to select a contiguous subsection. Shift adds arcs and Control
-   removes them.
-3. Drag an outward heading from the selected arc; the client quantizes it to
-   one of the six axial directions and previews the continuation wedge.
-4. Adjust commitment with `[` / `]`, confirm with Enter, or cancel with Escape.
+1. Paint one connected owned source region. Its neutral-facing boundary must
+   contain one contiguous intended front; continue painting backward to include
+   the troops and routes that may feed it.
+2. Press and drag `P` outward from that front. The client quantizes the gesture
+   to one of the six axial directions.
+3. Preview the exact active edges, continuation wedge, participating source
+   cells, and any cells excluded because they cannot connect to that front.
+4. Adjust commitment, confirm with Enter, or cancel with Escape.
 
-Existing cell selections remain intact for Transfer, Balance, and Front-load.
-If cells are selected before Push Front begins, their incident neutral frontier
-may be offered as the initial arc, but the authoritative command still contains
-the exact sorted directed edges.
+The heading keeps the selected region's forward-facing edge and its two
+adjacent directions, which prevents the back and sides of a deep selection from
+becoming unintended fronts. If the resulting edges form multiple disconnected
+arcs, the preview is invalid until the source selection is refined to one arc.
 
 A heading activates straight-ahead expansion and the two adjacent hex
 directions, weighted `2:1:1`. A source facing multiple chosen edges divides one
@@ -239,11 +241,12 @@ directions. Expand All has no heading and may fan out through every valid
 neutral direction.
 
 Visual segment IDs are deliberately not authoritative because the perimeter
-changes after every capture. The server revalidates the submitted edge set,
-accepts the still-valid subset with explicit exclusions, and rejects the order
-only when no selected edge remains valid. Repeating an expansion command
-updates the desired local commitment rather than stacking another copy, so
-click speed cannot manufacture momentum.
+changes after every capture. The command contains the exact sorted selected
+source cells, derived directed edges, direction, and commitment. The server
+revalidates the source region and edge set, accepts the still-valid subset with
+explicit exclusions, and rejects the order only when no selected edge remains
+valid. Repeating an expansion command updates the desired local commitment
+rather than stacking another copy, so click speed cannot manufacture momentum.
 
 ### One-shot redistribution
 
