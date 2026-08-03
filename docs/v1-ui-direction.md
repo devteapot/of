@@ -10,17 +10,20 @@ The client has one modal order state machine:
 
 ```text
 Idle -> Push Front orient -> Push Front preview -> Submit -> Idle
+Idle -> Expand All preview -> Submit -> Idle
 Idle -> Redistribute Balance -> Preview -> Submit -> Idle
 Idle -> Redistribute Front-load -> Orient -> Preview -> Submit -> Idle
 Idle -> Redistribute Core-load -> Preview -> Submit -> Idle
 Idle -> Redistribute Perimeter-load -> Preview -> Submit -> Idle
 ```
 
-The same owned-region selection feeds Push Front and all four redistribution
-presets. Server intentions remain independent of input gestures:
+The same owned-region selection feeds Push Front, Expand All, and all four
+redistribution presets. Server intentions remain independent of input gestures:
 
 - `PushFront { selected_cells, direction, commitment }`
 - `CancelPushFront { selected_cells, direction }`
+- `ExpandAll { selected_cells, dispatch }`
+- `CancelExpandAll { selected_cells }`
 - `Redistribute { cells, preset, direction?, participation }`
 - `SetMobilization { target }`
 
@@ -78,6 +81,27 @@ reach the map edge, or are manually cancelled independently. Precise infantry
 transfer is not part of the V1 command surface; exact cell movement is reserved
 for possible future discrete units such as tanks or boats.
 
+### Expand All
+
+- Shift+`P` or the HUD `EXPAND ALL` button previews every unique passable
+  selected-to-neutral edge around the connected owned selection. No orientation
+  gesture is required; disconnected boundary arcs may coexist.
+- Rear selected cells feed their nearest eligible boundary through traversable
+  selected terrain. Every movement-isolated part of the selection must expose
+  at least one eligible neutral boundary of its own.
+- `[` / `]` changes dispatch by ten percentage points. The preview shows an
+  **up to** amount from visible local strength; the authority applies that share
+  once to each selected cell's currently unallocated soldiers at submission.
+  It is separate from mobilization.
+- Each boundary's combined pool is divided evenly among its local outward exits.
+  Amber edges communicate neutral expansion, while red remains reserved for a
+  directional Push Front that can attack.
+- `Enter` starts independent straight lanes. A lane stops before enemy
+  territory, when exhausted or blocked, at the map edge, or when cancelled. It
+  may cross friendly ground without paying another occupation garrison.
+- From the same selected-region preview, `X` cancels matching active Expand All
+  operations and releases survivors where they currently are.
+
 ### Redistribution
 
 - `B` previews Balance over the owned selection and `Enter` submits it.
@@ -93,7 +117,11 @@ for possible future discrete units such as tanks or boats.
 
 ### Mobilization
 
-The global mobilization target remains visible in the bottom bar. The caption says that it affects future recruitment and does not demobilize existing troops. It can be adjusted through the pointer slider or with `M` plus the arrow keys.
+The global mobilization target remains visible in the bottom bar. The caption
+says that it affects future recruitment and does not demobilize existing
+troops. It is explicitly distinct from the order-panel Dispatch/Participate
+percentage and can be adjusted through the pointer slider or with `M` plus the
+arrow keys.
 
 ## HUD hierarchy
 
@@ -123,6 +151,8 @@ These overlays remain separate:
 - source: solid exposed perimeter around each selected component;
 - active Push Front: bold exact directional boundary edges, with hostile ticks
   when they lead into enemy ownership;
+- Expand All preview: amber perimeter edges only where the selected region can
+  enter neutral land; disconnected arcs and independent directions are allowed;
 - populated land: one batched external cluster perimeter in Civilians view;
 - selected-only push route: desaturated dashed arrows terminating at the exact
   frontier edge;
@@ -159,13 +189,14 @@ Congestion is accepted state, not a rejection. It increases estimated arrival ti
 The first-session hint is limited to:
 
 ```text
-LMB paint · P push · B/F/G/R redistribute · [ ] amount · X stop push · ? help
+LMB paint · P push · Shift+P expand all · B/F/G/R redistribute · [ ] order % · X stop · ? help
 ```
 
 Contextual first-use hints explain that Push Front uses only selected cells and
-continues in one exact direction with a fixed force pool, every redistribution
-preset still moves troops physically, and lowering mobilization does not send
-soldiers home.
+continues in one exact direction with a fixed force pool; Expand All uses the
+same region but only neutral boundaries; every redistribution preset still
+moves troops physically; and the order percentage does not change mobilization
+or send soldiers home.
 
 ## First playtest risks
 

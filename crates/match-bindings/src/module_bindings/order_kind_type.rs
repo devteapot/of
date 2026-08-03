@@ -17,6 +17,8 @@ pub enum OrderKind {
     PerimeterLoad,
 
     PushFront,
+
+    ExpandAll,
 }
 
 impl __sdk::InModule for OrderKind {

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
@@ -18,8 +18,9 @@ use match_bindings::{
     CommandReceiptTableAccess, DbConnection, MatchPhase, MatchStateTableAccess,
     MobilizationPolicyTableAccess, OrderKind, OrderStatus, PlayerSlotTableAccess, ReceiptStatus,
     TerrainClass, TransferDestinationTableAccess, TransferOrder, TransferOrderTableAccess,
-    TransferSourceTableAccess, TransitPacket, TransitPacketTableAccess, cancel_push_fronts as _,
-    issue_push_front as _, join_match as _, set_mobilization_target as _,
+    TransferSourceTableAccess, TransitPacket, TransitPacketTableAccess, cancel_expand_all as _,
+    cancel_push_fronts as _, issue_expand_all as _, issue_push_front as _, join_match as _,
+    set_mobilization_target as _,
 };
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
@@ -28,10 +29,12 @@ const PLAYER_TWO: u8 = 2;
 const SINGLETON_ID: u8 = 0;
 const COMMAND_ID_FLOOR: u64 = 9_000_000_000;
 const PUSH_COMMITMENT_BPS: u32 = 5_000;
+const EXPAND_COMMITMENT_BPS: u32 = 10_000;
 const MAX_PUSH_CORRIDOR_CELLS: usize = 5;
 const REQUIRED_LANE_CELLS: usize = 4;
 const OBSERVED_CAPTURE_LAYERS: usize = 2;
 const POST_CANCEL_STEPS: u64 = 2;
+const MIN_EXPAND_LANE_ALLOCATION: u64 = 4;
 
 #[derive(Debug, Parser)]
 #[command(about = "Exercise a live V1 match with two persistent anonymous identities")]
@@ -236,6 +239,44 @@ impl Client {
         wait_for_reducer(&rx, timeout, "cancel_push_fronts")
     }
 
+    fn issue_expand_all(
+        &self,
+        command_id: u64,
+        selected_cells: &[u32],
+        commitment_bps: u32,
+        timeout: Duration,
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.conn
+            .reducers
+            .issue_expand_all_then(
+                command_id,
+                selected_cells.to_vec(),
+                commitment_bps,
+                move |_, result| {
+                    let _ = tx.send(flatten_reducer_result(result));
+                },
+            )
+            .context("send issue_expand_all")?;
+        wait_for_reducer(&rx, timeout, "issue_expand_all")
+    }
+
+    fn cancel_expand_all(
+        &self,
+        command_id: u64,
+        selected_cells: &[u32],
+        timeout: Duration,
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.conn
+            .reducers
+            .cancel_expand_all_then(command_id, selected_cells.to_vec(), move |_, result| {
+                let _ = tx.send(flatten_reducer_result(result));
+            })
+            .context("send cancel_expand_all")?;
+        wait_for_reducer(&rx, timeout, "cancel_expand_all")
+    }
+
     fn disconnect(&mut self, timeout: Duration) -> Result<()> {
         if self.stopped {
             return Ok(());
@@ -297,6 +338,22 @@ struct PushFrontCandidate {
     expected_requested: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExpandLane {
+    boundary_cell: u32,
+    anchor_cell: u32,
+    direction: Axial,
+}
+
+#[derive(Clone, Debug)]
+struct ExpandAllCandidate {
+    selected_cells: Vec<u32>,
+    commitment_bps: u32,
+    expected_requested: u64,
+    expected_source_commitments: HashMap<u32, u64>,
+    eligible_lanes: HashMap<u32, ExpandLane>,
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -308,7 +365,7 @@ fn main() -> Result<()> {
     let player_one_token = args.token_dir.join("player-one.token");
     let player_two_token = args.token_dir.join("player-two.token");
 
-    println!("[1/6] connecting two persistent identity profiles");
+    println!("[1/8] connecting two persistent identity profiles");
     let mut player_one = Client::connect(
         "player one",
         &player_one_token,
@@ -331,7 +388,7 @@ fn main() -> Result<()> {
     assert_slot_available_or_owned(&player_one, PLAYER_ONE, player_one.identity)?;
     assert_slot_available_or_owned(&player_one, PLAYER_TWO, player_two.identity)?;
 
-    println!("[2/6] claiming player slots and waiting for a running match");
+    println!("[2/8] claiming player slots and waiting for a running match");
     player_one.join_match(PLAYER_ONE, "E2E Player 1", timeout)?;
     player_two.join_match(PLAYER_TWO, "E2E Player 2", timeout)?;
     wait_for_slot(&player_one, PLAYER_ONE, player_one.identity, timeout, poll)?;
@@ -346,17 +403,11 @@ fn main() -> Result<()> {
         Ok(state.and_then(|row| (row.phase == MatchPhase::Running).then_some(row.logical_step)))
     })?;
 
-    println!("[3/6] verifying idempotent mobilization and its receipt");
+    println!("[3/8] verifying idempotent mobilization and its receipt");
     let mobilization_id = unused_command_id(&player_one.conn, PLAYER_ONE, COMMAND_ID_FLOOR)?;
-    let current_target = player_one
-        .conn
-        .db
-        .mobilization_policy()
-        .player_id()
-        .find(&PLAYER_ONE)
-        .context("player one mobilization policy is absent")?
-        .target_bps;
-    let target_bps = if current_target == 0 { 100 } else { 0 };
+    // Keep recruitment stopped after proving the policy command. That makes
+    // the exact percentage snapshots below stable across simulation ticks.
+    let target_bps = 0;
     player_one.set_mobilization_target(mobilization_id, target_bps, timeout)?;
     let mobilization_receipt = wait_for_receipt(
         &player_one,
@@ -395,7 +446,7 @@ fn main() -> Result<()> {
             .and_then(|policy| (policy.target_bps == target_bps).then_some(())))
     })?;
 
-    println!("[4/6] issuing an authoritative directional front push");
+    println!("[4/8] issuing an authoritative directional front push");
     let candidate = select_push_front_candidate(&player_one.conn, PLAYER_ONE)?;
     let push_id = unused_command_id(
         &player_one.conn,
@@ -503,7 +554,7 @@ fn main() -> Result<()> {
         "idempotent front-push retry produced {matching_receipts} receipts and {matching_orders} orders"
     );
 
-    println!("[5/6] observing sustained progression, then cancelling the active push");
+    println!("[5/8] observing sustained progression, then cancelling the active push");
     let mut observed_packet_progress = false;
     let active_order = wait_until("two successive front-push captures", timeout, poll, || {
         let Some(order) = player_one
@@ -709,7 +760,259 @@ fn main() -> Result<()> {
         "logical simulation step did not progress beyond {running_step}"
     );
 
-    println!("[6/6] reconnecting player one with its persisted token");
+    println!("[6/8] issuing one fixed-percentage neutral expansion across all fronts");
+    let expand_candidate = select_expand_all_candidate(&player_one.conn, PLAYER_ONE)?;
+    let expand_id = unused_command_id(
+        &player_one.conn,
+        PLAYER_ONE,
+        cancel_id
+            .checked_add(1)
+            .context("push-cancellation command ID overflow")?,
+    )?;
+    player_one.issue_expand_all(
+        expand_id,
+        &expand_candidate.selected_cells,
+        expand_candidate.commitment_bps,
+        timeout,
+    )?;
+    let expand_receipt = wait_for_receipt(
+        &player_one,
+        PLAYER_ONE,
+        expand_id,
+        "issue_expand_all",
+        timeout,
+        poll,
+    )?;
+    ensure!(
+        expand_receipt.order_id != 0,
+        "accepted all-front expansion receipt did not reference an order"
+    );
+
+    wait_until("all-front expansion persistence", timeout, poll, || {
+        let Some(order) = player_one
+            .conn
+            .db
+            .transfer_order()
+            .order_id()
+            .find(&expand_receipt.order_id)
+        else {
+            return Ok(None);
+        };
+        assert_expand_order(&order, &expand_candidate, expand_id)?;
+        assert_order_conservation(&order)?;
+        ensure!(
+            order.status == OrderStatus::Active && order.in_transit_infantry > 0,
+            "all-front expansion exhausted before cancellation coverage; use a fresh default fixture with a larger connected source pool"
+        );
+        assert_expand_persistence(&player_one.conn, &expand_candidate, &order)?;
+        Ok(Some(order))
+    })?;
+
+    player_one.issue_expand_all(
+        expand_id,
+        &expand_candidate.selected_cells,
+        expand_candidate.commitment_bps,
+        timeout,
+    )?;
+    let matching_receipts = player_one
+        .conn
+        .db
+        .command_receipt()
+        .iter()
+        .filter(|receipt| receipt.player_id == PLAYER_ONE && receipt.client_command_id == expand_id)
+        .count();
+    let matching_orders = player_one
+        .conn
+        .db
+        .transfer_order()
+        .iter()
+        .filter(|order| order.player_id == PLAYER_ONE && order.client_command_id == expand_id)
+        .count();
+    ensure!(
+        matching_receipts == 1 && matching_orders == 1,
+        "idempotent all-front retry produced {matching_receipts} receipts and {matching_orders} orders"
+    );
+
+    let active_expand = wait_until(
+        "independent all-front lane progression",
+        timeout,
+        poll,
+        || {
+            let order = player_one
+                .conn
+                .db
+                .transfer_order()
+                .order_id()
+                .find(&expand_receipt.order_id)
+                .context("all-front order disappeared while observing lane progression")?;
+            assert_expand_order(&order, &expand_candidate, expand_id)?;
+            assert_order_conservation(&order)?;
+            ensure!(
+                order.status == OrderStatus::Active && order.in_transit_infantry > 0,
+                "all-front expansion exhausted before two independent lane directions progressed; use a fresh default fixture with a larger connected source pool"
+            );
+            let progressed_anchors = player_one
+                .conn
+                .db
+                .transfer_destination()
+                .iter()
+                .filter(|destination| destination.order_id == order.order_id)
+                .filter(|destination| {
+                    player_one
+                        .conn
+                        .db
+                        .cell_state()
+                        .cell_id()
+                        .find(&destination.cell_id)
+                        .is_some_and(|cell| cell.owner_player_id == PLAYER_ONE)
+                })
+                .map(|destination| destination.cell_id)
+                .collect::<HashSet<_>>();
+            let progressed_directions = progressed_anchors
+                .iter()
+                .filter_map(|anchor| expand_candidate.eligible_lanes.get(anchor))
+                .map(|lane| lane.direction)
+                .collect::<HashSet<_>>();
+            if progressed_anchors.len() < 2 || progressed_directions.len() < 2 {
+                return Ok(None);
+            }
+            assert_expand_persistence(&player_one.conn, &expand_candidate, &order)?;
+            Ok(Some(order))
+        },
+    )?;
+
+    println!("[7/8] cancelling every expansion lane and proving it remains stopped");
+    let expand_cancel_id = unused_command_id(
+        &player_one.conn,
+        PLAYER_ONE,
+        expand_id
+            .checked_add(1)
+            .context("all-front command ID overflow")?,
+    )?;
+    player_one.cancel_expand_all(expand_cancel_id, &expand_candidate.selected_cells, timeout)?;
+    let expand_cancel_receipt = wait_for_receipt(
+        &player_one,
+        PLAYER_ONE,
+        expand_cancel_id,
+        "cancel_expand_all",
+        timeout,
+        poll,
+    )?;
+    ensure!(
+        expand_cancel_receipt.order_id == expand_receipt.order_id,
+        "all-front cancellation receipt referenced order {} instead of {}; use a fresh database if older expansions overlap this selection",
+        expand_cancel_receipt.order_id,
+        expand_receipt.order_id
+    );
+
+    let (cancelled_expand, owners_at_expand_cancel, destinations_at_expand_cancel) =
+        wait_until("all-front expansion cancellation", timeout, poll, || {
+            let Some(order) = player_one
+                .conn
+                .db
+                .transfer_order()
+                .order_id()
+                .find(&expand_receipt.order_id)
+            else {
+                return Ok(None);
+            };
+            if order.status != OrderStatus::Cancelled {
+                return Ok(None);
+            }
+            assert_expand_order(&order, &expand_candidate, expand_id)?;
+            assert_order_conservation(&order)?;
+            ensure!(
+                order.in_transit_infantry == 0,
+                "cancelled all-front expansion retained {} in-transit infantry",
+                order.in_transit_infantry
+            );
+            ensure!(
+                !player_one
+                    .conn
+                    .db
+                    .transit_packet()
+                    .iter()
+                    .any(|packet| packet.order_id == order.order_id),
+                "cancelled all-front expansion retained transit packets"
+            );
+            assert_expand_sources(&player_one.conn, &expand_candidate, order.order_id, true)?;
+            Ok(Some((
+                order.clone(),
+                owner_snapshot(&player_one.conn),
+                destination_snapshot(&player_one.conn, order.order_id),
+            )))
+        })?;
+    ensure!(
+        cancelled_expand.delivered_infantry > active_expand.delivered_infantry,
+        "all-front cancellation did not release any of the {} infantry still in transit",
+        active_expand.in_transit_infantry
+    );
+    ensure!(
+        cancelled_expand.casualty_infantry == 0,
+        "neutral-only expansion unexpectedly recorded {} casualties",
+        cancelled_expand.casualty_infantry
+    );
+
+    wait_until(
+        "post all-front cancellation simulation steps",
+        timeout,
+        poll,
+        || {
+            let Some(state) = player_one
+                .conn
+                .db
+                .match_state()
+                .singleton_id()
+                .find(&SINGLETON_ID)
+            else {
+                return Ok(None);
+            };
+            if state.logical_step
+                < cancelled_expand
+                    .updated_step
+                    .saturating_add(POST_CANCEL_STEPS)
+            {
+                return Ok(None);
+            }
+            let order = player_one
+                .conn
+                .db
+                .transfer_order()
+                .order_id()
+                .find(&expand_receipt.order_id)
+                .context("cancelled all-front order disappeared")?;
+            ensure!(
+                order.status == OrderStatus::Cancelled,
+                "cancelled all-front expansion changed status after later simulation steps"
+            );
+            assert_order_conservation(&order)?;
+            ensure!(
+                order == cancelled_expand,
+                "cancelled all-front order counters changed after later simulation steps"
+            );
+            ensure!(
+                !player_one
+                    .conn
+                    .db
+                    .transit_packet()
+                    .iter()
+                    .any(|packet| packet.order_id == order.order_id),
+                "cancelled all-front expansion emitted a later transit packet"
+            );
+            ensure!(
+                owner_snapshot(&player_one.conn) == owners_at_expand_cancel,
+                "cell ownership changed after all-front cancellation"
+            );
+            ensure!(
+                destination_snapshot(&player_one.conn, order.order_id)
+                    == destinations_at_expand_cancel,
+                "a cancelled all-front lane received infantry during a later simulation step"
+            );
+            Ok(Some(()))
+        },
+    )?;
+
+    println!("[8/8] reconnecting player one with its persisted token");
     let reconnect_count_before = player_two
         .conn
         .db
@@ -764,7 +1067,7 @@ fn main() -> Result<()> {
     reconnected.disconnect(timeout)?;
     player_two.disconnect(timeout)?;
     println!(
-        "PASS: receipts, idempotency, sustained front-push routing/conservation/cancellation, and token reuse verified"
+        "PASS: receipts, idempotency, directional push, neutral all-front expansion, conservation/cancellation, and token reuse verified"
     );
     Ok(())
 }
@@ -1131,6 +1434,204 @@ fn select_push_front_candidate(conn: &DbConnection, player_id: u8) -> Result<Pus
     )
 }
 
+#[allow(clippy::too_many_lines)]
+fn select_expand_all_candidate(conn: &DbConnection, player_id: u8) -> Result<ExpandAllCandidate> {
+    let terrain_by_id: HashMap<u32, CellTerrain> = conn
+        .db
+        .cell_terrain()
+        .iter()
+        .map(|terrain| (terrain.cell_id, terrain))
+        .collect();
+    let cell_by_id: HashMap<u32, CellState> = conn
+        .db
+        .cell_state()
+        .iter()
+        .map(|cell| (cell.cell_id, cell))
+        .collect();
+    let cell_by_coordinate: HashMap<Axial, u32> = terrain_by_id
+        .values()
+        .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
+        .collect();
+    let mut allocated_by_cell = HashMap::<u32, u64>::new();
+    for packet in conn
+        .db
+        .transit_packet()
+        .iter()
+        .filter(|packet| packet.owner_player_id == player_id)
+    {
+        *allocated_by_cell.entry(packet.current_cell).or_default() += packet.infantry;
+    }
+
+    let owned_ground = cell_by_id
+        .values()
+        .filter_map(|cell| {
+            let terrain = terrain_by_id.get(&cell.cell_id)?;
+            (cell.owner_player_id == player_id && terrain.passable)
+                .then_some(Axial::new(terrain.q, terrain.r))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut unvisited = owned_ground.clone();
+    let mut components = Vec::<BTreeSet<Axial>>::new();
+    while let Some(seed) = unvisited.first().copied() {
+        let mut component = BTreeSet::from([seed]);
+        let mut pending = VecDeque::from([seed]);
+        unvisited.remove(&seed);
+        while let Some(current) = pending.pop_front() {
+            let current_id = cell_by_coordinate[&current];
+            let current_terrain = &terrain_by_id[&current_id];
+            for neighbor in current.neighbors() {
+                if !unvisited.contains(&neighbor) {
+                    continue;
+                }
+                let neighbor_id = cell_by_coordinate[&neighbor];
+                let neighbor_terrain = &terrain_by_id[&neighbor_id];
+                if current_terrain
+                    .elevation
+                    .abs_diff(neighbor_terrain.elevation)
+                    > 1
+                {
+                    continue;
+                }
+                unvisited.remove(&neighbor);
+                component.insert(neighbor);
+                pending.push_back(neighbor);
+            }
+        }
+        components.push(component);
+    }
+
+    let mut candidates = Vec::new();
+    for component in components {
+        let selected_cells = component
+            .iter()
+            .map(|coordinate| cell_by_coordinate[coordinate])
+            .collect::<Vec<_>>();
+        let mut expected_source_commitments = HashMap::new();
+        let mut expected_requested = 0_u64;
+        for &cell_id in &selected_cells {
+            let state = &cell_by_id[&cell_id];
+            let available = state
+                .infantry
+                .saturating_sub(allocated_by_cell.get(&cell_id).copied().unwrap_or(0));
+            let committed = basis_point_share(available, EXPAND_COMMITMENT_BPS);
+            if committed > 0 {
+                expected_source_commitments.insert(cell_id, committed);
+            }
+            expected_requested = expected_requested
+                .checked_add(committed)
+                .context("all-front candidate commitment overflow")?;
+        }
+        if expected_requested == 0 {
+            continue;
+        }
+
+        // Match the authoritative target deduplication: the lowest source
+        // coordinate wins when a concavity exposes one neutral target twice.
+        let mut lane_by_target = BTreeMap::<Axial, ExpandLane>::new();
+        for &source_coordinate in &component {
+            let source_id = cell_by_coordinate[&source_coordinate];
+            let source_terrain = &terrain_by_id[&source_id];
+            for direction in Axial::DIRECTIONS {
+                let target_coordinate = source_coordinate + direction;
+                if component.contains(&target_coordinate) {
+                    continue;
+                }
+                let Some(&target_id) = cell_by_coordinate.get(&target_coordinate) else {
+                    continue;
+                };
+                let target_terrain = &terrain_by_id[&target_id];
+                let target_state = &cell_by_id[&target_id];
+                if target_state.owner_player_id != 0
+                    || !target_terrain.passable
+                    || !target_terrain.capturable
+                    || source_terrain.elevation.abs_diff(target_terrain.elevation) > 1
+                {
+                    continue;
+                }
+                lane_by_target
+                    .entry(target_coordinate)
+                    .or_insert(ExpandLane {
+                        boundary_cell: source_id,
+                        anchor_cell: target_id,
+                        direction,
+                    });
+            }
+        }
+        if lane_by_target.len() < 2 {
+            continue;
+        }
+        let eligible_lanes = lane_by_target
+            .into_values()
+            .map(|lane| (lane.anchor_cell, lane))
+            .collect::<HashMap<_, _>>();
+        let directions = eligible_lanes
+            .values()
+            .map(|lane| lane.direction)
+            .collect::<HashSet<_>>();
+        if directions.len() < 2 {
+            continue;
+        }
+
+        let outgoing_per_boundary =
+            eligible_lanes
+                .values()
+                .fold(HashMap::<u32, usize>::new(), |mut counts, lane| {
+                    *counts.entry(lane.boundary_cell).or_default() += 1;
+                    counts
+                });
+        if outgoing_per_boundary.iter().any(|(boundary, outgoing)| {
+            expected_source_commitments
+                .get(boundary)
+                .copied()
+                .unwrap_or(0)
+                < *outgoing as u64
+        }) {
+            continue;
+        }
+        let sustainable_lanes = eligible_lanes
+            .values()
+            .filter(|lane| {
+                let boundary_commitment = expected_source_commitments
+                    .get(&lane.boundary_cell)
+                    .copied()
+                    .unwrap_or(0);
+                let outgoing = outgoing_per_boundary[&lane.boundary_cell] as u64;
+                outgoing > 0 && boundary_commitment / outgoing >= MIN_EXPAND_LANE_ALLOCATION
+            })
+            .collect::<Vec<_>>();
+        let sustainable_directions = sustainable_lanes
+            .iter()
+            .map(|lane| lane.direction)
+            .collect::<HashSet<_>>();
+        if sustainable_lanes.len() < 2 || sustainable_directions.len() < 2 {
+            continue;
+        }
+
+        candidates.push(ExpandAllCandidate {
+            selected_cells,
+            commitment_bps: EXPAND_COMMITMENT_BPS,
+            expected_requested,
+            expected_source_commitments,
+            eligible_lanes,
+        });
+    }
+    candidates.sort_unstable_by_key(|candidate| {
+        (
+            std::cmp::Reverse(candidate.expected_requested),
+            std::cmp::Reverse(candidate.eligible_lanes.len()),
+            std::cmp::Reverse(candidate.selected_cells.len()),
+        )
+    });
+    candidates.into_iter().next().context(
+        "no traversably connected owned region has enough unallocated infantry for at least two independent neutral all-front lanes; run against a fresh default fixture",
+    )
+}
+
+fn basis_point_share(value: u64, basis_points: u32) -> u64 {
+    u64::try_from(u128::from(value) * u128::from(basis_points) / 10_000)
+        .expect("a basis-point share cannot exceed its input")
+}
+
 fn expected_occupation_garrison(terrain: &CellTerrain, cell: &CellState) -> u64 {
     if cell.military_capacity == 0 || terrain.terrain == TerrainClass::Water {
         return 0;
@@ -1299,6 +1800,268 @@ fn assert_push_routes(
         order.in_transit_infantry
     );
     Ok(())
+}
+
+fn assert_expand_order(
+    order: &TransferOrder,
+    candidate: &ExpandAllCandidate,
+    command_id: u64,
+) -> Result<()> {
+    ensure!(
+        order.player_id == PLAYER_ONE && order.client_command_id == command_id,
+        "all-front receipt referenced an order owned by another command"
+    );
+    ensure!(
+        order.kind == OrderKind::ExpandAll,
+        "all-front receipt referenced {:?} order {}",
+        order.kind,
+        order.order_id
+    );
+    ensure!(
+        (order.orientation_q, order.orientation_r) == (0, 0),
+        "unoriented all-front order persisted orientation ({}, {})",
+        order.orientation_q,
+        order.orientation_r
+    );
+    ensure!(
+        order.requested_infantry == candidate.expected_requested
+            && order.committed_infantry == candidate.expected_requested,
+        "{} bps all-front order requested/committed {}/{} infantry instead of the one-time expected {}",
+        candidate.commitment_bps,
+        order.requested_infantry,
+        order.committed_infantry,
+        candidate.expected_requested
+    );
+    Ok(())
+}
+
+fn assert_expand_sources(
+    conn: &DbConnection,
+    candidate: &ExpandAllCandidate,
+    order_id: u64,
+    require_released: bool,
+) -> Result<()> {
+    let actual = conn
+        .db
+        .transfer_source()
+        .iter()
+        .filter(|source| source.order_id == order_id)
+        .map(|source| {
+            (
+                source.cell_id,
+                (source.committed_infantry, source.queued_infantry),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    ensure!(
+        actual.len() == candidate.expected_source_commitments.len(),
+        "all-front order persisted {} positive sources instead of {}",
+        actual.len(),
+        candidate.expected_source_commitments.len()
+    );
+    for (&cell_id, &expected) in &candidate.expected_source_commitments {
+        let (committed, queued) = actual
+            .get(&cell_id)
+            .copied()
+            .with_context(|| format!("all-front source cell {cell_id} was not persisted"))?;
+        ensure!(
+            committed == expected,
+            "all-front source {cell_id} committed {committed} infantry instead of one {} bps share {expected}",
+            candidate.commitment_bps
+        );
+        ensure!(
+            queued <= committed,
+            "all-front source {cell_id} queued {queued} infantry beyond its {committed} commitment"
+        );
+        if require_released {
+            ensure!(
+                queued == 0,
+                "cancelled all-front source {cell_id} retained {queued} queued infantry"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_expand_persistence(
+    conn: &DbConnection,
+    candidate: &ExpandAllCandidate,
+    order: &TransferOrder,
+) -> Result<()> {
+    assert_expand_sources(conn, candidate, order.order_id, false)?;
+    let selected = candidate
+        .selected_cells
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let terrain_by_id = conn
+        .db
+        .cell_terrain()
+        .iter()
+        .map(|terrain| (terrain.cell_id, terrain))
+        .collect::<HashMap<_, _>>();
+    let destinations = conn
+        .db
+        .transfer_destination()
+        .iter()
+        .filter(|destination| destination.order_id == order.order_id)
+        .collect::<Vec<_>>();
+    let actual_anchors = destinations
+        .iter()
+        .map(|destination| destination.cell_id)
+        .collect::<HashSet<_>>();
+    let expected_anchors = candidate
+        .eligible_lanes
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    ensure!(
+        actual_anchors == expected_anchors,
+        "all-front order did not persist exactly one stable anchor for every eligible neutral target"
+    );
+    let directions = destinations
+        .iter()
+        .map(|destination| candidate.eligible_lanes[&destination.cell_id].direction)
+        .collect::<HashSet<_>>();
+    ensure!(
+        destinations.len() >= 2 && directions.len() >= 2,
+        "all-front fixture produced {} stable anchors in {} directions instead of at least two independent lanes",
+        destinations.len(),
+        directions.len()
+    );
+    let target_total = destinations.iter().try_fold(0_u64, |total, destination| {
+        ensure!(
+            destination.target_infantry > 0
+                && destination.received_infantry <= destination.target_infantry,
+            "all-front lane {} has invalid received/target accounting {}/{}",
+            destination.cell_id,
+            destination.received_infantry,
+            destination.target_infantry
+        );
+        let target_state = conn
+            .db
+            .cell_state()
+            .cell_id()
+            .find(&destination.cell_id)
+            .with_context(|| format!("all-front anchor {} disappeared", destination.cell_id))?;
+        ensure!(
+            target_state.owner_player_id == 0 || target_state.owner_player_id == PLAYER_ONE,
+            "neutral-only expansion persisted enemy cell {} as a target",
+            destination.cell_id
+        );
+        total
+            .checked_add(destination.target_infantry)
+            .context("all-front destination accounting overflow")
+    })?;
+    ensure!(
+        target_total == order.committed_infantry,
+        "all-front lane targets total {target_total} instead of committed infantry {}",
+        order.committed_infantry
+    );
+
+    let packets = conn
+        .db
+        .transit_packet()
+        .iter()
+        .filter(|packet| packet.order_id == order.order_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        !packets.is_empty(),
+        "active all-front order has no transit packets"
+    );
+    let mut packet_total = 0_u64;
+    for packet in packets {
+        ensure!(
+            packet.owner_player_id == PLAYER_ONE && selected.contains(&packet.origin_cell),
+            "all-front packet belongs to another player or originated outside the selection"
+        );
+        let lane = candidate
+            .eligible_lanes
+            .get(&packet.destination_cell)
+            .with_context(|| {
+                format!(
+                    "all-front packet references unknown lane anchor {}",
+                    packet.destination_cell
+                )
+            })?;
+        ensure!(
+            packet.route.first() == Some(&packet.origin_cell),
+            "all-front packet route did not begin at its selected origin"
+        );
+        let route_index = usize::try_from(packet.route_index).context("route index overflow")?;
+        ensure!(
+            packet.route.get(route_index) == Some(&packet.current_cell),
+            "all-front packet current cell does not match its route index"
+        );
+        let anchor_index = packet
+            .route
+            .iter()
+            .position(|cell_id| *cell_id == lane.anchor_cell)
+            .context("all-front packet route omitted its stable lane anchor")?;
+        ensure!(
+            anchor_index > 0
+                && packet.route[..anchor_index]
+                    .iter()
+                    .all(|cell_id| selected.contains(cell_id)),
+            "all-front packet escaped the selected source region before its neutral anchor"
+        );
+        ensure!(
+            packet.route.get(anchor_index - 1) == Some(&lane.boundary_cell),
+            "all-front packet did not leave through its deterministic boundary cell"
+        );
+        for cells in packet.route.windows(2) {
+            let from = terrain_by_id
+                .get(&cells[0])
+                .with_context(|| format!("route terrain {} disappeared", cells[0]))?;
+            let to = terrain_by_id
+                .get(&cells[1])
+                .with_context(|| format!("route terrain {} disappeared", cells[1]))?;
+            ensure!(
+                Axial::new(from.q, from.r).distance(Axial::new(to.q, to.r)) == 1,
+                "all-front route contains a non-adjacent step"
+            );
+        }
+        for cells in packet.route[anchor_index - 1..].windows(2) {
+            let from = &terrain_by_id[&cells[0]];
+            let to = &terrain_by_id[&cells[1]];
+            ensure!(
+                Axial::new(to.q, to.r) - Axial::new(from.q, from.r) == lane.direction,
+                "all-front lane changed direction after leaving its selected boundary"
+            );
+        }
+        packet_total = packet_total
+            .checked_add(packet.infantry)
+            .context("all-front packet accounting overflow")?;
+    }
+    ensure!(
+        packet_total == order.in_transit_infantry,
+        "all-front packet total {packet_total} differs from order in-transit infantry {}",
+        order.in_transit_infantry
+    );
+    Ok(())
+}
+
+fn owner_snapshot(conn: &DbConnection) -> HashMap<u32, u8> {
+    conn.db
+        .cell_state()
+        .iter()
+        .map(|cell| (cell.cell_id, cell.owner_player_id))
+        .collect()
+}
+
+fn destination_snapshot(conn: &DbConnection, order_id: u64) -> HashMap<u32, (u64, u64)> {
+    conn.db
+        .transfer_destination()
+        .iter()
+        .filter(|destination| destination.order_id == order_id)
+        .map(|destination| {
+            (
+                destination.cell_id,
+                (destination.target_infantry, destination.received_infantry),
+            )
+        })
+        .collect()
 }
 
 fn assert_order_conservation(order: &TransferOrder) -> Result<()> {

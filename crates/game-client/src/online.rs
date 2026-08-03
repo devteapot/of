@@ -19,8 +19,9 @@ use match_bindings::{
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
     PlayerSlotTableAccess, ReceiptStatus, TransferDestinationTableAccess, TransferOrder,
     TransferOrderTableAccess, TransferSource, TransferSourceTableAccess, TransitPacket,
-    TransitPacketTableAccess, cancel_push_fronts, issue_balance, issue_core_load, issue_front_load,
-    issue_perimeter_load, issue_push_front, join_match, set_mobilization_target,
+    TransitPacketTableAccess, cancel_expand_all, cancel_push_fronts, issue_balance,
+    issue_core_load, issue_expand_all, issue_front_load, issue_perimeter_load, issue_push_front,
+    join_match, set_mobilization_target,
 };
 use spacetimedb_sdk::__codegen::InternalError;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
@@ -93,6 +94,8 @@ impl SharedSignals {
 enum PendingCommand {
     PushFront,
     CancelPush,
+    ExpandAll,
+    CancelExpandAll,
     Balance,
     FrontLoad,
     CoreLoad,
@@ -105,6 +108,8 @@ impl PendingCommand {
         match self {
             Self::PushFront => "Push Front",
             Self::CancelPush => "Stop Push",
+            Self::ExpandAll => "Expand All",
+            Self::CancelExpandAll => "Stop Expand All",
             Self::Balance => "Balance",
             Self::FrontLoad => "Front-load",
             Self::CoreLoad => "Core-load",
@@ -117,6 +122,8 @@ impl PendingCommand {
         match self {
             Self::PushFront => "issue_push_front",
             Self::CancelPush => "cancel_push_fronts",
+            Self::ExpandAll => "issue_expand_all",
+            Self::CancelExpandAll => "cancel_expand_all",
             Self::Balance => "issue_balance",
             Self::FrontLoad => "issue_front_load",
             Self::CoreLoad => "issue_core_load",
@@ -512,6 +519,21 @@ fn invoke_intent(
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::PushFront)
         }
+        ClientIntent::ExpandAll {
+            sources,
+            commitment_percent,
+        } => {
+            connection
+                .reducers
+                .issue_expand_all_then(
+                    command_id,
+                    ids_for_selection(transport, sources)?,
+                    u32::from((*commitment_percent).clamp(1, 100)) * 100,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::ExpandAll)
+        }
         ClientIntent::CancelPush { sources, direction } => {
             connection
                 .reducers
@@ -524,6 +546,17 @@ fn invoke_intent(
                 )
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::CancelPush)
+        }
+        ClientIntent::CancelExpandAll { sources } => {
+            connection
+                .reducers
+                .cancel_expand_all_then(
+                    command_id,
+                    ids_for_selection(transport, sources)?,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::CancelExpandAll)
         }
         ClientIntent::Redistribute {
             cells,

@@ -22,18 +22,6 @@ execution substrate, not a promise to restore precise infantry transfer.
 aggregate-infantry interactions, route readability, order priorities, and
 controls that remain usable on large maps.
 
-### Neutral Expand All shortcut
-
-A later neutral-only shortcut could pulse all eligible borders using troops
-already present at each local front. It should accelerate low-stakes opening
-expansion without attacking enemies, creating global army power, or rewarding
-click spam. This remains separate from the exact selected-front command until
-playtests show whether its convenience is needed.
-
-**Depends on:** validated sustained Push Front behavior, clear commitment,
-garrison, lane-stop, and momentum feedback, deterministic contention, and
-safeguards against opaque automation.
-
 ### Roads and paths
 
 Roads and paths could reduce travel time and increase troop-flow capacity along particular edges. This would make infrastructure a strategic investment and make redeployment routes visible targets rather than passive bonuses.

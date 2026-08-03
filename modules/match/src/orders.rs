@@ -5,7 +5,8 @@ use std::{
 
 use hex_core::{
     Axial, DistributionPreset, FrontSelectionError, HexMap, MovementConfig, ground_traversal,
-    redistribution_targets_with_commitment, selected_front_edges,
+    redistribution_targets_with_commitment, selected_all_front_edges, selected_front_edges,
+    unique_target_front_edges,
 };
 use spacetimedb::{ReducerContext, Table};
 
@@ -15,8 +16,8 @@ use crate::rules::{
     route_to, state, terrain, write_receipt,
 };
 use crate::schema::{
-    OrderKind, OrderStatus, ReceiptStatus, TransferDestination, TransferOrder, TransferSource,
-    TransitPacket,
+    NEUTRAL_PLAYER, OrderKind, OrderStatus, ReceiptStatus, TransferDestination, TransferOrder,
+    TransferSource, TransitPacket,
 };
 use crate::schema::{
     mobilization_policy, transfer_destination, transfer_order, transfer_source, transit_packet,
@@ -35,6 +36,12 @@ struct PlannedDistribution {
     /// percentage-aware target's frozen per-cell lower bound.
     source_limits: BTreeMap<u32, u64>,
     demands: BTreeMap<u32, u64>,
+    amount: u64,
+}
+
+struct ExpandContribution {
+    source: u32,
+    internal_route: Vec<u32>,
     amount: u64,
 }
 
@@ -160,6 +167,43 @@ pub fn issue_push_front(
         player_id,
         client_command_id,
         "issue_push_front",
+        result,
+    )
+}
+
+/// Commits one fixed share of every selected cell's currently unallocated
+/// infantry to all eligible neutral boundaries around the selected region.
+/// Each resulting lane sustains its initial outward direction independently.
+#[spacetimedb::reducer]
+pub fn issue_expand_all(
+    ctx: &ReducerContext,
+    client_command_id: u64,
+    selected_cells: Vec<u32>,
+    commitment_bps: u32,
+) -> Result<(), String> {
+    let player_id = require_running_player(ctx)?;
+    if command_was_seen(ctx, player_id, client_command_id) {
+        return Ok(());
+    }
+    let result = plan_expand_all(ctx, player_id, &selected_cells, commitment_bps).and_then(
+        |(requested, legs)| {
+            persist_order(
+                ctx,
+                player_id,
+                client_command_id,
+                OrderKind::ExpandAll,
+                requested,
+                Axial::ZERO,
+                legs,
+            )
+            .map(Some)
+        },
+    );
+    receipt_result(
+        ctx,
+        player_id,
+        client_command_id,
+        "issue_expand_all",
         result,
     )
 }
@@ -302,6 +346,26 @@ pub fn cancel_push_fronts(
     )
 }
 
+#[spacetimedb::reducer]
+pub fn cancel_expand_all(
+    ctx: &ReducerContext,
+    client_command_id: u64,
+    selected_cells: Vec<u32>,
+) -> Result<(), String> {
+    let player_id = require_running_player(ctx)?;
+    if command_was_seen(ctx, player_id, client_command_id) {
+        return Ok(());
+    }
+    let result = cancel_matching_expand_all(ctx, player_id, &selected_cells);
+    receipt_result(
+        ctx,
+        player_id,
+        client_command_id,
+        "cancel_expand_all",
+        result,
+    )
+}
+
 fn plan_push_front(
     ctx: &ReducerContext,
     player_id: u8,
@@ -422,6 +486,237 @@ fn plan_push_front(
         return Err("the push front has no committed infantry".into());
     }
     Ok((requested, legs))
+}
+
+fn plan_expand_all(
+    ctx: &ReducerContext,
+    player_id: u8,
+    selected_cells: &[u32],
+    commitment_bps: u32,
+) -> Result<(u64, Vec<PlannedLeg>), String> {
+    validate_basis_points(commitment_bps, "expand commitment")?;
+
+    let selected_ids = unique_selection(selected_cells, "expand source")?;
+    let mut selected_map = HexMap::new();
+    let mut coordinate_to_id = BTreeMap::new();
+    for cell_id in selected_ids {
+        let terrain_row = terrain(ctx, cell_id)?;
+        let cell = core_cell(ctx, cell_id)?;
+        if !terrain_row.passable || cell.owner != Some(u32::from(player_id)) {
+            return Err(format!(
+                "expand source cell {cell_id} is not owned passable ground"
+            ));
+        }
+        coordinate_to_id.insert(cell.coordinate, cell_id);
+        selected_map.insert(cell);
+    }
+    let selected_coordinates = coordinate_to_id.keys().copied().collect::<BTreeSet<_>>();
+    let match_config = config(ctx)?;
+
+    let mut eligible_targets = BTreeMap::<(Axial, Axial), u32>::new();
+    for (&source_coordinate, &source_id) in &coordinate_to_id {
+        for direction in Axial::DIRECTIONS {
+            let target_coordinate = source_coordinate + direction;
+            if selected_coordinates.contains(&target_coordinate) {
+                continue;
+            }
+            let Some(target_id) =
+                crate::rules::cell_id_for_coordinate(&match_config, target_coordinate)
+            else {
+                continue;
+            };
+            let target_terrain = terrain(ctx, target_id)?;
+            let target_state = cell_state(ctx, target_id)?;
+            if expand_target_is_eligible(
+                target_state.owner_player_id,
+                target_terrain.passable,
+                target_terrain.capturable,
+                edge_runtime_limits(ctx, source_id, target_id)?.is_some(),
+            ) {
+                eligible_targets.insert((source_coordinate, target_coordinate), target_id);
+            }
+        }
+    }
+
+    let edges = selected_all_front_edges(&selected_coordinates, |source, target| {
+        eligible_targets.contains_key(&(source, target))
+    })
+    .map_err(expand_selection_message)?;
+    let edges = unique_target_front_edges(&edges);
+    let mut outgoing_by_boundary = BTreeMap::<Axial, Vec<(Axial, u32)>>::new();
+    for edge in edges {
+        outgoing_by_boundary
+            .entry(edge.source)
+            .or_default()
+            .push((edge.target, eligible_targets[&(edge.source, edge.target)]));
+    }
+    for outgoing in outgoing_by_boundary.values_mut() {
+        outgoing.sort_unstable();
+    }
+
+    let movement = MovementConfig {
+        max_elevation_step: u16::from(match_config.max_elevation_step),
+        level_cost: 10,
+        uphill_cost: 15,
+        downhill_cost: 10,
+    };
+    let boundary_sources = outgoing_by_boundary
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let routes = front_route_tree(&selected_map, &boundary_sources, &movement);
+    if routes.labels.len() != selected_coordinates.len() {
+        return Err(
+            "expand selection is split from its neutral boundary by an internal cliff".into(),
+        );
+    }
+
+    let mut requested = 0_u64;
+    let mut contributions_by_boundary = BTreeMap::<Axial, Vec<ExpandContribution>>::new();
+    for (&source_coordinate, &source_id) in &coordinate_to_id {
+        let source = cell_state(ctx, source_id)?;
+        let (boundary, route_coordinates) = routes
+            .route_to_boundary(source_coordinate)
+            .ok_or_else(|| format!("expand source cell {source_id} cannot reach a boundary"))?;
+        let allocated = allocated_infantry_at_cell(ctx, player_id, source_id);
+        let available = source.infantry.saturating_sub(allocated);
+        let commitment = basis_point_share(available, commitment_bps);
+        requested = requested
+            .checked_add(commitment)
+            .ok_or_else(|| "expand requested infantry overflow".to_string())?;
+        if commitment == 0 {
+            continue;
+        }
+
+        let internal_route = route_coordinates
+            .into_iter()
+            .map(|coordinate| {
+                coordinate_to_id
+                    .get(&coordinate)
+                    .copied()
+                    .ok_or_else(|| "expand route escaped the selected region".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        contributions_by_boundary
+            .entry(boundary)
+            .or_default()
+            .push(ExpandContribution {
+                source: source_id,
+                internal_route,
+                amount: commitment,
+            });
+    }
+
+    if requested == 0 {
+        return Err("the expand selection has no uncommitted infantry at this commitment".into());
+    }
+    let mut legs = Vec::new();
+    for (boundary, contributions) in contributions_by_boundary {
+        let outgoing = outgoing_by_boundary
+            .get(&boundary)
+            .ok_or_else(|| "expand route ended at an unknown boundary".to_string())?;
+        let amounts = contributions
+            .iter()
+            .map(|contribution| contribution.amount)
+            .collect::<Vec<_>>();
+        for (contribution_index, lane_index, amount) in
+            aggregate_lane_allocations(&amounts, outgoing.len())?
+        {
+            let contribution = &contributions[contribution_index];
+            let target_id = outgoing[lane_index].1;
+            let mut route = contribution.internal_route.clone();
+            route.push(target_id);
+            legs.push(PlannedLeg {
+                source: contribution.source,
+                destination: target_id,
+                amount,
+                route,
+            });
+        }
+    }
+    let committed = legs.iter().try_fold(0_u64, |total, leg| {
+        total
+            .checked_add(leg.amount)
+            .ok_or_else(|| "expand committed infantry overflow".to_string())
+    })?;
+    if committed != requested {
+        return Err(format!(
+            "expand planning violates infantry conservation: requested {requested}, committed {committed}"
+        ));
+    }
+    Ok((requested, legs))
+}
+
+fn expand_target_is_eligible(
+    target_owner: u8,
+    passable: bool,
+    capturable: bool,
+    traversable: bool,
+) -> bool {
+    target_owner == NEUTRAL_PLAYER && passable && capturable && traversable
+}
+
+fn even_partition_at(total: u64, parts: usize, index: usize) -> u64 {
+    debug_assert!(parts > 0);
+    debug_assert!(index < parts);
+    let parts_u64 = parts as u64;
+    total / parts_u64 + u64::from((index as u64) < total % parts_u64)
+}
+
+/// Splits the aggregate boundary pool into even lane quotas, then consumes the
+/// sorted source contributions into those quotas. Taking remainders only once
+/// per boundary prevents many small sources from all favoring the first lane.
+fn aggregate_lane_allocations(
+    contribution_amounts: &[u64],
+    lane_count: usize,
+) -> Result<Vec<(usize, usize, u64)>, String> {
+    if lane_count == 0 {
+        return Err("expand boundary has no outgoing lanes".into());
+    }
+    let total = contribution_amounts.iter().try_fold(0_u64, |sum, amount| {
+        sum.checked_add(*amount)
+            .ok_or_else(|| "expand boundary pool overflow".to_string())
+    })?;
+    let mut lane_remaining = (0..lane_count)
+        .map(|index| even_partition_at(total, lane_count, index))
+        .collect::<Vec<_>>();
+    let mut allocations = Vec::new();
+    let mut lane_index = 0;
+    for (contribution_index, &amount) in contribution_amounts.iter().enumerate() {
+        let mut remaining = amount;
+        while remaining > 0 {
+            while lane_index < lane_count && lane_remaining[lane_index] == 0 {
+                lane_index += 1;
+            }
+            if lane_index == lane_count {
+                return Err("expand lane quotas did not conserve source strength".into());
+            }
+            let assigned = remaining.min(lane_remaining[lane_index]);
+            allocations.push((contribution_index, lane_index, assigned));
+            remaining -= assigned;
+            lane_remaining[lane_index] -= assigned;
+        }
+    }
+    if lane_remaining.iter().any(|remaining| *remaining != 0) {
+        return Err("expand lane quotas left committed strength unassigned".into());
+    }
+    Ok(allocations)
+}
+
+fn expand_selection_message(error: FrontSelectionError) -> String {
+    match error {
+        FrontSelectionError::EmptySelection => "expand selection is empty",
+        FrontSelectionError::DisconnectedSelection => {
+            "expand selection must be one six-connected region"
+        }
+        FrontSelectionError::NoEligibleFront => {
+            "the selected region has no adjacent neutral passable ground"
+        }
+        FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront => {
+            "invalid all-front expansion boundary"
+        }
+    }
+    .into()
 }
 
 fn front_selection_message(error: FrontSelectionError) -> String {
@@ -561,7 +856,7 @@ fn active_destination_reservations(ctx: &ReducerContext, player_id: u8) -> BTree
             .is_some_and(|order| {
                 order.status == OrderStatus::Active
                     && order.player_id == player_id
-                    && order.kind != OrderKind::PushFront
+                    && !matches!(order.kind, OrderKind::PushFront | OrderKind::ExpandAll)
             });
         if active {
             *reservations.entry(destination.cell_id).or_default() += destination
@@ -832,6 +1127,42 @@ fn cancel_matching_pushes(
     Ok((matching.len() == 1).then_some(matching[0]))
 }
 
+fn cancel_matching_expand_all(
+    ctx: &ReducerContext,
+    player_id: u8,
+    selected_cells: &[u32],
+) -> Result<Option<u64>, String> {
+    let selected = unique_selection(selected_cells, "expand cancellation")?;
+    let mut matching = ctx
+        .db
+        .transfer_order()
+        .iter()
+        .filter(|order| {
+            order.player_id == player_id
+                && order.status == OrderStatus::Active
+                && order.kind == OrderKind::ExpandAll
+        })
+        .filter_map(|order| {
+            let sources = ctx
+                .db
+                .transfer_source()
+                .source_by_order()
+                .filter(order.order_id)
+                .map(|source| source.cell_id)
+                .collect::<BTreeSet<_>>();
+            (!sources.is_empty() && sources.is_subset(&selected)).then_some(order.order_id)
+        })
+        .collect::<Vec<_>>();
+    matching.sort_unstable();
+    if matching.is_empty() {
+        return Err("no active all-front expansion matches that selected source region".into());
+    }
+    for order_id in matching.iter().copied() {
+        cancel_order(ctx, player_id, order_id)?;
+    }
+    Ok((matching.len() == 1).then_some(matching[0]))
+}
+
 fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<(), String> {
     let mut order = ctx
         .db
@@ -1024,5 +1355,61 @@ mod tests {
         assert_eq!(cancelled_settled_strength(100, 15, 25, 60), Ok(75));
         assert!(cancelled_settled_strength(100, 15, 25, 59).is_err());
         assert!(cancelled_settled_strength(100, u64::MAX, 0, 1).is_err());
+    }
+
+    #[test]
+    fn all_front_forks_split_exactly_and_deterministically() {
+        assert_eq!(
+            (0..3)
+                .map(|index| even_partition_at(10, 3, index))
+                .collect::<Vec<_>>(),
+            vec![4, 3, 3]
+        );
+        for total in 0..=100_u64 {
+            for parts in 1..=6 {
+                let split = (0..parts)
+                    .map(|index| even_partition_at(total, parts, index))
+                    .collect::<Vec<_>>();
+                assert_eq!(split.iter().sum::<u64>(), total);
+                assert!(split.windows(2).all(|pair| pair[0] >= pair[1]));
+                assert!(split.windows(2).all(|pair| pair[0] - pair[1] <= 1));
+            }
+        }
+    }
+
+    #[test]
+    fn all_front_expansion_only_accepts_neutral_traversable_ground() {
+        assert!(expand_target_is_eligible(0, true, true, true));
+        assert!(!expand_target_is_eligible(1, true, true, true));
+        assert!(!expand_target_is_eligible(2, true, true, true));
+        assert!(!expand_target_is_eligible(0, false, true, true));
+        assert!(!expand_target_is_eligible(0, true, false, true));
+        assert!(!expand_target_is_eligible(0, true, true, false));
+    }
+
+    #[test]
+    fn commitment_is_taken_once_before_a_boundary_fork() {
+        let available = 101;
+        let committed = basis_point_share(available, 2_500);
+        let forked = (0..4)
+            .map(|index| even_partition_at(committed, 4, index))
+            .sum::<u64>();
+
+        assert_eq!(committed, 25);
+        assert_eq!(forked, committed);
+    }
+
+    #[test]
+    fn many_small_sources_split_evenly_as_one_boundary_pool() {
+        let allocations = aggregate_lane_allocations(&vec![1; 101], 3).unwrap();
+        let mut lane_totals = [0_u64; 3];
+        let mut source_totals = vec![0_u64; 101];
+        for (source, lane, amount) in allocations {
+            source_totals[source] += amount;
+            lane_totals[lane] += amount;
+        }
+
+        assert_eq!(lane_totals, [34, 34, 33]);
+        assert!(source_totals.iter().all(|amount| *amount == 1));
     }
 }

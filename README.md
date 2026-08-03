@@ -1,11 +1,11 @@
 # Hex RTS V1
 
 A native two-player RTS prototype about moving conserved aggregate forces across
-a stepped 2.5D hex world. Players select a connected owned region, then sustain
-a push from one exact section of its border instead of selecting individual
-soldiers or painting destination cells. Terrain height, military capacity, edge
-throughput, combat frontage, garrisons, resistance, and travel time determine
-how far each lane advances.
+a stepped 2.5D hex world. Players select a connected owned region, then either
+push one oriented section of its border or expand across every neutral boundary
+instead of selecting individual soldiers or painting destination cells. Terrain
+height, military capacity, edge throughput, combat frontage, garrisons,
+resistance, and travel time determine how far each lane advances.
 
 The project intentionally has no settled title, fiction, or production art yet.
 V1 is a graybox built to test the Push Front, troop-flow, and redistribution
@@ -20,6 +20,9 @@ loop.
 - A global mobilization target that converts population locally over time.
 - Sustained directional Push Front orders with spatial conservation,
   lane-by-lane resistance, congestion, and manual cancellation.
+- Neutral-only Expand All orders that dispatch one selected percentage, route
+  rear troops to their nearest boundary, split local forks evenly, and let each
+  resulting lane advance independently.
 - Percentage-aware one-shot Balance, oriented Front-load, Core-load, and
   Perimeter-load redistribution.
 - Height-aware movement, impassable cliffs, uphill combat penalties, edge
@@ -78,9 +81,9 @@ Use separate terminals from the repository root.
 
    For later schema-compatible module updates that must preserve an in-progress
    match, use `./scripts/publish-local.sh` without arguments instead. The
-   sustained-Push and redistribution API cutover changes the persisted schema
-   and reducer surface, so an older local database must be recreated with the
-   fresh command above.
+   sustained-Push, Expand All, and redistribution API cutover changes the
+   persisted schema and reducer surface, so an older local database must be
+   recreated with the fresh command above.
 
 3. Before either player joins, optionally choose a map preset. The development
    map is already the default:
@@ -127,12 +130,13 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 | Control/Command + `A` | Select all locally owned hexes |
 | Hold `P`, drag outward, release | Preview a sustained push from the selected front in one exact hex direction |
 | Click `P PUSH FRONT`, then click outward on the map | Mouse-only alternative for orienting the same Push Front preview |
-| `[` / `]` during an order preview | Lower or raise the participating troop percentage |
+| Shift + `P` or click `EXPAND ALL` | Preview every eligible neutral edge around the selected region |
+| `[` / `]` during an order preview | Lower or raise the troops dispatched/participating in that order; this is separate from mobilization |
 | `B` | Preview Balance over the selected region |
 | Hold `F`, drag, release | Orient and preview Front-load |
 | `G` | Preview Core-load toward the selected region's center |
 | `R` | Preview Perimeter-load toward the selected region's outside rings |
-| `X` during an oriented Push Front preview | Cancel matching active pushes from the selected front and direction |
+| `X` during a Push Front or Expand All preview | Cancel matching active operations from that selection |
 | Enter | Confirm the current preview |
 | Escape | Cancel the current mode; in idle, clear selection |
 | Middle drag or Space + left drag | Pan |
@@ -153,6 +157,16 @@ that feeds independent straight lanes; terrain, elevation, throughput,
 frontage, resistance, and terrain-scaled garrisons determine how far each lane
 travels. Contested cells keep one authoritative controller while their terrain
 color blends controller and attacker pressure for readability.
+
+Expand All uses the same connected selection without an orientation. Every
+selected cell contributes the chosen dispatch percentage of its currently
+unallocated soldiers once; rear strength routes to its nearest eligible neutral
+boundary, each local boundary pool is divided evenly among its exits, and the
+straight lanes continue independently.
+Expand All never attacks: a lane stops before enemy territory. Use directional
+Push Front when enemy contact or a deliberate direction is intended. The
+mobilization slider controls future civilian recruitment and does not change
+the percentage dispatched by an order.
 
 ## Verification
 

@@ -181,26 +181,56 @@ selected-only routes in one transaction. Accepted strength becomes ordinary
 aggregate transit packets; rejected commands create a receipt without partial
 gameplay mutation.
 
-Commitment is a desired total share of each source stack, not a percentage of
-whatever remains after every click. Infantry already allocated from that
-source to the same directional front counts toward the target, while unrelated
-orders only reduce what remains available. Repeating an unchanged 50% Push
-therefore cannot ratchet the same stack toward 100%. Destination reservations
-are scoped to the issuing player; another player's pending attack cannot
-pre-claim neutral capacity before the forces physically meet.
+Commitment is a one-time share of the currently unallocated strength in each
+selected source when the command is accepted. Existing allocations reduce the
+available base; the percentage is never multiplied by the number of front
+edges. Submitting another command is a new allocation decision and applies to
+what remains unallocated at that later moment. Destination reservations are
+scoped to the issuing player; another player's pending attack cannot pre-claim
+neutral capacity before the forces physically meet.
 
 With the same front selection and direction previewed, `X` cancels matching
 active Push Front orders. Cancellation releases their remaining allocations at
 the cells where they currently exist; it does not rewind captures, return force
 to its original source, or erase casualties.
 
+### Expand All: neutral opening expansion
+
+Expand All applies the same spatial commitment model to every eligible neutral
+boundary around one connected owned selection. Use Shift+`P` or the HUD button
+to preview it, plain `[` / `]` to set the dispatch percentage, `Enter` to start,
+and `X` from the same preview to stop matching operations. It requires no
+orientation and never includes an enemy-held target; directional Push Front
+remains the command for attacks.
+
+Each selected cell snapshots the chosen share of its currently unallocated
+infantry exactly once. It is not multiplied by the number of adjacent edges.
+Rear cells route within the selected region to their nearest eligible neutral
+boundary. Where one boundary cell has several outward exits, their combined
+local pool is divided as evenly as integer strength permits before source
+contributions fill those lane quotas. This makes each fork use the same effort
+without letting rounding repeatedly favor one exit.
+
+Every unique first target becomes a stable lane anchor. Concave boundaries that
+reach the same outside target are deterministically deduplicated, then each
+lane continues along its own initial axial direction under the same capacity,
+throughput, elevation, and terrain-scaled garrison rules as Push Front. A lane
+may cross already-friendly traversable cells without recapturing or
+regarrisoning them, which prevents intersecting independent rays from blocking
+one another. It stops independently when its mobile pool is exhausted, blocked,
+reaches the map edge, is cancelled, or would enter enemy territory. Ownership
+is rechecked during execution, so a neutral target that becomes hostile is not
+attacked by an already-issued Expand All operation.
+
+The dispatch percentage belongs to the current order. It is deliberately
+separate from the global mobilization target, which governs future conversion
+of civilians into soldiers. This distinction is shown in the order panel and
+help text.
+
 The generic aggregate transfer machinery remains a useful implementation
 substrate for routes, queues, congestion, and delivery, but V1 has no public
 precise-infantry-transfer command. Exact cell targeting is reserved for possible
-future discrete units such as tanks or boats. A neutral-only Expand All
-shortcut also remains a possible opening-flow experiment after the
-selected-front loop is validated; it must not replace the spatial commitment
-rules above.
+future discrete units such as tanks or boats.
 
 ### One-shot redistribution
 
@@ -338,26 +368,32 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
    direction using one fixed committed pool. Terrain-scaled garrisons consume
    momentum, lanes stop independently, and no command can teleport or duplicate
    strength.
-9. Cutting a corridor creates genuinely independent connected components whose existing population and forces remain usable locally but cannot transfer across the cut.
-10. Players can apply percentage-aware one-shot Balance, oriented Front-load,
+9. Players can preview Expand All over a connected owned selection, choose an
+   order dispatch percentage independently of mobilization, and advance every
+   eligible neutral boundary with conserved, locally split, independent lanes
+   that stop before enemy territory.
+10. Cutting a corridor creates genuinely independent connected components whose existing population and forces remain usable locally but cannot transfer across the cut.
+11. Players can apply percentage-aware one-shot Balance, oriented Front-load,
     Core-load, and Perimeter-load orders, preview their target densities, and
     watch the participating force physically redistribute while each cell's
     unparticipating share remains in place.
-11. Combat is resolved across contested edges using frontage, elevation, capacity, and casualties, including attacks from more than one edge without double-counting defenders.
-12. Ownership changes through combat and expansion, and all authoritative state is fully visible to both players.
-13. Graybox overlays make ownership, force density, occupancy/capacity, Push
+12. Combat is resolved across contested edges using frontage, elevation, capacity, and casualties, including attacks from more than one edge without double-counting defenders.
+13. Ownership changes through combat and expansion, and all authoritative state is fully visible to both players.
+14. Graybox overlays make ownership, force density, occupancy/capacity, Push
     Front flows, queues, active edges, blocked orders, and contested pressure
     understandable without implying dual occupancy or requiring production
     assets.
-14. Core tuning values are configurable so playtests can adjust the model without changing its data or interaction foundations.
+15. Core tuning values are configurable so playtests can adjust the model without changing its data or interaction foundations.
 
 ## Questions for Playtesting, Not Pre-production Blockers
 
 - Does selecting a front plus its backward reinforcement corridor feel direct,
   and does fixed-pool sustained advancement create understandable momentum
   without excessive input or opaque automation?
-- Would a neutral-only Expand All shortcut improve the opening without
-  obscuring spatial logistics or rewarding click spam?
+- Does Expand All make neutral opening expansion faster without obscuring which
+  local troops feed each independent lane or encouraging repeated click spam?
+- Is nearest-boundary routing with even local fork splitting understandable,
+  or does the preview need stronger lane-allocation feedback?
 - Which selection gestures make irregular connected source regions easy to express?
 - Is the local civilian-to-military mobilization model understandable before an explicit economy is introduced?
 - Do capacity, throughput, and frontage create clear bottlenecks rather than frustrating queues?

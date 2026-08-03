@@ -54,6 +54,7 @@ pub enum OrderKind {
     CoreLoad,
     PerimeterLoad,
     PushFront,
+    ExpandAll,
 }
 
 #[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,7 +247,7 @@ pub struct TransferDestination {
     pub destination_key: String,
     pub order_id: u64,
     /// Destination for redistribution orders; stable first-front lane anchor
-    /// for a sustained Push Front order.
+    /// for a sustained Push Front or Expand All operation.
     pub cell_id: u32,
     pub target_infantry: u64,
     pub received_infantry: u64,
@@ -257,6 +258,10 @@ pub struct TransferDestination {
     accessor = transit_packet,
     public,
     index(accessor = packet_by_order, btree(columns = [order_id])),
+    index(
+        accessor = packet_by_order_destination,
+        btree(columns = [order_id, destination_cell])
+    ),
     index(accessor = packet_by_cell, btree(columns = [current_cell]))
 )]
 pub struct TransitPacket {

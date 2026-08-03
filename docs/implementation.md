@@ -89,6 +89,12 @@ a player identity.
   the exact stored axial direction using its fixed committed pool.
 - `cancel_push_fronts` — stop matching active directional pushes and release
   remaining allocations where the troops currently are.
+- `issue_expand_all` — commit a percentage of one connected selected region's
+  currently unallocated infantry to every eligible neutral boundary. Sources
+  route to the nearest boundary, local forks split evenly, and each stable lane
+  sustains its own initial direction.
+- `cancel_expand_all` — stop matching active all-front expansion orders for the
+  submitted source region and release their remaining allocations in place.
 - `issue_balance` — create a percentage-aware physical density equalization
   order.
 - `issue_front_load` — create a percentage-aware physical directional density
@@ -98,8 +104,8 @@ a player identity.
 - `issue_perimeter_load` — create a percentage-aware physical outward radial
   density order.
 There is no public precise-infantry-transfer reducer. The generic transfer
-tables are execution machinery shared by Push Front and redistribution, not a
-cell-targeting player command.
+tables are execution machinery shared by Push Front, Expand All, and
+redistribution, not a cell-targeting player command.
 
 Rejected gameplay commands still create an authoritative receipt with a reason;
 they do not partially mutate match state.
@@ -193,6 +199,19 @@ consume or delay its fixed committed pool. Lanes stop independently when
 exhausted, blocked, defeated, at the map edge, or cancelled. With the same
 front and direction previewed, `X` stops matching active pushes.
 
+Shift+`P` (or `EXPAND ALL` in the HUD) skips orientation and previews every
+eligible neutral edge around the connected selection. Plain brackets change
+the order's dispatch percentage; this is independent of the mobilization
+slider, which controls future recruitment. Each selected cell contributes that
+share of its currently unallocated infantry once. Rear sources use a shared
+nearest-boundary route tree, each boundary's combined pool is split evenly
+among its unique outward targets, and those lanes sustain their initial
+directions independently. Enemy targets are excluded initially and rechecked
+during execution, so Expand All stops rather than becoming an implicit attack.
+Intersecting rays may traverse already-friendly cells without capturing or
+regarrisoning them. From the same preview, `X` cancels matching Expand All
+orders.
+
 `B`, `F`, `G`, and `R` preview Balance, directional Front-load, Core-load, and
 Perimeter-load. Brackets adjust percentage participation for all four. The
 unparticipating share of each selected cell's current stack remains frozen in
@@ -204,15 +223,17 @@ cell-to-cell control is reserved for possible future discrete units.
 ## Tests and current evidence
 
 - `hex-core` covers coordinates, chunks, traversal, routing, connectivity,
-  selected directional-front derivation, capacity, throughput, backpressure,
-  conservation, multi-edge combat, redistribution, and exact 80% victory math.
+  selected directional- and all-front derivation, capacity, throughput,
+  backpressure, conservation, multi-edge combat, redistribution, and exact 80%
+  victory math.
 - `worldgen` pins all curated maps, round-trips serialization, rejects invalid
   metadata/duplicates, and sweeps supported custom seeds.
 - The module's native tests pin preset metadata; module compilation validates
   the SpacetimeDB schema and WASM target.
 - The headless real-server smoke test uses two identities to cover slot claims,
   match start, subscriptions, idempotent receipts, sustained multi-layer Push
-  progression, cancellation, and token-based reconnect.
+  progression, multi-direction neutral Expand All, cancellation, and
+  token-based reconnect.
 - The Bevy client has coordinate/fixture/route tests and a native launch smoke.
 - CI repeats formatting, workspace tests/lints, module tests/lints/build, and
   generated-binding drift detection.
@@ -224,8 +245,10 @@ cell-to-cell control is reserved for possible future discrete units.
 - Corridor routes and axial lane directions are deterministic and fixed when an
   order is accepted; sustained Push packets extend only along that ray and do
   not dynamically replan around later ownership changes.
-- Push Front converts the chosen commitment percentage to authoritative basis
-  points. There are no order priorities or adaptive lane retargeting.
+- Push Front and Expand All convert the chosen dispatch percentage to
+  authoritative basis points. There are no order priorities or adaptive lane
+  retargeting. Expand All applies only to the submitted connected selection;
+  the V1 4,096-cell command limit is not a world-scale global policy.
 - Population/mobilization uses a provisional full-state cadence. Movement and
   combat use active sets, but nominal/stress performance gates still need
   representative playtest measurement.

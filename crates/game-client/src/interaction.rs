@@ -10,7 +10,9 @@ use crate::{
     camera::GameCamera,
     geometry::axial_to_plane,
     model::{MatchView, ToastKind},
-    network::{ClientIntent, NetworkSet, RedistributionPreset, ServerUpdate},
+    network::{
+        ClientIntent, NetworkSet, RedistributionPreset, ServerUpdate, expand_all_front_edges,
+    },
     terrain::TerrainChunk,
 };
 
@@ -21,7 +23,10 @@ pub struct OrderPreview {
     pub excluded: BTreeSet<Axial>,
     pub heatmap: BTreeMap<Axial, f32>,
     pub eta_seconds: u32,
-    pub requested_strength: u64,
+    /// Upper-bound estimate from visible infantry. Active authoritative packet
+    /// allocations are not represented in `MatchView`, so the accepted order
+    /// may dispatch less than this value.
+    pub strength_upper_bound: u64,
     pub destination_capacity: u64,
     pub bottleneck: Option<(Axial, Axial)>,
     pub invalid_reason: Option<&'static str>,
@@ -32,6 +37,7 @@ pub enum OrderMode {
     Idle,
     PushFrontOrient { start: Vec3, current: Vec3 },
     PushFrontPreview { direction: Axial },
+    ExpandAllPreview,
     BalancePreview,
     FrontLoadOrient { start: Vec3, current: Vec3 },
     FrontLoadPreview { direction: Vec2 },
@@ -46,6 +52,7 @@ impl OrderMode {
             Self::Idle => "SOURCE SELECTION",
             Self::PushFrontOrient { .. } => "PUSH FRONT · ORIENT",
             Self::PushFrontPreview { .. } => "PUSH FRONT PREVIEW",
+            Self::ExpandAllPreview => "EXPAND ALL PREVIEW",
             Self::BalancePreview => "BALANCE PREVIEW",
             Self::FrontLoadOrient { .. } => "FRONT-LOAD · ORIENT",
             Self::FrontLoadPreview { .. } => "FRONT-LOAD PREVIEW",
@@ -179,6 +186,7 @@ enum SelectionCombine {
 enum PreviewModeKey {
     Idle,
     PushFront { direction: Option<Axial> },
+    ExpandAll,
     Balance,
     FrontLoad { direction: Option<(u32, u32)> },
     CoreLoad,
@@ -313,6 +321,7 @@ impl InteractionState {
 pub enum UiAction {
     PushFront,
     PushFrontKey,
+    ExpandAll,
     Balance,
     FrontLoad,
     FrontLoadKey,
@@ -452,7 +461,11 @@ fn process_order_input(
 
     let mut requested_actions = Vec::new();
     if keyboard.just_pressed(KeyCode::KeyP) {
-        requested_actions.push(UiAction::PushFrontKey);
+        requested_actions.push(if shift_pressed(&keyboard) {
+            UiAction::ExpandAll
+        } else {
+            UiAction::PushFrontKey
+        });
     }
     if keyboard.just_pressed(KeyCode::KeyB) {
         requested_actions.push(UiAction::Balance);
@@ -663,6 +676,17 @@ fn handle_action(
                 }
             }
         }
+        UiAction::ExpandAll => {
+            if interaction.sources.is_empty() {
+                view.show_toast("Paint owned source hexes first", ToastKind::Rejection);
+            } else if matches!(interaction.mode, OrderMode::Idle) {
+                interaction.mode = OrderMode::ExpandAllPreview;
+                view.show_toast(
+                    "Expand All previews every neutral frontier · [/] adjusts dispatch request",
+                    ToastKind::Info,
+                );
+            }
+        }
         UiAction::Balance => {
             if interaction.sources.len() < 2 {
                 view.show_toast(
@@ -750,6 +774,7 @@ fn is_percentage_preview(mode: &OrderMode) -> bool {
     matches!(
         mode,
         OrderMode::PushFrontPreview { .. }
+            | OrderMode::ExpandAllPreview
             | OrderMode::BalancePreview
             | OrderMode::FrontLoadPreview { .. }
             | OrderMode::CoreLoadPreview
@@ -762,30 +787,47 @@ fn cancel_matching_push(
     view: &mut MatchView,
     intents: &mut MessageWriter<ClientIntent>,
 ) {
-    let OrderMode::PushFrontPreview { direction } = &interaction.mode else {
-        view.show_toast(
-            "Select and orient a front first, then X stops matching pushes",
-            ToastKind::Info,
-        );
-        return;
-    };
     if interaction.sources.is_empty() {
         view.show_toast(
-            "Select the push's source region first",
+            "Select the expansion's source region first",
             ToastKind::Rejection,
         );
         return;
     }
-    let direction = *direction;
-    interaction.return_after_rejection = Some(OrderMode::PushFrontPreview { direction });
-    interaction.submitting_command_id = None;
-    interaction.mode = OrderMode::Submitting {
-        _label: "STOP PUSH",
+    let Some((intent, label, return_mode)) = cancellation_request(interaction) else {
+        view.show_toast(
+            "Preview a directional Push or Expand All first, then X stops matching operations",
+            ToastKind::Info,
+        );
+        return;
     };
-    intents.write(ClientIntent::CancelPush {
-        sources: interaction.sources.clone(),
-        direction,
-    });
+    interaction.return_after_rejection = Some(return_mode);
+    interaction.submitting_command_id = None;
+    interaction.mode = OrderMode::Submitting { _label: label };
+    intents.write(intent);
+}
+
+fn cancellation_request(
+    interaction: &InteractionState,
+) -> Option<(ClientIntent, &'static str, OrderMode)> {
+    match interaction.mode {
+        OrderMode::PushFrontPreview { direction } => Some((
+            ClientIntent::CancelPush {
+                sources: interaction.sources.clone(),
+                direction,
+            },
+            "STOP PUSH",
+            OrderMode::PushFrontPreview { direction },
+        )),
+        OrderMode::ExpandAllPreview => Some((
+            ClientIntent::CancelExpandAll {
+                sources: interaction.sources.clone(),
+            },
+            "STOP EXPAND ALL",
+            OrderMode::ExpandAllPreview,
+        )),
+        _ => None,
+    }
 }
 
 fn submit_current(
@@ -812,6 +854,19 @@ fn submit_current(
                 OrderMode::PushFrontPreview {
                     direction: *direction,
                 },
+            )
+        }
+        OrderMode::ExpandAllPreview
+            if !interaction.preview.front_edges.is_empty()
+                && interaction.preview.invalid_reason.is_none() =>
+        {
+            (
+                ClientIntent::ExpandAll {
+                    sources: interaction.sources.clone(),
+                    commitment_percent: interaction.amount_percent,
+                },
+                "EXPAND ALL",
+                OrderMode::ExpandAllPreview,
             )
         }
         OrderMode::BalancePreview => (
@@ -856,7 +911,7 @@ fn submit_current(
             "PERIMETER-LOAD",
             OrderMode::PerimeterLoadPreview,
         ),
-        OrderMode::PushFrontPreview { .. } => {
+        OrderMode::PushFrontPreview { .. } | OrderMode::ExpandAllPreview => {
             view.show_toast(
                 interaction
                     .preview
@@ -955,6 +1010,7 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
                 direction: interaction.push_direction(),
             }
         }
+        OrderMode::ExpandAllPreview => PreviewModeKey::ExpandAll,
         OrderMode::BalancePreview => PreviewModeKey::Balance,
         OrderMode::FrontLoadOrient { .. } | OrderMode::FrontLoadPreview { .. } => {
             PreviewModeKey::FrontLoad {
@@ -1039,13 +1095,13 @@ fn build_push_front_preview(
 
     preview.front_edges = edges;
     let percentage = u64::from(commitment_percent.clamp(10, 100));
-    preview.requested_strength = sources
+    preview.strength_upper_bound = sources
         .iter()
         .filter_map(|coordinate| view.cell(*coordinate))
         .map(|cell| cell.infantry.saturating_mul(percentage) / 100)
         .fold(0_u64, u64::saturating_add);
-    if preview.requested_strength == 0 {
-        preview.invalid_reason = Some("Selected sources have no infantry to commit");
+    if preview.strength_upper_bound == 0 {
+        preview.invalid_reason = Some("Selected sources have no visible infantry to request");
         return;
     }
     let targets = preview
@@ -1094,7 +1150,141 @@ fn build_push_front_preview(
     }
     let max_distance = distance.values().copied().max().unwrap_or(0);
     let congestion = preview
-        .requested_strength
+        .strength_upper_bound
+        .saturating_sub(preview.destination_capacity)
+        / 20;
+    preview.eta_seconds = (u64::from(max_distance.saturating_add(1)) * 2 + congestion)
+        .min(u64::from(u32::MAX)) as u32;
+}
+
+fn build_expand_all_preview(
+    view: &MatchView,
+    selected: &BTreeSet<Axial>,
+    commitment_percent: u8,
+    preview: &mut OrderPreview,
+) {
+    if selected.len() > MAX_COMMAND_SELECTION_CELLS {
+        preview.invalid_reason = Some("Expand All selection exceeds the 4096-cell V1 limit");
+        return;
+    }
+    if selected.is_empty() {
+        preview.invalid_reason = Some("Select owned cells before expanding");
+        return;
+    }
+    let sources = selected
+        .iter()
+        .filter(|coordinate| {
+            view.cell(**coordinate).is_some_and(|cell| {
+                view.is_local_owned(**coordinate) && cell.is_land() && !cell.blocked
+            })
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if sources.len() != selected.len() {
+        preview
+            .excluded
+            .extend(selected.difference(&sources).copied());
+        preview.invalid_reason = Some("Every selected source must be owned passable ground");
+        return;
+    }
+
+    let edges = match expand_all_front_edges(view, &sources) {
+        Ok(edges) => edges,
+        Err(FrontSelectionError::EmptySelection) => {
+            preview.invalid_reason = Some("Select owned cells before expanding");
+            return;
+        }
+        Err(FrontSelectionError::DisconnectedSelection) => {
+            preview.invalid_reason = Some("Expand All selection must be one connected region");
+            return;
+        }
+        Err(FrontSelectionError::NoEligibleFront) => {
+            preview.invalid_reason = Some("The selection has no passable neutral frontier");
+            return;
+        }
+        Err(FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront) => {
+            preview.invalid_reason = Some("Expand All frontier is invalid");
+            return;
+        }
+    };
+    let front_sources = edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    let (next, distance) = selected_reachability_to_front(view, &sources, &front_sources);
+    if next.len() != sources.len() {
+        preview.excluded.extend(
+            sources
+                .iter()
+                .filter(|source| !next.contains_key(source))
+                .copied(),
+        );
+        preview.invalid_reason =
+            Some("Every selected source must reach a neutral frontier inside the selection");
+        return;
+    }
+
+    preview.front_edges = edges;
+    let percentage = u64::from(commitment_percent.clamp(10, 100));
+    preview.strength_upper_bound = sources
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| cell.infantry.saturating_mul(percentage) / 100)
+        .fold(0_u64, u64::saturating_add);
+    if preview.strength_upper_bound == 0 {
+        preview.invalid_reason = Some("Selected sources have no visible infantry to request");
+        return;
+    }
+    let targets = preview
+        .front_edges
+        .iter()
+        .map(|edge| edge.target)
+        .collect::<BTreeSet<_>>();
+    preview.destination_capacity = targets
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| cell.military_capacity)
+        .fold(0_u64, u64::saturating_add);
+    if preview.destination_capacity == 0 {
+        preview.invalid_reason = Some("The neutral frontier has no military capacity");
+        return;
+    }
+
+    // Show one representative rear-to-front route. Every edge is still drawn,
+    // while this route communicates that the rear selection feeds its nearest
+    // boundary rather than cloning troops into each outward direction.
+    let route_start = sources
+        .iter()
+        .filter(|source| view.cell(**source).is_some_and(|cell| cell.infantry > 0))
+        .max_by_key(|source| (distance.get(source).copied().unwrap_or(0), **source))
+        .copied();
+    if let Some(mut current) = route_start {
+        preview.route.push(current);
+        while let Some(next_cell) = next.get(&current).copied() {
+            if next_cell == current {
+                break;
+            }
+            current = next_cell;
+            preview.route.push(current);
+        }
+        if let Some(edge) = preview
+            .front_edges
+            .iter()
+            .find(|edge| edge.source == current)
+        {
+            preview.route.push(edge.target);
+        }
+    }
+    if preview.route.len() >= 2 {
+        preview.bottleneck = preview
+            .route
+            .windows(2)
+            .min_by_key(|edge| view.cell(edge[1]).map_or(0, |cell| cell.military_capacity))
+            .map(|edge| (edge[0], edge[1]));
+    }
+    let max_distance = distance.values().copied().max().unwrap_or(0);
+    let congestion = preview
+        .strength_upper_bound
         .saturating_sub(preview.destination_capacity)
         / 20;
     preview.eta_seconds = (u64::from(max_distance.saturating_add(1)) * 2 + congestion)
@@ -1185,6 +1375,12 @@ fn update_order_preview(view: Res<MatchView>, mut interaction: ResMut<Interactio
                 preview.invalid_reason = Some("Drag farther to choose one of six directions");
             }
         }
+        OrderMode::ExpandAllPreview => build_expand_all_preview(
+            &view,
+            &interaction.sources,
+            interaction.amount_percent,
+            &mut preview,
+        ),
         OrderMode::BalancePreview => build_redistribution_preview(
             &view,
             &interaction.sources,
@@ -1292,7 +1488,7 @@ fn build_redistribution_preview(
             },
         );
     }
-    preview.requested_strength = selected
+    preview.strength_upper_bound = selected
         .iter()
         .filter_map(|coordinate| view.cell(*coordinate))
         .map(|cell| cell.infantry.saturating_mul(u64::from(amount_bps)) / 10_000)
@@ -1634,7 +1830,7 @@ mod tests {
                 Axial::new(3, 0),
             ]
         );
-        assert_eq!(preview.requested_strength, 60);
+        assert_eq!(preview.strength_upper_bound, 60);
         assert_eq!(preview.destination_capacity, 100);
         assert!(preview.excluded.is_empty());
         assert_eq!(preview.invalid_reason, None);
@@ -1642,13 +1838,13 @@ mod tests {
         app.world_mut()
             .resource_mut::<InteractionState>()
             .preview
-            .requested_strength = 999;
+            .strength_upper_bound = 999;
         app.update();
         assert_eq!(
             app.world()
                 .resource::<InteractionState>()
                 .preview
-                .requested_strength,
+                .strength_upper_bound,
             999,
             "an unchanged cache key must skip the full preview rebuild"
         );
@@ -1661,7 +1857,7 @@ mod tests {
             app.world()
                 .resource::<InteractionState>()
                 .preview
-                .requested_strength,
+                .strength_upper_bound,
             30
         );
     }
@@ -1709,8 +1905,89 @@ mod tests {
 
         assert_eq!(
             preview.invalid_reason,
-            Some("Selected sources have no infantry to commit")
+            Some("Selected sources have no visible infantry to request")
         );
+    }
+
+    #[test]
+    fn expand_all_preview_finds_every_neutral_direction_and_excludes_enemy_edges() {
+        let source = Axial::ZERO;
+        let enemy_target = source + Axial::DIRECTIONS[2];
+        let mut view = MatchView::connecting(1);
+        view.cells
+            .insert(source, preview_cell(source, Some(1), 60, 0));
+        for direction in Axial::DIRECTIONS {
+            let coordinate = source + direction;
+            let owner = (coordinate == enemy_target).then_some(2);
+            view.cells
+                .insert(coordinate, preview_cell(coordinate, owner, 0, 0));
+        }
+        view.rebuild_chunk_index();
+
+        let mut preview = OrderPreview::default();
+        build_expand_all_preview(&view, &BTreeSet::from([source]), 25, &mut preview);
+
+        assert_eq!(preview.invalid_reason, None);
+        assert_eq!(preview.front_edges.len(), 5);
+        assert!(
+            preview
+                .front_edges
+                .iter()
+                .all(|edge| edge.target != enemy_target)
+        );
+        assert_eq!(preview.strength_upper_bound, 15);
+        assert_eq!(preview.destination_capacity, 500);
+    }
+
+    #[test]
+    fn expand_all_preview_deduplicates_a_shared_concave_target() {
+        let left = Axial::ZERO;
+        let right = Axial::new(1, 0);
+        let shared_target = Axial::new(0, 1);
+        let mut view = MatchView::connecting(1);
+        for coordinate in [left, right] {
+            view.cells
+                .insert(coordinate, preview_cell(coordinate, Some(1), 20, 0));
+        }
+        view.cells
+            .insert(shared_target, preview_cell(shared_target, None, 0, 0));
+        view.rebuild_chunk_index();
+
+        let mut preview = OrderPreview::default();
+        build_expand_all_preview(&view, &BTreeSet::from([left, right]), 50, &mut preview);
+
+        assert_eq!(preview.invalid_reason, None);
+        assert_eq!(
+            preview.front_edges,
+            vec![DirectedFrontEdge {
+                source: left,
+                target: shared_target,
+            }]
+        );
+        assert_eq!(preview.strength_upper_bound, 20);
+    }
+
+    #[test]
+    fn expand_all_preview_rejects_disconnected_source_regions() {
+        let left = Axial::ZERO;
+        let right = Axial::new(3, 0);
+        let mut view = MatchView::connecting(1);
+        for source in [left, right] {
+            view.cells
+                .insert(source, preview_cell(source, Some(1), 20, 0));
+            let target = source + Axial::new(0, 1);
+            view.cells.insert(target, preview_cell(target, None, 0, 0));
+        }
+        view.rebuild_chunk_index();
+
+        let mut preview = OrderPreview::default();
+        build_expand_all_preview(&view, &BTreeSet::from([left, right]), 50, &mut preview);
+
+        assert_eq!(
+            preview.invalid_reason,
+            Some("Expand All selection must be one connected region")
+        );
+        assert!(preview.front_edges.is_empty());
     }
 
     #[test]
@@ -1751,5 +2028,53 @@ mod tests {
         assert!(submission_matches(&interaction, Some(41)));
         assert!(!submission_matches(&interaction, Some(42)));
         assert!(submission_matches(&interaction, None));
+    }
+
+    #[test]
+    fn expand_all_cancellation_emits_the_selected_source_region() {
+        let sources = BTreeSet::from([Axial::ZERO, Axial::new(1, 0)]);
+        let interaction = InteractionState {
+            sources: sources.clone(),
+            mode: OrderMode::ExpandAllPreview,
+            ..Default::default()
+        };
+
+        let (intent, label, return_mode) =
+            cancellation_request(&interaction).expect("Expand All can be cancelled");
+        let ClientIntent::CancelExpandAll {
+            sources: cancelled_sources,
+        } = intent
+        else {
+            panic!("Expand All preview must emit its matching cancellation intent");
+        };
+        assert_eq!(cancelled_sources, sources);
+        assert_eq!(label, "STOP EXPAND ALL");
+        assert!(matches!(return_mode, OrderMode::ExpandAllPreview));
+    }
+
+    #[test]
+    fn rejected_expand_all_cancellation_restores_its_preview() {
+        let interaction = InteractionState {
+            mode: OrderMode::Submitting {
+                _label: "STOP EXPAND ALL",
+            },
+            return_after_rejection: Some(OrderMode::ExpandAllPreview),
+            submitting_command_id: Some(41),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.add_message::<ServerUpdate>()
+            .insert_resource(interaction)
+            .add_systems(Update, finish_submission);
+        app.world_mut().write_message(ServerUpdate::Rejected {
+            command_id: Some(41),
+            reason: "nothing matched".to_owned(),
+            relevant_cell: None,
+        });
+        app.update();
+
+        let interaction = app.world().resource::<InteractionState>();
+        assert!(matches!(interaction.mode, OrderMode::ExpandAllPreview));
+        assert_eq!(interaction.submitting_command_id, None);
     }
 }

@@ -6,6 +6,7 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+pub mod cancel_expand_all_reducer;
 pub mod cancel_push_fronts_reducer;
 pub mod cell_state_table;
 pub mod cell_state_type;
@@ -18,6 +19,7 @@ pub mod command_receipt_type;
 pub mod configure_map_reducer;
 pub mod issue_balance_reducer;
 pub mod issue_core_load_reducer;
+pub mod issue_expand_all_reducer;
 pub mod issue_front_load_reducer;
 pub mod issue_perimeter_load_reducer;
 pub mod issue_push_front_reducer;
@@ -47,6 +49,7 @@ pub mod transfer_source_type;
 pub mod transit_packet_table;
 pub mod transit_packet_type;
 
+pub use cancel_expand_all_reducer::cancel_expand_all;
 pub use cancel_push_fronts_reducer::cancel_push_fronts;
 pub use cell_state_table::*;
 pub use cell_state_type::CellState;
@@ -59,6 +62,7 @@ pub use command_receipt_type::CommandReceipt;
 pub use configure_map_reducer::configure_map;
 pub use issue_balance_reducer::issue_balance;
 pub use issue_core_load_reducer::issue_core_load;
+pub use issue_expand_all_reducer::issue_expand_all;
 pub use issue_front_load_reducer::issue_front_load;
 pub use issue_perimeter_load_reducer::issue_perimeter_load;
 pub use issue_push_front_reducer::issue_push_front;
@@ -96,6 +100,10 @@ pub use transit_packet_type::TransitPacket;
 /// to indicate which reducer caused the event.
 
 pub enum Reducer {
+    CancelExpandAll {
+        client_command_id: u64,
+        selected_cells: Vec<u32>,
+    },
     CancelPushFronts {
         client_command_id: u64,
         selected_cells: Vec<u32>,
@@ -114,6 +122,11 @@ pub enum Reducer {
         client_command_id: u64,
         selected_cells: Vec<u32>,
         amount_bps: u32,
+    },
+    IssueExpandAll {
+        client_command_id: u64,
+        selected_cells: Vec<u32>,
+        commitment_bps: u32,
     },
     IssueFrontLoad {
         client_command_id: u64,
@@ -151,10 +164,12 @@ impl __sdk::InModule for Reducer {
 impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
+            Reducer::CancelExpandAll { .. } => "cancel_expand_all",
             Reducer::CancelPushFronts { .. } => "cancel_push_fronts",
             Reducer::ConfigureMap { .. } => "configure_map",
             Reducer::IssueBalance { .. } => "issue_balance",
             Reducer::IssueCoreLoad { .. } => "issue_core_load",
+            Reducer::IssueExpandAll { .. } => "issue_expand_all",
             Reducer::IssueFrontLoad { .. } => "issue_front_load",
             Reducer::IssuePerimeterLoad { .. } => "issue_perimeter_load",
             Reducer::IssuePushFront { .. } => "issue_push_front",
@@ -166,6 +181,13 @@ impl __sdk::Reducer for Reducer {
     #[allow(clippy::clone_on_copy)]
     fn args_bsatn(&self) -> Result<Vec<u8>, __sats::bsatn::EncodeError> {
         match self {
+            Reducer::CancelExpandAll {
+                client_command_id,
+                selected_cells,
+            } => __sats::bsatn::to_vec(&cancel_expand_all_reducer::CancelExpandAllArgs {
+                client_command_id: client_command_id.clone(),
+                selected_cells: selected_cells.clone(),
+            }),
             Reducer::CancelPushFronts {
                 client_command_id,
                 selected_cells,
@@ -199,6 +221,15 @@ impl __sdk::Reducer for Reducer {
                 client_command_id: client_command_id.clone(),
                 selected_cells: selected_cells.clone(),
                 amount_bps: amount_bps.clone(),
+            }),
+            Reducer::IssueExpandAll {
+                client_command_id,
+                selected_cells,
+                commitment_bps,
+            } => __sats::bsatn::to_vec(&issue_expand_all_reducer::IssueExpandAllArgs {
+                client_command_id: client_command_id.clone(),
+                selected_cells: selected_cells.clone(),
+                commitment_bps: commitment_bps.clone(),
             }),
             Reducer::IssueFrontLoad {
                 client_command_id,

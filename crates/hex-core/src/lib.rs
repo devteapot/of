@@ -22,7 +22,10 @@ pub use combat::{
 pub use connectivity::{connected_components, owned_components};
 pub use conquest::{ConquestError, ConquestProgress, ConquestRule};
 pub use coord::{Axial, ChunkAddress, ChunkCoord, Cube, HexDirection, HexEdge};
-pub use front::{DirectedFrontEdge, FrontSelectionError, selected_front_edges};
+pub use front::{
+    DirectedFrontEdge, FrontSelectionError, selected_all_front_edges, selected_front_edges,
+    unique_target_front_edges,
+};
 pub use map::{
     Cell, EdgeLimits, ForceComposition, HexMap, LogisticsConfig, MovementConfig, PlayerId,
     Strength, TerrainKind, Traversal, ground_traversal,

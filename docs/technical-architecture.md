@@ -128,10 +128,10 @@ schema. Generated files carry a prominent generated marker, are committed, and
 are never manually edited. CI regenerates the bindings and fails on an
 unexpected diff so schema drift is visible.
 
-The sustained-Push and four-preset redistribution cutover changes both the
-persisted schema and public reducer API. SpacetimeDB 2.7.1 cannot migrate this
-development schema in place; after pulling the cutover, recreate the local
-database and regenerate bindings with:
+The sustained-Push, Expand All, and four-preset redistribution cutover changes
+both the persisted schema and public reducer API. SpacetimeDB 2.7.1 cannot
+migrate this development schema in place; after pulling the cutover, recreate
+the local database and regenerate bindings with:
 
 ```bash
 ./scripts/publish-local.sh --fresh --confirm-delete-of-match-dev
@@ -144,6 +144,7 @@ Clients send intentions such as:
 - join or reclaim a player slot;
 - set the player's global mobilization target;
 - issue or cancel a selected-region directional Push Front order;
+- issue or cancel a selected-region neutral-only Expand All order;
 - issue a percentage-aware one-shot Balance, oriented Front-load, Core-load, or
   Perimeter-load redistribution order.
 
@@ -225,6 +226,26 @@ blocked, defeated, at the map edge, or manually cancelled. Cancellation
 releases remaining allocations where they physically are; it is not a rewind.
 The public precise-infantry-transfer reducer has been removed. Exact cell
 movement is reserved for possible future discrete tanks, boats, or other units.
+
+Expand All is the neutral-only companion producer. Its reducer accepts one
+six-connected owned selection and a basis-point dispatch share, with no
+orientation. It snapshots that share from every cell's currently unallocated
+infantry once, routes each source within the selection to its nearest eligible
+neutral boundary, aggregates contributions locally per boundary, and divides
+each boundary pool evenly among its outward exits. Shared concave targets are
+deduplicated into one stable lane anchor. Each lane derives its own initial
+axial direction and then uses the same sustained throughput, capacity,
+elevation, and garrison machinery as Push Front. Runtime ownership is checked
+before movement: friendly cells remain valid transit, neutral cells may be
+captured, and enemy cells stop and release the lane without combat.
+
+Expand All means every neutral boundary of the submitted six-connected
+selection, not every disconnected territory component owned by the player.
+`Ctrl/Cmd+A` provides the whole-owned-region gesture when that territory is one
+six-connected region; internally movement-isolated parts can proceed only when
+each has its own reachable neutral boundary. The 4,096-cell V1 command limit
+remains in force; a future world-scale global policy would need symbolic
+region/component commands rather than a massive cell payload.
 
 Balance, Front-load, Core-load, and Perimeter-load share one deterministic
 integer target allocator. Their basis-point participation value freezes the
@@ -358,12 +379,15 @@ specific gesture.
 Bulk selections must not multiply pathfinding work. Push Front derives its
 exact directional boundary in shared pure code, validates one source component
 and one active-front component, and searches backward only through selected
-cells. Previews cache results by selection and authoritative cell-state
-revisions. Every V1 order preview and reducer rejects selections above 4,096
-cells before building heatmaps, routes, or payloads. This is a safety bound,
-not the world-scale selection design. Every authority adapter must debit only
-source cells that can reach the accepted front or redistribution deficit under
-that order's constraints.
+cells. Expand All derives every eligible neutral boundary in one pass and uses
+one multi-source nearest-boundary route tree; sustained packets are indexed by
+their stable `(order, lane anchor)` rather than rescanning every packet in a
+broad order for one lane. Previews cache results by selection and authoritative
+cell-state revisions. Every V1 order preview and reducer rejects selections
+above 4,096 cells before building heatmaps, routes, or payloads. This is a
+safety bound, not the world-scale selection design. Every authority adapter
+must debit only source cells that can reach the accepted front or
+redistribution deficit under that order's constraints.
 
 Native-only filesystem, windowing, and startup behavior belongs behind narrow
 boundaries where practical. A WASM compile gate is deferred with browser
@@ -412,7 +436,8 @@ High-value invariants include:
 
 The V1 headless two-identity smoke covers join, match start, subscription,
 idempotent command receipts, sustained multi-layer Push progression,
-cancellation, and token-based reconnect. Command rejection, simultaneous hostile orders, full
+multi-direction neutral Expand All progression, both cancellation paths, and
+token-based reconnect. Command rejection, simultaneous hostile orders, full
 Conquest completion, schedule fault injection, and completed-match immutability
 remain integration-test extensions; pure rule tests cover their deterministic
 building blocks where applicable.
@@ -457,10 +482,11 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
 4. **Map interaction slice:** load authoritative chunked terrain, render stepped
    graybox hexes, implement camera and height-aware picking, and select connected
    owned source regions.
-5. **Troop-flow slice:** add cell capacity, a fixed-pool sustained Push Front
-   order, authoritative selected-corridor routing/validation, scheduled
-   lane-by-lane movement, terrain-scaled garrisons, congestion, density shading,
-   exact initial-edge preview, and ETA feedback.
+5. **Troop-flow slice:** add cell capacity, fixed-pool sustained Push Front and
+   neutral-only Expand All orders, authoritative selected-corridor
+   routing/validation, scheduled lane-by-lane movement, terrain-scaled
+   garrisons, congestion, density shading, exact initial-edge preview, and ETA
+   feedback.
 6. **Conflict slice:** add hostile edges, combat frontage, capture, elevation modifiers, disconnected components, and the Conquest win condition at 80% of capturable land.
 7. **Reliability slice:** add command idempotency, reconnect/reclaim, snapshot rebuild, scheduler recovery, deterministic replay fixtures, and completed-match handling.
 8. **Scale slice:** validate the 128 and 192 presets; retain 256, high-order-count traces, profiling, and soak gates as post-slice performance work.

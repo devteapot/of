@@ -61,6 +61,54 @@ pub fn selected_front_edges(
     Ok(edges)
 }
 
+/// Derives every eligible outward edge around a selected source region.
+///
+/// Unlike [`selected_front_edges`], this operation has no orientation and its
+/// active boundary is allowed to contain multiple disconnected arcs. The
+/// selected source region itself must still be six-connected. Callers decide
+/// eligibility, which lets the authoritative simulation restrict expansion to
+/// neutral, passable, capturable ground without coupling this pure crate to a
+/// particular ownership policy.
+pub fn selected_all_front_edges(
+    sources: &BTreeSet<Axial>,
+    mut target_is_eligible: impl FnMut(Axial, Axial) -> bool,
+) -> Result<Vec<DirectedFrontEdge>, FrontSelectionError> {
+    if sources.is_empty() {
+        return Err(FrontSelectionError::EmptySelection);
+    }
+    if !is_connected(sources) {
+        return Err(FrontSelectionError::DisconnectedSelection);
+    }
+
+    let mut edges = Vec::new();
+    for &source in sources {
+        for direction in Axial::DIRECTIONS {
+            let target = source + direction;
+            if !sources.contains(&target) && target_is_eligible(source, target) {
+                edges.push(DirectedFrontEdge { source, target });
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Err(FrontSelectionError::NoEligibleFront);
+    }
+    edges.sort_unstable_by_key(|edge| (edge.source, edge.target));
+    Ok(edges)
+}
+
+/// Keeps one deterministic incoming lane for every target cell.
+///
+/// Concave selections can expose the same outside hex from more than one
+/// boundary cell. A stable target anchor must identify exactly one lane, so the
+/// lowest source coordinate wins after sorting by `(target, source)`.
+pub fn unique_target_front_edges(edges: &[DirectedFrontEdge]) -> Vec<DirectedFrontEdge> {
+    let mut candidates = edges.to_vec();
+    candidates.sort_unstable_by_key(|edge| (edge.target, edge.source));
+    candidates.dedup_by_key(|edge| edge.target);
+    candidates.sort_unstable_by_key(|edge| (edge.source, edge.target));
+    candidates
+}
+
 fn is_connected(cells: &BTreeSet<Axial>) -> bool {
     let Some(seed) = cells.first().copied() else {
         return false;
@@ -142,6 +190,86 @@ mod tests {
         assert_eq!(
             selected_front_edges(&source, Axial::new(1, 0), |_, _| false),
             Err(FrontSelectionError::NoEligibleFront)
+        );
+    }
+
+    #[test]
+    fn all_fronts_include_every_eligible_arc_without_requiring_arc_connectivity() {
+        let sources = BTreeSet::from([Axial::new(0, 0), Axial::new(1, 0), Axial::new(2, 0)]);
+        let west = Axial::new(-1, 0);
+        let east = Axial::new(3, 0);
+        let edges =
+            selected_all_front_edges(&sources, |_, target| target == west || target == east)
+                .expect("opposite boundary arcs are both valid");
+
+        assert_eq!(
+            edges,
+            vec![
+                DirectedFrontEdge {
+                    source: Axial::new(0, 0),
+                    target: west,
+                },
+                DirectedFrontEdge {
+                    source: Axial::new(2, 0),
+                    target: east,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn all_fronts_exclude_selected_neighbors_and_rejected_targets() {
+        let sources = BTreeSet::from([Axial::ZERO, Axial::new(1, 0)]);
+        let edges = selected_all_front_edges(&sources, |_, target| target.r == -1)
+            .expect("the northern perimeter is eligible");
+
+        assert!(edges.iter().all(|edge| !sources.contains(&edge.target)));
+        assert!(edges.iter().all(|edge| edge.target.r == -1));
+        assert_eq!(edges.len(), 4);
+    }
+
+    #[test]
+    fn all_fronts_still_require_one_connected_source_region() {
+        let disconnected = BTreeSet::from([Axial::ZERO, Axial::new(2, 0)]);
+        assert_eq!(
+            selected_all_front_edges(&disconnected, |_, _| true),
+            Err(FrontSelectionError::DisconnectedSelection)
+        );
+    }
+
+    #[test]
+    fn shared_concave_target_gets_one_stable_lane_anchor() {
+        let shared = Axial::new(1, 0);
+        let high_source = Axial::new(1, -1);
+        let low_source = Axial::ZERO;
+        let other_target = Axial::new(-1, 0);
+        let edges = vec![
+            DirectedFrontEdge {
+                source: high_source,
+                target: shared,
+            },
+            DirectedFrontEdge {
+                source: low_source,
+                target: other_target,
+            },
+            DirectedFrontEdge {
+                source: low_source,
+                target: shared,
+            },
+        ];
+
+        assert_eq!(
+            unique_target_front_edges(&edges),
+            vec![
+                DirectedFrontEdge {
+                    source: low_source,
+                    target: other_target,
+                },
+                DirectedFrontEdge {
+                    source: low_source,
+                    target: shared,
+                },
+            ]
         );
     }
 }

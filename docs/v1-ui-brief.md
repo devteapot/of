@@ -29,15 +29,20 @@ combat frontage, resistance, and terrain-scaled garrisons. It never teleports.
 7. Confirm the sustained Push Front command or stop a matching active push.
    Each axial lane continues independently until its committed pool is
    exhausted, blocked, defeated, reaches the map edge, or is manually cancelled.
-8. Select an owned region and issue percentage-aware one-shot Balance,
+8. From the same connected selection, preview and confirm a neutral-only Expand
+   All operation. The chosen dispatch share is taken once from each selected
+   unallocated stack, rear troops feed their nearest boundary, local forks split
+   evenly, and each direction advances independently until it stops before an
+   enemy, exhausts, blocks, reaches the edge, or is cancelled.
+9. Select an owned region and issue percentage-aware one-shot Balance,
    Core-load, or Perimeter-load redistribution.
-9. Select an owned region, drag an orientation arrow, preview a directional
+10. Select an owned region, drag an orientation arrow, preview a directional
    target-density heatmap, and issue percentage-aware Front-load
    redistribution. The unparticipating share remains frozen per source cell.
-10. Distinguish a contested cell by a controller/attacker pressure blend without
+11. Distinguish a contested cell by a controller/attacker pressure blend without
     interpreting it as authoritative dual occupancy.
-11. Adjust a global mobilization target. Lowering it stops future conversion but does not demobilize existing troops.
-12. Read active flows, congestion, combat fronts, ownership changes, casualties, conquest percentage, and the 80% victory result.
+12. Adjust a global mobilization target. Lowering it stops future conversion but does not demobilize existing troops; this future-recruitment target remains visibly separate from each order's dispatch/participation percentage.
+13. Read active flows, congestion, combat fronts, ownership changes, casualties, conquest percentage, and the 80% victory result.
 
 ## Presentation constraints
 
@@ -64,11 +69,11 @@ combat frontage, resistance, and terrain-scaled garrisons. It never teleports.
 Provide an implementation-oriented critique and one recommended layout/input model. Specify:
 
 - information hierarchy;
-- exact Push Front selection/orientation and redistribution gestures;
+- exact Push Front selection/orientation, Expand All, and redistribution gestures;
 - compact HUD regions and their contents;
 - overlay encodings that work together;
-- state transitions for Push Front, cancellation, and all four redistribution
-  previews;
+- state transitions for Push Front, Expand All, cancellation, and all four
+  redistribution previews;
 - rejection/error feedback;
 - the smallest viable onboarding hints;
 - major ambiguity or readability risks to test first.

@@ -33,6 +33,7 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
 
     clear_combat_fronts(ctx);
     trim_all_overallocated_packets(ctx, logical_step)?;
+    stop_blocked_expand_lanes(ctx, logical_step)?;
     move_friendly_packets(ctx, logical_step)?;
     resolve_combats(ctx, logical_step)?;
     finalize_orders(ctx, logical_step)?;
@@ -42,6 +43,47 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
         population_step(ctx, logical_step)?;
     }
     Ok(state(ctx)?.phase == MatchPhase::Running)
+}
+
+/// Expansion is neutral-only even if ownership changes after the command was
+/// accepted. Friendly cells remain valid transit, but a lane is released in
+/// place before crossing any cell currently owned by an enemy.
+fn stop_blocked_expand_lanes(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+    let expand_orders = ctx
+        .db
+        .transfer_order()
+        .order_by_status()
+        .filter(OrderStatus::Active)
+        .filter(|order| order.kind == OrderKind::ExpandAll)
+        .map(|order| (order.order_id, order.player_id))
+        .collect::<Vec<_>>();
+    if expand_orders.is_empty() {
+        return Ok(());
+    }
+
+    let mut blocked_lanes = BTreeMap::<(u64, u32), TransitPacket>::new();
+    for (order_id, player_id) in expand_orders {
+        for packet in ctx.db.transit_packet().packet_by_order().filter(order_id) {
+            let next_index = packet.route_index as usize + 1;
+            let Some(&next_cell) = packet.route.get(next_index) else {
+                continue;
+            };
+            let next_owner = cell_state(ctx, next_cell)?.owner_player_id;
+            if expand_next_owner_is_blocked(player_id, next_owner) {
+                blocked_lanes
+                    .entry((packet.order_id, packet.destination_cell))
+                    .or_insert(packet);
+            }
+        }
+    }
+    for ((order_id, lane_anchor), _) in blocked_lanes {
+        settle_stopped_sustained_lane(ctx, order_id, lane_anchor, logical_step)?;
+    }
+    Ok(())
+}
+
+fn expand_next_owner_is_blocked(player_id: u8, next_owner: u8) -> bool {
+    next_owner != NEUTRAL_PLAYER && next_owner != player_id
 }
 
 fn clear_combat_fronts(ctx: &ReducerContext) {
@@ -593,7 +635,7 @@ fn advance_packet(
         .ok_or_else(|| "packet route ended before movement".to_string())?;
 
     if next_index as usize + 1 == packet.route.len() {
-        extend_push_lane(ctx, &packet, next_cell, logical_step)?;
+        extend_sustained_lane(ctx, &packet, next_cell, logical_step)?;
         packet = ctx
             .db
             .transit_packet()
@@ -619,7 +661,7 @@ fn advance_packet(
 
     if next_index as usize + 1 == packet.route.len() {
         increment_destination_received(ctx, packet.order_id, packet.destination_cell, moved)?;
-        settle_stopped_push_lane(ctx, packet.order_id, packet.destination_cell, logical_step)?;
+        settle_stopped_sustained_lane(ctx, packet.order_id, packet.destination_cell, logical_step)?;
         return Ok(());
     }
 
@@ -659,7 +701,7 @@ fn advance_packet(
 /// `destination_cell` is deliberately kept as the stable lane anchor. This
 /// allows packets from different selected source cells to share one advancing
 /// ray without rewriting packet keys or destination metadata every layer.
-fn extend_push_lane(
+fn extend_sustained_lane(
     ctx: &ReducerContext,
     packet: &TransitPacket,
     reached_cell: u32,
@@ -668,7 +710,9 @@ fn extend_push_lane(
     let Some(order) = ctx.db.transfer_order().order_id().find(packet.order_id) else {
         return Err("push order is missing while extending a lane".into());
     };
-    if order.status != OrderStatus::Active || order.kind != OrderKind::PushFront {
+    if order.status != OrderStatus::Active
+        || !matches!(order.kind, OrderKind::PushFront | OrderKind::ExpandAll)
+    {
         return Ok(false);
     }
 
@@ -682,7 +726,22 @@ fn extend_push_lane(
         return Ok(true);
     }
 
-    let direction = hex_core::Axial::new(order.orientation_q, order.orientation_r);
+    let direction = match order.kind {
+        OrderKind::PushFront => hex_core::Axial::new(order.orientation_q, order.orientation_r),
+        OrderKind::ExpandAll => {
+            let route_len = current.route.len();
+            let from_cell = *current
+                .route
+                .get(route_len.saturating_sub(2))
+                .ok_or_else(|| "expand lane route has no outward edge".to_string())?;
+            edge_direction(
+                coordinate_for_cell(ctx, from_cell)?,
+                coordinate_for_cell(ctx, reached_cell)?,
+            )
+            .ok_or_else(|| "expand lane ended with a non-adjacent edge".to_string())?
+        }
+        _ => return Ok(false),
+    };
     if !hex_core::Axial::DIRECTIONS.contains(&direction) {
         return Err("active push order has an invalid direction".into());
     }
@@ -694,22 +753,32 @@ fn extend_push_lane(
     let next_terrain = terrain(ctx, next_cell)?;
     let next_state = cell_state(ctx, next_cell)?;
     let traversable = edge_runtime_limits(ctx, reached_cell, next_cell)?.is_some();
-    if !push_target_is_eligible(
-        order.player_id,
-        next_state.owner_player_id,
-        next_terrain.passable,
-        next_terrain.capturable,
-        traversable,
-    ) {
+    let eligible = match order.kind {
+        OrderKind::PushFront => push_target_is_eligible(
+            order.player_id,
+            next_state.owner_player_id,
+            next_terrain.passable,
+            next_terrain.capturable,
+            traversable,
+        ),
+        OrderKind::ExpandAll => expand_continuation_target_is_eligible(
+            order.player_id,
+            next_state.owner_player_id,
+            next_terrain.passable,
+            next_terrain.capturable,
+            traversable,
+        ),
+        _ => false,
+    };
+    if !eligible {
         return Ok(false);
     }
 
     let packets = ctx
         .db
         .transit_packet()
-        .packet_by_order()
-        .filter(order.order_id)
-        .filter(|candidate| candidate.destination_cell == packet.destination_cell)
+        .packet_by_order_destination()
+        .filter((order.order_id, packet.destination_cell))
         .collect::<Vec<_>>();
     let mut extended = false;
     for mut candidate in packets {
@@ -731,6 +800,26 @@ fn push_target_is_eligible(
     traversable: bool,
 ) -> bool {
     passable && capturable && traversable && target_owner != player_id
+}
+
+fn expand_continuation_target_is_eligible(
+    player_id: u8,
+    target_owner: u8,
+    passable: bool,
+    capturable: bool,
+    traversable: bool,
+) -> bool {
+    (target_owner == NEUTRAL_PLAYER || target_owner == player_id)
+        && passable
+        && capturable
+        && traversable
+}
+
+fn edge_direction(from: hex_core::Axial, to: hex_core::Axial) -> Option<hex_core::Axial> {
+    let direction = to - from;
+    hex_core::Axial::DIRECTIONS
+        .contains(&direction)
+        .then_some(direction)
 }
 
 fn append_lane_layer(route: &mut Vec<u32>, reached_cell: u32, next_cell: u32) -> bool {
@@ -854,7 +943,7 @@ fn occupation_garrison(military_capacity: u64, terrain: TerrainClass) -> u64 {
 /// ray reached friendly territory, the map boundary, or an impassable edge.
 /// The underlying infantry remains in its current cell; only the operation's
 /// allocation metadata is retired.
-fn settle_stopped_push_lane(
+fn settle_stopped_sustained_lane(
     ctx: &ReducerContext,
     order_id: u64,
     lane_anchor: u32,
@@ -863,15 +952,14 @@ fn settle_stopped_push_lane(
     let Some(order) = ctx.db.transfer_order().order_id().find(order_id) else {
         return Err("order is missing while settling a stopped push lane".into());
     };
-    if order.kind != OrderKind::PushFront {
+    if !matches!(order.kind, OrderKind::PushFront | OrderKind::ExpandAll) {
         return Ok(());
     }
     let mut packets = ctx
         .db
         .transit_packet()
-        .packet_by_order()
-        .filter(order_id)
-        .filter(|packet| packet.destination_cell == lane_anchor)
+        .packet_by_order_destination()
+        .filter((order_id, lane_anchor))
         .collect::<Vec<_>>();
     packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
     for packet in packets {
@@ -971,7 +1059,7 @@ fn trim_packets_at_cell(
     owner_player_id: u8,
     logical_step: u64,
 ) -> Result<(), String> {
-    let infantry = cell_state(ctx, cell_id)?.infantry;
+    let cell = cell_state(ctx, cell_id)?;
     let mut packets: Vec<_> = ctx
         .db
         .transit_packet()
@@ -981,7 +1069,12 @@ fn trim_packets_at_cell(
         .collect();
     packets.sort_unstable_by(|left, right| right.packet_key.cmp(&left.packet_key));
     let allocated: u64 = packets.iter().map(|packet| packet.infantry).sum();
-    let mut trim = allocated.saturating_sub(infantry);
+    let mut trim = packet_trim_required(
+        cell.owner_player_id,
+        owner_player_id,
+        cell.infantry,
+        allocated,
+    );
     for packet in packets {
         if trim == 0 {
             break;
@@ -991,6 +1084,23 @@ fn trim_packets_at_cell(
         trim -= lost;
     }
     Ok(())
+}
+
+/// Returns how much allocation metadata is no longer backed by infantry at a
+/// cell. Strength in a captured cell belongs exclusively to its current owner;
+/// it must never keep a displaced owner's packets alive.
+fn packet_trim_required(
+    cell_owner: u8,
+    packet_owner: u8,
+    cell_infantry: u64,
+    allocated: u64,
+) -> u64 {
+    let backing = if cell_owner == packet_owner {
+        cell_infantry
+    } else {
+        0
+    };
+    allocated.saturating_sub(backing)
 }
 
 fn trim_all_overallocated_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
@@ -1055,6 +1165,48 @@ mod tests {
     }
 
     #[test]
+    fn partial_frontage_keeps_the_extended_route_for_leading_and_queued_packets() {
+        // `extend_sustained_lane` updates every packet sharing the stable lane
+        // anchor before `advance_packet` splits off the throughput-approved
+        // amount. Consequently both the leading child and source remainder
+        // retain the next layer rather than stopping after a partial capture.
+        let mut leading_route = vec![1, 2];
+        let mut queued_remainder_route = vec![1, 2];
+        assert!(append_lane_layer(&mut leading_route, 2, 3));
+        assert!(append_lane_layer(&mut queued_remainder_route, 2, 3));
+
+        let offered = 100_u64;
+        let throughput = 17_u64;
+        let advanced = offered.min(throughput);
+        let queued = offered - advanced;
+        assert_eq!((advanced, queued), (17, 83));
+        assert_eq!(leading_route, vec![1, 2, 3]);
+        assert_eq!(queued_remainder_route, leading_route);
+    }
+
+    #[test]
+    fn captured_cell_strength_never_backs_displaced_owner_packets() {
+        // Regression: the old implementation compared player one's 30
+        // allocated troops with player two's newly arrived 100 infantry and
+        // therefore retired nothing after capture.
+        assert_eq!(packet_trim_required(2, 1, 100, 30), 30);
+        assert_eq!(packet_trim_required(1, 2, u64::MAX, 7), 7);
+    }
+
+    #[test]
+    fn packet_backing_is_computed_independently_for_every_owner() {
+        let cell_owner = 2;
+        let cell_infantry = 50;
+        let allocations = [(1, 30), (2, 70), (3, 5)];
+        let trims = allocations.map(|(packet_owner, allocated)| {
+            packet_trim_required(cell_owner, packet_owner, cell_infantry, allocated)
+        });
+
+        assert_eq!(trims, [30, 20, 5]);
+        assert_eq!(packet_trim_required(2, 2, 50, 40), 0);
+    }
+
+    #[test]
     fn a_push_stops_before_friendly_impassable_or_uncapturable_ground() {
         assert!(push_target_is_eligible(1, 0, true, true, true));
         assert!(push_target_is_eligible(1, 2, true, true, true));
@@ -1062,6 +1214,55 @@ mod tests {
         assert!(!push_target_is_eligible(1, 0, false, true, true));
         assert!(!push_target_is_eligible(1, 0, true, false, true));
         assert!(!push_target_is_eligible(1, 0, true, true, false));
+    }
+
+    #[test]
+    fn all_front_continuation_accepts_neutral_or_friendly_but_never_enemy_ground() {
+        assert!(expand_continuation_target_is_eligible(
+            1,
+            NEUTRAL_PLAYER,
+            true,
+            true,
+            true
+        ));
+        assert!(expand_continuation_target_is_eligible(
+            1, 1, true, true, true
+        ));
+        assert!(!expand_continuation_target_is_eligible(
+            1, 2, true, true, true
+        ));
+        assert!(!expand_continuation_target_is_eligible(
+            1, 0, false, true, true
+        ));
+        assert!(!expand_continuation_target_is_eligible(
+            1, 1, true, false, true
+        ));
+        assert!(!expand_continuation_target_is_eligible(
+            1, 0, true, true, false
+        ));
+    }
+
+    #[test]
+    fn ownership_change_to_enemy_stops_expand_but_friendly_transit_remains_valid() {
+        assert!(!expand_next_owner_is_blocked(1, NEUTRAL_PLAYER));
+        assert!(!expand_next_owner_is_blocked(1, 1));
+        assert!(expand_next_owner_is_blocked(1, 2));
+    }
+
+    #[test]
+    fn all_front_lanes_keep_their_independent_initial_directions() {
+        assert_eq!(
+            edge_direction(hex_core::Axial::ZERO, hex_core::Axial::new(1, 0)),
+            Some(hex_core::Axial::new(1, 0))
+        );
+        assert_eq!(
+            edge_direction(hex_core::Axial::ZERO, hex_core::Axial::new(0, -1)),
+            Some(hex_core::Axial::new(0, -1))
+        );
+        assert_eq!(
+            edge_direction(hex_core::Axial::ZERO, hex_core::Axial::new(2, 0)),
+            None
+        );
     }
 
     #[test]

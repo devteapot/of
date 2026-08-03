@@ -11,8 +11,9 @@ use std::{
 
 use bevy::prelude::*;
 use hex_core::{
-    Axial, Cell, DistributionPreset as CoreDistributionPreset, ForceComposition,
-    FrontSelectionError, HexMap, redistribution_targets_with_commitment, selected_front_edges,
+    Axial, Cell, DirectedFrontEdge, DistributionPreset as CoreDistributionPreset, ForceComposition,
+    FrontSelectionError, HexMap, redistribution_targets_with_commitment, selected_all_front_edges,
+    selected_front_edges, unique_target_front_edges,
 };
 
 use crate::{
@@ -34,6 +35,13 @@ pub enum ClientIntent {
         sources: BTreeSet<Axial>,
         direction: Axial,
         commitment_percent: u8,
+    },
+    ExpandAll {
+        sources: BTreeSet<Axial>,
+        commitment_percent: u8,
+    },
+    CancelExpandAll {
+        sources: BTreeSet<Axial>,
     },
     CancelPush {
         sources: BTreeSet<Axial>,
@@ -120,6 +128,17 @@ pub fn resolve_offline_intents(
                 direction,
                 commitment_percent,
             } => resolve_push_front(&view, sources, *direction, *commitment_percent),
+            ClientIntent::ExpandAll {
+                sources,
+                commitment_percent,
+            } => resolve_expand_all(&view, sources, *commitment_percent),
+            ClientIntent::CancelExpandAll { .. } => ServerUpdate::Accepted {
+                command_id: None,
+                summary: "Matching active Expand All operations stopped".to_owned(),
+                patches: Vec::new(),
+                flow: None,
+                front: None,
+            },
             ClientIntent::CancelPush { .. } => ServerUpdate::Accepted {
                 command_id: None,
                 summary: "Matching active Push Front operations stopped".to_owned(),
@@ -388,6 +407,233 @@ fn resolve_push_front(
     }
 }
 
+/// Every passable selected-to-neutral edge around a selected region.
+///
+/// A target is deliberately neutral-only: Expand All grows into unclaimed
+/// territory and never turns into an implicit attack when it reaches another
+/// player. The returned ordering is stable so both commitment splitting and
+/// previews remain deterministic.
+pub(crate) fn expand_all_front_edges(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+) -> Result<Vec<DirectedFrontEdge>, FrontSelectionError> {
+    let edges = selected_all_front_edges(sources, |source, target| {
+        let Some(source_cell) = view.cell(source) else {
+            return false;
+        };
+        view.cell(target).is_some_and(|target_cell| {
+            target_cell.owner.is_none()
+                && target_cell.is_land()
+                && !target_cell.blocked
+                && (i32::from(source_cell.elevation) - i32::from(target_cell.elevation))
+                    .unsigned_abs()
+                    <= 1
+        })
+    })?;
+    // Concave selections can expose the same target from more than one source.
+    // Match the authoritative target-keyed lane identity exactly.
+    Ok(unique_target_front_edges(&edges))
+}
+
+fn resolve_expand_all(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    commitment_percent: u8,
+) -> ServerUpdate {
+    if sources.is_empty() {
+        return rejection("Expand All selection is empty", None);
+    }
+    if let Some(invalid) = sources.iter().find(|coordinate| {
+        view.cell(**coordinate).is_none_or(|cell| {
+            !view.is_local_owned(**coordinate) || !cell.is_land() || cell.blocked
+        })
+    }) {
+        return rejection(
+            "Expand All sources must be owned passable ground",
+            Some(*invalid),
+        );
+    }
+
+    let edges = match expand_all_front_edges(view, sources) {
+        Ok(edges) => edges,
+        Err(error) => {
+            return rejection(expand_error_message(error), sources.first().copied());
+        }
+    };
+    let front_sources = edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    let assignments = selected_front_assignments(view, sources, &front_sources);
+    if assignments.len() != sources.len() {
+        let relevant = sources
+            .iter()
+            .find(|source| !assignments.contains_key(source))
+            .copied();
+        return rejection(
+            "Every selected source must reach a neutral frontier inside the selection",
+            relevant,
+        );
+    }
+
+    // Snapshot one percentage of each selected stack exactly once. Boundary
+    // forks split this fixed pool; they never clone the commitment per edge.
+    let percentage = u64::from(commitment_percent.clamp(10, 100));
+    let requested_by_source = sources
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| {
+            (
+                cell.coordinate,
+                cell.infantry.saturating_mul(percentage) / 100,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let committed = requested_by_source.values().copied().sum::<u64>();
+    if committed == 0 {
+        return rejection(
+            "Selected sources have no infantry to dispatch",
+            sources.first().copied(),
+        );
+    }
+
+    let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
+    let mut committed_by_boundary = BTreeMap::<Axial, u64>::new();
+    for (source, source_request) in &requested_by_source {
+        let boundary = assignments
+            .get(source)
+            .expect("every selected source was assigned to a neutral frontier");
+        let boundary_commitment = committed_by_boundary.entry(*boundary).or_default();
+        *boundary_commitment = boundary_commitment.saturating_add(*source_request);
+        let cell = view.cell(*source).expect("expand source was validated");
+        changed.insert(
+            *source,
+            (cell.owner, cell.infantry.saturating_sub(*source_request)),
+        );
+    }
+
+    let mut edges_by_boundary = BTreeMap::<Axial, Vec<DirectedFrontEdge>>::new();
+    for edge in &edges {
+        edges_by_boundary
+            .entry(edge.source)
+            .or_default()
+            .push(*edge);
+    }
+
+    let mut captured = 0_u32;
+    let mut representative_route = Vec::new();
+    for (boundary, boundary_commitment) in committed_by_boundary {
+        let boundary_edges = edges_by_boundary
+            .get(&boundary)
+            .expect("assigned boundary has at least one outward edge");
+        let lane_count = u64::try_from(boundary_edges.len()).expect("edge count fits u64");
+        let lane_base = boundary_commitment / lane_count;
+        let lane_remainder = boundary_commitment % lane_count;
+        let rear_sources = assignments
+            .iter()
+            .filter_map(|(source, assigned)| {
+                (*assigned == boundary && *source != boundary).then_some(*source)
+            })
+            .collect::<Vec<_>>();
+
+        for (edge_index, edge) in boundary_edges.iter().enumerate() {
+            let mut mobile = lane_base
+                + u64::from(
+                    u64::try_from(edge_index).expect("edge index fits u64") < lane_remainder,
+                );
+            if mobile == 0 {
+                continue;
+            }
+            let direction = edge.target - edge.source;
+            let mut current = boundary;
+            let mut occupied = rear_sources.clone();
+            occupied.push(boundary);
+            let mut lane_route = vec![boundary];
+
+            while mobile > 0 {
+                let next = current + direction;
+                let Some(destination) = view.cell(next) else {
+                    break;
+                };
+                let Some(from) = view.cell(current) else {
+                    break;
+                };
+                let current_owner = changed
+                    .get(&next)
+                    .map_or(destination.owner, |state| state.0);
+                if !destination.is_land()
+                    || destination.blocked
+                    || (i32::from(from.elevation) - i32::from(destination.elevation)).unsigned_abs()
+                        > 1
+                {
+                    break;
+                }
+                if current_owner.is_some_and(|owner| owner != view.local_player) {
+                    break;
+                }
+
+                lane_route.push(next);
+                if current_owner == Some(view.local_player) {
+                    // An all-front lane can cross friendly ground without
+                    // paying another occupation garrison, then continue into
+                    // neutral territory on the far side.
+                    current = next;
+                    occupied.push(next);
+                    continue;
+                }
+                debug_assert!(current_owner.is_none());
+                captured = captured.saturating_add(1);
+                let garrison = occupation_garrison(destination).min(mobile);
+                mobile -= garrison;
+                changed.insert(next, (Some(view.local_player), garrison));
+                current = next;
+                occupied.push(next);
+            }
+
+            if mobile > 0 {
+                station_offline_strength(view, &mut changed, &occupied, mobile);
+            }
+            if lane_route.len() > representative_route.len() {
+                representative_route = lane_route;
+            }
+        }
+    }
+
+    let first_edge = edges[0];
+    ServerUpdate::Accepted {
+        command_id: None,
+        summary: format!(
+            "Expand All accepted · {committed} dispatched at {}% · {captured} neutral cells captured",
+            commitment_percent.clamp(10, 100)
+        ),
+        patches: changed
+            .into_iter()
+            .map(|(coordinate, (owner, infantry))| CellPatch {
+                coordinate,
+                owner,
+                infantry,
+            })
+            .collect(),
+        flow: Some(ActiveFlow {
+            route: if representative_route.len() >= 2 {
+                representative_route
+            } else {
+                vec![first_edge.source, first_edge.target]
+            },
+            strength: committed,
+            attacking: false,
+            age: 0.0,
+            lifetime: 10.0,
+        }),
+        front: Some(ActiveFront {
+            friendly: first_edge.source,
+            hostile: first_edge.target,
+            intensity: (committed as f32 / 100.0).clamp(0.25, 1.0),
+            age: 0.0,
+        }),
+    }
+}
+
 fn selected_front_assignments(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
@@ -506,6 +752,19 @@ const fn front_error_message(error: FrontSelectionError) -> &'static str {
         FrontSelectionError::NoEligibleFront => "No non-owned passable front faces that direction",
         FrontSelectionError::DisconnectedFront => {
             "The selected boundary creates separate front arcs"
+        }
+    }
+}
+
+const fn expand_error_message(error: FrontSelectionError) -> &'static str {
+    match error {
+        FrontSelectionError::EmptySelection => "Expand All selection is empty",
+        FrontSelectionError::DisconnectedSelection => {
+            "Expand All selection must be one connected region"
+        }
+        FrontSelectionError::NoEligibleFront => "The selection has no passable neutral frontier",
+        FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront => {
+            "Expand All frontier is invalid"
         }
     }
 }
@@ -748,6 +1007,177 @@ mod tests {
                 Axial::new(3, 0),
             ]
         );
+    }
+
+    #[test]
+    fn offline_expand_all_splits_one_commitment_across_boundary_forks() {
+        let source = Axial::ZERO;
+        let north_east = Axial::new(1, -1);
+        let east = Axial::new(1, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(source, cell(source, 60));
+        view.cells.insert(north_east, neutral_cell(north_east));
+        view.cells.insert(east, neutral_cell(east));
+        view.rebuild_chunk_index();
+
+        let update = resolve_expand_all(&view, &BTreeSet::from([source]), 50);
+        let ServerUpdate::Accepted {
+            summary, patches, ..
+        } = update
+        else {
+            panic!("a two-edge neutral frontier should accept Expand All");
+        };
+        let infantry_after = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+                .expect("every participating cell has a patch")
+        };
+
+        assert!(summary.contains("30 dispatched"));
+        assert_eq!(infantry_after(source), 30);
+        assert_eq!(infantry_after(north_east), 15);
+        assert_eq!(infantry_after(east), 15);
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 60);
+    }
+
+    #[test]
+    fn offline_expand_all_advances_each_lane_through_successive_neutral_layers() {
+        let source = Axial::ZERO;
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(source, cell(source, 40));
+        for distance in 1..=3 {
+            let coordinate = Axial::new(distance, 0);
+            view.cells.insert(coordinate, neutral_cell(coordinate));
+        }
+        view.rebuild_chunk_index();
+
+        let update = resolve_expand_all(&view, &BTreeSet::from([source]), 50);
+        let ServerUpdate::Accepted {
+            summary,
+            patches,
+            flow,
+            ..
+        } = update
+        else {
+            panic!("a clear neutral lane should accept Expand All");
+        };
+        let infantry_after = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+                .expect("every occupied layer has a patch")
+        };
+
+        assert!(summary.contains("3 neutral cells captured"));
+        assert_eq!(infantry_after(source), 20);
+        assert_eq!(infantry_after(Axial::new(1, 0)), 5);
+        assert_eq!(infantry_after(Axial::new(2, 0)), 5);
+        assert_eq!(infantry_after(Axial::new(3, 0)), 10);
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 40);
+        assert_eq!(
+            flow.expect("sustained expand flow").route,
+            vec![
+                Axial::ZERO,
+                Axial::new(1, 0),
+                Axial::new(2, 0),
+                Axial::new(3, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_expand_all_transits_friendly_ground_without_regarrisoning_it() {
+        let source = Axial::ZERO;
+        let first_neutral = Axial::new(1, 0);
+        let friendly_transit = Axial::new(2, 0);
+        let far_neutral = Axial::new(3, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(source, cell(source, 40));
+        view.cells
+            .insert(first_neutral, neutral_cell(first_neutral));
+        view.cells
+            .insert(friendly_transit, cell(friendly_transit, 7));
+        view.cells.insert(far_neutral, neutral_cell(far_neutral));
+        view.rebuild_chunk_index();
+
+        let ServerUpdate::Accepted {
+            summary,
+            patches,
+            flow,
+            ..
+        } = resolve_expand_all(&view, &BTreeSet::from([source]), 50)
+        else {
+            panic!("friendly ground should be transparent to a neutral expansion lane");
+        };
+        let infantry_after = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+        };
+
+        assert!(summary.contains("2 neutral cells captured"));
+        assert_eq!(infantry_after(source), Some(20));
+        assert_eq!(infantry_after(first_neutral), Some(5));
+        assert_eq!(infantry_after(friendly_transit), None);
+        assert_eq!(infantry_after(far_neutral), Some(15));
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 40);
+        assert_eq!(
+            flow.expect("friendly transit flow").route,
+            vec![source, first_neutral, friendly_transit, far_neutral]
+        );
+    }
+
+    #[test]
+    fn expand_all_keeps_one_lane_for_a_shared_concave_target() {
+        let left = Axial::ZERO;
+        let right = Axial::new(1, 0);
+        let shared_target = Axial::new(0, 1);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(left, cell(left, 20));
+        view.cells.insert(right, cell(right, 20));
+        view.cells
+            .insert(shared_target, neutral_cell(shared_target));
+        view.rebuild_chunk_index();
+        let sources = BTreeSet::from([left, right]);
+
+        let edges = expand_all_front_edges(&view, &sources).expect("connected neutral frontier");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, shared_target);
+
+        let ServerUpdate::Accepted { patches, .. } = resolve_expand_all(&view, &sources, 50) else {
+            panic!("deduplicated shared target should be accepted");
+        };
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 40);
+        assert_eq!(
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == shared_target)
+                .map(|patch| patch.infantry),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn expand_all_rejects_disconnected_source_regions() {
+        let left = Axial::ZERO;
+        let right = Axial::new(3, 0);
+        let mut view = MatchView::connecting(1);
+        for source in [left, right] {
+            view.cells.insert(source, cell(source, 20));
+            let target = source + Axial::new(0, 1);
+            view.cells.insert(target, neutral_cell(target));
+        }
+        view.rebuild_chunk_index();
+
+        assert!(matches!(
+            resolve_expand_all(&view, &BTreeSet::from([left, right]), 50),
+            ServerUpdate::Rejected { reason, .. }
+                if reason.contains("one connected region")
+        ));
     }
 
     #[test]
