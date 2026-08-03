@@ -197,6 +197,7 @@ impl Client {
         selected_cells: &[u32],
         direction: Axial,
         commitment_bps: u32,
+        supersede_order_ids: &[u64],
         timeout: Duration,
     ) -> Result<()> {
         let (tx, rx) = mpsc::channel();
@@ -208,6 +209,7 @@ impl Client {
                 direction.q,
                 direction.r,
                 commitment_bps,
+                supersede_order_ids.to_vec(),
                 move |_, result| {
                     let _ = tx.send(flatten_reducer_result(result));
                 },
@@ -244,6 +246,7 @@ impl Client {
         command_id: u64,
         selected_cells: &[u32],
         commitment_bps: u32,
+        supersede_order_ids: &[u64],
         timeout: Duration,
     ) -> Result<()> {
         let (tx, rx) = mpsc::channel();
@@ -253,6 +256,7 @@ impl Client {
                 command_id,
                 selected_cells.to_vec(),
                 commitment_bps,
+                supersede_order_ids.to_vec(),
                 move |_, result| {
                     let _ = tx.send(flatten_reducer_result(result));
                 },
@@ -457,6 +461,7 @@ fn main() -> Result<()> {
         &candidate.selected_cells,
         candidate.direction,
         candidate.commitment_bps,
+        &[],
         timeout,
     )?;
     let push_receipt = wait_for_receipt(
@@ -530,6 +535,7 @@ fn main() -> Result<()> {
         &candidate.selected_cells,
         candidate.direction,
         candidate.commitment_bps,
+        &[],
         timeout,
     )?;
     let matching_receipts = player_one
@@ -551,10 +557,91 @@ fn main() -> Result<()> {
         "idempotent front-push retry produced {matching_receipts} receipts and {matching_orders} orders"
     );
 
-    println!("[5/8] observing sustained progression, then cancelling the active push");
-    let mut observed_packet_progress = false;
-    let active_order = wait_until("two successive front-push captures", timeout, poll, || {
-        let Some(order) = player_one
+    let rejected_retask_id = unused_command_id(
+        &player_one.conn,
+        PLAYER_ONE,
+        push_id.checked_add(1).context("push command ID overflow")?,
+    )?;
+    player_one.issue_push_front(
+        rejected_retask_id,
+        &[],
+        Axial::ZERO,
+        candidate.commitment_bps,
+        &[push_receipt.order_id],
+        timeout,
+    )?;
+    let rejected_retask = wait_for_rejected_receipt(
+        &player_one,
+        PLAYER_ONE,
+        rejected_retask_id,
+        "issue_push_front",
+        timeout,
+        poll,
+    )?;
+    ensure!(
+        rejected_retask.message.contains("direction"),
+        "invalid replacement was rejected for an unexpected reason: {}",
+        rejected_retask.message
+    );
+    let preserved_order = player_one
+        .conn
+        .db
+        .transfer_order()
+        .order_id()
+        .find(&push_receipt.order_id)
+        .context("failed replacement removed the original push")?;
+    ensure!(
+        preserved_order.status == OrderStatus::Active && preserved_order.in_transit_infantry > 0,
+        "failed replacement did not preserve an active original push with surviving packets"
+    );
+    assert_order_conservation(&preserved_order)?;
+    let preserved_packet_total = player_one
+        .conn
+        .db
+        .transit_packet()
+        .iter()
+        .filter(|packet| packet.order_id == push_receipt.order_id)
+        .try_fold(0_u64, |total, packet| {
+            total
+                .checked_add(packet.infantry)
+                .context("preserved packet strength overflow")
+        })?;
+    ensure!(
+        preserved_packet_total == preserved_order.in_transit_infantry,
+        "failed replacement left {} packet infantry for an order reporting {} in transit",
+        preserved_packet_total,
+        preserved_order.in_transit_infantry
+    );
+
+    let retask_id = unused_command_id(
+        &player_one.conn,
+        PLAYER_ONE,
+        rejected_retask_id
+            .checked_add(1)
+            .context("rejected retask command ID overflow")?,
+    )?;
+    player_one.issue_push_front(
+        retask_id,
+        &[],
+        candidate.direction,
+        candidate.commitment_bps,
+        &[push_receipt.order_id],
+        timeout,
+    )?;
+    let retask_receipt = wait_for_receipt(
+        &player_one,
+        PLAYER_ONE,
+        retask_id,
+        "issue_push_front",
+        timeout,
+        poll,
+    )?;
+    ensure!(
+        retask_receipt.order_id != 0 && retask_receipt.order_id != push_receipt.order_id,
+        "retask did not create a distinct replacement order"
+    );
+    let retasked_old_order = wait_until("atomic front-push replacement", timeout, poll, || {
+        let Some(old_order) = player_one
             .conn
             .db
             .transfer_order()
@@ -563,7 +650,79 @@ fn main() -> Result<()> {
         else {
             return Ok(None);
         };
-        assert_push_order(&order, &candidate, push_id)?;
+        let Some(replacement) = player_one
+            .conn
+            .db
+            .transfer_order()
+            .order_id()
+            .find(&retask_receipt.order_id)
+        else {
+            return Ok(None);
+        };
+        if old_order.status != OrderStatus::Cancelled
+            || replacement.status != OrderStatus::Active
+            || replacement.in_transit_infantry == 0
+        {
+            return Ok(None);
+        }
+        assert_order_conservation(&old_order)?;
+        assert_order_conservation(&replacement)?;
+        ensure!(
+            !player_one
+                .conn
+                .db
+                .transit_packet()
+                .iter()
+                .any(|packet| packet.order_id == old_order.order_id),
+            "superseded push retained transit packets"
+        );
+        Ok(Some(old_order))
+    })?;
+    ensure!(
+        retasked_old_order.delivered_infantry > 0,
+        "retasking did not settle any surviving strength on the old order"
+    );
+    let uncaptured_after_retask = candidate
+        .lane_cells
+        .iter()
+        .copied()
+        .filter(|cell_id| {
+            player_one
+                .conn
+                .db
+                .cell_state()
+                .cell_id()
+                .find(cell_id)
+                .is_some_and(|cell| cell.owner_player_id != PLAYER_ONE)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        uncaptured_after_retask.len() >= OBSERVED_CAPTURE_LAYERS,
+        "only {} lane cell(s) remained uncaptured after retasking; the live fixture advanced too far to prove replacement progression",
+        uncaptured_after_retask.len()
+    );
+    let replacement_capture_targets = uncaptured_after_retask[..OBSERVED_CAPTURE_LAYERS].to_vec();
+
+    println!("[5/8] observing retasked progression, then cancelling the replacement push");
+    let mut observed_packet_progress = false;
+    let active_order = wait_until("two successive front-push captures", timeout, poll, || {
+        let Some(order) = player_one
+            .conn
+            .db
+            .transfer_order()
+            .order_id()
+            .find(&retask_receipt.order_id)
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            order.player_id == PLAYER_ONE
+                && order.client_command_id == retask_id
+                && order.kind == OrderKind::PushFront
+                && (order.orientation_q, order.orientation_r)
+                    == (candidate.direction.q, candidate.direction.r),
+            "replacement receipt referenced an invalid Push Front order"
+        );
         assert_order_conservation(&order)?;
         let packets: Vec<_> = player_one
             .conn
@@ -575,11 +734,7 @@ fn main() -> Result<()> {
         observed_packet_progress |= packets
             .iter()
             .any(|packet| packet.route_index > 0 || packet.updated_step > order.created_step);
-        if !packets.is_empty() {
-            assert_push_routes(&player_one.conn, &candidate, &order, &packets)?;
-        }
-
-        let captured_layers = candidate.lane_cells[..OBSERVED_CAPTURE_LAYERS]
+        let captured_layers = replacement_capture_targets
             .iter()
             .filter(|cell_id| {
                 player_one
@@ -615,17 +770,31 @@ fn main() -> Result<()> {
     );
     ensure!(
         active_order.created_step >= running_step,
-        "front-push order predates the observed running match"
+        "replacement front-push order predates the observed running match"
     );
 
     let cancel_id = unused_command_id(
         &player_one.conn,
         PLAYER_ONE,
-        push_id.checked_add(1).context("push command ID overflow")?,
+        retask_id
+            .checked_add(1)
+            .context("retask command ID overflow")?,
     )?;
+    let replacement_sources = player_one
+        .conn
+        .db
+        .transfer_source()
+        .iter()
+        .filter(|source| source.order_id == retask_receipt.order_id)
+        .map(|source| source.cell_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        !replacement_sources.is_empty(),
+        "replacement push persisted no physical source cells"
+    );
     player_one.cancel_push_fronts(
         cancel_id,
-        &candidate.selected_cells,
+        &replacement_sources,
         candidate.direction,
         timeout,
     )?;
@@ -638,10 +807,10 @@ fn main() -> Result<()> {
         poll,
     )?;
     ensure!(
-        cancel_receipt.order_id == push_receipt.order_id,
+        cancel_receipt.order_id == retask_receipt.order_id,
         "cancellation receipt referenced order {} instead of the unique sustained push {}; use a fresh database if older active pushes overlap this selection",
         cancel_receipt.order_id,
-        push_receipt.order_id
+        retask_receipt.order_id
     );
 
     let (cancelled_order, owners_at_cancel) =
@@ -651,14 +820,13 @@ fn main() -> Result<()> {
                 .db
                 .transfer_order()
                 .order_id()
-                .find(&push_receipt.order_id)
+                .find(&retask_receipt.order_id)
             else {
                 return Ok(None);
             };
             if order.status != OrderStatus::Cancelled {
                 return Ok(None);
             }
-            assert_push_order(&order, &candidate, push_id)?;
             assert_order_conservation(&order)?;
             ensure!(
                 order.in_transit_infantry == 0,
@@ -682,9 +850,9 @@ fn main() -> Result<()> {
                 .filter(|source| source.order_id == order.order_id)
                 .collect();
             ensure!(
-                sources.len() == candidate.selected_cells.len()
+                sources.len() == replacement_sources.len()
                     && sources.iter().all(|source| source.queued_infantry == 0),
-                "cancellation did not release every selected source allocation"
+                "cancellation did not release every replacement source allocation"
             );
             let owners = lane_owners(&player_one.conn, &candidate.lane_cells)?;
             Ok(Some((order, owners)))
@@ -721,7 +889,7 @@ fn main() -> Result<()> {
             .db
             .transfer_order()
             .order_id()
-            .find(&push_receipt.order_id)
+            .find(&retask_receipt.order_id)
             .context("cancelled push order disappeared")?;
         ensure!(
             order.status == OrderStatus::Cancelled,
@@ -771,6 +939,7 @@ fn main() -> Result<()> {
         expand_id,
         &expand_candidate.selected_cells,
         expand_candidate.commitment_bps,
+        &[],
         timeout,
     )?;
     let expand_receipt = wait_for_receipt(
@@ -810,6 +979,7 @@ fn main() -> Result<()> {
         expand_id,
         &expand_candidate.selected_cells,
         expand_candidate.commitment_bps,
+        &[],
         timeout,
     )?;
     let matching_receipts = player_one
@@ -1077,7 +1247,7 @@ fn main() -> Result<()> {
     reconnected.disconnect(timeout)?;
     player_two.disconnect(timeout)?;
     println!(
-        "PASS: receipts, idempotency, directional push, neutral all-front expansion, conservation/cancellation, and token reuse verified"
+        "PASS: receipts, idempotency, atomic front retasking, directional push, neutral all-front expansion, conservation/cancellation, and token reuse verified"
     );
     Ok(())
 }
@@ -1266,6 +1436,34 @@ fn wait_for_receipt(
         receipt.status == ReceiptStatus::Accepted,
         "{command_name} receipt was rejected: {}",
         receipt.message
+    );
+    Ok(receipt)
+}
+
+fn wait_for_rejected_receipt(
+    client: &Client,
+    player_id: u8,
+    command_id: u64,
+    command_name: &str,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<CommandReceipt> {
+    let key = format!("{player_id}:{command_id}");
+    let receipt = wait_until(
+        &format!("rejected {command_name} command receipt"),
+        timeout,
+        poll,
+        || Ok(client.conn.db.command_receipt().receipt_key().find(&key)),
+    )?;
+    ensure!(
+        receipt.player_id == player_id
+            && receipt.client_command_id == command_id
+            && receipt.command_name == command_name,
+        "rejected receipt {key} did not identify the expected command"
+    );
+    ensure!(
+        receipt.status == ReceiptStatus::Rejected,
+        "{command_name} unexpectedly succeeded while testing atomic rejection"
     );
     Ok(receipt)
 }

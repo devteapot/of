@@ -8,16 +8,18 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub(super) struct IssueCoreLoadArgs {
     pub client_command_id: u64,
-    pub selected_cells: Vec<u32>,
+    pub source_cells: Vec<u32>,
     pub amount_bps: u32,
+    pub supersede_order_ids: Vec<u64>,
 }
 
 impl From<IssueCoreLoadArgs> for super::Reducer {
     fn from(args: IssueCoreLoadArgs) -> Self {
         Self::IssueCoreLoad {
             client_command_id: args.client_command_id,
-            selected_cells: args.selected_cells,
+            source_cells: args.source_cells,
             amount_bps: args.amount_bps,
+            supersede_order_ids: args.supersede_order_ids,
         }
     }
 }
@@ -40,10 +42,17 @@ pub trait issue_core_load {
     fn issue_core_load(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         amount_bps: u32,
+        supersede_order_ids: Vec<u64>,
     ) -> __sdk::Result<()> {
-        self.issue_core_load_then(client_command_id, selected_cells, amount_bps, |_, _| {})
+        self.issue_core_load_then(
+            client_command_id,
+            source_cells,
+            amount_bps,
+            supersede_order_ids,
+            |_, _| {},
+        )
     }
 
     /// Request that the remote module invoke the reducer `issue_core_load` to run as soon as possible,
@@ -55,8 +64,9 @@ pub trait issue_core_load {
     fn issue_core_load_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         amount_bps: u32,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -70,8 +80,9 @@ impl issue_core_load for super::RemoteReducers {
     fn issue_core_load_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         amount_bps: u32,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -82,8 +93,9 @@ impl issue_core_load for super::RemoteReducers {
         self.imp.invoke_reducer_with_callback(
             IssueCoreLoadArgs {
                 client_command_id,
-                selected_cells,
+                source_cells,
                 amount_bps,
+                supersede_order_ids,
             },
             callback,
         )

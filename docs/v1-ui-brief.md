@@ -32,21 +32,24 @@ combat frontage, resistance, and terrain-scaled garrisons. It never teleports.
 7. Confirm the sustained Push Front command or stop a matching active push.
    Each axial lane continues independently until its committed pool is
    exhausted, blocked, defeated, reaches the map edge, or is manually cancelled.
-8. From the same connected selection, preview and confirm a neutral-only Expand
+8. Select a locally attacked contested cell as a tagged handle, preview every
+   current packet cell and lane belonging to its snapshotted local orders, and
+   atomically replace those orders without treating the enemy cell as occupied.
+9. From the same connected selection, preview and confirm a neutral-only Expand
    All operation. The chosen dispatch share is taken once from each selected
    unallocated stack. Combined strength splits evenly at each outward local
    branch, merges at shared children, and continues through successive perimeter
    layers. Each branch advances independently until it stops before an enemy,
    exhausts, blocks, reaches the edge, or is cancelled.
-9. Select an owned region and issue percentage-aware one-shot Balance,
+10. Select an owned region and issue percentage-aware one-shot Balance,
    Core-load, or Perimeter-load redistribution.
-10. Select an owned region, drag an orientation arrow, preview a directional
+11. Select an owned region, drag an orientation arrow, preview a directional
    target-density heatmap, and issue percentage-aware Front-load
    redistribution. The unparticipating share remains frozen per source cell.
-11. Distinguish a contested cell by a controller/attacker pressure blend without
+12. Distinguish a contested cell by a controller/attacker pressure blend without
     interpreting it as authoritative dual occupancy.
-12. Adjust a global mobilization target. Lowering it stops future conversion but does not demobilize existing troops; this future-recruitment target remains visibly separate from each order's dispatch/participation percentage.
-13. Read active flows, congestion, combat fronts, ownership changes, casualties, conquest percentage, and the 80% victory result.
+13. Adjust a global mobilization target. Lowering it stops future conversion but does not demobilize existing troops; this future-recruitment target remains visibly separate from each order's dispatch/participation percentage.
+14. Read active flows, congestion, combat fronts, ownership changes, casualties, conquest percentage, and the 80% victory result.
 
 ## Presentation constraints
 

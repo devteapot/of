@@ -32,7 +32,7 @@ use crate::{
     map_view::MapViewMode,
     model::{
         ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, ContestedCellView,
-        MatchPhase, MatchView, ToastKind,
+        MatchPhase, MatchView, RetaskProjection, ToastKind,
     },
     network::{ClientIntent, NetworkSet, RedistributionPreset, ServerUpdate},
 };
@@ -503,6 +503,7 @@ fn invoke_intent(
     match intent {
         ClientIntent::PushFront {
             sources,
+            supersede_order_ids,
             direction,
             commitment_percent,
         } => {
@@ -514,6 +515,7 @@ fn invoke_intent(
                     direction.q,
                     direction.r,
                     u32::from((*commitment_percent).clamp(1, 100)) * 100,
+                    supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
@@ -521,6 +523,7 @@ fn invoke_intent(
         }
         ClientIntent::ExpandAll {
             sources,
+            supersede_order_ids,
             commitment_percent,
         } => {
             connection
@@ -529,6 +532,7 @@ fn invoke_intent(
                     command_id,
                     ids_for_selection(transport, sources)?,
                     u32::from((*commitment_percent).clamp(1, 100)) * 100,
+                    supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
@@ -560,6 +564,7 @@ fn invoke_intent(
         }
         ClientIntent::Redistribute {
             cells,
+            supersede_order_ids,
             preset: RedistributionPreset::Balance,
             amount_percent,
             ..
@@ -570,6 +575,7 @@ fn invoke_intent(
                     command_id,
                     ids_for_selection(transport, cells)?,
                     u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
@@ -577,6 +583,7 @@ fn invoke_intent(
         }
         ClientIntent::Redistribute {
             cells,
+            supersede_order_ids,
             preset: RedistributionPreset::FrontLoad,
             direction,
             amount_percent,
@@ -592,6 +599,7 @@ fn invoke_intent(
                     orientation_q,
                     orientation_r,
                     u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
@@ -599,6 +607,7 @@ fn invoke_intent(
         }
         ClientIntent::Redistribute {
             cells,
+            supersede_order_ids,
             preset: RedistributionPreset::CoreLoad,
             amount_percent,
             ..
@@ -609,6 +618,7 @@ fn invoke_intent(
                     command_id,
                     ids_for_selection(transport, cells)?,
                     u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
@@ -616,6 +626,7 @@ fn invoke_intent(
         }
         ClientIntent::Redistribute {
             cells,
+            supersede_order_ids,
             preset: RedistributionPreset::PerimeterLoad,
             amount_percent,
             ..
@@ -626,6 +637,7 @@ fn invoke_intent(
                     command_id,
                     ids_for_selection(transport, cells)?,
                     u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
@@ -694,6 +706,8 @@ struct AuthoritySnapshot {
 impl AuthoritySnapshot {
     fn capture(connection: &DbConnection, dirty: u32) -> Self {
         let terrain_changed = dirty & TERRAIN_DIRTY != 0;
+        let tactical_changed =
+            dirty & (TERRAIN_DIRTY | FLOWS_DIRTY | FRONTS_DIRTY | ORDERS_DIRTY) != 0;
         Self {
             identity: connection.try_identity(),
             terrain: terrain_changed.then(|| connection.db.cell_terrain().iter().collect()),
@@ -711,12 +725,16 @@ impl AuthoritySnapshot {
                 .then(|| connection.db.mobilization_policy().iter().collect()),
             receipts: (dirty & (RECEIPTS_DIRTY | PLAYERS_DIRTY) != 0)
                 .then(|| connection.db.command_receipt().iter().collect()),
-            packets: (dirty & (FLOWS_DIRTY | TERRAIN_DIRTY) != 0)
-                .then(|| connection.db.transit_packet().iter().collect()),
-            fronts: (dirty & (FRONTS_DIRTY | TERRAIN_DIRTY) != 0)
-                .then(|| connection.db.combat_front().iter().collect()),
-            orders: (dirty & ORDERS_DIRTY != 0)
-                .then(|| connection.db.transfer_order().iter().collect()),
+            packets: tactical_changed.then(|| connection.db.transit_packet().iter().collect()),
+            fronts: tactical_changed.then(|| connection.db.combat_front().iter().collect()),
+            orders: tactical_changed.then(|| {
+                connection
+                    .db
+                    .transfer_order()
+                    .iter()
+                    .filter(|order| order.status == OrderStatus::Active)
+                    .collect()
+            }),
             sources: (dirty & ORDERS_DIRTY != 0)
                 .then(|| connection.db.transfer_source().iter().collect()),
         }
@@ -792,15 +810,25 @@ fn synchronize_authoritative_view(
     if let Some(receipts) = snapshot.receipts {
         process_receipts(&mut transport, &view, receipts, &mut updates);
     }
-    if let Some(packets) = snapshot.packets {
+    if let Some(packets) = snapshot.packets.as_deref() {
         view.active_flows = packets_to_flows(&transport, &view, packets);
     }
-    if let Some(fronts) = snapshot.fronts {
+    if let Some(fronts) = snapshot.fronts.as_deref() {
         let (active_fronts, contested_cells) = fronts_to_overlays(&transport, &view, fronts);
         view.active_fronts = active_fronts;
         view.set_contested_cells(contested_cells);
     }
-    if let (Some(orders), Some(sources)) = (snapshot.orders, snapshot.sources) {
+    if let (Some(orders), Some(packets), Some(fronts)) = (
+        snapshot.orders.as_deref(),
+        snapshot.packets.as_deref(),
+        snapshot.fronts.as_deref(),
+    ) {
+        let projection =
+            retask_projection_from_authority(&transport, &view, orders, packets, fronts);
+        view.set_retask_projection(projection);
+    }
+    if let (Some(orders), Some(sources)) = (snapshot.orders.as_deref(), snapshot.sources.as_deref())
+    {
         view.active_orders = orders
             .iter()
             .filter(|order| order.status == OrderStatus::Active)
@@ -1190,10 +1218,10 @@ fn process_receipts(
 fn packets_to_flows(
     transport: &OnlineTransport,
     view: &MatchView,
-    packets: Vec<TransitPacket>,
+    packets: &[TransitPacket],
 ) -> Vec<ActiveFlow> {
     packets
-        .into_iter()
+        .iter()
         .filter_map(|packet| {
             let route_index = packet.route_index as usize;
             let route = packet
@@ -1226,7 +1254,7 @@ fn packets_to_flows(
 fn fronts_to_overlays(
     transport: &OnlineTransport,
     view: &MatchView,
-    fronts: Vec<CombatFront>,
+    fronts: &[CombatFront],
 ) -> (Vec<ActiveFront>, BTreeMap<Axial, ContestedCellView>) {
     let mut overlays = Vec::new();
     let mut pressure_by_target = BTreeMap::<Axial, BTreeMap<u32, u64>>::new();
@@ -1299,6 +1327,84 @@ fn fronts_to_overlays(
         })
         .collect();
     (overlays, contested)
+}
+
+fn retask_projection_from_authority(
+    transport: &OnlineTransport,
+    view: &MatchView,
+    orders: &[TransferOrder],
+    packets: &[TransitPacket],
+    fronts: &[CombatFront],
+) -> RetaskProjection {
+    let active_local_orders = orders
+        .iter()
+        .filter(|order| {
+            order.status == OrderStatus::Active && u32::from(order.player_id) == view.local_player
+        })
+        .map(|order| order.order_id)
+        .collect::<BTreeSet<_>>();
+    let mut projection = RetaskProjection::default();
+    let mut orders_by_edge = BTreeMap::<(u32, u32), BTreeSet<u64>>::new();
+
+    for packet in packets.iter().filter(|packet| {
+        u32::from(packet.owner_player_id) == view.local_player
+            && active_local_orders.contains(&packet.order_id)
+    }) {
+        let Some(current) = transport
+            .id_to_coordinate
+            .get(&packet.current_cell)
+            .copied()
+        else {
+            continue;
+        };
+        let active_cell = projection
+            .active_strength_by_cell
+            .entry(current)
+            .or_default();
+        *active_cell = active_cell.saturating_add(packet.infantry);
+        let order_cell = projection
+            .order_strength_by_cell
+            .entry(packet.order_id)
+            .or_default()
+            .entry(current)
+            .or_default();
+        *order_cell = order_cell.saturating_add(packet.infantry);
+
+        let next_index = packet.route_index as usize + 1;
+        if let Some(&next) = packet.route.get(next_index) {
+            orders_by_edge
+                .entry((packet.current_cell, next))
+                .or_default()
+                .insert(packet.order_id);
+        }
+    }
+
+    for front in fronts.iter().filter(|front| {
+        u32::from(front.attacker_player_id) == view.local_player
+            && front
+                .queued_infantry
+                .saturating_add(front.attacker_engaged)
+                .saturating_sub(front.attacker_casualties)
+                > 0
+    }) {
+        let Some(handle) = transport.id_to_coordinate.get(&front.to_cell).copied() else {
+            continue;
+        };
+        if !view.is_local_retask_handle(handle) {
+            continue;
+        }
+        let Some(order_ids) = orders_by_edge.get(&(front.from_cell, front.to_cell)) else {
+            continue;
+        };
+        projection
+            .handle_orders
+            .entry(handle)
+            .or_default()
+            .extend(order_ids);
+    }
+
+    projection.active_order_ids = projection.order_strength_by_cell.keys().copied().collect();
+    projection
 }
 
 fn reducer_failure(result: Result<Result<(), String>, InternalError>) -> Option<String> {
@@ -1455,7 +1561,7 @@ mod tests {
             updated_step: 1,
         };
 
-        let flows = packets_to_flows(&transport, &view, vec![edge, hostile_edge, resting]);
+        let flows = packets_to_flows(&transport, &view, &[edge, hostile_edge, resting]);
         assert_eq!(flows.len(), 2);
         assert_eq!(flows[0].route, vec![Axial::ZERO, Axial::new(1, 0)]);
         assert!(!flows[0].attacking, "neutral expansion is not hostile");
@@ -1508,7 +1614,7 @@ mod tests {
             attacker_casualties: 0,
             ..first.clone()
         };
-        let (overlays, contested) = fronts_to_overlays(&transport, &view, vec![first, second]);
+        let (overlays, contested) = fronts_to_overlays(&transport, &view, &[first, second]);
 
         assert_eq!(overlays.len(), 2);
         let contest = contested.get(&to).expect("target should be contested");
@@ -1516,6 +1622,118 @@ mod tests {
         assert_eq!(contest.attacker_player, 1);
         assert_eq!(contest.attacker_strength, 50);
         assert!((contest.attacker_share - (50.0 / 115.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn retask_projection_maps_a_contested_handle_to_all_current_order_cells() {
+        let mut transport = OnlineTransport::new(test_config());
+        let rear = Axial::ZERO;
+        let front = Axial::new(1, 0);
+        let handle = Axial::new(2, 0);
+        for (cell_id, coordinate) in [(10, rear), (11, front), (12, handle)] {
+            transport.id_to_coordinate.insert(cell_id, coordinate);
+        }
+
+        let mut view = MatchView::connecting(1);
+        for (coordinate, owner, infantry) in [
+            (rear, Some(1), 30),
+            (front, Some(1), 20),
+            (handle, Some(2), 40),
+        ] {
+            view.cells.insert(
+                coordinate,
+                CellView {
+                    coordinate,
+                    terrain: TerrainKind::Plains,
+                    elevation: 0,
+                    owner,
+                    civilians: 0,
+                    infantry,
+                    military_capacity: 100,
+                    blocked: false,
+                },
+            );
+        }
+
+        let combat = CombatFront {
+            front_key: "11:12:1".to_owned(),
+            attacker_player_id: 1,
+            defender_player_id: 2,
+            from_cell: 11,
+            to_cell: 12,
+            queued_infantry: 12,
+            attacker_engaged: 5,
+            defender_engaged: 5,
+            attacker_casualties: 0,
+            defender_casualties: 0,
+            frontage: 25,
+            uphill: false,
+            logical_step: 7,
+        };
+        let (_, contested) = fronts_to_overlays(&transport, &view, std::slice::from_ref(&combat));
+        view.set_contested_cells(contested);
+
+        let order = |order_id, player_id, status| TransferOrder {
+            order_id,
+            player_id,
+            client_command_id: order_id,
+            kind: match_bindings::OrderKind::PushFront,
+            status,
+            requested_infantry: 20,
+            committed_infantry: 20,
+            in_transit_infantry: 20,
+            delivered_infantry: 0,
+            casualty_infantry: 0,
+            orientation_q: 1,
+            orientation_r: 0,
+            created_step: 1,
+            updated_step: 7,
+        };
+        let packet = |packet_key: &str,
+                      order_id,
+                      current_cell,
+                      destination_cell,
+                      infantry,
+                      route: Vec<u32>| TransitPacket {
+            packet_key: packet_key.to_owned(),
+            order_id,
+            owner_player_id: 1,
+            origin_cell: 10,
+            current_cell,
+            destination_cell,
+            infantry,
+            route_index: 0,
+            route,
+            updated_step: 7,
+        };
+        let orders = [
+            order(7, 1, OrderStatus::Active),
+            order(8, 1, OrderStatus::Active),
+            order(9, 1, OrderStatus::Completed),
+        ];
+        let packets = [
+            packet("7:11:12", 7, 11, 12, 12, vec![11, 12]),
+            packet("7:10:10", 7, 10, 10, 8, vec![10]),
+            packet("8:10:10", 8, 10, 10, 5, vec![10]),
+            packet("9:10:10", 9, 10, 10, 99, vec![10]),
+        ];
+
+        let projection =
+            retask_projection_from_authority(&transport, &view, &orders, &packets, &[combat]);
+
+        assert_eq!(
+            projection.handle_orders,
+            BTreeMap::from([(handle, BTreeSet::from([7]))])
+        );
+        assert_eq!(projection.active_order_ids, BTreeSet::from([7, 8]));
+        assert_eq!(
+            projection.order_strength_by_cell[&7],
+            BTreeMap::from([(rear, 8), (front, 12)])
+        );
+        assert_eq!(
+            projection.active_strength_by_cell,
+            BTreeMap::from([(rear, 13), (front, 12)])
+        );
     }
 
     #[test]

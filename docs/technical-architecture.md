@@ -232,6 +232,24 @@ releases remaining allocations where they physically are; it is not a rewind.
 The public precise-infantry-transfer reducer has been removed. Exact cell
 movement is reserved for possible future discrete tanks, boats, or other units.
 
+Contested cells are also client-facing handles for explicit whole-order
+retasking. The client snapshots local active order IDs rather than treating the
+enemy-controlled target as a troop location. Issue reducers receive ordinary
+owned source IDs plus deduplicated supersede-order IDs. The authority derives
+all survivor `current_cell` values itself, unions them into the effective
+physical selection, and computes availability as cell infantry minus packets
+belonging to non-superseded orders. Superseded destination reservations are
+excluded from redistribution planning; unrelated reservations remain.
+
+Retasking uses a read-only prepare phase followed by an atomic apply phase.
+Every requested order must be local, active, conserved, and retain at least one
+packet. The complete replacement topology, routes, strength, and 4,096-cell
+bound are validated before the first cancellation. Planning rejections create
+the normal rejected receipt without gameplay mutation. Apply-time invariant
+failure aborts the transaction, rolling back both cancellations and the new
+order. This prevents partial multi-order replacement and eliminates
+double-allocation without trusting client-projected packet locations.
+
 Expand All is the neutral-only companion producer. Its reducer accepts one
 six-connected owned selection and a basis-point dispatch share, with no
 orientation. It snapshots that share from every cell's currently unallocated
@@ -419,7 +437,9 @@ one-edge packets: contributions merge by current node, and no complete
 source-by-exit paths are persisted. The private outside-depth and cursor vectors
 are linear in map cells per active Expand All order, a deliberate V1 bound that
 must be profiled before global policies or much larger maps. Previews cache
-results by selection and authoritative cell-state revisions. Every V1 order
+results by selection, authoritative cell-state revisions, and a separate
+active-order and packet retask revision. Building that projection scans only
+subscribed active state, not map cells. Every V1 order
 preview and reducer rejects selections above 4,096 cells before building
 heatmaps, routes, or payloads. This is a safety bound, not the world-scale
 selection design. Every authority adapter must debit only source cells that can

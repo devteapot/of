@@ -203,7 +203,7 @@ fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
             });
         panel.spawn((
             Text::new(
-                "MAP KEY\nouter perimeter     selected region\namber rings         expansion wave\nred edge            attack front\nmixed player fill   contested pressure\n× marker            blocked\nopposing chevrons   combat",
+                "MAP KEY\nouter perimeter     selected source region\nmagenta dashes      retask handle\ncyan dashes         derived packet sources\namber rings         expansion wave\nred edge            attack front\nmixed player fill   contested pressure\n× marker            blocked\nopposing chevrons   combat",
             ),
             TextFont::from_font_size(10.5),
             TextColor(MUTED),
@@ -409,7 +409,7 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
         help.spawn(section_title("FIELD MANUAL  //  ? TO CLOSE"));
         help.spawn((
             Text::new(
-                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts. In source mode, [ / ] removes or adds one complete hex ring around the brush, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes.\n\nPUSH FRONTS\nThe outward-facing selected cells form the front; connected selected cells behind them are its reinforcement corridor. A blocked gap may split the boundary into multiple active arcs; each arc is fed independently from the connected selection. Hold P, drag outward, and release to choose one of six directions; Enter starts a sustained directional push. Shift+P instead treats the connected selection as one seed and previews a perimeter wave. Central strength branches through selected neighbors, merges at shared boundary cells, and then advances through successive one-cell offset rings. It stops rather than attacking enemy territory. Plain [ / ] changes the share requested from each selected cell. The UP TO estimate uses visible infantry; the authority subtracts troops already allocated to active orders, so acceptance can be lower. Recreate the matching directional or all-front selection, then X stops those active operations.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters. Contested cells mix both player colors by relative force.\n\nREDISTRIBUTE\nB balances density, F orients front-load, G loads toward the selection core, and R loads toward its perimeter. Plain [ / ] changes how much of every selected stack participates; Enter confirms. Pale nested outlines show the estimated target density.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. Mobilization is the future recruitment/conversion target; it is separate from the order dispatch share. Lowering it does not demobilize existing soldiers.",
+                "SELECT\nLMB drag paints owned source hexes and magenta enemy contested retask handles. A handle snapshots the exact local orders currently pressing that cell; cyan dashes show those orders' derived current packet sources. Shift adds; Control subtracts. In source mode, [ / ] removes or adds one complete hex ring around the brush, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes and clears retask handles.\n\nPUSH FRONTS\nThe outward-facing selected cells form the front; connected selected cells behind them are its reinforcement corridor. A blocked gap may split the boundary into multiple active arcs; each arc is fed independently from the connected selection. Hold P, drag outward, and release to choose one of six directions; Enter starts a sustained directional push. Shift+P instead treats the connected selection as one seed and previews a perimeter wave. Central strength branches through selected neighbors, merges at shared boundary cells, and then advances through successive one-cell offset rings. It stops rather than attacking enemy territory. Plain [ / ] changes the share requested from each effective source. The estimate includes selected retasked troops but protects unrelated active allocations. Enter atomically replaces the snapshotted orders if they are still active. X is a legacy stop command matched from ordinary owned sources; retask handles are intentionally ignored.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters. Contested cells mix both player colors by relative force.\n\nREDISTRIBUTE\nB balances density, F orients front-load, G loads toward the selection core, and R loads toward its perimeter. Plain [ / ] changes how much of every effective source stack participates; Enter confirms or atomically retasks selected orders. Pale nested outlines show the ideal estimated target density. Unrelated incoming redistribution reservations remain protected, so authority may reduce a destination below the heatmap to prevent overbooking.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. Mobilization is the future recruitment/conversion target; it is separate from the order dispatch share. Lowering it does not demobilize existing soldiers.",
             ),
             TextFont::from_font_size(12.0),
             TextColor(TEXT),
@@ -591,7 +591,16 @@ fn update_hud(
         selection_totals.cell_state_revision = view.cell_state_revision;
         selection_totals.initialized = true;
     }
-    let (strength, capacity, civilians) = selection_totals.totals;
+    let (raw_strength, raw_capacity, civilians) = selection_totals.totals;
+    let (strength, capacity) =
+        if interaction.has_selection() && interaction.preview.projected_source_count > 0 {
+            (
+                interaction.preview.projected_strength,
+                interaction.preview.projected_capacity,
+            )
+        } else {
+            (raw_strength, raw_capacity)
+        };
     let occupancy = if capacity == 0 {
         0.0
     } else {
@@ -601,7 +610,7 @@ fn update_hud(
         || "none".to_owned(),
         |(from, to)| format!("{},{} → {},{}", from.q, from.r, to.q, to.r),
     );
-    let context_hint = match interaction.mode {
+    let mut context_hint = match interaction.mode {
         OrderMode::Idle => format!(
             "BRUSH {}x{} · RING {} · [/] perimeter · Shift width · Ctrl height",
             interaction.brush.width(),
@@ -613,35 +622,48 @@ fn update_hud(
         }
         OrderMode::PushFrontPreview { .. } => interaction.preview.invalid_reason.map_or_else(
             || {
-                "UP TO uses visible troops; authority subtracts active allocations · Enter starts · X stops"
+                "UP TO excludes unrelated active allocations · Enter starts or retasks · X stops legacy source matches"
                     .to_owned()
             },
             |reason| format!("INVALID · {reason}"),
         ),
         OrderMode::ExpandAllPreview => interaction.preview.invalid_reason.map_or_else(
             || {
-                "Amber bands are successive branching/merging rings · UP TO may be reduced by active allocations · Enter starts · X stops"
+                "Amber bands are branching/merging rings · unrelated active allocations stay protected · Enter starts or retasks"
                     .to_owned()
             },
             |reason| format!("INVALID · {reason}"),
         ),
         OrderMode::BalancePreview => {
-            "Nested outlines show percentage-aware estimated target density".to_owned()
+            "Ideal target heatmap · unrelated incoming reservations may reduce authority targets"
+                .to_owned()
         }
         OrderMode::FrontLoadOrient { .. } => {
             "Choose direction · release F or click map to preview".to_owned()
         }
         OrderMode::FrontLoadPreview { .. } => {
-            "Arrow shows orientation · [/] participation · Enter confirms".to_owned()
+            "Arrow shows orientation · ideal heatmap; authority preserves unrelated reservations"
+                .to_owned()
         }
         OrderMode::CoreLoadPreview => {
-            "Loads inward from the selection centroid · [/] participation".to_owned()
+            "Loads inward · ideal heatmap; authority preserves unrelated reservations".to_owned()
         }
         OrderMode::PerimeterLoadPreview => {
-            "Loads outward toward the selection perimeter · [/] participation".to_owned()
+            "Loads outward · ideal heatmap; authority preserves unrelated reservations".to_owned()
         }
         OrderMode::Submitting { .. } => "Waiting for authoritative response…".to_owned(),
     };
+    if interaction.preview.retask_order_count > 0 {
+        context_hint = format!(
+            "RETASK {} HANDLE{} · {} ORDER{} · {} INF\n{}",
+            interaction.preview.retask_handle_count,
+            plural(interaction.preview.retask_handle_count),
+            interaction.preview.retask_order_count,
+            plural(interaction.preview.retask_order_count),
+            interaction.preview.retask_strength,
+            context_hint,
+        );
+    }
     let percentage_label = match interaction.mode {
         OrderMode::PushFrontOrient { .. }
         | OrderMode::PushFrontPreview { .. }
@@ -695,7 +717,7 @@ fn update_hud(
             format!(
                 "ORDER  //  {}\nSOURCE {:>3} HEXES  ·  INF {:>5} / {:>5}\nCIVILIANS {:>5}  ·  DENSITY {:>3.0}%\n{} {:>3} CELLS  ·  UP TO EST. {:>5}\n{} {:>3}%  ·  {}  ·  EXCLUDED {:>2}\nETA ≈ {:>3}s  ·  BOTTLENECK {}\n\n{}",
                 interaction.mode.label(),
-                interaction.sources.len(),
+                interaction.preview.projected_source_count,
                 strength,
                 capacity,
                 civilians,

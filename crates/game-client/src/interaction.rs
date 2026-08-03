@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 
 use bevy::{picking::pointer::PointerInteraction, prelude::*};
 use hex_core::{
@@ -9,7 +9,7 @@ use hex_core::{
 use crate::{
     camera::GameCamera,
     geometry::axial_to_plane,
-    model::{MatchView, ToastKind},
+    model::{MatchView, OrderSelectionProjectionError, ProjectedOrderSelection, ToastKind},
     network::{
         ClientIntent, ExpandWaveError, MAX_WAVE_PREVIEW_RINGS, NetworkSet, RedistributionPreset,
         ServerUpdate, forecast_expand_wave,
@@ -23,12 +23,19 @@ pub struct OrderPreview {
     pub front_edges: Vec<DirectedFrontEdge>,
     pub excluded: BTreeSet<Axial>,
     pub heatmap: BTreeMap<Axial, f32>,
+    pub projected_sources: BTreeSet<Axial>,
     pub wave_depth: BTreeMap<Axial, u16>,
     pub wave_truncated: bool,
+    pub projected_source_count: usize,
+    pub retask_handle_count: usize,
+    pub retask_order_count: usize,
+    pub retask_strength: u64,
+    pub projected_strength: u64,
+    pub projected_capacity: u64,
     pub eta_seconds: u32,
-    /// Upper-bound estimate from visible infantry. Active authoritative packet
-    /// allocations are not represented in `MatchView`, so the accepted order
-    /// may dispatch less than this value.
+    /// Upper-bound estimate after excluding unrelated active packet
+    /// allocations. A newer authoritative snapshot or destination reservation
+    /// can still reduce what the server accepts.
     pub strength_upper_bound: u64,
     pub destination_capacity: u64,
     pub bottleneck: Option<(Axial, Axial)>,
@@ -80,6 +87,7 @@ struct PaintStroke {
 
 const MAX_BRUSH_SIZE: u8 = 31;
 const MAX_COMMAND_SELECTION_CELLS: usize = 4_096;
+const MAX_COMMAND_SUPERSEDE_ORDERS: usize = 4_096;
 
 /// A map-aligned paint footprint with independent rectangular extents and hex rings.
 ///
@@ -203,6 +211,7 @@ struct OrderPreviewKey {
     mode: PreviewModeKey,
     cell_state_revision: u64,
     topology_revision: u64,
+    retask_revision: u64,
 }
 
 fn axial_to_offset_row(coordinate: Axial) -> i32 {
@@ -263,6 +272,9 @@ pub struct InteractionState {
     pub hovered: Option<Axial>,
     pub cursor_world: Option<Vec3>,
     pub sources: BTreeSet<Axial>,
+    /// Enemy contested cells selected as stable handles. The associated order
+    /// IDs are snapshotted when painted and never rebound implicitly.
+    pub retask_handles: BTreeMap<Axial, BTreeSet<u64>>,
     pub mode: OrderMode,
     pub amount_percent: u8,
     pub preview: OrderPreview,
@@ -282,6 +294,7 @@ impl Default for InteractionState {
             hovered: None,
             cursor_world: None,
             sources: BTreeSet::new(),
+            retask_handles: BTreeMap::new(),
             mode: OrderMode::Idle,
             amount_percent: 50,
             preview: OrderPreview::default(),
@@ -298,6 +311,14 @@ impl Default for InteractionState {
 }
 
 impl InteractionState {
+    pub fn supersede_order_ids(&self) -> BTreeSet<u64> {
+        self.retask_handles.values().flatten().copied().collect()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        !self.sources.is_empty() || !self.retask_handles.is_empty()
+    }
+
     pub fn push_direction(&self) -> Option<Axial> {
         match self.mode {
             OrderMode::PushFrontOrient { start, current } => {
@@ -347,6 +368,7 @@ impl Plugin for GameInteractionPlugin {
                 Update,
                 (
                     update_hovered_cell,
+                    reconcile_selection,
                     process_order_input,
                     paint_regions,
                     update_order_preview,
@@ -437,8 +459,9 @@ fn process_order_input(
     if matches!(interaction.mode, OrderMode::Idle) {
         if command_modifier_pressed(&keyboard) && keyboard.just_pressed(KeyCode::KeyA) {
             let selected = all_local_owned_cells(&view);
-            if interaction.sources != selected {
+            if interaction.sources != selected || !interaction.retask_handles.is_empty() {
                 interaction.sources = selected;
+                interaction.retask_handles.clear();
                 interaction.source_revision = interaction.source_revision.wrapping_add(1);
             }
         } else if keyboard.just_pressed(KeyCode::KeyC)
@@ -446,8 +469,8 @@ fn process_order_input(
         {
             let cluster = local_owned_cluster(&view, seed);
             if !cluster.is_empty()
-                && combine_selection(
-                    &mut interaction.sources,
+                && combine_physical_selection(
+                    &mut interaction,
                     cluster,
                     selection_combine(&keyboard),
                 )
@@ -604,15 +627,14 @@ fn requested_brush_resize(
 
 fn all_local_owned_cells(view: &MatchView) -> BTreeSet<Axial> {
     view.cells
-        .iter()
-        .filter_map(|(coordinate, cell)| {
-            (cell.owner == Some(view.local_player)).then_some(*coordinate)
-        })
+        .keys()
+        .filter(|coordinate| view.is_local_owned_passable(**coordinate))
+        .copied()
         .collect()
 }
 
 fn local_owned_cluster(view: &MatchView, seed: Axial) -> BTreeSet<Axial> {
-    if !view.is_local_owned(seed) {
+    if !view.is_local_owned_passable(seed) {
         return BTreeSet::new();
     }
 
@@ -620,12 +642,41 @@ fn local_owned_cluster(view: &MatchView, seed: Axial) -> BTreeSet<Axial> {
     let mut frontier = VecDeque::from([seed]);
     while let Some(coordinate) = frontier.pop_front() {
         for neighbor in coordinate.neighbors() {
-            if view.is_local_owned(neighbor) && cluster.insert(neighbor) {
+            if view.is_local_owned_passable(neighbor) && cluster.insert(neighbor) {
                 frontier.push_back(neighbor);
             }
         }
     }
     cluster
+}
+
+fn reconcile_selection(view: Res<MatchView>, mut interaction: ResMut<InteractionState>) {
+    let changed = {
+        let interaction = &mut *interaction;
+        prune_invalid_selection(
+            &view,
+            &mut interaction.sources,
+            &mut interaction.retask_handles,
+        )
+    };
+    if changed {
+        interaction.source_revision = interaction.source_revision.wrapping_add(1);
+    }
+}
+
+fn prune_invalid_selection(
+    view: &MatchView,
+    sources: &mut BTreeSet<Axial>,
+    retask_handles: &mut BTreeMap<Axial, BTreeSet<u64>>,
+) -> bool {
+    let previous_sources = sources.len();
+    let previous_handles = retask_handles.clone();
+    sources.retain(|coordinate| view.is_local_owned_passable(*coordinate));
+    for order_ids in retask_handles.values_mut() {
+        order_ids.retain(|order_id| view.retask_projection.active_order_ids.contains(order_id));
+    }
+    retask_handles.retain(|_, order_ids| !order_ids.is_empty());
+    sources.len() != previous_sources || *retask_handles != previous_handles
 }
 
 fn combine_selection(
@@ -648,6 +699,23 @@ fn combine_selection(
     selection.len() != previous_len
 }
 
+fn combine_physical_selection(
+    interaction: &mut InteractionState,
+    cells: BTreeSet<Axial>,
+    combine: SelectionCombine,
+) -> bool {
+    let handles_before = interaction.retask_handles.len();
+    match combine {
+        SelectionCombine::Replace => interaction.retask_handles.clear(),
+        SelectionCombine::Add => {}
+        SelectionCombine::Remove => interaction
+            .retask_handles
+            .retain(|coordinate, _| !cells.contains(coordinate)),
+    }
+    combine_selection(&mut interaction.sources, cells, combine)
+        || interaction.retask_handles.len() != handles_before
+}
+
 fn handle_action(
     action: UiAction,
     interaction: &mut InteractionState,
@@ -656,8 +724,11 @@ fn handle_action(
 ) {
     match action {
         action @ (UiAction::PushFront | UiAction::PushFrontKey) => {
-            if interaction.sources.is_empty() {
-                view.show_toast("Paint owned source hexes first", ToastKind::Rejection);
+            if !interaction.has_selection() {
+                view.show_toast(
+                    "Paint sources or active-front handles first",
+                    ToastKind::Rejection,
+                );
             } else if matches!(interaction.mode, OrderMode::Idle) {
                 if let Some(start) = interaction.cursor_world {
                     interaction.orientation_uses_click = matches!(action, UiAction::PushFront);
@@ -680,8 +751,11 @@ fn handle_action(
             }
         }
         UiAction::ExpandAll => {
-            if interaction.sources.is_empty() {
-                view.show_toast("Paint owned source hexes first", ToastKind::Rejection);
+            if !interaction.has_selection() {
+                view.show_toast(
+                    "Paint sources or active-front handles first",
+                    ToastKind::Rejection,
+                );
             } else if matches!(interaction.mode, OrderMode::Idle) {
                 interaction.mode = OrderMode::ExpandAllPreview;
                 view.show_toast(
@@ -691,41 +765,29 @@ fn handle_action(
             }
         }
         UiAction::Balance => {
-            if interaction.sources.len() < 2 {
-                view.show_toast(
-                    "Balance needs at least two owned hexes",
-                    ToastKind::Rejection,
-                );
+            if !interaction.has_selection() {
+                view.show_toast("Balance needs selected troops", ToastKind::Rejection);
             } else if matches!(interaction.mode, OrderMode::Idle) {
                 interaction.mode = OrderMode::BalancePreview;
             }
         }
         UiAction::CoreLoad => {
-            if interaction.sources.len() < 2 {
-                view.show_toast(
-                    "Core-load needs at least two owned hexes",
-                    ToastKind::Rejection,
-                );
+            if !interaction.has_selection() {
+                view.show_toast("Core-load needs selected troops", ToastKind::Rejection);
             } else if matches!(interaction.mode, OrderMode::Idle) {
                 interaction.mode = OrderMode::CoreLoadPreview;
             }
         }
         UiAction::PerimeterLoad => {
-            if interaction.sources.len() < 2 {
-                view.show_toast(
-                    "Perimeter-load needs at least two owned hexes",
-                    ToastKind::Rejection,
-                );
+            if !interaction.has_selection() {
+                view.show_toast("Perimeter-load needs selected troops", ToastKind::Rejection);
             } else if matches!(interaction.mode, OrderMode::Idle) {
                 interaction.mode = OrderMode::PerimeterLoadPreview;
             }
         }
         action @ (UiAction::FrontLoad | UiAction::FrontLoadKey) => {
-            if interaction.sources.len() < 2 {
-                view.show_toast(
-                    "Front-load needs at least two owned hexes",
-                    ToastKind::Rejection,
-                );
+            if !interaction.has_selection() {
+                view.show_toast("Front-load needs selected troops", ToastKind::Rejection);
             } else if matches!(interaction.mode, OrderMode::Idle) {
                 if let Some(start) = interaction.cursor_world {
                     interaction.orientation_uses_click = matches!(action, UiAction::FrontLoad);
@@ -751,8 +813,9 @@ fn handle_action(
         UiAction::CancelPush => cancel_matching_push(interaction, view, intents),
         UiAction::Cancel => {
             if matches!(interaction.mode, OrderMode::Idle) {
-                if !interaction.sources.is_empty() {
+                if interaction.has_selection() {
                     interaction.sources.clear();
+                    interaction.retask_handles.clear();
                     interaction.source_revision = interaction.source_revision.wrapping_add(1);
                 }
             } else if !matches!(interaction.mode, OrderMode::Submitting { .. }) {
@@ -792,7 +855,11 @@ fn cancel_matching_push(
 ) {
     if interaction.sources.is_empty() {
         view.show_toast(
-            "Select the expansion's source region first",
+            if interaction.retask_handles.is_empty() {
+                "Select the expansion's owned source region first"
+            } else {
+                "X matches ordinary owned sources only; use Enter to replace selected retask orders"
+            },
             ToastKind::Rejection,
         );
         return;
@@ -842,14 +909,40 @@ fn submit_current(
         view.show_toast(reason, ToastKind::Rejection);
         return;
     }
-    let (intent, label, return_mode) = match &interaction.mode {
+    let Some((intent, label, return_mode)) = submission_request(interaction) else {
+        if matches!(
+            interaction.mode,
+            OrderMode::PushFrontPreview { .. } | OrderMode::ExpandAllPreview
+        ) {
+            view.show_toast(
+                interaction
+                    .preview
+                    .invalid_reason
+                    .unwrap_or("The selection has no valid outward front"),
+                ToastKind::Rejection,
+            );
+        }
+        return;
+    };
+    interaction.return_after_rejection = Some(return_mode);
+    interaction.submitting_command_id = None;
+    interaction.mode = OrderMode::Submitting { _label: label };
+    intents.write(intent);
+}
+
+fn submission_request(
+    interaction: &InteractionState,
+) -> Option<(ClientIntent, &'static str, OrderMode)> {
+    let supersede_order_ids = interaction.supersede_order_ids();
+    match &interaction.mode {
         OrderMode::PushFrontPreview { direction }
             if !interaction.preview.front_edges.is_empty()
                 && interaction.preview.invalid_reason.is_none() =>
         {
-            (
+            Some((
                 ClientIntent::PushFront {
                     sources: interaction.sources.clone(),
+                    supersede_order_ids: supersede_order_ids.clone(),
                     direction: *direction,
                     commitment_percent: interaction.amount_percent,
                 },
@@ -857,34 +950,37 @@ fn submit_current(
                 OrderMode::PushFrontPreview {
                     direction: *direction,
                 },
-            )
+            ))
         }
         OrderMode::ExpandAllPreview
             if !interaction.preview.front_edges.is_empty()
                 && interaction.preview.invalid_reason.is_none() =>
         {
-            (
+            Some((
                 ClientIntent::ExpandAll {
                     sources: interaction.sources.clone(),
+                    supersede_order_ids: supersede_order_ids.clone(),
                     commitment_percent: interaction.amount_percent,
                 },
                 "EXPAND ALL",
                 OrderMode::ExpandAllPreview,
-            )
+            ))
         }
-        OrderMode::BalancePreview => (
+        OrderMode::BalancePreview => Some((
             ClientIntent::Redistribute {
                 cells: interaction.sources.clone(),
+                supersede_order_ids: supersede_order_ids.clone(),
                 preset: RedistributionPreset::Balance,
                 direction: None,
                 amount_percent: interaction.amount_percent,
             },
             "BALANCE",
             OrderMode::BalancePreview,
-        ),
-        OrderMode::FrontLoadPreview { direction } => (
+        )),
+        OrderMode::FrontLoadPreview { direction } => Some((
             ClientIntent::Redistribute {
                 cells: interaction.sources.clone(),
+                supersede_order_ids: supersede_order_ids.clone(),
                 preset: RedistributionPreset::FrontLoad,
                 direction: Some(*direction),
                 amount_percent: interaction.amount_percent,
@@ -893,43 +989,31 @@ fn submit_current(
             OrderMode::FrontLoadPreview {
                 direction: *direction,
             },
-        ),
-        OrderMode::CoreLoadPreview => (
+        )),
+        OrderMode::CoreLoadPreview => Some((
             ClientIntent::Redistribute {
                 cells: interaction.sources.clone(),
+                supersede_order_ids: supersede_order_ids.clone(),
                 preset: RedistributionPreset::CoreLoad,
                 direction: None,
                 amount_percent: interaction.amount_percent,
             },
             "CORE-LOAD",
             OrderMode::CoreLoadPreview,
-        ),
-        OrderMode::PerimeterLoadPreview => (
+        )),
+        OrderMode::PerimeterLoadPreview => Some((
             ClientIntent::Redistribute {
                 cells: interaction.sources.clone(),
+                supersede_order_ids,
                 preset: RedistributionPreset::PerimeterLoad,
                 direction: None,
                 amount_percent: interaction.amount_percent,
             },
             "PERIMETER-LOAD",
             OrderMode::PerimeterLoadPreview,
-        ),
-        OrderMode::PushFrontPreview { .. } | OrderMode::ExpandAllPreview => {
-            view.show_toast(
-                interaction
-                    .preview
-                    .invalid_reason
-                    .unwrap_or("The selection has no valid outward front"),
-                ToastKind::Rejection,
-            );
-            return;
-        }
-        _ => return,
-    };
-    interaction.return_after_rejection = Some(return_mode);
-    interaction.submitting_command_id = None;
-    interaction.mode = OrderMode::Submitting { _label: label };
-    intents.write(intent);
+        )),
+        _ => None,
+    }
 }
 
 fn paint_regions(
@@ -948,8 +1032,11 @@ fn paint_regions(
 
     if mouse.just_pressed(MouseButton::Left) && interaction.hovered.is_some() {
         let combine = selection_combine(&keyboard);
-        if combine == SelectionCombine::Replace && !interaction.sources.is_empty() {
+        if combine == SelectionCombine::Replace
+            && (!interaction.sources.is_empty() || !interaction.retask_handles.is_empty())
+        {
             interaction.sources.clear();
+            interaction.retask_handles.clear();
             interaction.source_revision = interaction.source_revision.wrapping_add(1);
         }
         interaction.stroke = Some(PaintStroke {
@@ -979,19 +1066,10 @@ fn paint_regions(
         interaction.stroke = Some(stroke);
         let mut changed = false;
         for center in centers {
-            for coordinate in interaction
-                .brush
-                .cells(center)
-                .into_iter()
-                .filter(|coordinate| view.is_local_owned(*coordinate))
-            {
-                match stroke.operation {
-                    PaintOperation::Add => {
-                        changed |= interaction.sources.insert(coordinate);
-                    }
-                    PaintOperation::Remove => {
-                        changed |= interaction.sources.remove(&coordinate);
-                    }
+            for coordinate in interaction.brush.cells(center) {
+                if may_paint_selection_cell(&view, &interaction, coordinate, stroke.operation) {
+                    changed |=
+                        paint_selection_cell(&view, &mut interaction, coordinate, stroke.operation);
                 }
             }
         }
@@ -1002,6 +1080,51 @@ fn paint_regions(
 
     if mouse.just_released(MouseButton::Left) {
         interaction.stroke = None;
+    }
+}
+
+fn may_paint_selection_cell(
+    view: &MatchView,
+    interaction: &InteractionState,
+    coordinate: Axial,
+    operation: PaintOperation,
+) -> bool {
+    view.is_local_selection_cell(coordinate)
+        || (operation == PaintOperation::Remove
+            && (interaction.sources.contains(&coordinate)
+                || interaction.retask_handles.contains_key(&coordinate)))
+}
+
+fn paint_selection_cell(
+    view: &MatchView,
+    interaction: &mut InteractionState,
+    coordinate: Axial,
+    operation: PaintOperation,
+) -> bool {
+    match operation {
+        PaintOperation::Add if view.is_local_owned_passable(coordinate) => {
+            interaction.sources.insert(coordinate)
+        }
+        PaintOperation::Add => {
+            let Some(order_ids) = view
+                .retask_projection
+                .handle_orders
+                .get(&coordinate)
+                .filter(|order_ids| !order_ids.is_empty())
+            else {
+                return false;
+            };
+            let Entry::Vacant(entry) = interaction.retask_handles.entry(coordinate) else {
+                return false;
+            };
+            entry.insert(order_ids.clone());
+            true
+        }
+        PaintOperation::Remove => {
+            let removed_source = interaction.sources.remove(&coordinate);
+            let removed_handle = interaction.retask_handles.remove(&coordinate).is_some();
+            removed_source || removed_handle
+        }
     }
 }
 
@@ -1032,9 +1155,11 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
         mode,
         cell_state_revision: view.cell_state_revision,
         topology_revision: view.chunk_index_revision,
+        retask_revision: view.retask_revision,
     })
 }
 
+#[cfg(test)]
 fn build_push_front_preview(
     view: &MatchView,
     selected: &BTreeSet<Axial>,
@@ -1042,6 +1167,21 @@ fn build_push_front_preview(
     commitment_percent: u8,
     preview: &mut OrderPreview,
 ) {
+    let Ok(projection) = view.project_order_selection(selected, &BTreeSet::new()) else {
+        preview.invalid_reason = Some("Push sources are no longer available");
+        return;
+    };
+    build_projected_push_front_preview(view, &projection, direction, commitment_percent, preview);
+}
+
+fn build_projected_push_front_preview(
+    view: &MatchView,
+    projection: &ProjectedOrderSelection,
+    direction: Axial,
+    commitment_percent: u8,
+    preview: &mut OrderPreview,
+) {
+    let selected = &projection.cells;
     if selected.len() > MAX_COMMAND_SELECTION_CELLS {
         preview.invalid_reason = Some("Push selection exceeds the 4096-cell V1 command limit");
         return;
@@ -1100,8 +1240,15 @@ fn build_push_front_preview(
     let percentage = u64::from(commitment_percent.clamp(10, 100));
     preview.strength_upper_bound = sources
         .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| cell.infantry.saturating_mul(percentage) / 100)
+        .map(|coordinate| {
+            projection
+                .affected_strength_by_cell
+                .get(coordinate)
+                .copied()
+                .unwrap_or(0)
+                .saturating_mul(percentage)
+                / 100
+        })
         .fold(0_u64, u64::saturating_add);
     if preview.strength_upper_bound == 0 {
         preview.invalid_reason = Some("Selected sources have no visible infantry to request");
@@ -1124,7 +1271,14 @@ fn build_push_front_preview(
 
     let route_start = sources
         .iter()
-        .filter(|source| view.cell(**source).is_some_and(|cell| cell.infantry > 0))
+        .filter(|source| {
+            projection
+                .affected_strength_by_cell
+                .get(source)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
         .max_by_key(|source| (distance.get(source).copied().unwrap_or(0), **source))
         .copied();
     if let Some(mut current) = route_start {
@@ -1160,12 +1314,27 @@ fn build_push_front_preview(
         .min(u64::from(u32::MAX)) as u32;
 }
 
+#[cfg(test)]
 fn build_expand_all_preview(
     view: &MatchView,
     selected: &BTreeSet<Axial>,
     commitment_percent: u8,
     preview: &mut OrderPreview,
 ) {
+    let Ok(projection) = view.project_order_selection(selected, &BTreeSet::new()) else {
+        preview.invalid_reason = Some("Expand All sources are no longer available");
+        return;
+    };
+    build_projected_expand_all_preview(view, &projection, commitment_percent, preview);
+}
+
+fn build_projected_expand_all_preview(
+    view: &MatchView,
+    projection: &ProjectedOrderSelection,
+    commitment_percent: u8,
+    preview: &mut OrderPreview,
+) {
+    let selected = &projection.cells;
     if selected.len() > MAX_COMMAND_SELECTION_CELLS {
         preview.invalid_reason = Some("Expand All selection exceeds the 4096-cell V1 limit");
         return;
@@ -1191,31 +1360,36 @@ fn build_expand_all_preview(
         return;
     }
 
-    let forecast =
-        match forecast_expand_wave(view, &sources, commitment_percent, MAX_WAVE_PREVIEW_RINGS) {
-            Ok(forecast) => forecast,
-            Err(ExpandWaveError::Front(FrontSelectionError::EmptySelection)) => {
-                preview.invalid_reason = Some("Select owned cells before expanding");
-                return;
-            }
-            Err(ExpandWaveError::Front(FrontSelectionError::DisconnectedSelection)) => {
-                preview.invalid_reason = Some("Expand All selection must be one connected region");
-                return;
-            }
-            Err(ExpandWaveError::Front(FrontSelectionError::NoEligibleFront)) => {
-                preview.invalid_reason = Some("The selection has no passable neutral frontier");
-                return;
-            }
-            Err(ExpandWaveError::Front(FrontSelectionError::InvalidDirection)) => {
-                preview.invalid_reason = Some("Expand All frontier is invalid");
-                return;
-            }
-            Err(ExpandWaveError::InternalRoute) => {
-                preview.invalid_reason =
-                    Some("Every selected source must reach the perimeter inside the selection");
-                return;
-            }
-        };
+    let forecast = match forecast_expand_wave(
+        view,
+        &sources,
+        &projection.affected_strength_by_cell,
+        commitment_percent,
+        MAX_WAVE_PREVIEW_RINGS,
+    ) {
+        Ok(forecast) => forecast,
+        Err(ExpandWaveError::Front(FrontSelectionError::EmptySelection)) => {
+            preview.invalid_reason = Some("Select owned cells before expanding");
+            return;
+        }
+        Err(ExpandWaveError::Front(FrontSelectionError::DisconnectedSelection)) => {
+            preview.invalid_reason = Some("Expand All selection must be one connected region");
+            return;
+        }
+        Err(ExpandWaveError::Front(FrontSelectionError::NoEligibleFront)) => {
+            preview.invalid_reason = Some("The selection has no passable neutral frontier");
+            return;
+        }
+        Err(ExpandWaveError::Front(FrontSelectionError::InvalidDirection)) => {
+            preview.invalid_reason = Some("Expand All frontier is invalid");
+            return;
+        }
+        Err(ExpandWaveError::InternalRoute) => {
+            preview.invalid_reason =
+                Some("Every selected source must reach the perimeter inside the selection");
+            return;
+        }
+    };
 
     preview.front_edges = forecast.initial_edges;
     preview.wave_depth = forecast.reached_depth;
@@ -1303,12 +1477,57 @@ fn update_order_preview(view: Res<MatchView>, mut interaction: ResMut<Interactio
         interaction.preview_key = Some(key);
         return;
     }
+    let supersede_order_ids = interaction.supersede_order_ids();
+    if supersede_order_ids.len() > MAX_COMMAND_SUPERSEDE_ORDERS {
+        preview.invalid_reason = Some("Retask selection exceeds the 4096-order V1 command limit");
+        interaction.preview = preview;
+        interaction.preview_key = Some(key);
+        return;
+    }
+    let projection = match view.project_order_selection(&interaction.sources, &supersede_order_ids)
+    {
+        Ok(projection) => projection,
+        Err(error) => {
+            preview.invalid_reason = Some(projection_error_text(error));
+            interaction.preview = preview;
+            interaction.preview_key = Some(key);
+            return;
+        }
+    };
+    preview.projected_source_count = projection.cells.len();
+    preview.projected_sources.clone_from(&projection.cells);
+    preview.retask_handle_count = interaction.retask_handles.len();
+    preview.retask_order_count = projection.superseded_order_count;
+    preview.retask_strength = projection.superseded_strength;
+    preview.projected_strength = projection.affected_strength_by_cell.values().copied().sum();
+    preview.projected_capacity = projection
+        .cells
+        .iter()
+        .map(|coordinate| {
+            let capacity = view
+                .cell(*coordinate)
+                .map_or(0, |cell| cell.military_capacity);
+            capacity.saturating_sub(
+                projection
+                    .unaffected_strength_by_cell
+                    .get(coordinate)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .sum();
+    if projection.cells.len() > MAX_COMMAND_SELECTION_CELLS {
+        preview.invalid_reason = Some("Selection exceeds the 4096-cell V1 command limit");
+        interaction.preview = preview;
+        interaction.preview_key = Some(key);
+        return;
+    }
     match &interaction.mode {
         OrderMode::PushFrontOrient { .. } | OrderMode::PushFrontPreview { .. } => {
             if let Some(direction) = interaction.push_direction() {
-                build_push_front_preview(
+                build_projected_push_front_preview(
                     &view,
-                    &interaction.sources,
+                    &projection,
                     direction,
                     interaction.amount_percent,
                     &mut preview,
@@ -1317,15 +1536,15 @@ fn update_order_preview(view: Res<MatchView>, mut interaction: ResMut<Interactio
                 preview.invalid_reason = Some("Drag farther to choose one of six directions");
             }
         }
-        OrderMode::ExpandAllPreview => build_expand_all_preview(
+        OrderMode::ExpandAllPreview => build_projected_expand_all_preview(
             &view,
-            &interaction.sources,
+            &projection,
             interaction.amount_percent,
             &mut preview,
         ),
-        OrderMode::BalancePreview => build_redistribution_preview(
+        OrderMode::BalancePreview => build_projected_redistribution_preview(
             &view,
-            &interaction.sources,
+            &projection,
             CoreDistributionPreset::Balance,
             interaction.amount_percent,
             &mut preview,
@@ -1333,9 +1552,9 @@ fn update_order_preview(view: Res<MatchView>, mut interaction: ResMut<Interactio
         OrderMode::FrontLoadOrient { .. } | OrderMode::FrontLoadPreview { .. } => {
             if let Some(direction) = interaction.frontload_direction() {
                 if let Some(direction) = quantize_world_direction(direction) {
-                    build_redistribution_preview(
+                    build_projected_redistribution_preview(
                         &view,
-                        &interaction.sources,
+                        &projection,
                         CoreDistributionPreset::front_load(direction),
                         interaction.amount_percent,
                         &mut preview,
@@ -1345,16 +1564,16 @@ fn update_order_preview(view: Res<MatchView>, mut interaction: ResMut<Interactio
                 }
             }
         }
-        OrderMode::CoreLoadPreview => build_redistribution_preview(
+        OrderMode::CoreLoadPreview => build_projected_redistribution_preview(
             &view,
-            &interaction.sources,
+            &projection,
             CoreDistributionPreset::CoreLoad,
             interaction.amount_percent,
             &mut preview,
         ),
-        OrderMode::PerimeterLoadPreview => build_redistribution_preview(
+        OrderMode::PerimeterLoadPreview => build_projected_redistribution_preview(
             &view,
-            &interaction.sources,
+            &projection,
             CoreDistributionPreset::PerimeterLoad,
             interaction.amount_percent,
             &mut preview,
@@ -1366,15 +1585,30 @@ fn update_order_preview(view: Res<MatchView>, mut interaction: ResMut<Interactio
     interaction.preview_key = Some(key);
 }
 
-fn build_redistribution_preview(
+const fn projection_error_text(error: OrderSelectionProjectionError) -> &'static str {
+    match error {
+        OrderSelectionProjectionError::InvalidSource(_) => {
+            "A selected source is no longer owned passable ground"
+        }
+        OrderSelectionProjectionError::StaleOrder(_) => {
+            "A retask handle no longer references an active local order"
+        }
+        OrderSelectionProjectionError::UnknownPacketCell(_) => {
+            "A retasked order references an unknown map cell"
+        }
+    }
+}
+
+fn build_projected_redistribution_preview(
     view: &MatchView,
-    selected: &BTreeSet<Axial>,
+    projection: &ProjectedOrderSelection,
     preset: CoreDistributionPreset,
     amount_percent: u8,
     preview: &mut OrderPreview,
 ) {
+    let selected = &projection.cells;
     if selected.len() < 2 {
-        preview.invalid_reason = Some("Redistribution needs at least two owned hexes");
+        preview.invalid_reason = Some("Redistribution needs at least two effective source hexes");
         return;
     }
 
@@ -1389,7 +1623,17 @@ fn build_redistribution_preview(
             preview.invalid_reason = Some("Redistribution needs owned passable ground");
             return;
         }
-        total = total.saturating_add(cell.infantry);
+        let affected = projection
+            .affected_strength_by_cell
+            .get(&coordinate)
+            .copied()
+            .unwrap_or(0);
+        let unaffected = projection
+            .unaffected_strength_by_cell
+            .get(&coordinate)
+            .copied()
+            .unwrap_or(0);
+        total = total.saturating_add(affected);
         map.insert(Cell {
             coordinate,
             terrain: cell.terrain,
@@ -1399,8 +1643,8 @@ fn build_redistribution_preview(
             owner: cell.owner,
             civilian_population: cell.civilians,
             civilian_capacity: cell.civilians,
-            forces: ForceComposition::infantry(cell.infantry),
-            military_capacity: cell.military_capacity,
+            forces: ForceComposition::infantry(affected),
+            military_capacity: cell.military_capacity.saturating_sub(unaffected),
         });
     }
 
@@ -1418,27 +1662,50 @@ fn build_redistribution_preview(
     };
 
     for (&coordinate, &target) in &distribution.targets {
-        let capacity = view
-            .cell(coordinate)
-            .map_or(0, |cell| cell.military_capacity);
+        let Some(cell) = view.cell(coordinate) else {
+            continue;
+        };
+        let capacity = cell.military_capacity;
+        let unaffected = projection
+            .unaffected_strength_by_cell
+            .get(&coordinate)
+            .copied()
+            .unwrap_or(0);
         preview.heatmap.insert(
             coordinate,
             if capacity == 0 {
                 0.0
             } else {
-                target as f32 / capacity as f32
+                unaffected.saturating_add(target) as f32 / capacity as f32
             },
         );
     }
     preview.strength_upper_bound = selected
         .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| cell.infantry.saturating_mul(u64::from(amount_bps)) / 10_000)
+        .map(|coordinate| {
+            projection
+                .affected_strength_by_cell
+                .get(coordinate)
+                .copied()
+                .unwrap_or(0)
+                .saturating_mul(u64::from(amount_bps))
+                / 10_000
+        })
         .sum();
     preview.destination_capacity = selected
         .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| cell.military_capacity)
+        .map(|coordinate| {
+            let capacity = view
+                .cell(*coordinate)
+                .map_or(0, |cell| cell.military_capacity);
+            capacity.saturating_sub(
+                projection
+                    .unaffected_strength_by_cell
+                    .get(coordinate)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
         .sum();
     preview.eta_seconds = selected.len() as u32 / 3 + 3;
 }
@@ -1491,7 +1758,7 @@ fn submission_matches(interaction: &InteractionState, command_id: Option<u64>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CellView;
+    use crate::model::{CellView, ContestedCellView, RetaskProjection};
     use hex_core::TerrainKind;
 
     fn preview_cell(
@@ -1524,6 +1791,40 @@ mod tests {
         }
         view.rebuild_chunk_index();
         view
+    }
+
+    fn retask_preview_view() -> (MatchView, Axial, Axial, Axial) {
+        let rear = Axial::ZERO;
+        let front = Axial::new(1, 0);
+        let handle = Axial::new(2, 0);
+        let mut view = MatchView::connecting(1);
+        for cell in [
+            preview_cell(rear, Some(1), 100, 0),
+            preview_cell(front, Some(1), 80, 0),
+            preview_cell(handle, Some(2), 40, 0),
+        ] {
+            view.cells.insert(cell.coordinate, cell);
+        }
+        view.set_contested_cells(BTreeMap::from([(
+            handle,
+            ContestedCellView {
+                controller_player: 2,
+                attacker_player: 1,
+                attacker_strength: 50,
+                attacker_share: 50.0 / 90.0,
+            },
+        )]));
+        view.set_retask_projection(RetaskProjection {
+            handle_orders: BTreeMap::from([(handle, BTreeSet::from([7]))]),
+            active_order_ids: BTreeSet::from([7, 8]),
+            order_strength_by_cell: BTreeMap::from([
+                (7, BTreeMap::from([(rear, 30), (front, 20)])),
+                (8, BTreeMap::from([(rear, 20)])),
+            ]),
+            active_strength_by_cell: BTreeMap::from([(rear, 50), (front, 20)]),
+        });
+        view.rebuild_chunk_index();
+        (view, rear, front, handle)
     }
 
     fn pressed(keys: impl IntoIterator<Item = KeyCode>) -> ButtonInput<KeyCode> {
@@ -1670,6 +1971,82 @@ mod tests {
     }
 
     #[test]
+    fn retask_handle_snapshots_orders_and_reconciliation_never_rebinds_it() {
+        let (mut view, _rear, _front, handle) = retask_preview_view();
+        let mut interaction = InteractionState::default();
+
+        assert!(may_paint_selection_cell(
+            &view,
+            &interaction,
+            handle,
+            PaintOperation::Add
+        ));
+        assert!(paint_selection_cell(
+            &view,
+            &mut interaction,
+            handle,
+            PaintOperation::Add
+        ));
+        assert_eq!(
+            interaction.retask_handles,
+            BTreeMap::from([(handle, BTreeSet::from([7]))])
+        );
+
+        let mut refreshed = view.retask_projection.clone();
+        refreshed.handle_orders.insert(handle, BTreeSet::from([8]));
+        view.set_retask_projection(refreshed);
+        assert!(!paint_selection_cell(
+            &view,
+            &mut interaction,
+            handle,
+            PaintOperation::Add
+        ));
+        assert_eq!(interaction.retask_handles[&handle], BTreeSet::from([7]));
+
+        view.contested_cells.remove(&handle);
+        assert!(!view.is_local_selection_cell(handle));
+        assert!(may_paint_selection_cell(
+            &view,
+            &interaction,
+            handle,
+            PaintOperation::Remove
+        ));
+        let mut active = view.retask_projection.clone();
+        active.active_order_ids = BTreeSet::from([7, 8]);
+        view.set_retask_projection(active);
+        assert!(!prune_invalid_selection(
+            &view,
+            &mut interaction.sources,
+            &mut interaction.retask_handles
+        ));
+        assert_eq!(interaction.retask_handles[&handle], BTreeSet::from([7]));
+
+        let mut finished = view.retask_projection.clone();
+        finished.active_order_ids = BTreeSet::from([8]);
+        view.set_retask_projection(finished);
+        assert!(prune_invalid_selection(
+            &view,
+            &mut interaction.sources,
+            &mut interaction.retask_handles
+        ));
+        assert!(interaction.retask_handles.is_empty());
+        assert!(!interaction.sources.contains(&handle));
+    }
+
+    #[test]
+    fn captured_retask_handle_stays_a_ghost_until_its_snapshotted_order_finishes() {
+        let (mut view, _rear, _front, handle) = retask_preview_view();
+        let mut sources = BTreeSet::new();
+        let mut handles = BTreeMap::from([(handle, BTreeSet::from([7]))]);
+        view.cell_mut(handle).expect("handle cell").owner = Some(1);
+        view.contested_cells.remove(&handle);
+
+        assert!(!prune_invalid_selection(&view, &mut sources, &mut handles));
+        assert_eq!(handles[&handle], BTreeSet::from([7]));
+        assert!(!sources.contains(&handle));
+    }
+
+    #[test]
     fn select_all_contains_only_local_owned_cells() {
         let view = MatchView::offline_fixture();
         let selected = all_local_owned_cells(&view);
@@ -1737,10 +2114,42 @@ mod tests {
         prior = current;
 
         view.chunk_index_revision = view.chunk_index_revision.wrapping_add(1);
+        let current = order_preview_key(&view, &interaction).expect("topology key");
+        assert_ne!(current, prior);
+        prior = current;
+
+        view.retask_revision = view.retask_revision.wrapping_add(1);
         assert_ne!(
-            order_preview_key(&view, &interaction).expect("topology key"),
+            order_preview_key(&view, &interaction).expect("retask key"),
             prior
         );
+    }
+
+    #[test]
+    fn handle_only_preview_expands_to_current_packet_cells() {
+        let (view, rear, front, handle) = retask_preview_view();
+        let interaction = InteractionState {
+            retask_handles: BTreeMap::from([(handle, BTreeSet::from([7]))]),
+            mode: OrderMode::BalancePreview,
+            amount_percent: 50,
+            source_revision: 1,
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(view)
+            .insert_resource(interaction)
+            .add_systems(Update, update_order_preview);
+        app.update();
+
+        let preview = &app.world().resource::<InteractionState>().preview;
+        assert_eq!(preview.invalid_reason, None);
+        assert_eq!(preview.projected_sources, BTreeSet::from([rear, front]));
+        assert_eq!(preview.projected_source_count, 2);
+        assert_eq!(preview.retask_handle_count, 1);
+        assert_eq!(preview.retask_order_count, 1);
+        assert_eq!(preview.retask_strength, 50);
+        assert_eq!(preview.projected_strength, 160);
+        assert!(!preview.heatmap.is_empty());
     }
 
     #[test]
@@ -2088,6 +2497,102 @@ mod tests {
             Some("Selection exceeds the 4096-cell V1 command limit")
         );
         assert!(preview.heatmap.is_empty());
+    }
+
+    #[test]
+    fn every_order_preview_rejects_too_many_superseded_orders_before_projection() {
+        let handle = Axial::new(1, 0);
+        let interaction = InteractionState {
+            retask_handles: BTreeMap::from([(
+                handle,
+                (0..=u64::try_from(MAX_COMMAND_SUPERSEDE_ORDERS).expect("limit fits u64"))
+                    .collect(),
+            )]),
+            mode: OrderMode::BalancePreview,
+            source_revision: 1,
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(MatchView::connecting(1))
+            .insert_resource(interaction)
+            .add_systems(Update, update_order_preview);
+        app.update();
+
+        let preview = &app.world().resource::<InteractionState>().preview;
+        assert_eq!(
+            preview.invalid_reason,
+            Some("Retask selection exceeds the 4096-order V1 command limit")
+        );
+        assert!(preview.heatmap.is_empty());
+    }
+
+    #[test]
+    fn every_issue_intent_carries_the_exact_snapshotted_order_ids() {
+        let source = Axial::ZERO;
+        let handle = Axial::new(2, 0);
+        let ids = BTreeSet::from([7, 9]);
+        let mut interaction = InteractionState {
+            sources: BTreeSet::from([source]),
+            retask_handles: BTreeMap::from([(handle, ids.clone())]),
+            amount_percent: 70,
+            preview: OrderPreview {
+                front_edges: vec![DirectedFrontEdge {
+                    source,
+                    target: Axial::new(1, 0),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        interaction.mode = OrderMode::PushFrontPreview {
+            direction: Axial::new(1, 0),
+        };
+        let (push, _, _) = submission_request(&interaction).expect("push request");
+        let ClientIntent::PushFront {
+            sources,
+            supersede_order_ids,
+            commitment_percent,
+            ..
+        } = push
+        else {
+            panic!("expected Push Front intent");
+        };
+        assert_eq!(sources, BTreeSet::from([source]));
+        assert_eq!(supersede_order_ids, ids);
+        assert_eq!(commitment_percent, 70);
+
+        interaction.mode = OrderMode::ExpandAllPreview;
+        let (expand, _, _) = submission_request(&interaction).expect("expand request");
+        let ClientIntent::ExpandAll {
+            sources,
+            supersede_order_ids,
+            commitment_percent,
+        } = expand
+        else {
+            panic!("expected Expand All intent");
+        };
+        assert_eq!(sources, BTreeSet::from([source]));
+        assert_eq!(supersede_order_ids, BTreeSet::from([7, 9]));
+        assert_eq!(commitment_percent, 70);
+
+        interaction.mode = OrderMode::CoreLoadPreview;
+        let (redistribute, _, _) =
+            submission_request(&interaction).expect("redistribution request");
+        let ClientIntent::Redistribute {
+            cells,
+            supersede_order_ids,
+            amount_percent,
+            preset,
+            ..
+        } = redistribute
+        else {
+            panic!("expected redistribution intent");
+        };
+        assert_eq!(cells, BTreeSet::from([source]));
+        assert_eq!(supersede_order_ids, BTreeSet::from([7, 9]));
+        assert_eq!(amount_percent, 70);
+        assert_eq!(preset, RedistributionPreset::CoreLoad);
     }
 
     #[test]

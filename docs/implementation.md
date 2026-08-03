@@ -197,6 +197,16 @@ authoritative cell IDs, invokes reducers, pumps SpacetimeDB frames, and rebuilds
 message boundary for UI development but is not a rules-equivalent substitute
 for the server.
 
+`MatchView` joins active local transfer orders, their packets, and hostile
+front edges into a compact retask projection. A selection stores ordinary
+owned cells separately from `handle -> snapshotted order IDs`; packet current
+cells are derived live for preview but newly pressing order IDs are never
+adopted. Reducer intents send physical source IDs and explicit supersede-order
+IDs. The module preflights conservation and the complete new plan against a
+virtual release, then cancels the exact old IDs and persists the prepared order
+in the same transaction. A rejection therefore leaves old packets, counters,
+and reservations intact.
+
 The V1 conquest interaction is Push Front: paint one connected owned region,
 hold `P`, drag outward, and release to preview one exact direction. Plain
 brackets adjust commitment and `Enter` submits. Selected cells facing non-owned

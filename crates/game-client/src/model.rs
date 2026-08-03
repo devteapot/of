@@ -151,6 +151,37 @@ pub struct ContestedCellView {
     pub attacker_share: f32,
 }
 
+/// Client-side projection used to preview redistribution commands that retask
+/// troops already committed to an active order. Enemy contested cells act as
+/// handles; selecting one expands to every current packet cell of each order
+/// represented at that combat front.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RetaskProjection {
+    pub handle_orders: BTreeMap<Axial, BTreeSet<u64>>,
+    pub active_order_ids: BTreeSet<u64>,
+    pub order_strength_by_cell: BTreeMap<u64, BTreeMap<Axial, u64>>,
+    pub active_strength_by_cell: BTreeMap<Axial, u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProjectedOrderSelection {
+    pub cells: BTreeSet<Axial>,
+    /// Strength this command may affect before its participation percentage is
+    /// applied. Unrelated active packet allocations are excluded.
+    pub affected_strength_by_cell: BTreeMap<Axial, u64>,
+    /// Strength that remains outside this command at each projected cell.
+    pub unaffected_strength_by_cell: BTreeMap<Axial, u64>,
+    pub superseded_order_count: usize,
+    pub superseded_strength: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderSelectionProjectionError {
+    InvalidSource(Axial),
+    StaleOrder(u64),
+    UnknownPacketCell(Axial),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToastKind {
     Info,
@@ -199,6 +230,10 @@ pub struct MatchView {
     /// this projection must dirty the chunks containing removed and inserted
     /// coordinates so their vertex colors are refreshed.
     pub contested_cells: BTreeMap<Axial, ContestedCellView>,
+    pub retask_projection: RetaskProjection,
+    /// Advances independently of cell state so order/packet-only changes
+    /// invalidate redistribution previews without forcing terrain recoloring.
+    pub retask_revision: u64,
     pub latest_result: String,
     pub order_log: VecDeque<String>,
     pub toast: Option<Toast>,
@@ -227,6 +262,8 @@ impl MatchView {
             active_flows: Vec::new(),
             active_fronts: Vec::new(),
             contested_cells: BTreeMap::new(),
+            retask_projection: RetaskProjection::default(),
+            retask_revision: 0,
             latest_result: "Connecting to authoritative match…".to_owned(),
             order_log: VecDeque::new(),
             toast: None,
@@ -355,6 +392,8 @@ impl MatchView {
                 age: 0.0,
             }],
             contested_cells: BTreeMap::new(),
+            retask_projection: RetaskProjection::default(),
+            retask_revision: 0,
             latest_result: "Offline fixture loaded · commands resolve locally".to_owned(),
             order_log,
             toast: Some(Toast {
@@ -413,6 +452,109 @@ impl MatchView {
     pub fn is_local_owned(&self, coordinate: Axial) -> bool {
         self.cell(coordinate)
             .is_some_and(|cell| cell.owner == Some(self.local_player))
+    }
+
+    pub fn is_local_owned_passable(&self, coordinate: Axial) -> bool {
+        self.cell(coordinate).is_some_and(|cell| {
+            cell.owner == Some(self.local_player) && cell.is_land() && !cell.blocked
+        })
+    }
+
+    pub fn is_local_retask_handle(&self, coordinate: Axial) -> bool {
+        let Some(cell) = self.cell(coordinate) else {
+            return false;
+        };
+        cell.is_land()
+            && !cell.blocked
+            && cell.owner.is_some_and(|owner| owner != self.local_player)
+            && self
+                .contested_cells
+                .get(&coordinate)
+                .is_some_and(|contest| {
+                    contest.attacker_player == self.local_player && contest.attacker_strength > 0
+                })
+    }
+
+    pub fn is_local_selection_cell(&self, coordinate: Axial) -> bool {
+        self.is_local_owned_passable(coordinate) || self.is_local_retask_handle(coordinate)
+    }
+
+    pub fn set_retask_projection(&mut self, projection: RetaskProjection) {
+        if self.retask_projection == projection {
+            return;
+        }
+        self.retask_projection = projection;
+        self.retask_revision = self.retask_revision.wrapping_add(1);
+    }
+
+    pub fn project_order_selection(
+        &self,
+        sources: &BTreeSet<Axial>,
+        supersede_order_ids: &BTreeSet<u64>,
+    ) -> Result<ProjectedOrderSelection, OrderSelectionProjectionError> {
+        if let Some(&invalid) = sources
+            .iter()
+            .find(|coordinate| !self.is_local_owned_passable(**coordinate))
+        {
+            return Err(OrderSelectionProjectionError::InvalidSource(invalid));
+        }
+
+        let mut superseded_by_cell = BTreeMap::<Axial, u64>::new();
+        for &order_id in supersede_order_ids {
+            if !self.retask_projection.active_order_ids.contains(&order_id) {
+                return Err(OrderSelectionProjectionError::StaleOrder(order_id));
+            }
+            let Some(strength_by_cell) =
+                self.retask_projection.order_strength_by_cell.get(&order_id)
+            else {
+                return Err(OrderSelectionProjectionError::StaleOrder(order_id));
+            };
+            for (&coordinate, &strength) in strength_by_cell {
+                let pooled = superseded_by_cell.entry(coordinate).or_default();
+                *pooled = pooled.saturating_add(strength);
+            }
+        }
+
+        let mut projected = ProjectedOrderSelection {
+            cells: sources
+                .iter()
+                .copied()
+                .chain(superseded_by_cell.keys().copied())
+                .collect(),
+            superseded_order_count: supersede_order_ids.len(),
+            superseded_strength: superseded_by_cell.values().copied().sum(),
+            ..Default::default()
+        };
+        for &coordinate in &projected.cells {
+            let Some(cell) = self.cell(coordinate) else {
+                return Err(OrderSelectionProjectionError::UnknownPacketCell(coordinate));
+            };
+            let active = self
+                .retask_projection
+                .active_strength_by_cell
+                .get(&coordinate)
+                .copied()
+                .unwrap_or(0)
+                .min(cell.infantry);
+            let superseded = superseded_by_cell
+                .get(&coordinate)
+                .copied()
+                .unwrap_or(0)
+                .min(active);
+            // Once an order is explicitly superseded, its current packet cells
+            // become physical sources. All otherwise-unallocated infantry at
+            // those cells is available too; only unrelated active allocations
+            // remain outside the replacement command.
+            let unallocated = cell.infantry.saturating_sub(active);
+            let affected = unallocated.saturating_add(superseded).min(cell.infantry);
+            projected
+                .affected_strength_by_cell
+                .insert(coordinate, affected);
+            projected
+                .unaffected_strength_by_cell
+                .insert(coordinate, cell.infantry.saturating_sub(affected));
+        }
+        Ok(projected)
     }
 
     pub fn conquest_percent(&self, player: u32) -> f32 {
@@ -755,5 +897,79 @@ mod tests {
         assert!(view.dirty_chunks.contains(&chunk_of(added)));
         assert!(!view.contested_cells.contains_key(&cleared));
         assert!(view.contested_cells.contains_key(&added));
+    }
+
+    #[test]
+    fn retask_projection_releases_selected_orders_but_preserves_unrelated_allocations() {
+        let first = Axial::ZERO;
+        let second = Axial::new(1, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(first, flat_cell(first, 100));
+        view.cells.insert(second, flat_cell(second, 50));
+        view.set_retask_projection(RetaskProjection {
+            active_order_ids: BTreeSet::from([7, 9]),
+            order_strength_by_cell: BTreeMap::from([
+                (7, BTreeMap::from([(first, 40), (second, 10)])),
+                (9, BTreeMap::from([(first, 20), (second, 20)])),
+            ]),
+            active_strength_by_cell: BTreeMap::from([(first, 60), (second, 30)]),
+            ..Default::default()
+        });
+
+        let projected = view
+            .project_order_selection(&BTreeSet::new(), &BTreeSet::from([7]))
+            .expect("active order should project to every packet cell");
+
+        assert_eq!(projected.cells, BTreeSet::from([first, second]));
+        assert_eq!(projected.superseded_order_count, 1);
+        assert_eq!(projected.superseded_strength, 50);
+        assert_eq!(
+            projected.affected_strength_by_cell,
+            BTreeMap::from([(first, 80), (second, 30)])
+        );
+        assert_eq!(
+            projected.unaffected_strength_by_cell,
+            BTreeMap::from([(first, 20), (second, 20)])
+        );
+    }
+
+    #[test]
+    fn enemy_local_pressure_is_a_handle_but_local_contest_is_an_owned_source() {
+        let enemy = Axial::ZERO;
+        let local = Axial::new(1, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(
+            enemy,
+            CellView {
+                owner: Some(PLAYER_TWO),
+                ..flat_cell(enemy, 20)
+            },
+        );
+        view.cells.insert(local, flat_cell(local, 30));
+        view.contested_cells = BTreeMap::from([
+            (
+                enemy,
+                ContestedCellView {
+                    controller_player: PLAYER_TWO,
+                    attacker_player: PLAYER_ONE,
+                    attacker_strength: 15,
+                    attacker_share: 15.0 / 35.0,
+                },
+            ),
+            (
+                local,
+                ContestedCellView {
+                    controller_player: PLAYER_ONE,
+                    attacker_player: PLAYER_TWO,
+                    attacker_strength: 10,
+                    attacker_share: 0.25,
+                },
+            ),
+        ]);
+
+        assert!(view.is_local_retask_handle(enemy));
+        assert!(!view.is_local_owned_passable(enemy));
+        assert!(view.is_local_owned_passable(local));
+        assert!(!view.is_local_retask_handle(local));
     }
 }

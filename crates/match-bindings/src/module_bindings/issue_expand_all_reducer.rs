@@ -8,16 +8,18 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub(super) struct IssueExpandAllArgs {
     pub client_command_id: u64,
-    pub selected_cells: Vec<u32>,
+    pub source_cells: Vec<u32>,
     pub commitment_bps: u32,
+    pub supersede_order_ids: Vec<u64>,
 }
 
 impl From<IssueExpandAllArgs> for super::Reducer {
     fn from(args: IssueExpandAllArgs) -> Self {
         Self::IssueExpandAll {
             client_command_id: args.client_command_id,
-            selected_cells: args.selected_cells,
+            source_cells: args.source_cells,
             commitment_bps: args.commitment_bps,
+            supersede_order_ids: args.supersede_order_ids,
         }
     }
 }
@@ -40,10 +42,17 @@ pub trait issue_expand_all {
     fn issue_expand_all(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         commitment_bps: u32,
+        supersede_order_ids: Vec<u64>,
     ) -> __sdk::Result<()> {
-        self.issue_expand_all_then(client_command_id, selected_cells, commitment_bps, |_, _| {})
+        self.issue_expand_all_then(
+            client_command_id,
+            source_cells,
+            commitment_bps,
+            supersede_order_ids,
+            |_, _| {},
+        )
     }
 
     /// Request that the remote module invoke the reducer `issue_expand_all` to run as soon as possible,
@@ -55,8 +64,9 @@ pub trait issue_expand_all {
     fn issue_expand_all_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         commitment_bps: u32,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -70,8 +80,9 @@ impl issue_expand_all for super::RemoteReducers {
     fn issue_expand_all_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         commitment_bps: u32,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -82,8 +93,9 @@ impl issue_expand_all for super::RemoteReducers {
         self.imp.invoke_reducer_with_callback(
             IssueExpandAllArgs {
                 client_command_id,
-                selected_cells,
+                source_cells,
                 commitment_bps,
+                supersede_order_ids,
             },
             callback,
         )

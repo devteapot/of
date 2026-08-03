@@ -18,7 +18,10 @@ use hex_core::{
 
 use crate::{
     geometry::axial_to_plane,
-    model::{ActiveFlow, ActiveFront, MatchPhase, MatchView, ToastKind},
+    model::{
+        ActiveFlow, ActiveFront, MatchPhase, MatchView, OrderSelectionProjectionError,
+        ProjectedOrderSelection, ToastKind,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,11 +36,13 @@ pub enum RedistributionPreset {
 pub enum ClientIntent {
     PushFront {
         sources: BTreeSet<Axial>,
+        supersede_order_ids: BTreeSet<u64>,
         direction: Axial,
         commitment_percent: u8,
     },
     ExpandAll {
         sources: BTreeSet<Axial>,
+        supersede_order_ids: BTreeSet<u64>,
         commitment_percent: u8,
     },
     CancelExpandAll {
@@ -49,6 +54,7 @@ pub enum ClientIntent {
     },
     Redistribute {
         cells: BTreeSet<Axial>,
+        supersede_order_ids: BTreeSet<u64>,
         preset: RedistributionPreset,
         direction: Option<Vec2>,
         amount_percent: u8,
@@ -125,13 +131,26 @@ pub fn resolve_offline_intents(
         let update = match intent {
             ClientIntent::PushFront {
                 sources,
+                supersede_order_ids,
                 direction,
                 commitment_percent,
-            } => resolve_push_front(&view, sources, *direction, *commitment_percent),
+            } => resolve_push_front_with_retask(
+                &view,
+                sources,
+                supersede_order_ids,
+                *direction,
+                *commitment_percent,
+            ),
             ClientIntent::ExpandAll {
                 sources,
+                supersede_order_ids,
                 commitment_percent,
-            } => resolve_expand_all(&view, sources, *commitment_percent),
+            } => resolve_expand_all_with_retask(
+                &view,
+                sources,
+                supersede_order_ids,
+                *commitment_percent,
+            ),
             ClientIntent::CancelExpandAll { .. } => ServerUpdate::Accepted {
                 command_id: None,
                 summary: "Matching active Expand All operations stopped".to_owned(),
@@ -148,10 +167,18 @@ pub fn resolve_offline_intents(
             },
             ClientIntent::Redistribute {
                 cells,
+                supersede_order_ids,
                 preset,
                 direction,
                 amount_percent,
-            } => resolve_redistribution(&view, cells, *preset, *direction, *amount_percent),
+            } => resolve_redistribution_with_retask(
+                &view,
+                cells,
+                supersede_order_ids,
+                *preset,
+                *direction,
+                *amount_percent,
+            ),
             ClientIntent::SetMobilization { target } => ServerUpdate::MobilizationChanged {
                 command_id: None,
                 target: target.clamp(0.0, 1.0),
@@ -222,12 +249,43 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
     }
 }
 
+#[cfg(test)]
 fn resolve_push_front(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
     direction: Axial,
     commitment_percent: u8,
 ) -> ServerUpdate {
+    resolve_push_front_with_retask(
+        view,
+        sources,
+        &BTreeSet::new(),
+        direction,
+        commitment_percent,
+    )
+}
+
+fn resolve_push_front_with_retask(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    supersede_order_ids: &BTreeSet<u64>,
+    direction: Axial,
+    commitment_percent: u8,
+) -> ServerUpdate {
+    let projection = match view.project_order_selection(sources, supersede_order_ids) {
+        Ok(projection) => projection,
+        Err(error) => return projection_rejection(error),
+    };
+    resolve_projected_push_front(view, &projection, direction, commitment_percent)
+}
+
+fn resolve_projected_push_front(
+    view: &MatchView,
+    projection: &ProjectedOrderSelection,
+    direction: Axial,
+    commitment_percent: u8,
+) -> ServerUpdate {
+    let sources = &projection.cells;
     if let Some(invalid) = sources.iter().find(|coordinate| {
         view.cell(**coordinate).is_none_or(|cell| {
             !view.is_local_owned(**coordinate) || !cell.is_land() || cell.blocked
@@ -270,12 +328,13 @@ fn resolve_push_front(
     let percentage = u64::from(commitment_percent.clamp(10, 100));
     let requested_by_source = sources
         .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| {
-            (
-                cell.coordinate,
-                cell.infantry.saturating_mul(percentage) / 100,
-            )
+        .map(|coordinate| {
+            let strength = projection
+                .affected_strength_by_cell
+                .get(coordinate)
+                .copied()
+                .unwrap_or(0);
+            (*coordinate, strength.saturating_mul(percentage) / 100)
         })
         .collect::<BTreeMap<_, _>>();
     let requested = requested_by_source
@@ -302,9 +361,22 @@ fn resolve_push_front(
         let committed = committed_by_boundary.entry(*boundary).or_default();
         *committed = committed.saturating_add(*source_request);
         let cell = view.cell(*source).expect("push source was validated");
+        let unaffected = projection
+            .unaffected_strength_by_cell
+            .get(source)
+            .copied()
+            .unwrap_or(0);
+        let affected = projection
+            .affected_strength_by_cell
+            .get(source)
+            .copied()
+            .unwrap_or(0);
         changed.insert(
             *source,
-            (cell.owner, cell.infantry.saturating_sub(*source_request)),
+            (
+                cell.owner,
+                unaffected.saturating_add(affected.saturating_sub(*source_request)),
+            ),
         );
     }
     let committed = committed_by_boundary.values().copied().sum();
@@ -617,20 +689,20 @@ fn wave_continuation_target_is_eligible(view: &MatchView, from: Axial, target: A
 }
 
 fn boundary_strength_pools(
-    view: &MatchView,
     sources: &BTreeSet<Axial>,
     commitment_percent: u8,
     topology: &ExpandWaveTopology,
+    source_strength_by_cell: &BTreeMap<Axial, u64>,
 ) -> (u64, BTreeMap<Axial, u64>, BTreeMap<Axial, u64>) {
     let percentage = u64::from(commitment_percent.clamp(10, 100));
     let requested_by_source = sources
         .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| {
-            (
-                cell.coordinate,
-                cell.infantry.saturating_mul(percentage) / 100,
-            )
+        .map(|coordinate| {
+            let strength = source_strength_by_cell
+                .get(coordinate)
+                .copied()
+                .unwrap_or(0);
+            (*coordinate, strength.saturating_mul(percentage) / 100)
         })
         .collect::<BTreeMap<_, _>>();
     let requested = requested_by_source.values().copied().sum();
@@ -677,12 +749,17 @@ fn distribute_evenly(total: u64, targets: &[Axial], incoming: &mut BTreeMap<Axia
 pub(crate) fn forecast_expand_wave(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
+    source_strength_by_cell: &BTreeMap<Axial, u64>,
     commitment_percent: u8,
     max_rings: u16,
 ) -> Result<ExpandWaveForecast, ExpandWaveError> {
     let topology = build_expand_wave_topology(view, sources, Some(max_rings))?;
-    let (strength_upper_bound, _, boundary_pools) =
-        boundary_strength_pools(view, sources, commitment_percent, &topology);
+    let (strength_upper_bound, _, boundary_pools) = boundary_strength_pools(
+        sources,
+        commitment_percent,
+        &topology,
+        source_strength_by_cell,
+    );
     let mut incoming = BTreeMap::new();
     for (boundary, amount) in boundary_pools {
         distribute_evenly(
@@ -751,11 +828,34 @@ pub(crate) fn forecast_expand_wave(
     })
 }
 
+#[cfg(test)]
 fn resolve_expand_all(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
     commitment_percent: u8,
 ) -> ServerUpdate {
+    resolve_expand_all_with_retask(view, sources, &BTreeSet::new(), commitment_percent)
+}
+
+fn resolve_expand_all_with_retask(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    supersede_order_ids: &BTreeSet<u64>,
+    commitment_percent: u8,
+) -> ServerUpdate {
+    let projection = match view.project_order_selection(sources, supersede_order_ids) {
+        Ok(projection) => projection,
+        Err(error) => return projection_rejection(error),
+    };
+    resolve_projected_expand_all(view, &projection, commitment_percent)
+}
+
+fn resolve_projected_expand_all(
+    view: &MatchView,
+    projection: &ProjectedOrderSelection,
+    commitment_percent: u8,
+) -> ServerUpdate {
+    let sources = &projection.cells;
     if sources.is_empty() {
         return rejection("Expand All selection is empty", None);
     }
@@ -782,8 +882,12 @@ fn resolve_expand_all(
             );
         }
     };
-    let (committed, requested_by_source, boundary_pools) =
-        boundary_strength_pools(view, sources, commitment_percent, &topology);
+    let (committed, requested_by_source, boundary_pools) = boundary_strength_pools(
+        sources,
+        commitment_percent,
+        &topology,
+        &projection.affected_strength_by_cell,
+    );
     if committed == 0 {
         return rejection(
             "Selected sources have no infantry to dispatch",
@@ -794,9 +898,22 @@ fn resolve_expand_all(
     let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
     for (source, source_request) in &requested_by_source {
         let cell = view.cell(*source).expect("expand source was validated");
+        let unaffected = projection
+            .unaffected_strength_by_cell
+            .get(source)
+            .copied()
+            .unwrap_or(0);
+        let affected = projection
+            .affected_strength_by_cell
+            .get(source)
+            .copied()
+            .unwrap_or(0);
         changed.insert(
             *source,
-            (cell.owner, cell.infantry.saturating_sub(*source_request)),
+            (
+                cell.owner,
+                unaffected.saturating_add(affected.saturating_sub(*source_request)),
+            ),
         );
     }
 
@@ -1079,6 +1196,7 @@ const fn expand_error_message(error: FrontSelectionError) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn resolve_redistribution(
     view: &MatchView,
     cells: &BTreeSet<Axial>,
@@ -1086,9 +1204,42 @@ fn resolve_redistribution(
     direction: Option<Vec2>,
     amount_percent: u8,
 ) -> ServerUpdate {
+    resolve_redistribution_with_retask(
+        view,
+        cells,
+        &BTreeSet::new(),
+        preset,
+        direction,
+        amount_percent,
+    )
+}
+
+fn resolve_redistribution_with_retask(
+    view: &MatchView,
+    cells: &BTreeSet<Axial>,
+    supersede_order_ids: &BTreeSet<u64>,
+    preset: RedistributionPreset,
+    direction: Option<Vec2>,
+    amount_percent: u8,
+) -> ServerUpdate {
+    let projection = match view.project_order_selection(cells, supersede_order_ids) {
+        Ok(projection) => projection,
+        Err(error) => return projection_rejection(error),
+    };
+    resolve_projected_redistribution(view, &projection, preset, direction, amount_percent)
+}
+
+fn resolve_projected_redistribution(
+    view: &MatchView,
+    projection: &ProjectedOrderSelection,
+    preset: RedistributionPreset,
+    direction: Option<Vec2>,
+    amount_percent: u8,
+) -> ServerUpdate {
+    let cells = &projection.cells;
     if cells.len() < 2 {
         return rejection(
-            "Redistribution needs at least two owned hexes",
+            "Redistribution needs at least two effective source hexes",
             cells.first().copied(),
         );
     }
@@ -1123,7 +1274,17 @@ fn resolve_redistribution(
                 Some(coordinate),
             );
         }
-        total = total.saturating_add(cell.infantry);
+        let affected = projection
+            .affected_strength_by_cell
+            .get(&coordinate)
+            .copied()
+            .unwrap_or(0);
+        let unaffected = projection
+            .unaffected_strength_by_cell
+            .get(&coordinate)
+            .copied()
+            .unwrap_or(0);
+        total = total.saturating_add(affected);
         map.insert(Cell {
             coordinate,
             terrain: cell.terrain,
@@ -1133,8 +1294,8 @@ fn resolve_redistribution(
             owner: cell.owner,
             civilian_population: cell.civilians,
             civilian_capacity: cell.civilians,
-            forces: ForceComposition::infantry(cell.infantry),
-            military_capacity: cell.military_capacity,
+            forces: ForceComposition::infantry(affected),
+            military_capacity: cell.military_capacity.saturating_sub(unaffected),
         });
     }
     let amount_bps = u32::from(amount_percent.clamp(10, 100)) * 100;
@@ -1154,10 +1315,17 @@ fn resolve_redistribution(
     let patches = distribution
         .targets
         .into_iter()
-        .map(|(coordinate, infantry)| CellPatch {
-            coordinate,
-            owner: Some(view.local_player),
-            infantry,
+        .map(|(coordinate, infantry)| {
+            let unaffected = projection
+                .unaffected_strength_by_cell
+                .get(&coordinate)
+                .copied()
+                .unwrap_or(0);
+            CellPatch {
+                coordinate,
+                owner: Some(view.local_player),
+                infantry: unaffected.saturating_add(infantry),
+            }
         })
         .collect();
 
@@ -1187,6 +1355,23 @@ fn rejection(reason: impl Into<String>, relevant_cell: Option<Axial>) -> ServerU
     }
 }
 
+fn projection_rejection(error: OrderSelectionProjectionError) -> ServerUpdate {
+    match error {
+        OrderSelectionProjectionError::InvalidSource(coordinate) => rejection(
+            "Order source is no longer owned passable ground",
+            Some(coordinate),
+        ),
+        OrderSelectionProjectionError::StaleOrder(order_id) => rejection(
+            format!("Retask order #{order_id} is no longer active with local troops"),
+            None,
+        ),
+        OrderSelectionProjectionError::UnknownPacketCell(coordinate) => rejection(
+            "Retask order references a cell missing from the local map",
+            Some(coordinate),
+        ),
+    }
+}
+
 fn world_direction_to_axial(direction: Vec2) -> Option<Axial> {
     if direction.length_squared() < 0.001 {
         return None;
@@ -1203,7 +1388,7 @@ fn world_direction_to_axial(direction: Vec2) -> Option<Axial> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CellView;
+    use crate::model::{CellView, RetaskProjection};
     use hex_core::TerrainKind;
 
     fn cell(coordinate: Axial, infantry: u64) -> CellView {
@@ -1628,6 +1813,64 @@ mod tests {
         };
         assert_eq!(target(left), Some(75));
         assert_eq!(target(right), Some(25));
+    }
+
+    #[test]
+    fn offline_retask_redistributes_selected_packets_and_preserves_unrelated_strength() {
+        let left = Axial::ZERO;
+        let right = Axial::new(1, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(left, cell(left, 100));
+        view.cells.insert(right, cell(right, 20));
+        view.set_retask_projection(RetaskProjection {
+            handle_orders: BTreeMap::new(),
+            active_order_ids: BTreeSet::from([7, 8]),
+            order_strength_by_cell: BTreeMap::from([
+                (7, BTreeMap::from([(left, 30), (right, 10)])),
+                (8, BTreeMap::from([(left, 20)])),
+            ]),
+            active_strength_by_cell: BTreeMap::from([(left, 50), (right, 10)]),
+        });
+        view.rebuild_chunk_index();
+
+        let projected = view
+            .project_order_selection(&BTreeSet::new(), &BTreeSet::from([7]))
+            .expect("selected active order projects");
+        assert_eq!(projected.unaffected_strength_by_cell[&left], 20);
+        assert_eq!(projected.affected_strength_by_cell[&left], 80);
+
+        let update = resolve_redistribution_with_retask(
+            &view,
+            &BTreeSet::new(),
+            &BTreeSet::from([7]),
+            RedistributionPreset::Balance,
+            None,
+            50,
+        );
+        let ServerUpdate::Accepted { patches, .. } = update else {
+            panic!("handle-only redistribution should be accepted");
+        };
+        let target = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+        };
+        assert_eq!(target(left), Some(64));
+        assert_eq!(target(right), Some(56));
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 120);
+
+        assert!(matches!(
+            resolve_redistribution_with_retask(
+                &view,
+                &BTreeSet::new(),
+                &BTreeSet::from([9]),
+                RedistributionPreset::Balance,
+                None,
+                50,
+            ),
+            ServerUpdate::Rejected { reason, .. } if reason.contains("no longer active")
+        ));
     }
 
     #[test]

@@ -22,6 +22,9 @@ loop.
 - A global mobilization target that converts population locally over time.
 - Sustained directional Push Front orders with spatial conservation,
   lane-by-lane resistance, congestion, and manual cancellation.
+- Atomic whole-order retasking through contested-front handles: surviving
+  strength is reused at its real current cells, without teleporting or
+  double-allocating it.
 - Neutral-only Expand All orders that dispatch one selected percentage, route
   strength outward through a branching selected-region flow, merge converging
   contributions, and continue as an independently advancing perimeter wave.
@@ -121,7 +124,7 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 
 | Input | Action |
 | --- | --- |
-| Left drag | Paint cells |
+| Left drag | Paint owned cells or a locally attacked contested-front handle |
 | Shift + left drag | Add to the current region |
 | Control + left drag | Remove from the current region |
 | `[` / `]` while selecting | Remove or add one complete hex ring around the brush |
@@ -163,6 +166,15 @@ lanes; terrain, elevation, throughput, frontage, resistance, and terrain-scaled
 garrisons determine how far each lane travels. Contested cells keep one
 authoritative controller while their terrain color blends controller and
 attacker pressure for readability.
+
+A locally attacked contested cell can also be selected as an order handle.
+The client snapshots the active local order IDs pressing that cell. Confirming
+Push Front, Expand All, or a redistribution preset atomically replaces those
+whole orders: every surviving packet is released at its authoritative current
+cell, combined with the explicitly selected owned region, and replanned using
+the chosen percentage. Newly pressing orders never join the snapshot
+implicitly. If the replacement is invalid or an order became stale, the server
+rejects it and leaves every old order unchanged.
 
 Expand All uses the same connected selection without an orientation. Every
 selected cell contributes the chosen dispatch percentage of its currently

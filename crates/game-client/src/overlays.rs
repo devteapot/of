@@ -18,6 +18,7 @@ const SOURCE: Color = Color::srgb(0.44, 0.90, 0.94);
 const FRIENDLY: Color = Color::srgb(0.26, 0.78, 0.91);
 const HOSTILE: Color = Color::srgb(1.0, 0.39, 0.30);
 const AMBER: Color = Color::srgb(1.0, 0.69, 0.25);
+const RETASK: Color = Color::srgb(0.91, 0.54, 1.0);
 const BLOCKED: Color = Color::srgba(0.83, 0.35, 0.24, 0.72);
 
 #[derive(Clone, Copy)]
@@ -45,10 +46,11 @@ fn draw_world_overlays(
     chunks: Query<&TerrainChunk>,
     mut gizmos: Gizmos,
 ) {
-    let needs_visible_cells = !interaction.sources.is_empty()
+    let needs_visible_cells = interaction.has_selection()
         || !interaction.preview.front_edges.is_empty()
         || !interaction.preview.wave_depth.is_empty()
         || !interaction.preview.heatmap.is_empty()
+        || !interaction.preview.projected_sources.is_empty()
         || !interaction.preview.excluded.is_empty();
     let visible_cells = if needs_visible_cells {
         visible_cell_coordinates(&visible, &chunks)
@@ -125,13 +127,42 @@ fn draw_selection(
         gizmos,
     );
 
+    for coordinate in visible_cells
+        .iter()
+        .filter(|coordinate| interaction.retask_handles.contains_key(coordinate))
+    {
+        let Some(cell) = view.cell(*coordinate) else {
+            continue;
+        };
+        let center = point(cell, 0.135);
+        for direction in [0, 2, 4] {
+            draw_hex_edge(gizmos, center, direction, 0.91, RETASK);
+        }
+    }
+
+    if interaction.preview.retask_order_count > 0 {
+        for coordinate in visible_cells.iter().filter(|coordinate| {
+            interaction.preview.projected_sources.contains(coordinate)
+                && !interaction.sources.contains(coordinate)
+        }) {
+            let Some(cell) = view.cell(*coordinate) else {
+                continue;
+            };
+            let center = point(cell, 0.125);
+            for direction in [1, 3, 5] {
+                draw_hex_edge(gizmos, center, direction, 0.88, FRIENDLY);
+            }
+        }
+    }
+
     let hovered_footprint = interaction.hovered.map_or_else(BTreeSet::new, |hovered| {
         interaction
             .brush
             .cells(hovered)
             .into_iter()
             .filter(|coordinate| {
-                matches!(interaction.mode, OrderMode::Idle) && view.is_local_owned(*coordinate)
+                matches!(interaction.mode, OrderMode::Idle)
+                    && view.is_local_selection_cell(*coordinate)
             })
             .collect()
     });
@@ -262,7 +293,7 @@ fn draw_preview(
         interaction.mode,
         OrderMode::FrontLoadOrient { .. } | OrderMode::FrontLoadPreview { .. }
     ) && let Some(direction) = interaction.frontload_direction()
-        && let Some(center) = selection_center(view, &interaction.sources)
+        && let Some(center) = projected_selection_center(view, interaction)
     {
         let direction = Vec3::new(direction.x, 0.0, direction.y);
         gizmos
@@ -274,13 +305,20 @@ fn draw_preview(
         interaction.mode,
         OrderMode::PushFrontOrient { .. } | OrderMode::PushFrontPreview { .. }
     ) && let Some(direction) = interaction.push_direction()
-        && let Some(center) = selection_center(view, &interaction.sources)
+        && let Some(center) = projected_selection_center(view, interaction)
     {
         let direction = axial_to_world_direction(direction);
         gizmos
             .arrow(center - direction * 0.65, center + direction * 1.8, AMBER)
             .with_tip_length(0.38);
     }
+}
+
+fn projected_selection_center(view: &MatchView, interaction: &InteractionState) -> Option<Vec3> {
+    let order_ids = interaction.supersede_order_ids();
+    view.project_order_selection(&interaction.sources, &order_ids)
+        .ok()
+        .and_then(|projection| selection_center(view, &projection.cells))
 }
 
 fn draw_expand_wave(

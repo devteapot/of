@@ -49,6 +49,10 @@ and validates the same front; visual segment IDs are never authoritative.
 ### Selection and Push Front
 
 - Left click or drag paints owned source hexes.
+- A locally attacked enemy-controlled contested hex may instead be painted as
+  a tagged order handle. The gesture snapshots the local active order IDs
+  pressing that edge; the hex is not inserted into route geometry as though it
+  were owned.
 - `Shift + left`: add; `Control + left`: subtract.
 - In source-selection mode, `[` / `]` remove or add one complete six-neighbor
   ring around the brush. `Shift` modifies only width, and `Control` modifies
@@ -56,6 +60,14 @@ and validates the same front; visual segment IDs are never authoritative.
   remains centered on the hovered hex.
 - `C` selects the hovered six-connected owned cluster; Shift adds that cluster
   and Control removes it. `Control/Command + A` selects every owned hex.
+- Cluster and all-owned selection remain physical snapshots: they prune lost
+  or impassable cells, never auto-add later captures, and never flood through a
+  contested handle. Press `C` again to refresh the current owned component.
+- A tagged handle follows its snapshotted order IDs while their packet
+  locations update. It does not acquire newly pressing orders or silently
+  become a physical source after capture. The preview distinguishes the handle
+  from the derived current source cells and reports replaced order count and
+  surviving strength.
 - Hold `P`, drag outward, and release to quantize one exact hex direction. The
   selected region must be connected. Its active directional boundary may
   contain multiple disconnected arcs.
@@ -126,6 +138,9 @@ for possible future discrete units such as tanks or boats.
   preset. The unparticipating share of every cell's current stack is frozen in
   that cell; only the selected share joins the redistributed pool.
 - The heatmap represents proposed target density, not strength that has already moved.
+- Tagged contested handles may participate in every preset. Their whole
+  snapshotted orders are replaced atomically and the heatmap is calculated from
+  the packets' current physical cells plus explicitly selected owned cells.
 - `Enter` submits and `Escape` cancels while retaining the region selection.
 
 ### Mobilization

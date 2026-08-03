@@ -47,6 +47,29 @@ struct PlannedExpansion {
     requested: u64,
 }
 
+/// Read-only command view used to replace active orders without releasing
+/// their packets until the replacement has been fully planned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetaskSelection {
+    source_cells: BTreeSet<u32>,
+    superseded_order_ids: BTreeSet<u64>,
+    released_by_cell: BTreeMap<u32, u64>,
+}
+
+impl RetaskSelection {
+    fn released_at(&self, cell_id: u32) -> u64 {
+        self.released_by_cell.get(&cell_id).copied().unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetaskPacketSnapshot {
+    order_id: u64,
+    current_cell: u32,
+    infantry: u64,
+    current_cell_owned: bool,
+}
+
 #[derive(Clone, Debug)]
 struct FrontRouteTree {
     /// Coordinate -> `(cost to front, assigned boundary coordinate, next coordinate)`.
@@ -142,35 +165,56 @@ pub fn set_mobilization_target(
 pub fn issue_push_front(
     ctx: &ReducerContext,
     client_command_id: u64,
-    selected_cells: Vec<u32>,
+    source_cells: Vec<u32>,
     direction_q: i32,
     direction_r: i32,
     commitment_bps: u32,
+    supersede_order_ids: Vec<u64>,
 ) -> Result<(), String> {
     let player_id = require_running_player(ctx)?;
     if command_was_seen(ctx, player_id, client_command_id) {
         return Ok(());
     }
     let direction = Axial::new(direction_q, direction_r);
-    let result = plan_push_front(ctx, player_id, &selected_cells, direction, commitment_bps)
-        .and_then(|(requested, legs)| {
-            persist_order(
+    let prepared = resolve_retask_selection(
+        ctx,
+        player_id,
+        &source_cells,
+        &supersede_order_ids,
+        "push source",
+    )
+    .and_then(|selection| {
+        plan_push_front(ctx, player_id, &selection, direction, commitment_bps)
+            .map(|(requested, legs)| (selection, requested, legs))
+    });
+    let (selection, requested, legs) = match prepared {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            return receipt_result(
                 ctx,
                 player_id,
                 client_command_id,
-                OrderKind::PushFront,
-                requested,
-                direction,
-                legs,
-            )
-            .map(Some)
-        });
+                "issue_push_front",
+                Err(message),
+            );
+        }
+    };
+    cancel_superseded_orders(ctx, player_id, &selection.superseded_order_ids)?;
+    let order_id = persist_order(
+        ctx,
+        player_id,
+        client_command_id,
+        OrderKind::PushFront,
+        requested,
+        direction,
+        legs,
+    )?;
     receipt_result(
         ctx,
         player_id,
         client_command_id,
         "issue_push_front",
-        result,
+        Ok(Some(order_id)),
     )
 }
 
@@ -180,21 +224,44 @@ pub fn issue_push_front(
 pub fn issue_expand_all(
     ctx: &ReducerContext,
     client_command_id: u64,
-    selected_cells: Vec<u32>,
+    source_cells: Vec<u32>,
     commitment_bps: u32,
+    supersede_order_ids: Vec<u64>,
 ) -> Result<(), String> {
     let player_id = require_running_player(ctx)?;
     if command_was_seen(ctx, player_id, client_command_id) {
         return Ok(());
     }
-    let result = plan_expand_all(ctx, player_id, &selected_cells, commitment_bps)
-        .and_then(|plan| persist_expand_order(ctx, player_id, client_command_id, plan).map(Some));
+    let prepared = resolve_retask_selection(
+        ctx,
+        player_id,
+        &source_cells,
+        &supersede_order_ids,
+        "expand source",
+    )
+    .and_then(|selection| {
+        plan_expand_all(ctx, player_id, &selection, commitment_bps).map(|plan| (selection, plan))
+    });
+    let (selection, plan) = match prepared {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            return receipt_result(
+                ctx,
+                player_id,
+                client_command_id,
+                "issue_expand_all",
+                Err(message),
+            );
+        }
+    };
+    cancel_superseded_orders(ctx, player_id, &selection.superseded_order_ids)?;
+    let order_id = persist_expand_order(ctx, player_id, client_command_id, plan)?;
     receipt_result(
         ctx,
         player_id,
         client_command_id,
         "issue_expand_all",
-        result,
+        Ok(Some(order_id)),
     )
 }
 
@@ -202,14 +269,16 @@ pub fn issue_expand_all(
 pub fn issue_balance(
     ctx: &ReducerContext,
     client_command_id: u64,
-    selected_cells: Vec<u32>,
+    source_cells: Vec<u32>,
     amount_bps: u32,
+    supersede_order_ids: Vec<u64>,
 ) -> Result<(), String> {
     issue_distribution(
         ctx,
         client_command_id,
-        selected_cells,
+        source_cells,
         amount_bps,
+        supersede_order_ids,
         OrderKind::Balance,
         DistributionPreset::Balance,
         Axial::ZERO,
@@ -221,17 +290,19 @@ pub fn issue_balance(
 pub fn issue_front_load(
     ctx: &ReducerContext,
     client_command_id: u64,
-    selected_cells: Vec<u32>,
+    source_cells: Vec<u32>,
     orientation_q: i32,
     orientation_r: i32,
     amount_bps: u32,
+    supersede_order_ids: Vec<u64>,
 ) -> Result<(), String> {
     let direction = Axial::new(orientation_q, orientation_r);
     issue_distribution(
         ctx,
         client_command_id,
-        selected_cells,
+        source_cells,
         amount_bps,
+        supersede_order_ids,
         OrderKind::FrontLoad,
         DistributionPreset::front_load(direction),
         direction,
@@ -243,14 +314,16 @@ pub fn issue_front_load(
 pub fn issue_core_load(
     ctx: &ReducerContext,
     client_command_id: u64,
-    selected_cells: Vec<u32>,
+    source_cells: Vec<u32>,
     amount_bps: u32,
+    supersede_order_ids: Vec<u64>,
 ) -> Result<(), String> {
     issue_distribution(
         ctx,
         client_command_id,
-        selected_cells,
+        source_cells,
         amount_bps,
+        supersede_order_ids,
         OrderKind::CoreLoad,
         DistributionPreset::CoreLoad,
         Axial::ZERO,
@@ -262,14 +335,16 @@ pub fn issue_core_load(
 pub fn issue_perimeter_load(
     ctx: &ReducerContext,
     client_command_id: u64,
-    selected_cells: Vec<u32>,
+    source_cells: Vec<u32>,
     amount_bps: u32,
+    supersede_order_ids: Vec<u64>,
 ) -> Result<(), String> {
     issue_distribution(
         ctx,
         client_command_id,
-        selected_cells,
+        source_cells,
         amount_bps,
+        supersede_order_ids,
         OrderKind::PerimeterLoad,
         DistributionPreset::PerimeterLoad,
         Axial::ZERO,
@@ -281,8 +356,9 @@ pub fn issue_perimeter_load(
 fn issue_distribution(
     ctx: &ReducerContext,
     client_command_id: u64,
-    selected_cells: Vec<u32>,
+    source_cells: Vec<u32>,
     amount_bps: u32,
+    supersede_order_ids: Vec<u64>,
     kind: OrderKind,
     preset: DistributionPreset,
     orientation: Axial,
@@ -292,25 +368,67 @@ fn issue_distribution(
     if command_was_seen(ctx, player_id, client_command_id) {
         return Ok(());
     }
-    let result =
-        distribution_plan(ctx, player_id, &selected_cells, preset, amount_bps).and_then(|plan| {
-            if plan.amount == 0 {
-                Ok(None)
-            } else {
-                create_order(
-                    ctx,
-                    player_id,
-                    client_command_id,
-                    kind,
-                    plan.source_limits,
-                    plan.demands,
-                    plan.amount,
-                    orientation,
-                )
-                .map(Some)
-            }
-        });
-    receipt_result(ctx, player_id, client_command_id, command_name, result)
+    let prepared = resolve_retask_selection(
+        ctx,
+        player_id,
+        &source_cells,
+        &supersede_order_ids,
+        "redistribution",
+    )
+    .and_then(|selection| {
+        let plan = distribution_plan(ctx, player_id, &selection, preset, amount_bps)?;
+        let replacement = if plan.amount == 0 {
+            // A zero-delta redistribution with explicit superseded IDs is an
+            // intentional stop-in-place: survivors are released, but no new
+            // allocation is needed for the already-satisfied distribution.
+            None
+        } else {
+            let amount = plan.amount;
+            let legs = plan_distribution_legs(
+                ctx,
+                player_id,
+                &selection,
+                plan.source_limits,
+                plan.demands,
+                amount,
+            )?;
+            Some((amount, legs))
+        };
+        Ok((selection, replacement))
+    });
+    let (selection, replacement) = match prepared {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            return receipt_result(
+                ctx,
+                player_id,
+                client_command_id,
+                command_name,
+                Err(message),
+            );
+        }
+    };
+    cancel_superseded_orders(ctx, player_id, &selection.superseded_order_ids)?;
+    let order_id = if let Some((requested, legs)) = replacement {
+        Some(persist_order(
+            ctx,
+            player_id,
+            client_command_id,
+            kind,
+            requested,
+            orientation,
+            legs,
+        )?)
+    } else {
+        None
+    };
+    receipt_result(
+        ctx,
+        player_id,
+        client_command_id,
+        command_name,
+        Ok(order_id),
+    )
 }
 
 #[spacetimedb::reducer]
@@ -356,10 +474,191 @@ pub fn cancel_expand_all(
     )
 }
 
+fn resolve_retask_selection(
+    ctx: &ReducerContext,
+    player_id: u8,
+    source_cells: &[u32],
+    supersede_order_ids: &[u64],
+    label: &str,
+) -> Result<RetaskSelection, String> {
+    if source_cells.is_empty() && supersede_order_ids.is_empty() {
+        return Err(format!("{label} selection is empty"));
+    }
+    if source_cells.len() > MAX_SELECTION_CELLS {
+        return Err(format!(
+            "{label} selection exceeds the {MAX_SELECTION_CELLS}-cell command limit"
+        ));
+    }
+    if supersede_order_ids.len() > MAX_SELECTION_CELLS {
+        return Err(format!(
+            "superseded order selection exceeds the {MAX_SELECTION_CELLS}-order command limit"
+        ));
+    }
+    let owned_cells = source_cells.iter().copied().collect::<BTreeSet<_>>();
+    for &cell_id in &owned_cells {
+        if cell_state(ctx, cell_id)?.owner_player_id != player_id {
+            return Err(format!("{label} source cell {cell_id} is not owned"));
+        }
+    }
+
+    let requested_order_ids = supersede_order_ids.iter().copied().collect::<BTreeSet<_>>();
+    let mut active_orders = BTreeMap::new();
+    let mut packets = Vec::new();
+    for &order_id in &requested_order_ids {
+        let order = ctx
+            .db
+            .transfer_order()
+            .order_id()
+            .find(order_id)
+            .ok_or_else(|| format!("unknown superseded order {order_id}"))?;
+        let order_packets = ctx
+            .db
+            .transit_packet()
+            .packet_by_order()
+            .filter(order_id)
+            .collect::<Vec<_>>();
+        validate_superseded_order_claim(
+            order_id,
+            player_id,
+            order.player_id,
+            order.status,
+            !order_packets.is_empty(),
+        )?;
+        for packet in order_packets {
+            if packet.owner_player_id != player_id {
+                return Err(format!(
+                    "superseded order {order_id} has a packet owned by another player"
+                ));
+            }
+            packets.push(RetaskPacketSnapshot {
+                order_id,
+                current_cell: packet.current_cell,
+                infantry: packet.infantry,
+                current_cell_owned: cell_state(ctx, packet.current_cell)?.owner_player_id
+                    == player_id,
+            });
+        }
+        active_orders.insert(order_id, order);
+    }
+    let selection = resolve_retask_snapshot(owned_cells, &requested_order_ids, &packets)?;
+
+    // Preflight every old order before any reducer mutation. `cancel_order`
+    // performs the same accounting check when the prepared replacement is
+    // committed, so a bad survivor ledger cannot partially cancel a group.
+    for order_id in &selection.superseded_order_ids {
+        let order = active_orders
+            .get(order_id)
+            .ok_or_else(|| format!("retask order {order_id} is no longer active"))?;
+        let released = packets
+            .iter()
+            .filter(|packet| packet.order_id == *order_id)
+            .try_fold(0_u64, |total, packet| {
+                total
+                    .checked_add(packet.infantry)
+                    .ok_or_else(|| "retasked order strength overflow".to_string())
+            })?;
+        cancelled_settled_strength(
+            order.committed_infantry,
+            order.delivered_infantry,
+            order.casualty_infantry,
+            released,
+        )?;
+    }
+    Ok(selection)
+}
+
+fn validate_superseded_order_claim(
+    order_id: u64,
+    requester_player_id: u8,
+    order_player_id: u8,
+    status: OrderStatus,
+    has_surviving_packets: bool,
+) -> Result<(), String> {
+    if order_player_id != requester_player_id {
+        return Err(format!(
+            "superseded order {order_id} belongs to the other player"
+        ));
+    }
+    if status != OrderStatus::Active {
+        return Err(format!("superseded order {order_id} is no longer active"));
+    }
+    if !has_surviving_packets {
+        return Err(format!(
+            "superseded order {order_id} has no surviving packets"
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_retask_snapshot(
+    mut owned_cells: BTreeSet<u32>,
+    requested_order_ids: &BTreeSet<u64>,
+    packets: &[RetaskPacketSnapshot],
+) -> Result<RetaskSelection, String> {
+    for &order_id in requested_order_ids {
+        if !packets.iter().any(|packet| packet.order_id == order_id) {
+            return Err(format!(
+                "superseded order {order_id} has no surviving packets"
+            ));
+        }
+    }
+
+    let mut released_by_cell = BTreeMap::<u32, u64>::new();
+    for packet in packets
+        .iter()
+        .filter(|packet| requested_order_ids.contains(&packet.order_id))
+    {
+        if !packet.current_cell_owned {
+            return Err(format!(
+                "retask order {} has surviving strength on non-owned cell {}",
+                packet.order_id, packet.current_cell
+            ));
+        }
+        owned_cells.insert(packet.current_cell);
+        let released = released_by_cell.entry(packet.current_cell).or_default();
+        *released = released
+            .checked_add(packet.infantry)
+            .ok_or_else(|| "retasked cell strength overflow".to_string())?;
+    }
+    if owned_cells.len() > MAX_SELECTION_CELLS {
+        return Err(format!(
+            "retask physical selection exceeds the {MAX_SELECTION_CELLS}-cell command limit"
+        ));
+    }
+    Ok(RetaskSelection {
+        source_cells: owned_cells,
+        superseded_order_ids: requested_order_ids.clone(),
+        released_by_cell,
+    })
+}
+
+fn available_after_retask_release(
+    total_infantry: u64,
+    allocated_infantry: u64,
+    released_infantry: u64,
+) -> Result<u64, String> {
+    let unaffected =
+        unaffected_after_retask_release(total_infantry, allocated_infantry, released_infantry)?;
+    Ok(total_infantry - unaffected)
+}
+
+fn unaffected_after_retask_release(
+    current_infantry: u64,
+    allocated_infantry: u64,
+    released_infantry: u64,
+) -> Result<u64, String> {
+    if released_infantry > allocated_infantry {
+        return Err("retask released strength exceeds allocated strength at its cell".into());
+    }
+    let physically_allocated = allocated_infantry.min(current_infantry);
+    let physically_released = released_infantry.min(physically_allocated);
+    Ok(physically_allocated - physically_released)
+}
+
 fn plan_push_front(
     ctx: &ReducerContext,
     player_id: u8,
-    selected_cells: &[u32],
+    selection: &RetaskSelection,
     direction: Axial,
     commitment_bps: u32,
 ) -> Result<(u64, Vec<PlannedLeg>), String> {
@@ -368,10 +667,9 @@ fn plan_push_front(
         return Err("push direction must be one of the six adjacent hex directions".into());
     }
 
-    let selected_ids = unique_selection(selected_cells, "push source")?;
     let mut selected_map = HexMap::new();
     let mut coordinate_to_id = BTreeMap::new();
-    for cell_id in selected_ids {
+    for &cell_id in &selection.source_cells {
         let terrain_row = terrain(ctx, cell_id)?;
         let cell = core_cell(ctx, cell_id)?;
         if !terrain_row.passable || cell.owner != Some(u32::from(player_id)) {
@@ -442,7 +740,11 @@ fn plan_push_front(
             .get(&boundary)
             .ok_or_else(|| "push route ended at an unknown boundary".to_string())?;
         let allocated = allocated_infantry_at_cell(ctx, player_id, source_id);
-        let available = source.infantry.saturating_sub(allocated);
+        let available = available_after_retask_release(
+            source.infantry,
+            allocated,
+            selection.released_at(source_id),
+        )?;
         let commitment = basis_point_share(available, commitment_bps);
         requested = requested
             .checked_add(commitment)
@@ -481,12 +783,12 @@ fn plan_push_front(
 fn plan_expand_all(
     ctx: &ReducerContext,
     player_id: u8,
-    selected_cells: &[u32],
+    selection: &RetaskSelection,
     commitment_bps: u32,
 ) -> Result<PlannedExpansion, String> {
     validate_basis_points(commitment_bps, "expand commitment")?;
 
-    let selected_ids = unique_selection(selected_cells, "expand source")?;
+    let selected_ids = &selection.source_cells;
     let mut coordinate_to_id = BTreeMap::new();
     let mut commitments = BTreeMap::new();
     let mut requested = 0_u64;
@@ -500,7 +802,12 @@ fn plan_expand_all(
         }
         coordinate_to_id.insert(cell.coordinate, cell_id);
         let allocated = allocated_infantry_at_cell(ctx, player_id, cell_id);
-        let commitment = basis_point_share(cell.force().saturating_sub(allocated), commitment_bps);
+        let available = available_after_retask_release(
+            cell.force(),
+            allocated,
+            selection.released_at(cell_id),
+        )?;
+        let commitment = basis_point_share(available, commitment_bps);
         requested = requested
             .checked_add(commitment)
             .ok_or_else(|| "expand requested infantry overflow".to_string())?;
@@ -547,7 +854,7 @@ fn plan_expand_all(
         .map(|edge| eligible_targets[&(edge.source, edge.target)])
         .collect::<BTreeSet<_>>();
     let seed_depth_by_id =
-        seed_inward_depths(ctx, &coordinate_to_id, &boundary_cells, &selected_ids)?;
+        seed_inward_depths(ctx, &coordinate_to_id, &boundary_cells, selected_ids)?;
 
     let cell_count = usize::from(match_config.map_width)
         .checked_mul(usize::from(match_config.map_height))
@@ -556,7 +863,7 @@ fn plan_expand_all(
         ctx,
         &match_config,
         player_id,
-        &selected_ids,
+        selected_ids,
         &first_ring,
         cell_count,
     )?;
@@ -564,7 +871,7 @@ fn plan_expand_all(
     if requested == 0 {
         return Err("the expand selection has no uncommitted infantry at this commitment".into());
     }
-    let selected_cells = selected_ids.into_iter().collect::<Vec<_>>();
+    let selected_cells = selected_ids.iter().copied().collect::<Vec<_>>();
     let seed_depths = selected_cells
         .iter()
         .map(|cell_id| seed_depth_by_id[cell_id])
@@ -825,24 +1132,34 @@ fn front_route_tree(
 fn distribution_plan(
     ctx: &ReducerContext,
     player_id: u8,
-    selected_cells: &[u32],
+    selection: &RetaskSelection,
     preset: DistributionPreset,
     amount_bps: u32,
 ) -> Result<PlannedDistribution, String> {
     validate_basis_points(amount_bps, "redistribution amount")?;
-    let selected = unique_selection(selected_cells, "redistribution")?;
     let mut map = HexMap::new();
     let mut by_coordinate = BTreeMap::new();
+    let mut unaffected_by_cell = BTreeMap::new();
     let mut total = 0_u64;
-    for cell_id in selected {
-        let cell = core_cell(ctx, cell_id)?;
+    for &cell_id in &selection.source_cells {
+        let mut cell = core_cell(ctx, cell_id)?;
         if cell.owner != Some(u32::from(player_id)) {
             return Err(format!("redistribution cell {cell_id} is not owned"));
         }
+        let allocated = allocated_infantry_at_cell(ctx, player_id, cell_id);
+        let projected = redistribution_cell_projection(
+            cell.force(),
+            cell.military_capacity,
+            allocated,
+            selection.released_at(cell_id),
+        )?;
         total = total
-            .checked_add(cell.force())
+            .checked_add(projected.affected)
             .ok_or_else(|| "redistribution strength overflow".to_string())?;
+        cell.forces.infantry = projected.affected;
+        cell.military_capacity = projected.residual_capacity;
         by_coordinate.insert(cell.coordinate, cell_id);
+        unaffected_by_cell.insert(cell_id, projected.unaffected);
         map.insert(cell);
     }
     let targets = redistribution_targets_with_commitment(
@@ -858,13 +1175,22 @@ fn distribution_plan(
     let mut source_limits = BTreeMap::new();
     let mut demands = BTreeMap::new();
     let mut total_demand = 0_u64;
-    let reservations = active_destination_reservations(ctx, player_id);
-    for (coordinate, target) in targets.targets {
+    let reservations =
+        active_destination_reservations(ctx, player_id, &selection.superseded_order_ids);
+    for (coordinate, affected_target) in targets.targets {
         let cell_id = by_coordinate[&coordinate];
         let current = cell_state(ctx, cell_id)?.infantry;
+        let target = unaffected_by_cell[&cell_id]
+            .checked_add(affected_target)
+            .ok_or_else(|| "redistribution target overflow".to_string())?;
         if current > target {
+            // Unaffected allocations are already included in `target`, so
+            // this limit is entirely movable affected strength.
             source_limits.insert(cell_id, current - target);
         } else if target > current {
+            // Preserve anti-overreservation: the heatmap target remains the
+            // desired distribution, but unrelated packets already inbound to
+            // this cell reduce how much this new order needs to commit.
             let demand =
                 (target - current).saturating_sub(reservations.get(&cell_id).copied().unwrap_or(0));
             if demand > 0 {
@@ -880,7 +1206,11 @@ fn distribution_plan(
     })
 }
 
-fn active_destination_reservations(ctx: &ReducerContext, player_id: u8) -> BTreeMap<u32, u64> {
+fn active_destination_reservations(
+    ctx: &ReducerContext,
+    player_id: u8,
+    excluded_order_ids: &BTreeSet<u64>,
+) -> BTreeMap<u32, u64> {
     let mut reservations = BTreeMap::<u32, u64>::new();
     for destination in ctx.db.transfer_destination().iter() {
         let active = ctx
@@ -891,6 +1221,7 @@ fn active_destination_reservations(ctx: &ReducerContext, player_id: u8) -> BTree
             .is_some_and(|order| {
                 order.status == OrderStatus::Active
                     && order.player_id == player_id
+                    && !excluded_order_ids.contains(&order.order_id)
                     && !matches!(order.kind, OrderKind::PushFront | OrderKind::ExpandAll)
             });
         if active {
@@ -906,8 +1237,28 @@ fn basis_point_share(value: u64, basis_points: u32) -> u64 {
     (u128::from(value) * u128::from(basis_points) / 10_000) as u64
 }
 
-fn movable_redistribution_surplus(current: u64, allocated: u64, target_surplus: u64) -> u64 {
-    target_surplus.min(current).saturating_sub(allocated)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RedistributionCellProjection {
+    affected: u64,
+    unaffected: u64,
+    residual_capacity: u64,
+}
+
+fn redistribution_cell_projection(
+    current: u64,
+    military_capacity: u64,
+    allocated: u64,
+    superseded: u64,
+) -> Result<RedistributionCellProjection, String> {
+    if current > military_capacity {
+        return Err("redistribution cell strength exceeds military capacity".into());
+    }
+    let unaffected = unaffected_after_retask_release(current, allocated, superseded)?;
+    Ok(RedistributionCellProjection {
+        affected: current - unaffected,
+        unaffected,
+        residual_capacity: military_capacity - unaffected,
+    })
 }
 
 fn validate_basis_points(value: u32, label: &str) -> Result<(), String> {
@@ -930,24 +1281,16 @@ fn unique_selection(cells: &[u32], label: &str) -> Result<BTreeSet<u32>, String>
     Ok(cells.iter().copied().collect())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn create_order(
+fn plan_distribution_legs(
     ctx: &ReducerContext,
     player_id: u8,
-    client_command_id: u64,
-    kind: OrderKind,
+    selection: &RetaskSelection,
     source_limits: BTreeMap<u32, u64>,
     mut destination_demands: BTreeMap<u32, u64>,
     requested: u64,
-    orientation: Axial,
-) -> Result<u64, String> {
+) -> Result<Vec<PlannedLeg>, String> {
     if source_limits.is_empty() {
         return Err("source selection is empty".into());
-    }
-    if source_limits.len() > MAX_SELECTION_CELLS {
-        return Err(format!(
-            "source selection exceeds the {MAX_SELECTION_CELLS}-cell command limit"
-        ));
     }
     if destination_demands.is_empty() {
         return Err("destination selection is empty".into());
@@ -967,7 +1310,12 @@ fn create_order(
             return Err(format!("source cell {source} is not owned passable ground"));
         }
         let allocated = allocated_infantry_at_cell(ctx, player_id, source);
-        let available = movable_redistribution_surplus(cell.infantry, allocated, source_limit);
+        let available_after_release = available_after_retask_release(
+            cell.infantry,
+            allocated,
+            selection.released_at(source),
+        )?;
+        let available = source_limit.min(available_after_release);
         if available > 0 {
             available_by_source.insert(source, available);
         }
@@ -1031,16 +1379,7 @@ fn create_order(
     if requested == remaining {
         return Err("no selected source can route to a selected destination".into());
     }
-
-    persist_order(
-        ctx,
-        player_id,
-        client_command_id,
-        kind,
-        requested,
-        orientation,
-        legs,
-    )
+    Ok(legs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1268,6 +1607,17 @@ fn cancel_matching_expand_all(
     Ok((matching.len() == 1).then_some(matching[0]))
 }
 
+fn cancel_superseded_orders(
+    ctx: &ReducerContext,
+    player_id: u8,
+    order_ids: &BTreeSet<u64>,
+) -> Result<(), String> {
+    for &order_id in order_ids {
+        cancel_order(ctx, player_id, order_id)?;
+    }
+    Ok(())
+}
+
 fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<(), String> {
     let mut order = ctx
         .db
@@ -1353,6 +1703,82 @@ mod tests {
 
     fn selected_cell(coordinate: Axial, elevation: i16) -> Cell {
         Cell::ground(coordinate, elevation, Some(1), 100)
+    }
+
+    fn retask_packet(order_id: u64, current_cell: u32, infantry: u64) -> RetaskPacketSnapshot {
+        RetaskPacketSnapshot {
+            order_id,
+            current_cell,
+            infantry,
+            current_cell_owned: true,
+        }
+    }
+
+    #[test]
+    fn whole_order_retask_deduplicates_ids_and_credits_every_physical_origin() {
+        let requested_ids = [7, 7, 8].into_iter().collect::<BTreeSet<_>>();
+        let packets = vec![
+            retask_packet(7, 10, 30),
+            retask_packet(7, 11, 20),
+            retask_packet(8, 11, 5),
+            retask_packet(8, 12, 15),
+            retask_packet(9, 99, 100),
+        ];
+        let selection = resolve_retask_snapshot(BTreeSet::from([1]), &requested_ids, &packets)
+            .expect("both requested orders have owned surviving packets");
+
+        assert_eq!(selection.superseded_order_ids, BTreeSet::from([7, 8]));
+        assert_eq!(selection.source_cells, BTreeSet::from([1, 10, 11, 12]));
+        assert_eq!(
+            selection.released_by_cell,
+            BTreeMap::from([(10, 30), (11, 25), (12, 15)])
+        );
+        assert_eq!(selection.released_by_cell.values().sum::<u64>(), 70);
+
+        // Cell 11 also has 15 strength reserved by an unrelated order. The
+        // superseded 25 is released before applying 50%, so 32 of the now-65
+        // available strength is committed without touching that reservation.
+        let available = available_after_retask_release(80, 40, selection.released_at(11)).unwrap();
+        let replacement = basis_point_share(available, 5_000);
+        assert_eq!((available, replacement), (65, 32));
+        let allocated_after_replacement = 40 - selection.released_at(11) + replacement;
+        assert_eq!(allocated_after_replacement, 47);
+        assert!(allocated_after_replacement <= 80);
+    }
+
+    #[test]
+    fn failed_retask_preparation_leaves_the_old_packet_snapshot_unchanged() {
+        let requested_ids = BTreeSet::from([7]);
+        let packets = vec![retask_packet(7, 10, 30), retask_packet(7, 11, 20)];
+        let old_packets = packets.clone();
+
+        let prepared = resolve_retask_snapshot(BTreeSet::new(), &requested_ids, &packets).and_then(
+            |selection| {
+                validate_basis_points(0, "replacement commitment")?;
+                Ok(selection)
+            },
+        );
+
+        assert!(prepared.is_err());
+        assert_eq!(packets, old_packets);
+    }
+
+    #[test]
+    fn retask_claim_rejects_foreign_inactive_and_empty_orders() {
+        assert!(validate_superseded_order_claim(7, 1, 2, OrderStatus::Active, true).is_err());
+        assert!(validate_superseded_order_claim(7, 1, 1, OrderStatus::Completed, true).is_err());
+        assert!(validate_superseded_order_claim(7, 1, 1, OrderStatus::Cancelled, true).is_err());
+        assert!(validate_superseded_order_claim(7, 1, 1, OrderStatus::Active, false).is_err());
+        assert!(validate_superseded_order_claim(7, 1, 1, OrderStatus::Active, true).is_ok());
+
+        assert!(
+            resolve_retask_snapshot(
+                BTreeSet::new(),
+                &BTreeSet::from([7, 8]),
+                &[retask_packet(7, 10, 30)],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1523,14 +1949,71 @@ mod tests {
     }
 
     #[test]
-    fn redistribution_never_moves_below_a_percentage_frozen_target() {
-        // A 25% solve may ask 35 -> 27 and 65 -> 49. Even when the first
-        // source is routed first, its contribution is capped at its own eight
-        // soldier surplus instead of the destination's full demand.
-        assert_eq!(movable_redistribution_surplus(35, 0, 35 - 27), 8);
-        assert_eq!(movable_redistribution_surplus(65, 0, 65 - 49), 16);
-        assert_eq!(movable_redistribution_surplus(35, 5, 35 - 27), 3);
-        assert_eq!(movable_redistribution_surplus(35, 30, 35 - 27), 0);
+    fn redistribution_projection_releases_only_the_superseded_allocation() {
+        assert_eq!(
+            redistribution_cell_projection(80, 100, 40, 25),
+            Ok(RedistributionCellProjection {
+                affected: 65,
+                unaffected: 15,
+                residual_capacity: 85,
+            })
+        );
+    }
+
+    #[test]
+    fn redistribution_solves_only_movable_strength_in_residual_capacity() {
+        // Cell A has 40 allocated infantry, but 25 belongs to the order being
+        // superseded. Only the unrelated 15 remains frozen; all 20 at B is
+        // movable. This is the exact projection used by the client preview.
+        let a = redistribution_cell_projection(80, 100, 40, 25).unwrap();
+        let b = redistribution_cell_projection(20, 100, 0, 0).unwrap();
+        assert_eq!(
+            a,
+            RedistributionCellProjection {
+                affected: 65,
+                unaffected: 15,
+                residual_capacity: 85,
+            }
+        );
+        assert_eq!(
+            b,
+            RedistributionCellProjection {
+                affected: 20,
+                unaffected: 0,
+                residual_capacity: 100,
+            }
+        );
+
+        let a_coordinate = Axial::ZERO;
+        let b_coordinate = Axial::new(1, 0);
+        let mut map = HexMap::new();
+        let mut a_cell = selected_cell(a_coordinate, 0);
+        a_cell.forces.infantry = a.affected;
+        a_cell.military_capacity = a.residual_capacity;
+        map.insert(a_cell);
+        let mut b_cell = selected_cell(b_coordinate, 0);
+        b_cell.forces.infantry = b.affected;
+        b_cell.military_capacity = b.residual_capacity;
+        map.insert(b_cell);
+
+        let targets = redistribution_targets_with_commitment(
+            &map,
+            1,
+            [a_coordinate, b_coordinate],
+            a.affected + b.affected,
+            DistributionPreset::Balance,
+            10_000,
+        )
+        .unwrap()
+        .targets;
+        let full_a = a.unaffected + targets[&a_coordinate];
+        let full_b = b.unaffected + targets[&b_coordinate];
+
+        assert_eq!((targets[&a_coordinate], targets[&b_coordinate]), (39, 46));
+        assert_eq!((full_a, full_b), (54, 46));
+        assert_eq!(full_a + full_b, 100);
+        assert!(full_a >= a.unaffected);
+        assert_eq!(80 - full_a, 26);
     }
 
     #[test]

@@ -8,20 +8,22 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub(super) struct IssuePushFrontArgs {
     pub client_command_id: u64,
-    pub selected_cells: Vec<u32>,
+    pub source_cells: Vec<u32>,
     pub direction_q: i32,
     pub direction_r: i32,
     pub commitment_bps: u32,
+    pub supersede_order_ids: Vec<u64>,
 }
 
 impl From<IssuePushFrontArgs> for super::Reducer {
     fn from(args: IssuePushFrontArgs) -> Self {
         Self::IssuePushFront {
             client_command_id: args.client_command_id,
-            selected_cells: args.selected_cells,
+            source_cells: args.source_cells,
             direction_q: args.direction_q,
             direction_r: args.direction_r,
             commitment_bps: args.commitment_bps,
+            supersede_order_ids: args.supersede_order_ids,
         }
     }
 }
@@ -44,17 +46,19 @@ pub trait issue_push_front {
     fn issue_push_front(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         direction_q: i32,
         direction_r: i32,
         commitment_bps: u32,
+        supersede_order_ids: Vec<u64>,
     ) -> __sdk::Result<()> {
         self.issue_push_front_then(
             client_command_id,
-            selected_cells,
+            source_cells,
             direction_q,
             direction_r,
             commitment_bps,
+            supersede_order_ids,
             |_, _| {},
         )
     }
@@ -68,10 +72,11 @@ pub trait issue_push_front {
     fn issue_push_front_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         direction_q: i32,
         direction_r: i32,
         commitment_bps: u32,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -85,10 +90,11 @@ impl issue_push_front for super::RemoteReducers {
     fn issue_push_front_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
         direction_q: i32,
         direction_r: i32,
         commitment_bps: u32,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -99,10 +105,11 @@ impl issue_push_front for super::RemoteReducers {
         self.imp.invoke_reducer_with_callback(
             IssuePushFrontArgs {
                 client_command_id,
-                selected_cells,
+                source_cells,
                 direction_q,
                 direction_r,
                 commitment_bps,
+                supersede_order_ids,
             },
             callback,
         )

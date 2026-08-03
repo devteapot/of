@@ -192,6 +192,31 @@ what remains unallocated at that later moment. Destination reservations are
 scoped to the issuing player; another player's pending attack cannot pre-claim
 neutral capacity before the forces physically meet.
 
+### Contested handles and atomic retasking
+
+An enemy-controlled contested cell under local pressure may be selected as an
+**order handle**, not as a claim that local troops occupy that cell. At the
+selection gesture, the client snapshots the IDs of the local active orders
+feeding that hostile edge. A captured handle may remain visible as a tagged
+selection token while those snapshotted orders are active; it never silently
+turns into an ordinary physical source, and newly arriving orders never join
+the snapshot.
+
+Confirming Push Front, Expand All, or any redistribution preset supersedes each
+snapshotted order in full, including its other lanes. The authority finds every
+surviving packet and its real current cell, unions those physical cells with
+the explicitly selected owned cells, virtually releases only those
+allocations, and plans the replacement with the selected percentage. Other
+orders sharing a cell remain allocated and cannot be stolen. Delivered
+garrisons and casualties remain accounted to the old order.
+
+Planning and replacement form one transaction. Stale or foreign IDs, missing
+survivors, oversized or disconnected effective selections, blocked routes,
+and zero usable strength reject without cancelling any prior order. Only a
+fully valid plan cancels the old orders and persists the replacement. This is
+the V1 way to redirect aggregate infantry already committed at a front;
+precise one-hex infantry movement remains out of scope.
+
 With the same front selection and direction previewed, `X` cancels matching
 active Push Front orders. Cancellation releases their remaining allocations at
 the cells where they currently exist; it does not rewind captures, return force
@@ -256,6 +281,11 @@ the unparticipating share of its current stack is frozen as a per-cell lower
 bound; only the participating share joins the redistribution pool. Surplus
 strength moves toward deficits through the ordinary route, throughput, and
 capacity rules, so redistribution is never instantaneous.
+
+Troops allocated to unrelated active orders are frozen outside the movable
+pool and consume residual cell capacity. The heatmap remains the desired
+distribution; already-reserved incoming redistribution can reduce the new
+order's committed movement to prevent overbooking that destination.
 
 V1 includes four presets:
 
@@ -394,13 +424,17 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
     Core-load, and Perimeter-load orders, preview their target densities, and
     watch the participating force physically redistribute while each cell's
     unparticipating share remains in place.
-12. Combat is resolved across contested edges using frontage, elevation, capacity, and casualties, including attacks from more than one edge without double-counting defenders.
-13. Ownership changes through combat and expansion, and all authoritative state is fully visible to both players.
-14. Graybox overlays make ownership, force density, occupancy/capacity, Push
+12. A locally attacked contested cell can snapshot the active orders pressing
+    it and atomically retask all their surviving lanes from their real current
+    cells. Invalid replacement leaves the original orders unchanged and cannot
+    steal allocations from unrelated orders.
+13. Combat is resolved across contested edges using frontage, elevation, capacity, and casualties, including attacks from more than one edge without double-counting defenders.
+14. Ownership changes through combat and expansion, and all authoritative state is fully visible to both players.
+15. Graybox overlays make ownership, force density, occupancy/capacity, Push
     Front flows, queues, active edges, blocked orders, and contested pressure
     understandable without implying dual occupancy or requiring production
     assets.
-15. Core tuning values are configurable so playtests can adjust the model without changing its data or interaction foundations.
+16. Core tuning values are configurable so playtests can adjust the model without changing its data or interaction foundations.
 
 ## Questions for Playtesting, Not Pre-production Blockers
 
