@@ -197,6 +197,54 @@ The experiment belongs close to V1 because it changes the cadence of the core
 loop. Its exact capture threshold, reserve, continuation, and input gesture are
 playtest values rather than locked rules.
 
+#### Global Expand and selected-front Push
+
+The expansion simulation should expose two controls over the same underlying
+directed frontier edges:
+
+- **Expand All** (`X` in the first prototype) immediately seeds every valid
+  owned-to-neutral frontier edge using the remembered commitment percentage.
+- **Push Front** (`P`) lets the player select a contiguous portion of the
+  neutral frontier and give it a forward heading before committing it.
+
+The stable unit of intent is an edge
+`(owned source cell, adjacent neutral target cell)`, not a destination cell or
+a transient visual segment ID. The client derives natural selectable segments
+by walking the ownership perimeter in the fixed six-direction axial order. A
+segment is a maximal contiguous run of passable, capturable, unoccupied neutral
+edges. Enemy borders, water, cliffs, blocked cells, and map boundaries split
+segments. Closed loops use a deterministic display seam so the same unchanged
+border is presented consistently.
+
+The first Push Front interaction should be:
+
+1. Press `P` to highlight neutral-facing perimeter segments.
+2. Click a highlighted segment to select the natural segment, or drag along
+   the border to select a contiguous subsection. Shift adds arcs and Control
+   removes them.
+3. Drag an outward heading from the selected arc; the client quantizes it to
+   one of the six axial directions and previews the continuation wedge.
+4. Adjust commitment with `[` / `]`, confirm with Enter, or cancel with Escape.
+
+Existing cell selections remain intact for Transfer, Balance, and Front-load.
+If cells are selected before Push Front begins, their incident neutral frontier
+may be offered as the initial arc, but the authoritative command still contains
+the exact sorted directed edges.
+
+A heading activates straight-ahead expansion and the two adjacent hex
+directions, weighted `2:1:1`. A source facing multiple chosen edges divides one
+local commitment budget across them; it never duplicates strength. After a
+capture, continuation examines only the newly captured cell's forward three
+directions. Expand All has no heading and may fan out through every valid
+neutral direction.
+
+Visual segment IDs are deliberately not authoritative because the perimeter
+changes after every capture. The server revalidates the submitted edge set,
+accepts the still-valid subset with explicit exclusions, and rejects the order
+only when no selected edge remains valid. Repeating an expansion command
+updates the desired local commitment rather than stacking another copy, so
+click speed cannot manufacture momentum.
+
 ### One-shot redistribution
 
 A redistribution order applies a target density pattern to selected owned hexes. Surplus strength moves toward deficits through the ordinary route, throughput, and capacity rules; redistribution is never instantaneous.
@@ -234,10 +282,15 @@ V1 uses intentionally simple graybox graphics:
 - simple lighting;
 - clear borders and selection highlights;
 - route arrows, transfer direction, queues, and ETA;
-- occupancy-versus-capacity heatmaps;
-- force-density shading.
+- redistribution target-density heatmaps;
+- absolute force-strength shading, with alternate civilian and ownership
+  overview modes.
 
-Density shading is a core strategic view, not just a debugging aid. At medium and far zoom it should communicate where force is concentrated even before representative 3D assets exist.
+Force shading is a core strategic view, not just a debugging aid. It represents
+the absolute scalar strength held in each hex rather than the percentage of
+that hex's capacity. At medium and far zoom it should communicate where force
+is concentrated even before representative 3D assets exist; close zoom may add
+exact compact totals without changing the authoritative model.
 
 Later, the Bevy client may render a small deterministic sample of representative infantry, tank, or artillery models based on scalar composition. Those models are presentation only and are never authoritative individual units. Close, medium, and far zoom levels may use different representations without changing simulation state.
 

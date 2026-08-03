@@ -15,6 +15,7 @@ mod config;
 mod geometry;
 mod hud;
 mod interaction;
+mod map_view;
 mod model;
 mod network;
 mod online;
@@ -28,6 +29,7 @@ use camera::{camera_controls, spawn_camera_and_light};
 use config::ClientConfig;
 use hud::HudPlugin;
 use interaction::GameInteractionPlugin;
+use map_view::MapViewPlugin;
 use model::{MatchView, update_transient_state};
 use network::{NetworkBoundaryPlugin, NetworkSet, OfflineTransportPlugin, apply_server_updates};
 use online::{OnlineSyncSet, OnlineTransportPlugin};
@@ -57,6 +59,7 @@ fn main() {
         .add_plugins((
             NetworkBoundaryPlugin,
             GameInteractionPlugin,
+            MapViewPlugin,
             OverlayPlugin,
             HudPlugin,
             PerformanceOverlayPlugin,

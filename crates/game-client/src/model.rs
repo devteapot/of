@@ -156,6 +156,15 @@ pub struct Toast {
 #[derive(Resource, Debug)]
 pub struct MatchView {
     pub cells: BTreeMap<Axial, CellView>,
+    /// Stable spatial index used by rendering and overlays.
+    ///
+    /// Keeping this alongside `cells` means chunk work scales with the cells
+    /// in the chunk instead of repeatedly filtering the entire map.
+    pub cells_by_chunk: BTreeMap<ChunkCoord, Vec<Axial>>,
+    /// Monotonic topology generation consumed by the terrain renderer.
+    /// Ordinary cell-state updates leave this unchanged; wholesale map/index
+    /// replacements advance it so render-chunk reconciliation is event-driven.
+    pub chunk_index_revision: u64,
     pub local_player: u32,
     pub authority: AuthorityState,
     pub connection: [ConnectionState; 2],
@@ -180,6 +189,8 @@ impl MatchView {
     pub fn connecting(preferred_player: u8) -> Self {
         Self {
             cells: BTreeMap::new(),
+            cells_by_chunk: BTreeMap::new(),
+            chunk_index_revision: 0,
             local_player: u32::from(preferred_player),
             authority: AuthorityState::Connecting,
             connection: [ConnectionState::Syncing, ConnectionState::Syncing],
@@ -292,12 +303,15 @@ impl MatchView {
             }
         }
 
-        let dirty_chunks = cells.keys().copied().map(chunk_of).collect();
+        let cells_by_chunk = index_cells_by_chunk(&cells);
+        let dirty_chunks = cells_by_chunk.keys().copied().collect();
         let mut order_log = VecDeque::new();
         order_log.push_front("Fixture ready · authority adapter is offline".to_owned());
 
         Self {
             cells,
+            cells_by_chunk,
+            chunk_index_revision: 1,
             local_player: PLAYER_ONE,
             authority: AuthorityState::Offline,
             connection: [ConnectionState::Offline, ConnectionState::Offline],
@@ -335,6 +349,18 @@ impl MatchView {
     pub fn cell_mut(&mut self, coordinate: Axial) -> Option<&mut CellView> {
         self.dirty_chunks.insert(chunk_of(coordinate));
         self.cells.get_mut(&coordinate)
+    }
+
+    /// Rebuilds the spatial index after a wholesale authoritative map update.
+    /// Incremental cell-state changes do not need to touch this index because
+    /// coordinates never move between render chunks.
+    pub fn rebuild_chunk_index(&mut self) {
+        self.cells_by_chunk = index_cells_by_chunk(&self.cells);
+        self.chunk_index_revision = self.chunk_index_revision.wrapping_add(1);
+    }
+
+    pub fn cells_in_chunk(&self, chunk: ChunkCoord) -> &[Axial] {
+        self.cells_by_chunk.get(&chunk).map_or(&[], Vec::as_slice)
     }
 
     pub fn is_local_owned(&self, coordinate: Axial) -> bool {
@@ -387,6 +413,17 @@ impl MatchView {
             remaining: 4.5,
         });
     }
+}
+
+fn index_cells_by_chunk(cells: &BTreeMap<Axial, CellView>) -> BTreeMap<ChunkCoord, Vec<Axial>> {
+    let mut by_chunk = BTreeMap::<ChunkCoord, Vec<Axial>>::new();
+    for coordinate in cells.keys().copied() {
+        by_chunk
+            .entry(chunk_of(coordinate))
+            .or_default()
+            .push(coordinate);
+    }
+    by_chunk
 }
 
 pub fn update_transient_state(time: Res<Time>, mut view: ResMut<MatchView>) {
@@ -507,5 +544,36 @@ mod tests {
                 .iter()
                 .all(|coordinate| fixture.cell(*coordinate).unwrap().is_land())
         );
+    }
+
+    #[test]
+    fn chunk_index_contains_every_cell_exactly_once() {
+        let fixture = MatchView::offline_fixture();
+        let indexed = fixture
+            .cells_by_chunk
+            .values()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(indexed.len(), fixture.cells.len());
+        assert_eq!(indexed, fixture.cells.keys().copied().collect());
+        for (chunk, coordinates) in &fixture.cells_by_chunk {
+            assert!(
+                coordinates
+                    .iter()
+                    .all(|coordinate| chunk_of(*coordinate) == *chunk)
+            );
+        }
+    }
+
+    #[test]
+    fn rebuilding_chunk_index_advances_topology_revision() {
+        let mut fixture = MatchView::offline_fixture();
+        let before = fixture.chunk_index_revision;
+
+        fixture.rebuild_chunk_index();
+
+        assert_eq!(fixture.chunk_index_revision, before.wrapping_add(1));
     }
 }

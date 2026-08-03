@@ -20,9 +20,9 @@ V1 is a graybox built to test the troop-flow and redistribution loop.
 - One-shot Balance and oriented Front-load redistribution.
 - Height-aware movement, impassable cliffs, uphill combat penalties, edge
   frontage, casualties, capture, and disconnected pockets.
-- A native Bevy client with chunked 3D terrain, density shading, selection,
-  route/front overlays, HUD, inspector, previews, rejections, and reconnectable
-  SpacetimeDB profiles.
+- A native Bevy client with chunked 3D terrain, switchable soldier/civilian
+  shading and readable close-zoom totals, selection, route/front overlays, HUD,
+  inspector, previews, rejections, and reconnectable SpacetimeDB profiles.
 - An explicit offline fixture for fast interaction and rendering work.
 
 ## Pinned toolchain
@@ -123,6 +123,8 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 | Mouse wheel | Zoom |
 | Home | Frame the map |
 | `M` + arrow keys | Adjust mobilization target |
+| `1` / `2` / `3` | Show Overview, Soldiers, or Civilians map view |
+| `V` | Cycle map views |
 | `?` | Toggle help |
 | `F3` | Toggle the performance overlay |
 

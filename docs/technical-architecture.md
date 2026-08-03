@@ -1,7 +1,7 @@
 # Technical Architecture
 
 Status: implemented V1 architecture baseline
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 This document records the architecture commitments for the first playable version of the game. It deliberately separates those commitments from scaling questions that must be answered with measurements. Gameplay details live elsewhere; this document focuses on authority, state flow, code boundaries, rendering, persistence, and delivery order.
 
@@ -227,6 +227,11 @@ same partition is useful for:
 - dirty-region updates;
 - later interest management and level-of-detail work.
 
+The client may repartition subscribed cells into smaller render chunks; the
+current combined-mesh implementation uses 8 x 8 render chunks for finer
+frustum culling. Storage/subscription and rendering chunk sizes are tuning
+parameters and must never become part of gameplay semantics.
+
 The map format must not assume a square world. Initial performance fixtures should include:
 
 - 128 x 128 bounds: 16,384 cells before masking, useful for rapid iteration;
@@ -256,12 +261,21 @@ The initial material treatment exposes gameplay state clearly:
 
 - flat terrain color and elevation sides;
 - ownership tint and border emphasis;
-- troop density as a normalized visual channel, `troops / capacity`;
+- absolute troop strength as a stable, normalized visual channel;
+- alternate Overview and civilian-population map views;
 - hover and source/destination selection;
 - transfer routes, direction, congestion, and ETA;
 - active combat/front edges and blocked paths.
 
-Troop-density shading is presentation only. Clamp and interpolate it client-side from authoritative integer values. Keep overlays separable so a future art direction does not require changing simulation state.
+Map-view shading is presentation only. Clamp and interpolate it client-side
+from authoritative integer values against stable reference values, not a live
+map maximum. Combined chunk meshes retain cell-to-vertex color metadata so a
+state update can replace only color attributes. Recolor visible dirty chunks
+first and let hidden chunks converge under bounded per-frame budgets. Exact
+cell totals use one texture-atlas-backed world-space mesh with viewport-derived
+complete-set LOD; do not create one text/UI entity or material per gameplay
+cell. Keep overlays separable so a future art direction does not require
+changing simulation state.
 
 Picking should resolve pointer rays to chunks and deterministic hex coordinates instead of creating a physics collider for every cell. Height-aware picking must choose the visible top surface in stepped terrain. Selection is represented as compact cell sets or ranges, with direct source selection and destination painting as the first transfer interaction to test. The UX is expected to iterate; the server intent model should not depend on one specific gesture.
 

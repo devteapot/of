@@ -27,6 +27,14 @@ from targeted transfers and hostile attacks. Its final gesture is not locked;
 the current left-drag selection must remain available while the prototype is
 evaluated.
 
+The corresponding focused command is `PushFront { edges, direction,
+commitment }`. `X` activates Expand All without changing the cell selection;
+`P` highlights neutral-facing border segments. Clicking chooses a natural
+segment, dragging along the perimeter chooses a contiguous subsection, and an
+outward drag supplies a six-direction continuation heading. The client submits
+exact directed edge keys rather than a visual segment ID, so a changing border
+cannot silently retarget the command.
+
 ### Camera
 
 - Middle-mouse drag or `Space + left drag`: pan.
@@ -66,7 +74,14 @@ At 1280 x 720, the inspector and order details share one stacked side panel so t
 
 ## Map encodings
 
-Base chunk vertex colors combine ownership hue with force-density luminance. Height and shaded column sides convey elevation. These overlays remain separate:
+Base chunk vertex colors combine ownership hue with the current map-view
+luminance: absolute soldier strength by default, absolute civilian population
+in Civilians, and force-neutral ownership readability in Overview. `1`, `2`,
+and `3` select those views, while `V` cycles them. Exact compact totals appear
+only when projected hex spacing is readable. They are glyphs from one small
+texture atlas, batched into one world-space mesh over the visible hex tops—not
+individual Bevy UI elements. Height and shaded column sides convey elevation.
+These overlays remain separate:
 
 - hover: thin white ring;
 - source: solid outer outline with corner ticks;

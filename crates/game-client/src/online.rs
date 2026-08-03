@@ -28,6 +28,7 @@ use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 use crate::{
     config::ClientConfig,
     geometry::{HEX_RADIUS, chunk_of},
+    map_view::MapViewMode,
     model::{
         ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, MatchPhase, MatchView,
         ToastKind,
@@ -629,6 +630,7 @@ impl AuthoritySnapshot {
 fn synchronize_authoritative_view(
     mut transport: ResMut<OnlineTransport>,
     mut view: ResMut<MatchView>,
+    mode: Res<MapViewMode>,
     mut updates: MessageWriter<ServerUpdate>,
 ) {
     for event in transport.signals.drain() {
@@ -654,7 +656,7 @@ fn synchronize_authoritative_view(
             snapshot.cells.as_deref(),
         );
     } else if let Some(cells) = snapshot.cells {
-        update_cells(&transport, &mut view, &cells);
+        update_cells(&transport, &mut view, &cells, *mode);
     }
 
     if let Some(config) = snapshot.config {
@@ -850,7 +852,7 @@ fn rebuild_cells(
         .map(|state| (state.cell_id, state))
         .collect();
     view.dirty_chunks
-        .extend(view.cells.keys().copied().map(chunk_of));
+        .extend(view.cells_by_chunk.keys().copied());
     view.cells.clear();
     transport.coordinate_to_id.clear();
     transport.id_to_coordinate.clear();
@@ -867,9 +869,15 @@ fn rebuild_cells(
             .insert(coordinate, cell_view_from_rows(coordinate, &terrain, state));
         view.dirty_chunks.insert(chunk_of(coordinate));
     }
+    view.rebuild_chunk_index();
 }
 
-fn update_cells(transport: &OnlineTransport, view: &mut MatchView, states: &[CellState]) {
+fn update_cells(
+    transport: &OnlineTransport,
+    view: &mut MatchView,
+    states: &[CellState],
+    mode: MapViewMode,
+) {
     for state in states {
         let Some(coordinate) = transport.id_to_coordinate.get(&state.cell_id).copied() else {
             continue;
@@ -877,12 +885,15 @@ fn update_cells(transport: &OnlineTransport, view: &mut MatchView, states: &[Cel
         let next_owner = owner(state.owner_player_id);
         let rendering_changed = view.cell(coordinate).is_some_and(|cell| {
             cell.owner != next_owner
-                || cell.infantry != state.infantry
-                || cell.military_capacity != state.military_capacity
+                || (mode == MapViewMode::Civilians && cell.civilians != state.civilians)
+                || (mode == MapViewMode::Soldiers && cell.infantry != state.infantry)
         });
         if !rendering_changed {
             if let Some(cell) = view.cells.get_mut(&coordinate) {
+                cell.owner = next_owner;
                 cell.civilians = state.civilians;
+                cell.infantry = state.infantry;
+                cell.military_capacity = state.military_capacity;
             }
             continue;
         }
@@ -1375,6 +1386,72 @@ mod tests {
         };
 
         assert!(!cell_view_from_rows(Axial::ZERO, &terrain, None).blocked);
+    }
+
+    #[test]
+    fn civilian_only_updates_invalidate_the_render_chunk() {
+        let mut transport = OnlineTransport::new(test_config());
+        let mut view = MatchView::offline_fixture();
+        let coordinate = *view
+            .cells
+            .keys()
+            .find(|coordinate| view.cell(**coordinate).is_some_and(CellView::is_land))
+            .expect("fixture land cell");
+        let original = view.cell(coordinate).expect("indexed fixture cell").clone();
+        transport.id_to_coordinate.insert(42, coordinate);
+        view.dirty_chunks.clear();
+
+        update_cells(
+            &transport,
+            &mut view,
+            &[CellState {
+                cell_id: 42,
+                owner_player_id: original.owner.unwrap_or_default() as u8,
+                civilians: original.civilians + 1,
+                civilian_capacity: original.civilians + 100,
+                infantry: original.infantry,
+                military_capacity: original.military_capacity,
+                last_changed_step: 1,
+            }],
+            MapViewMode::Civilians,
+        );
+
+        assert_eq!(
+            view.cell(coordinate).unwrap().civilians,
+            original.civilians + 1
+        );
+        assert_eq!(view.dirty_chunks, BTreeSet::from([chunk_of(coordinate)]));
+    }
+
+    #[test]
+    fn civilian_only_updates_do_not_recolor_the_soldier_view() {
+        let mut transport = OnlineTransport::new(test_config());
+        let mut view = MatchView::offline_fixture();
+        let coordinate = *view.cells.keys().next().expect("fixture cell");
+        let original = view.cell(coordinate).expect("fixture cell").clone();
+        transport.id_to_coordinate.insert(43, coordinate);
+        view.dirty_chunks.clear();
+
+        update_cells(
+            &transport,
+            &mut view,
+            &[CellState {
+                cell_id: 43,
+                owner_player_id: original.owner.unwrap_or_default() as u8,
+                civilians: original.civilians + 1,
+                civilian_capacity: original.civilians + 100,
+                infantry: original.infantry,
+                military_capacity: original.military_capacity,
+                last_changed_step: 1,
+            }],
+            MapViewMode::Soldiers,
+        );
+
+        assert_eq!(
+            view.cell(coordinate).unwrap().civilians,
+            original.civilians + 1
+        );
+        assert!(view.dirty_chunks.is_empty());
     }
 
     #[cfg(unix)]

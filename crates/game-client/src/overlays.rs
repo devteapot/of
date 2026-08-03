@@ -1,10 +1,17 @@
-use bevy::prelude::*;
+use std::any::TypeId;
+
+use bevy::{
+    camera::visibility::{VisibilitySystems, VisibleEntities},
+    prelude::*,
+};
 use hex_core::Axial;
 
 use crate::{
+    camera::GameCamera,
     geometry::{corner, world_center},
     interaction::{InteractionState, OrderMode},
     model::{CellView, MatchView},
+    terrain::TerrainChunk,
 };
 
 const SOURCE: Color = Color::srgb(0.44, 0.90, 0.94);
@@ -17,7 +24,10 @@ pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, draw_world_overlays);
+        app.add_systems(
+            PostUpdate,
+            draw_world_overlays.after(VisibilitySystems::CheckVisibility),
+        );
     }
 }
 
@@ -25,28 +35,45 @@ fn draw_world_overlays(
     time: Res<Time>,
     view: Res<MatchView>,
     interaction: Res<InteractionState>,
+    visible: Single<&VisibleEntities, With<GameCamera>>,
+    chunks: Query<&TerrainChunk>,
     mut gizmos: Gizmos,
 ) {
-    draw_blocked_cells(&view, &mut gizmos);
+    draw_blocked_cells(&view, &visible, &chunks, &mut gizmos);
     draw_selection(&view, &interaction, &mut gizmos);
     draw_preview(&view, &interaction, &mut gizmos);
     draw_committed_orders(&view, time.elapsed_secs(), &mut gizmos);
 }
 
-fn draw_blocked_cells(view: &MatchView, gizmos: &mut Gizmos) {
-    for cell in view.cells.values().filter(|cell| cell.blocked) {
-        let center = point(cell, 0.075);
-        let arm = 0.18;
-        gizmos.line(
-            center + Vec3::new(-arm, 0.0, -arm),
-            center + Vec3::new(arm, 0.0, arm),
-            BLOCKED,
-        );
-        gizmos.line(
-            center + Vec3::new(-arm, 0.0, arm),
-            center + Vec3::new(arm, 0.0, -arm),
-            BLOCKED,
-        );
+fn draw_blocked_cells(
+    view: &MatchView,
+    visible: &VisibleEntities,
+    chunks: &Query<&TerrainChunk>,
+    gizmos: &mut Gizmos,
+) {
+    for entity in visible.iter(TypeId::of::<Mesh3d>()) {
+        let Ok(chunk) = chunks.get(*entity) else {
+            continue;
+        };
+        for cell in chunk
+            .cells
+            .iter()
+            .filter_map(|coordinate| view.cell(*coordinate))
+            .filter(|cell| cell.blocked)
+        {
+            let center = point(cell, 0.075);
+            let arm = 0.18;
+            gizmos.line(
+                center + Vec3::new(-arm, 0.0, -arm),
+                center + Vec3::new(arm, 0.0, arm),
+                BLOCKED,
+            );
+            gizmos.line(
+                center + Vec3::new(-arm, 0.0, arm),
+                center + Vec3::new(arm, 0.0, -arm),
+                BLOCKED,
+            );
+        }
     }
 }
 

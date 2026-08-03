@@ -6,7 +6,7 @@ use bevy::{
     ui::UiRect,
 };
 
-use crate::{model::MatchView, terrain::TerrainChunk};
+use crate::{map_view::MapViewDiagnostics, model::MatchView, terrain::TerrainChunk};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const PANEL: Color = Color::srgba(0.025, 0.038, 0.047, 0.94);
@@ -103,6 +103,7 @@ fn update_performance_overlay(
     time: Res<Time>,
     diagnostics: Res<DiagnosticsStore>,
     view: Res<MatchView>,
+    map_view: Res<MapViewDiagnostics>,
     chunks: Query<(), With<TerrainChunk>>,
     mut state: ResMut<PerformanceOverlayState>,
     text: Single<&mut Text, With<PerformanceText>>,
@@ -125,12 +126,14 @@ fn update_performance_overlay(
         .unwrap_or(0.0);
     let mut text = text.into_inner();
     let value = format!(
-        "PERFORMANCE  //  F3\nFPS {:>6}  ·  FRAME {:>7}\nENTITIES {:>6.0}  ·  CHUNKS {:>4}\nCELLS {:>9}  ·  DIRTY {:>5}\nORDERS {:>8}  ·  FLOWS {:>5}  ·  FRONTS {:>4}",
+        "PERFORMANCE  //  F3\nFPS {:>6}  ·  FRAME {:>7}\nENTITIES {:>6.0}  ·  CHUNKS {:>4} / {:>4} VISIBLE\nCELLS {:>9}  ·  LABELS {:>4}  ·  DIRTY {:>5}\nORDERS {:>8}  ·  FLOWS {:>5}  ·  FRONTS {:>4}",
         format_metric(fps, 1, ""),
         format_metric(frame_time, 2, " ms"),
         entities,
         chunks.iter().count(),
+        map_view.visible_chunks,
         view.cells.len(),
+        map_view.active_labels,
         view.dirty_chunks.len(),
         view.active_orders,
         view.active_flows.len(),

@@ -104,9 +104,33 @@ later.
 
 The native client renders combined chunk meshes rather than one entity per hex.
 Each triangle retains its authoritative axial cell so ray picking selects the
-visible stepped surface. Ownership hue and occupancy luminance are encoded in
-vertex colors; separate overlays communicate selection, target density, route,
-bottlenecks, active flow, and combat fronts.
+visible stepped surface. Ownership hue and the active map-view intensity are
+encoded in vertex colors; separate overlays communicate selection, target
+density, route, bottlenecks, active flow, and combat fronts.
+
+The default Soldiers view shades cells by absolute infantry strength rather
+than capacity occupancy. Overview removes force-dependent luminance, and the
+Civilians view shades by absolute civilian population. `1`, `2`, and `3`
+select those views directly; `V` cycles them. Stable presentation reference
+values keep an unrelated cell's color from changing when the map-wide maximum
+changes. At readable zoom levels, one texture-atlas-backed world-space mesh
+batches compact authoritative totals directly over their hex tops; there is no
+UI node or draw call per cell. Farther out, the vertex-color heatmap carries the
+information without trying to draw text for every cell. The label LOD is
+viewport-derived and displays the complete readable visible set or hides it,
+rather than silently sampling cells when a fixed budget is exceeded.
+
+Rendering work is organized by an 8 x 8 client-side spatial index. This is
+deliberately independent of the module's 16 x 16 storage/subscription chunks so
+the renderer can tune culling granularity without changing authoritative cell
+identity. Initial render-chunk creation is amortized, state changes replace
+only the affected vertex-color attributes, visible dirty chunks are
+prioritized, and hidden chunks converge under a bounded per-frame budget.
+The value batch and blocked overlays inspect visible render-chunk cells rather
+than scanning the whole map. This keeps presentation work tied primarily to
+the viewport, but world-scale maps will still require the documented
+chunk-interest subscriptions or regional summaries so the client does not
+retain every authoritative cell in memory.
 
 Input produces `ClientIntent`. The online transport maps coordinates to
 authoritative cell IDs, invokes reducers, pumps SpacetimeDB frames, and rebuilds
