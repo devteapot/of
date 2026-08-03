@@ -12,7 +12,9 @@ The defining mechanic is **spatially conserved troop flow**:
 
 Army strength cannot be reassigned instantly from one border to another. Troops have a location, routes take time, destinations have finite capacity, and terrain creates bottlenecks. This should preserve high-level RTS control while making geography and logistics matter.
 
-V1 exists to answer one question: is selecting regions, moving aggregate strength, redistributing it, and fighting over a height-aware hex map understandable and fun?
+V1 exists to answer one question: is selecting regions, pushing connected front
+sections, redistributing aggregate strength, and fighting over a height-aware
+hex map understandable and fun?
 
 ## Locked V1 Scope
 
@@ -87,7 +89,7 @@ The simulation distinguishes:
 
 They use the same abstract force scale but are not interchangeable. This separation allows a dense city behind a narrow gate, or a fast road that improves logistics without automatically increasing combat power.
 
-For a simple transfer step:
+For a simple movement step:
 
 `moved <= min(source strength, destination free capacity, edge throughput * elapsed time)`
 
@@ -116,7 +118,7 @@ If territory is cut into disconnected components:
 
 - each component keeps the civilians and forces physically inside it;
 - forces may redistribute within that component;
-- transfers cannot cross the lost connection;
+- troop movement cannot cross the lost connection;
 - the pocket can defend, attack outward, and attempt to reconnect;
 - reconnection permits movement again but does not instantly equalize strength.
 
@@ -124,129 +126,69 @@ There is no separate out-of-supply damage, disappearance, morale debuff, or HQ-c
 
 ## Player Orders and UX Experiments
 
-The underlying order semantics are locked; the final gesture and presentation are not.
+### Push Front: the primary conquest interaction
 
-### Source-to-destination transfer
+V1 does not expose destination-cell painting as its conquest loop. The player
+selects the territory and troops that may participate, then chooses exactly one
+of the six hex directions in which its boundary should advance:
 
-The first interaction to test is:
+1. Paint one connected owned source region. Begin with one contiguous border
+   section and continue backward into owned territory to include its
+   reinforcement corridor and troop pool.
+2. Hold `P`, drag outward, and release. The client quantizes the gesture to one
+   exact axial direction.
+3. Preview the exact active edges, selected routes, participating strength,
+   commitment, capacity, congestion, and any invalid condition.
+4. Use `[` / `]` to change commitment, `Enter` to submit, or `Escape` to
+   cancel while retaining the selected region.
 
-1. Select or paint a set of owned source hexes.
-2. Inspect their available movable strength.
-3. Select or paint destination hexes.
-4. Choose an amount or percentage to move.
-5. Preview routes, destination capacity, congestion, excluded cells, and ETA.
-6. Confirm the aggregate transfer.
+For every selected cell, only its neighbor in the chosen direction is
+considered. A valid active edge is therefore exactly `(selected source,
+source + direction)`: side and rear edges never join the command implicitly.
+The selected source region must be six-connected, and the selected cells that
+own active edges must form one connected front section. Targets must be
+capturable, traversable, and not already owned by the player. The same command
+expands into neutral land or attacks an enemy-held cell; ownership determines
+the resolution, not a separate targeting mode.
 
-The server distributes the requested strength across reachable destinations up to their capacities. Unreachable sources or destinations remain excluded and visibly explained. A neutral or hostile destination causes forces to stage at and feed the relevant contested border rather than travel through unowned territory.
+Cells behind the boundary contribute only through routes that stay inside the
+submitted selection. The route's final step is the exact previewed frontier
+edge. A cell outside the selection cannot become a convenient shortcut, and an
+unselected friendly stack cannot be debited. Internal cliffs or other blocked
+edges that split the selected reinforcement corridor make the command invalid
+rather than silently changing its meaning.
 
-The exact selection gestures, amount controls, path presentation, and confirmation flow are provisional and should be iterated in playtests.
+Each command is intentionally **one cell deep**. It moves toward or resolves
+only the currently previewed neighboring cells; it does not auto-retarget a
+new perimeter or run an invisible expansion wave after capture. The player may
+repeat Push Front from the newly advanced border. Its feeling of momentum comes
+from repeated high-level commands plus the physical infantry already moving
+through the selected corridor, constrained by capacity, throughput, frontage,
+terrain, and resistance—not from click-speed bonuses or a second expansion
+resource.
 
-### Next experiment: all-front neutral expansion
+The authoritative `issue_push_front` reducer receives a stable command ID, the
+exact sorted selected cell IDs, one axial direction, and commitment in basis
+points. It revalidates ownership, source connectivity, active-front
+connectivity, traversal, available unallocated infantry, target capacity, and
+selected-only routes in one transaction. Accepted strength becomes ordinary
+aggregate transit packets; rejected commands create a receipt without partial
+gameplay mutation.
 
-The target-based transfer is intentionally precise, but it is probably too
-deliberate to be the only way to cross the large amount of unclaimed land at
-the beginning of a match. The next gameplay experiment should add a fast
-**Expand** action alongside transfers rather than replacing them.
+Commitment is a desired total share of each source stack, not a percentage of
+whatever remains after every click. Infantry already allocated from that
+source to the same directional front counts toward the target, while unrelated
+orders only reduce what remains available. Repeating an unchanged 50% Push
+therefore cannot ratchet the same stack toward 100%. Destination reservations
+are scoped to the issuing player; another player's pending attack cannot
+pre-claim neutral capacity before the forces physically meet.
 
-An Expand activation is a one-shot pulse over every traversable edge from the
-player's territory into neutral, unoccupied land:
-
-- it never attacks or crosses into enemy-owned territory;
-- every disconnected component expands using only the infantry physically
-  present on its own frontier;
-- each frontier hex commits a player-selected share of its movable infantry,
-  while retaining a provisional local reserve;
-- a source facing several neutral edges divides its commitment instead of
-  duplicating it;
-- cliffs, water, full destinations, and other impassable edges are excluded;
-- issuing another pulse while one is active should adjust or renew the
-  commitment, not stack click-speed bonuses.
-
-The pulse creates expansion fronts, not instant ownership changes. Each front
-accumulates capture progress from its committed local infantry. Effective
-progress is bounded by edge throughput/frontage and modified by terrain and
-elevation, so additional infantry creates more momentum only until the local
-edge is saturated. When a neutral cell is captured, occupying infantry must be
-able to enter it and a small garrison is left behind. Remaining committed
-strength may continue into the next neutral edge. The wave therefore slows as
-it widens, crosses difficult terrain, fills capacity, or spends strength
-holding newly captured ground.
-
-This keeps spatial conservation intact: "momentum" is an observable consequence
-of local committed troops and geography, not a second army value or a global
-expansion currency. If both players reach the same neutral cell, the first
-front to complete capture progress claims it. An exact same-step tie leaves the
-cell neutral and stops both pulses there until a targeted order resolves the
-contest, avoiding an arbitrary player-slot priority. Any later arrival that
-finds enemy ownership also stops as an expansion pulse and leaves explicit
-attack rules to resolve the conflict.
-
-The first UX prototype should make Expand a single action with an adjustable
-commitment percentage and an immediate frontier/momentum visualization. Whether
-that action ultimately uses a keyboard shortcut, a HUD button, or a contextual
-left-click is deliberately open because ordinary left-drag currently owns
-region selection.
-
-This produces three useful levels of control:
-
-1. **Expand** for quick, neutral-only growth across all local fronts.
-2. **Transfer and redistribution** for moving real strength between regions.
-3. **Targeted attack** for deliberately crossing an enemy border.
-
-The experiment belongs close to V1 because it changes the cadence of the core
-loop. Its exact capture threshold, reserve, continuation, and input gesture are
-playtest values rather than locked rules.
-
-#### Global Expand and selected-front Push
-
-The expansion simulation should expose two controls over the same underlying
-directed frontier edges:
-
-- **Expand All** (`X` in the first prototype) immediately seeds every valid
-  owned-to-neutral frontier edge using the remembered commitment percentage.
-- **Push Front** (`P`) uses the ordinary selected owned region. The part of
-  that region touching neutral territory defines the front, while cells painted
-  backward from that border define the reinforcement pool and corridor.
-
-The player does not switch to a separate edge-selection tool. They paint a
-connected source region with the normal selector, beginning at a contiguous
-neutral-facing border and continuing as far backward into owned territory as
-desired. The adjustable brush and connected-cluster helpers make broad or deep
-source regions practical. The preview derives the region's exposed directed
-edges `(selected owned source cell, adjacent neutral target cell)`. Enemy
-borders, water, cliffs, blocked cells, and map boundaries cannot become neutral
-expansion edges.
-
-The first Push Front interaction should be:
-
-1. Paint one connected owned source region. Its neutral-facing boundary must
-   contain one contiguous intended front; continue painting backward to include
-   the troops and routes that may feed it.
-2. Press and drag `P` outward from that front. The client quantizes the gesture
-   to one of the six axial directions.
-3. Preview the exact active edges, continuation wedge, participating source
-   cells, and any cells excluded because they cannot connect to that front.
-4. Adjust commitment, confirm with Enter, or cancel with Escape.
-
-The heading keeps the selected region's forward-facing edge and its two
-adjacent directions, which prevents the back and sides of a deep selection from
-becoming unintended fronts. If the resulting edges form multiple disconnected
-arcs, the preview is invalid until the source selection is refined to one arc.
-
-A heading activates straight-ahead expansion and the two adjacent hex
-directions, weighted `2:1:1`. A source facing multiple chosen edges divides one
-local commitment budget across them; it never duplicates strength. After a
-capture, continuation examines only the newly captured cell's forward three
-directions. Expand All has no heading and may fan out through every valid
-neutral direction.
-
-Visual segment IDs are deliberately not authoritative because the perimeter
-changes after every capture. The command contains the exact sorted selected
-source cells, derived directed edges, direction, and commitment. The server
-revalidates the source region and edge set, accepts the still-valid subset with
-explicit exclusions, and rejects the order only when no selected edge remains
-valid. Repeating an expansion command updates the desired local commitment
-rather than stacking another copy, so click speed cannot manufacture momentum.
+The generic aggregate transfer machinery remains a useful implementation
+substrate for routes, queues, congestion, and delivery. Precise destination
+orders may return later as a lower-level logistics feature, but they are not a
+player-facing V1 conquest interaction. A neutral-only Expand All shortcut also
+remains a possible opening-flow experiment after the selected-front loop is
+validated; it must not replace the spatial commitment rules above.
 
 ### One-shot redistribution
 
@@ -284,7 +226,7 @@ V1 uses intentionally simple graybox graphics:
 - flat terrain and ownership colors;
 - simple lighting;
 - clear borders and selection highlights;
-- route arrows, transfer direction, queues, and ETA;
+- selected-only push routes, exact active front edges, queues, and ETA;
 - redistribution target-density heatmaps;
 - absolute force-strength shading, with alternate civilian and ownership
   overview modes.
@@ -340,7 +282,7 @@ Also provisional:
 - terrain capacity and throughput modifiers;
 - combat lethality, frontage ratio, neutral resistance, and uphill penalty;
 - the timer's resolution rule if a timer is enabled;
-- source/destination and redistribution UX details.
+- Push Front commitment and redistribution UX details.
 
 ## V1 Acceptance Criteria
 
@@ -352,21 +294,29 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
 4. Terrain elevation visibly affects traversal and uphill combat, and cliffs block ordinary ground movement.
 5. Civilian population grows locally and a global mobilization target converts it into local infantry strength over time.
 6. Lowering the mobilization target does not instantly demobilize existing force.
-7. Players can issue a source-region-to-destination-region transfer and inspect route, ETA, destination capacity, and congestion before confirmation.
-8. Transfers obey spatial conservation, capacity, and edge throughput; no command can teleport or duplicate strength.
+7. Players can select one connected owned region, hold-drag-release `P` to
+   choose one exact direction, and preview one connected active front before
+   confirmation.
+8. Push Front routes remain inside the exact selection until their final
+   one-cell frontier edge and obey spatial conservation, capacity, and edge
+   throughput; no command can teleport or duplicate strength.
 9. Cutting a corridor creates genuinely independent connected components whose existing population and forces remain usable locally but cannot transfer across the cut.
 10. Players can apply one-shot Balance and oriented Front-load redistribution orders, preview their target densities, and watch force physically redistribute.
 11. Combat is resolved across contested edges using frontage, elevation, capacity, and casualties, including attacks from more than one edge without double-counting defenders.
 12. Ownership changes through combat and expansion, and all authoritative state is fully visible to both players.
-13. Graybox overlays make ownership, force density, occupancy/capacity, transfers, queues, fronts, and blocked orders understandable without production assets.
+13. Graybox overlays make ownership, force density, occupancy/capacity, Push
+    Front flows, queues, active edges, and blocked orders understandable without
+    production assets.
 14. Core tuning values are configurable so playtests can adjust the model without changing its data or interaction foundations.
 
 ## Questions for Playtesting, Not Pre-production Blockers
 
-- Does direct source-to-destination movement feel natural, or should persistent target-density orders eventually become primary?
-- Does an all-front Expand pulse make the opening flow naturally without
-  removing the value of spatial logistics or rewarding click spam?
-- Which selection gestures make irregular source and destination regions easy to express?
+- Does selecting a front plus its backward reinforcement corridor feel direct,
+  and is repeating a one-cell-deep Push enough to create momentum without
+  excessive input?
+- Would a neutral-only Expand All shortcut improve the opening without
+  obscuring spatial logistics or rewarding click spam?
+- Which selection gestures make irregular connected source regions easy to express?
 - Is the local civilian-to-military mobilization model understandable before an explicit economy is introduced?
 - Do capacity, throughput, and frontage create clear bottlenecks rather than frustrating queues?
 - Does Balance solve post-push cleanup, and does an oriented density preset provide enough control?

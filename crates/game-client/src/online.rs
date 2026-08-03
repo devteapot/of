@@ -19,8 +19,8 @@ use match_bindings::{
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
     PlayerSlotTableAccess, ReceiptStatus, TransferDestinationTableAccess, TransferOrder,
     TransferOrderTableAccess, TransferSource, TransferSourceTableAccess, TransitPacket,
-    TransitPacketTableAccess, issue_balance, issue_front_load, issue_transfer, join_match,
-    set_mobilization_target,
+    TransitPacketTableAccess, issue_balance, issue_front_load, issue_push_front, issue_transfer,
+    join_match, set_mobilization_target,
 };
 use spacetimedb_sdk::__codegen::InternalError;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
@@ -91,6 +91,7 @@ impl SharedSignals {
 
 #[derive(Clone, Debug)]
 enum PendingCommand {
+    PushFront,
     Transfer,
     Balance,
     FrontLoad,
@@ -100,6 +101,7 @@ enum PendingCommand {
 impl PendingCommand {
     const fn label(&self) -> &'static str {
         match self {
+            Self::PushFront => "Push Front",
             Self::Transfer => "Transfer",
             Self::Balance => "Balance",
             Self::FrontLoad => "Front-load",
@@ -109,6 +111,7 @@ impl PendingCommand {
 
     const fn receipt_name(&self) -> &'static str {
         match self {
+            Self::PushFront => "issue_push_front",
             Self::Transfer => "issue_transfer",
             Self::Balance => "issue_balance",
             Self::FrontLoad => "issue_front_load",
@@ -485,6 +488,24 @@ fn invoke_intent(
     };
 
     match intent {
+        ClientIntent::PushFront {
+            sources,
+            direction,
+            commitment_percent,
+        } => {
+            connection
+                .reducers
+                .issue_push_front_then(
+                    command_id,
+                    ids_for_selection(transport, sources)?,
+                    direction.q,
+                    direction.r,
+                    u32::from((*commitment_percent).clamp(1, 100)) * 100,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::PushFront)
+        }
         ClientIntent::Transfer {
             sources,
             destinations,

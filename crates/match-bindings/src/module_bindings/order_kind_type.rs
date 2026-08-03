@@ -13,6 +13,8 @@ pub enum OrderKind {
     Balance,
 
     FrontLoad,
+
+    PushFront,
 }
 
 impl __sdk::InModule for OrderKind {

@@ -18,6 +18,7 @@ pub mod command_receipt_type;
 pub mod configure_map_reducer;
 pub mod issue_balance_reducer;
 pub mod issue_front_load_reducer;
+pub mod issue_push_front_reducer;
 pub mod issue_transfer_reducer;
 pub mod join_match_reducer;
 pub mod map_preset_type;
@@ -57,6 +58,7 @@ pub use command_receipt_type::CommandReceipt;
 pub use configure_map_reducer::configure_map;
 pub use issue_balance_reducer::issue_balance;
 pub use issue_front_load_reducer::issue_front_load;
+pub use issue_push_front_reducer::issue_push_front;
 pub use issue_transfer_reducer::issue_transfer;
 pub use join_match_reducer::join_match;
 pub use map_preset_type::MapPreset;
@@ -109,6 +111,13 @@ pub enum Reducer {
         orientation_q: i32,
         orientation_r: i32,
     },
+    IssuePushFront {
+        client_command_id: u64,
+        selected_cells: Vec<u32>,
+        direction_q: i32,
+        direction_r: i32,
+        commitment_bps: u32,
+    },
     IssueTransfer {
         client_command_id: u64,
         source_cells: Vec<u32>,
@@ -136,6 +145,7 @@ impl __sdk::Reducer for Reducer {
             Reducer::ConfigureMap { .. } => "configure_map",
             Reducer::IssueBalance { .. } => "issue_balance",
             Reducer::IssueFrontLoad { .. } => "issue_front_load",
+            Reducer::IssuePushFront { .. } => "issue_push_front",
             Reducer::IssueTransfer { .. } => "issue_transfer",
             Reducer::JoinMatch { .. } => "join_match",
             Reducer::SetMobilizationTarget { .. } => "set_mobilization_target",
@@ -174,6 +184,19 @@ impl __sdk::Reducer for Reducer {
                 selected_cells: selected_cells.clone(),
                 orientation_q: orientation_q.clone(),
                 orientation_r: orientation_r.clone(),
+            }),
+            Reducer::IssuePushFront {
+                client_command_id,
+                selected_cells,
+                direction_q,
+                direction_r,
+                commitment_bps,
+            } => __sats::bsatn::to_vec(&issue_push_front_reducer::IssuePushFrontArgs {
+                client_command_id: client_command_id.clone(),
+                selected_cells: selected_cells.clone(),
+                direction_q: direction_q.clone(),
+                direction_r: direction_r.clone(),
+                commitment_bps: commitment_bps.clone(),
             }),
             Reducer::IssueTransfer {
                 client_command_id,

@@ -6,6 +6,32 @@ The intended extension point is the same throughout: troops, resources, and infr
 
 ## Logistics and infrastructure
 
+### Precise redeployment and targeted logistics
+
+The generic aggregate-transfer substrate can later support a lower-level order
+that paints exact friendly destinations for reserves, evacuation, or carefully
+staged attacks. It is intentionally absent from the V1 player loop: selected
+region plus directional Push Front must first prove that ordinary conquest does
+not require destination-cell micromanagement. Any later precision tool must keep
+spatial conservation, expose its route and ETA, and avoid becoming a way to
+teleport pressure between borders.
+
+**Depends on:** validated Push Front cadence, a demonstrated need for finer
+redeployment, route readability, order priorities, and interactions that remain
+usable on large maps.
+
+### Neutral Expand All shortcut
+
+A later neutral-only shortcut could pulse all eligible borders using troops
+already present at each local front. It should accelerate low-stakes opening
+expansion without attacking enemies, creating global army power, or rewarding
+click spam. This remains separate from the exact selected-front command until
+playtests show whether its convenience is needed.
+
+**Depends on:** validated one-cell Push Front behavior, clear commitment and
+momentum feedback, deterministic same-cell contention, and safeguards against
+opaque automation.
+
 ### Roads and paths
 
 Roads and paths could reduce travel time and increase troop-flow capacity along particular edges. This would make infrastructure a strategic investment and make redeployment routes visible targets rather than passive bonuses.
@@ -137,6 +163,11 @@ A technology tree is not an assumed destination. It should be added only if rese
 Larger maps, long-running worlds, or multiple linked theaters could amplify logistics, regional policy, migration, and diplomacy. They could also turn useful travel time into inactivity and greatly increase state, subscription, pathfinding, and persistence costs.
 
 **Depends on:** benchmarks at several map sizes, chunked storage and rendering, interest management, hierarchical routing, regional aggregation, persistence/versioning, and a game loop that remains active while distant forces travel. Scale should grow because it improves decisions, not because the renderer can display more hexes.
+
+Before increasing the V1 4,096-cell command cap, replace per-source duplicated
+packet routes with shared suffixes, a route DAG, or another aggregate corridor
+representation. Track active packet count through the F3 `FLOWS` metric while
+profiling representative wide fronts.
 
 ## Browser target
 

@@ -63,7 +63,7 @@ Public state is split by read/update pattern:
 - `cell_state` holds mutable ownership, population, infantry, and capacities;
 - `command_receipt` records accepted and rejected idempotent commands;
 - `transfer_order`, `transfer_source`, `transfer_destination`, and
-  `transit_packet` expose order progress and congestion;
+  `transit_packet` expose generic aggregate-flow progress and congestion;
 - `combat_front` exposes the current contested edges and casualties.
 
 `simulation_schedule` is private. Clients cannot call the scheduled reducer as
@@ -74,8 +74,13 @@ a player identity.
 - `configure_map` — select Dev64, Playtest128, or Validation192 before joining.
 - `join_match` — claim or reclaim one of the two player slots.
 - `set_mobilization_target` — change the global target in basis points.
-- `issue_transfer` — commit an absolute infantry amount from source IDs toward
-  destination IDs.
+- `issue_push_front` — commit a percentage of one connected selected region
+  through its one connected directional front, using routes that stay selected
+  until the exact final edge.
+- `issue_transfer` — lower-level friendly-territory-only aggregate transfer
+  primitive retained for compatibility, testing, and future precision
+  logistics; the V1 client does not expose destination painting and the
+  reducer rejects unowned destinations.
 - `issue_balance` — create a physical one-shot density equalization order.
 - `issue_front_load` — create a physical one-shot directional density order.
 - `cancel_transfer_order` — release the remaining allocation of an active
@@ -135,15 +140,19 @@ only the affected vertex-color attributes, visible dirty chunks are
 prioritized, and hidden chunks converge under a bounded per-frame budget.
 The value batch, population outline, blocked overlay, and selected-region
 perimeters inspect visible render-chunk cells rather than scanning the whole
-map. Selection painting supports a centered odd-sized rectangular brush up to
-31 x 31 cells, connected local-owned components, and all-local-owned selection.
+map. Selection painting supports a centered odd-sized rectangular core with
+complete hex-ring dilation up to 31 x 31 cells, connected local-owned
+components, and all-local-owned selection. Width and height remain independently
+adjustable while combined resizing adds or removes a true one-cell perimeter.
 Large selections are materialized once in V1, but their per-frame outline work
 is viewport-bounded and emits only exposed edges. Order previews are keyed by
-selection and cell-state revisions, and a transfer classifies all selected
-sources and destinations with constant-count multi-source graph traversals
-rather than one route search per selected cell. This keeps presentation work
-tied primarily to the viewport and real state changes. World-scale maps will
-still require symbolic region selections plus chunk-interest subscriptions or
+selection and cell-state revisions. Push Front uses shared deterministic rules
+to derive only the exact chosen-direction boundary, then checks reachability
+backward through the selected region; it does not perform a route search for
+every possible map destination. The retained lower-level transfer preview uses
+constant-count multi-source graph traversals. This keeps presentation work tied
+primarily to the viewport and real state changes. World-scale maps will still
+require symbolic region selections plus chunk-interest subscriptions or
 regional summaries so the client does not retain or transmit every
 authoritative cell.
 
@@ -153,22 +162,27 @@ authoritative cell IDs, invokes reducers, pumps SpacetimeDB frames, and rebuilds
 message boundary for UI development but is not a rules-equivalent substitute
 for the server.
 
-The order interaction is deliberately provisional: paint sources, enter a
-modal transfer or redistribution preview, inspect the effect, and confirm. This
-is the first workflow to playtest rather than a commitment to the final UX.
+The V1 conquest interaction is Push Front: paint one connected owned region,
+hold `P`, drag outward, and release to preview one exact direction. Plain
+brackets adjust commitment and `Enter` submits. The server routes only through
+the submitted cells before crossing the exact final edge, and each command is
+one cell deep so continuing momentum requires repeating the high-level push.
+Balance and Front-load remain modal redistribution previews. Exact gestures and
+presentation remain playtest material, but painted destination transfer is not
+part of the exposed V1 loop.
 
 ## Tests and current evidence
 
 - `hex-core` covers coordinates, chunks, traversal, routing, connectivity,
-  capacity, throughput, backpressure, conservation, multi-edge combat,
-  redistribution, and exact 80% victory math.
+  selected directional-front derivation, capacity, throughput, backpressure,
+  conservation, multi-edge combat, redistribution, and exact 80% victory math.
 - `worldgen` pins all curated maps, round-trips serialization, rejects invalid
   metadata/duplicates, and sweeps supported custom seeds.
 - The module's native tests pin preset metadata; module compilation validates
   the SpacetimeDB schema and WASM target.
 - The headless real-server smoke test uses two identities to cover slot claims,
-  match start, subscriptions, idempotent receipts, a real transfer, progression,
-  and token-based reconnect.
+  match start, subscriptions, idempotent receipts, the lower-level aggregate
+  flow pipeline, progression, and token-based reconnect.
 - The Bevy client has coordinate/fixture/route tests and a native launch smoke.
 - CI repeats formatting, workspace tests/lints, module tests/lints/build, and
   generated-binding drift detection.
@@ -179,8 +193,8 @@ is the first workflow to playtest rather than a commitment to the final UX.
 - The second join auto-starts the match; there is no lobby UI or ready toggle.
 - Routes are deterministic and fixed when an order is accepted; active orders
   do not dynamically replan around later ownership changes.
-- Transfers use an absolute aggregate amount after the client converts its
-  percentage selection; there are no order priorities.
+- Push Front converts the chosen commitment percentage to authoritative basis
+  points. Accepted routes are fixed and there are no order priorities.
 - Population/mobilization uses a provisional full-state cadence. Movement and
   combat use active sets, but nominal/stress performance gates still need
   representative playtest measurement.

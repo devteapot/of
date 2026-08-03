@@ -1,12 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+};
 
-use hex_core::{Axial, DistributionPreset, HexMap, redistribution_targets};
+use hex_core::{
+    Axial, DistributionPreset, FrontSelectionError, HexMap, MovementConfig, ground_traversal,
+    redistribution_targets, selected_front_edges,
+};
 use spacetimedb::{ReducerContext, Table};
 
 use crate::rules::{
-    MAX_SELECTION_CELLS, allocated_infantry_at_cell, cell_state, command_was_seen,
-    coordinate_for_cell, core_cell, packet_key, require_running_player, route_to, state, terrain,
-    write_receipt,
+    MAX_SELECTION_CELLS, allocated_infantry_at_cell, cell_state, command_was_seen, config,
+    coordinate_for_cell, core_cell, edge_runtime_limits, packet_key, require_running_player,
+    route_to, state, terrain, write_receipt,
 };
 use crate::schema::{
     OrderKind, OrderStatus, ReceiptStatus, TransferDestination, TransferOrder, TransferSource,
@@ -28,6 +34,32 @@ struct PlannedDistribution {
     sources: Vec<u32>,
     demands: BTreeMap<u32, u64>,
     amount: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FrontRouteTree {
+    /// Coordinate -> `(cost to front, assigned boundary coordinate, next coordinate)`.
+    labels: BTreeMap<Axial, (u64, Axial, Axial)>,
+}
+
+impl FrontRouteTree {
+    fn route_to_boundary(&self, source: Axial) -> Option<(Axial, Vec<Axial>)> {
+        let &(_, boundary, _) = self.labels.get(&source)?;
+        let mut route = vec![source];
+        let mut current = source;
+        while current != boundary {
+            let &(_, _, next) = self.labels.get(&current)?;
+            if next == current {
+                return None;
+            }
+            current = next;
+            route.push(current);
+            if route.len() > self.labels.len() {
+                return None;
+            }
+        }
+        Some((boundary, route))
+    }
 }
 
 fn receipt_result(
@@ -119,6 +151,45 @@ pub fn issue_transfer(
         },
     );
     receipt_result(ctx, player_id, client_command_id, "issue_transfer", result)
+}
+
+/// Commits a selected, connected owned region toward its exact directional
+/// boundary. Cells behind the boundary contribute infantry through routes that
+/// remain inside the submitted selection until their final frontier edge.
+#[spacetimedb::reducer]
+pub fn issue_push_front(
+    ctx: &ReducerContext,
+    client_command_id: u64,
+    selected_cells: Vec<u32>,
+    direction_q: i32,
+    direction_r: i32,
+    commitment_bps: u32,
+) -> Result<(), String> {
+    let player_id = require_running_player(ctx)?;
+    if command_was_seen(ctx, player_id, client_command_id) {
+        return Ok(());
+    }
+    let direction = Axial::new(direction_q, direction_r);
+    let result = plan_push_front(ctx, player_id, &selected_cells, direction, commitment_bps)
+        .and_then(|(requested, legs)| {
+            persist_order(
+                ctx,
+                player_id,
+                client_command_id,
+                OrderKind::PushFront,
+                requested,
+                direction,
+                legs,
+            )
+            .map(Some)
+        });
+    receipt_result(
+        ctx,
+        player_id,
+        client_command_id,
+        "issue_push_front",
+        result,
+    )
 }
 
 #[spacetimedb::reducer]
@@ -221,7 +292,7 @@ fn direct_destination_demands(
         return Err("transfer infantry must be greater than zero".into());
     }
     let destinations = unique_selection(destinations, "destination")?;
-    let reservations = active_destination_reservations(ctx);
+    let reservations = active_destination_reservations(ctx, player_id);
 
     let mut remaining = requested;
     let mut demands = BTreeMap::new();
@@ -229,15 +300,16 @@ fn direct_destination_demands(
         let terrain_row = terrain(ctx, destination)?;
         if !terrain_row.passable || !terrain_row.capturable {
             return Err(format!(
-                "destination cell {destination} is not capturable ground"
+                "destination cell {destination} is not passable ground"
             ));
         }
         let cell = cell_state(ctx, destination)?;
-        let capacity_before_reservations = if cell.owner_player_id == player_id {
-            cell.military_capacity.saturating_sub(cell.infantry)
-        } else {
-            cell.military_capacity
-        };
+        if cell.owner_player_id != player_id {
+            return Err(format!(
+                "destination cell {destination} is not owned by the player; use Push Front for conquest"
+            ));
+        }
+        let capacity_before_reservations = cell.military_capacity.saturating_sub(cell.infantry);
         let capacity = capacity_before_reservations
             .saturating_sub(reservations.get(&destination).copied().unwrap_or(0));
         let demand = remaining.min(capacity);
@@ -253,6 +325,225 @@ fn direct_destination_demands(
         return Err("the selected destinations have no available military capacity".into());
     }
     Ok(demands)
+}
+
+fn plan_push_front(
+    ctx: &ReducerContext,
+    player_id: u8,
+    selected_cells: &[u32],
+    direction: Axial,
+    commitment_bps: u32,
+) -> Result<(u64, Vec<PlannedLeg>), String> {
+    if !(1..=10_000).contains(&commitment_bps) {
+        return Err("push commitment must be between 1 and 10000 basis points".into());
+    }
+    if !Axial::DIRECTIONS.contains(&direction) {
+        return Err("push direction must be one of the six adjacent hex directions".into());
+    }
+
+    let selected_ids = unique_selection(selected_cells, "push source")?;
+    let mut selected_map = HexMap::new();
+    let mut coordinate_to_id = BTreeMap::new();
+    for cell_id in selected_ids {
+        let terrain_row = terrain(ctx, cell_id)?;
+        let cell = core_cell(ctx, cell_id)?;
+        if !terrain_row.passable || cell.owner != Some(u32::from(player_id)) {
+            return Err(format!(
+                "push source cell {cell_id} is not owned passable ground"
+            ));
+        }
+        coordinate_to_id.insert(cell.coordinate, cell_id);
+        selected_map.insert(cell);
+    }
+    let selected_coordinates = coordinate_to_id.keys().copied().collect::<BTreeSet<_>>();
+
+    let match_config = config(ctx)?;
+    let mut target_by_boundary = BTreeMap::<Axial, u32>::new();
+    for (&source_coordinate, &source_id) in &coordinate_to_id {
+        let target_coordinate = source_coordinate + direction;
+        if selected_coordinates.contains(&target_coordinate) {
+            continue;
+        }
+        let Some(target_id) =
+            crate::rules::cell_id_for_coordinate(&match_config, target_coordinate)
+        else {
+            continue;
+        };
+        let target_terrain = terrain(ctx, target_id)?;
+        let target_state = cell_state(ctx, target_id)?;
+        if !target_terrain.passable
+            || !target_terrain.capturable
+            || target_state.owner_player_id == player_id
+            || edge_runtime_limits(ctx, source_id, target_id)?.is_none()
+        {
+            continue;
+        }
+        target_by_boundary.insert(source_coordinate, target_id);
+    }
+
+    let edges = selected_front_edges(&selected_coordinates, direction, |source, _target| {
+        target_by_boundary.contains_key(&source)
+    })
+    .map_err(front_selection_message)?;
+    debug_assert_eq!(edges.len(), target_by_boundary.len());
+
+    let movement = MovementConfig {
+        max_elevation_step: u16::from(match_config.max_elevation_step),
+        level_cost: 10,
+        uphill_cost: 15,
+        downhill_cost: 10,
+    };
+    let boundary_sources = edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    let routes = front_route_tree(&selected_map, &boundary_sources, &movement);
+    if routes.labels.len() != selected_coordinates.len() {
+        return Err(
+            "push selection is split by a cliff or another impassable internal edge".into(),
+        );
+    }
+
+    let reservations = active_destination_reservations(ctx, player_id);
+    let mut remaining_capacity = BTreeMap::<u32, u64>::new();
+    for target_id in target_by_boundary.values().copied() {
+        let target = cell_state(ctx, target_id)?;
+        let capacity = target
+            .military_capacity
+            .saturating_sub(reservations.get(&target_id).copied().unwrap_or(0));
+        remaining_capacity.insert(target_id, capacity);
+    }
+
+    let mut requested = 0_u64;
+    let mut legs = Vec::new();
+    let matching_push_allocations = active_push_allocations(ctx, player_id, direction);
+    for (&source_coordinate, &source_id) in &coordinate_to_id {
+        let source = cell_state(ctx, source_id)?;
+        let (boundary, route_coordinates) = routes
+            .route_to_boundary(source_coordinate)
+            .ok_or_else(|| format!("push source cell {source_id} cannot reach the front"))?;
+        let target_id = *target_by_boundary
+            .get(&boundary)
+            .ok_or_else(|| "push route ended at an unknown boundary".to_string())?;
+        let allocated = allocated_infantry_at_cell(ctx, player_id, source_id);
+        let matching_allocated = matching_push_allocations
+            .get(&(source_id, target_id))
+            .copied()
+            .unwrap_or(0);
+        let commitment = additional_commitment(
+            source.infantry,
+            allocated,
+            matching_allocated,
+            commitment_bps,
+        );
+        requested = requested
+            .checked_add(commitment)
+            .ok_or_else(|| "push requested infantry overflow".to_string())?;
+        if commitment == 0 {
+            continue;
+        }
+
+        let available_capacity = remaining_capacity
+            .get_mut(&target_id)
+            .ok_or_else(|| "push target capacity is missing".to_string())?;
+        let amount = commitment.min(*available_capacity);
+        if amount == 0 {
+            continue;
+        }
+        *available_capacity -= amount;
+        let mut route = route_coordinates
+            .into_iter()
+            .map(|coordinate| {
+                coordinate_to_id
+                    .get(&coordinate)
+                    .copied()
+                    .ok_or_else(|| "push route escaped the selected region".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        route.push(target_id);
+        legs.push(PlannedLeg {
+            source: source_id,
+            destination: target_id,
+            amount,
+            route,
+        });
+    }
+
+    if requested == 0 {
+        return Err("the push selection has no uncommitted infantry at this commitment".into());
+    }
+    if legs.is_empty() {
+        return Err("the push front has no unreserved destination capacity".into());
+    }
+    Ok((requested, legs))
+}
+
+fn front_selection_message(error: FrontSelectionError) -> String {
+    match error {
+        FrontSelectionError::EmptySelection => "push selection is empty",
+        FrontSelectionError::DisconnectedSelection => "push selection must be six-connected",
+        FrontSelectionError::InvalidDirection => {
+            "push direction must be one of the six adjacent hex directions"
+        }
+        FrontSelectionError::NoEligibleFront => {
+            "the selected region has no non-owned passable front in that direction"
+        }
+        FrontSelectionError::DisconnectedFront => {
+            "the selected directional front is split into disconnected sections"
+        }
+    }
+    .into()
+}
+
+fn front_route_tree(
+    selected_map: &HexMap,
+    boundary_sources: &BTreeSet<Axial>,
+    movement: &MovementConfig,
+) -> FrontRouteTree {
+    let mut labels = BTreeMap::<Axial, (u64, Axial, Axial)>::new();
+    let mut pending = BinaryHeap::<Reverse<(u64, Axial, Axial)>>::new();
+    for &boundary in boundary_sources {
+        if !selected_map.contains(boundary) {
+            continue;
+        }
+        labels.insert(boundary, (0, boundary, boundary));
+        pending.push(Reverse((0, boundary, boundary)));
+    }
+
+    while let Some(Reverse((cost, boundary, current))) = pending.pop() {
+        if labels
+            .get(&current)
+            .is_none_or(|&(best_cost, best_boundary, _)| {
+                (best_cost, best_boundary) != (cost, boundary)
+            })
+        {
+            continue;
+        }
+        let Some(current_cell) = selected_map.get(current) else {
+            continue;
+        };
+        let mut neighbors = current.neighbors();
+        neighbors.sort_unstable();
+        for neighbor in neighbors {
+            let Some(neighbor_cell) = selected_map.get(neighbor) else {
+                continue;
+            };
+            // Search backward from the front. The cost must therefore describe
+            // the eventual forward step `neighbor -> current`.
+            let Some(step) = ground_traversal(neighbor_cell, current_cell, movement) else {
+                continue;
+            };
+            let candidate = (cost.saturating_add(u64::from(step.cost)), boundary, current);
+            if labels
+                .get(&neighbor)
+                .is_none_or(|existing| candidate < *existing)
+            {
+                labels.insert(neighbor, candidate);
+                pending.push(Reverse((candidate.0, candidate.1, neighbor)));
+            }
+        }
+    }
+    FrontRouteTree { labels }
 }
 
 fn distribution_plan(
@@ -283,7 +574,7 @@ fn distribution_plan(
     let mut sources = Vec::new();
     let mut demands = BTreeMap::new();
     let mut total_demand = 0_u64;
-    let reservations = active_destination_reservations(ctx);
+    let reservations = active_destination_reservations(ctx, player_id);
     for (coordinate, target) in targets.targets {
         let cell_id = by_coordinate[&coordinate];
         let current = cell_state(ctx, cell_id)?.infantry;
@@ -305,7 +596,10 @@ fn distribution_plan(
     })
 }
 
-fn active_destination_reservations(ctx: &ReducerContext) -> BTreeMap<u32, u64> {
+fn active_destination_reservations(
+    ctx: &ReducerContext,
+    player_id: u8,
+) -> BTreeMap<u32, u64> {
     let mut reservations = BTreeMap::<u32, u64>::new();
     for destination in ctx.db.transfer_destination().iter() {
         let active = ctx
@@ -313,7 +607,9 @@ fn active_destination_reservations(ctx: &ReducerContext) -> BTreeMap<u32, u64> {
             .transfer_order()
             .order_id()
             .find(destination.order_id)
-            .is_some_and(|order| order.status == OrderStatus::Active);
+            .is_some_and(|order| {
+                order.status == OrderStatus::Active && order.player_id == player_id
+            });
         if active {
             *reservations.entry(destination.cell_id).or_default() += destination
                 .target_infantry
@@ -321,6 +617,47 @@ fn active_destination_reservations(ctx: &ReducerContext) -> BTreeMap<u32, u64> {
         }
     }
     reservations
+}
+
+fn active_push_allocations(
+    ctx: &ReducerContext,
+    player_id: u8,
+    direction: Axial,
+) -> BTreeMap<(u32, u32), u64> {
+    let matching_orders = ctx
+        .db
+        .transfer_order()
+        .iter()
+        .filter(|order| {
+            order.player_id == player_id
+                && order.status == OrderStatus::Active
+                && order.kind == OrderKind::PushFront
+                && order.orientation_q == direction.q
+                && order.orientation_r == direction.r
+        })
+        .map(|order| order.order_id)
+        .collect::<BTreeSet<_>>();
+    let mut allocations = BTreeMap::<(u32, u32), u64>::new();
+    for packet in ctx.db.transit_packet().iter().filter(|packet| {
+        packet.owner_player_id == player_id && matching_orders.contains(&packet.order_id)
+    }) {
+        *allocations
+            .entry((packet.origin_cell, packet.destination_cell))
+            .or_default() += packet.infantry;
+    }
+    allocations
+}
+
+fn additional_commitment(
+    infantry: u64,
+    total_allocated: u64,
+    matching_allocated: u64,
+    commitment_bps: u32,
+) -> u64 {
+    let desired = (u128::from(infantry) * u128::from(commitment_bps) / 10_000) as u64;
+    desired
+        .saturating_sub(matching_allocated)
+        .min(infantry.saturating_sub(total_allocated))
 }
 
 fn unique_selection(cells: &[u32], label: &str) -> Result<BTreeSet<u32>, String> {
@@ -426,9 +763,38 @@ fn create_order(
             });
         }
     }
-    let committed = requested - remaining;
-    if committed == 0 {
+    if requested == remaining {
         return Err("no selected source can route to a selected destination".into());
+    }
+
+    persist_order(
+        ctx,
+        player_id,
+        client_command_id,
+        kind,
+        requested,
+        orientation,
+        legs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_order(
+    ctx: &ReducerContext,
+    player_id: u8,
+    client_command_id: u64,
+    kind: OrderKind,
+    requested: u64,
+    orientation: Axial,
+    legs: Vec<PlannedLeg>,
+) -> Result<u64, String> {
+    let committed = legs.iter().try_fold(0_u64, |total, leg| {
+        total
+            .checked_add(leg.amount)
+            .ok_or_else(|| "order committed infantry overflow".to_string())
+    })?;
+    if committed == 0 {
+        return Err("order has no committed infantry".into());
     }
 
     let logical_step = state(ctx)?.logical_step;
@@ -530,4 +896,97 @@ fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hex_core::Cell;
+
+    fn selected_cell(coordinate: Axial, elevation: i16) -> Cell {
+        Cell::ground(coordinate, elevation, Some(1), 100)
+    }
+
+    #[test]
+    fn front_route_tree_stays_inside_selection_until_the_boundary() {
+        let mut map = HexMap::new();
+        for q in 0..=3 {
+            map.insert(selected_cell(Axial::new(q, 0), 0));
+        }
+        let boundary = Axial::new(3, 0);
+        let routes = front_route_tree(
+            &map,
+            &BTreeSet::from([boundary]),
+            &MovementConfig::default(),
+        );
+
+        assert_eq!(
+            routes.route_to_boundary(Axial::ZERO),
+            Some((
+                boundary,
+                vec![
+                    Axial::new(0, 0),
+                    Axial::new(1, 0),
+                    Axial::new(2, 0),
+                    Axial::new(3, 0),
+                ],
+            ))
+        );
+    }
+
+    #[test]
+    fn front_route_tree_uses_stable_boundary_ties() {
+        let origin = Axial::ZERO;
+        let first = Axial::new(0, 1);
+        let second = Axial::new(1, 0);
+        let mut map = HexMap::new();
+        for coordinate in [origin, first, second] {
+            map.insert(selected_cell(coordinate, 0));
+        }
+        let routes = front_route_tree(
+            &map,
+            &BTreeSet::from([second, first]),
+            &MovementConfig::default(),
+        );
+
+        assert_eq!(
+            routes.route_to_boundary(origin),
+            Some((first, vec![origin, first]))
+        );
+    }
+
+    #[test]
+    fn front_route_tree_does_not_cross_an_internal_cliff() {
+        let rear = Axial::ZERO;
+        let boundary = Axial::new(1, 0);
+        let mut map = HexMap::new();
+        map.insert(selected_cell(rear, 0));
+        map.insert(selected_cell(boundary, 2));
+        let routes = front_route_tree(
+            &map,
+            &BTreeSet::from([boundary]),
+            &MovementConfig::default(),
+        );
+
+        assert!(routes.route_to_boundary(rear).is_none());
+        assert_eq!(
+            routes.route_to_boundary(boundary),
+            Some((boundary, vec![boundary]))
+        );
+    }
+
+    #[test]
+    fn repeated_push_only_fills_the_remaining_commitment_target() {
+        assert_eq!(additional_commitment(100, 0, 0, 5_000), 50);
+        assert_eq!(additional_commitment(100, 20, 20, 5_000), 30);
+        assert_eq!(additional_commitment(100, 50, 50, 5_000), 0);
+        assert_eq!(additional_commitment(100, 80, 50, 5_000), 0);
+    }
+
+    #[test]
+    fn unrelated_allocations_limit_supply_without_satisfying_the_push_target() {
+        assert_eq!(additional_commitment(100, 50, 0, 5_000), 50);
+        assert_eq!(additional_commitment(100, 70, 0, 5_000), 30);
+        assert_eq!(additional_commitment(100, 70, 20, 5_000), 30);
+    }
 }

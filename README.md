@@ -1,13 +1,14 @@
 # Hex RTS V1
 
 A native two-player RTS prototype about moving conserved aggregate forces across
-a stepped 2.5D hex world. Players paint source and destination regions instead
-of selecting individual soldiers. Terrain height, military capacity, edge
-throughput, combat frontage, and travel time determine where pressure can be
-applied.
+a stepped 2.5D hex world. Players select a connected owned region, then push one
+exact section of its border instead of selecting individual soldiers or painting
+destination cells. Terrain height, military capacity, edge throughput, combat
+frontage, and travel time determine where pressure can be applied.
 
 The project intentionally has no settled title, fiction, or production art yet.
-V1 is a graybox built to test the troop-flow and redistribution loop.
+V1 is a graybox built to test the Push Front, troop-flow, and redistribution
+loop.
 
 ## What V1 includes
 
@@ -16,7 +17,7 @@ V1 is a graybox built to test the troop-flow and redistribution loop.
 - Deterministic 64×64, 128×128, and 192×192 stepped-island map presets.
 - Per-hex civilians, infantry, civilian capacity, and military capacity.
 - A global mobilization target that converts population locally over time.
-- Source-to-destination transfers with spatial conservation and congestion.
+- Directional Push Front orders with spatial conservation and congestion.
 - One-shot Balance and oriented Front-load redistribution.
 - Height-aware movement, impassable cliffs, uphill combat penalties, edge
   frontage, casualties, capture, and disconnected pockets.
@@ -111,14 +112,15 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 | Left drag | Paint cells |
 | Shift + left drag | Add to the current region |
 | Control + left drag | Remove from the current region |
-| `[` / `]` while selecting | Shrink or grow both brush axes |
+| `[` / `]` while selecting | Remove or add one complete hex ring around the brush |
 | Shift + `[` / `]` | Change brush width only |
 | Control + `[` / `]` | Change brush height only |
 | `C` | Select the connected owned cluster under the cursor |
 | Shift / Control + `C` | Add or remove that cluster |
 | Control/Command + `A` | Select all locally owned hexes |
-| `T` | Enter destination painting for a transfer |
-| `[` / `]` | Lower or raise transfer percentage |
+| Hold `P`, drag outward, release | Preview a one-cell-deep push from the selected region in one exact hex direction |
+| Click `P PUSH FRONT`, then click outward on the map | Mouse-only alternative for orienting the same Push Front preview |
+| `[` / `]` during Push Front preview | Lower or raise troop commitment |
 | `B` | Preview Balance over the selected region |
 | Hold `F`, drag, release | Orient and preview Front-load |
 | Enter | Confirm the current preview |
@@ -159,8 +161,9 @@ cargo run -p match-e2e
 
 ## Repository map
 
-- `crates/hex-core` — deterministic coordinates, traversal, routing, movement,
-  combat, connectivity, redistribution, and Conquest rules.
+- `crates/hex-core` — deterministic coordinates, directional-front selection,
+  traversal, routing, movement, combat, connectivity, redistribution, and
+  Conquest rules.
 - `crates/worldgen` — deterministic map generation and validation.
 - `crates/match-bindings` — generated SpacetimeDB Rust wire contract.
 - `crates/game-client` — native Bevy rendering, input, UI, and transport.

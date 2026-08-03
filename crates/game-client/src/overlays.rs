@@ -24,7 +24,6 @@ const BLOCKED: Color = Color::srgba(0.83, 0.35, 0.24, 0.72);
 struct PerimeterStyle {
     lift: f32,
     scale: f32,
-    split_destination_classes: bool,
 }
 
 pub struct OverlayPlugin;
@@ -47,7 +46,7 @@ fn draw_world_overlays(
     mut gizmos: Gizmos,
 ) {
     let needs_visible_cells = !interaction.sources.is_empty()
-        || !interaction.destinations.is_empty()
+        || !interaction.preview.front_edges.is_empty()
         || !interaction.preview.heatmap.is_empty()
         || !interaction.preview.excluded.is_empty();
     let visible_cells = if needs_visible_cells {
@@ -65,11 +64,14 @@ fn visible_cell_coordinates(
     visible: &VisibleEntities,
     chunks: &Query<&TerrainChunk>,
 ) -> Vec<Axial> {
-    visible
+    let mut coordinates = visible
         .iter(TypeId::of::<Mesh3d>())
         .filter_map(|entity| chunks.get(*entity).ok())
         .flat_map(|chunk| chunk.cells.iter().copied())
-        .collect()
+        .collect::<Vec<_>>();
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    coordinates
 }
 
 fn draw_blocked_cells(
@@ -117,28 +119,8 @@ fn draw_selection(
         PerimeterStyle {
             lift: 0.09,
             scale: 0.96,
-            split_destination_classes: false,
         },
         |_| SOURCE,
-        gizmos,
-    );
-
-    draw_region_perimeter(
-        view,
-        &interaction.destinations,
-        visible_cells,
-        PerimeterStyle {
-            lift: 0.105,
-            scale: 0.74,
-            split_destination_classes: true,
-        },
-        |cell| {
-            if cell.owner == Some(view.local_player) {
-                FRIENDLY
-            } else {
-                HOSTILE
-            }
-        },
         gizmos,
     );
 
@@ -147,10 +129,8 @@ fn draw_selection(
             .brush
             .cells(hovered)
             .into_iter()
-            .filter(|coordinate| match interaction.mode {
-                OrderMode::Idle => view.is_local_owned(*coordinate),
-                OrderMode::Transfer => view.cell(*coordinate).is_some_and(CellView::is_land),
-                _ => false,
+            .filter(|coordinate| {
+                matches!(interaction.mode, OrderMode::Idle) && view.is_local_owned(*coordinate)
             })
             .collect()
     });
@@ -162,7 +142,6 @@ fn draw_selection(
         PerimeterStyle {
             lift: 0.13,
             scale: 1.01,
-            split_destination_classes: false,
         },
         |_| Color::srgba(0.96, 0.98, 1.0, 0.92),
         gizmos,
@@ -192,32 +171,15 @@ fn draw_region_perimeter(
         let center = point(cell, style.lift);
         let color = color_for(cell);
         for (direction, neighbor) in coordinate.neighbors().into_iter().enumerate() {
-            if perimeter_edge_is_exposed(
-                view,
-                selection,
-                cell,
-                neighbor,
-                style.split_destination_classes,
-            ) {
+            if perimeter_edge_is_exposed(selection, neighbor) {
                 draw_hex_edge(gizmos, center, direction, style.scale, color);
             }
         }
     }
 }
 
-fn perimeter_edge_is_exposed(
-    view: &MatchView,
-    selection: &BTreeSet<Axial>,
-    cell: &CellView,
-    neighbor: Axial,
-    split_destination_classes: bool,
-) -> bool {
+fn perimeter_edge_is_exposed(selection: &BTreeSet<Axial>, neighbor: Axial) -> bool {
     !selection.contains(&neighbor)
-        || (split_destination_classes
-            && view.cell(neighbor).is_some_and(|neighbor| {
-                (neighbor.owner == Some(view.local_player))
-                    != (cell.owner == Some(view.local_player))
-            }))
 }
 
 fn draw_preview(
@@ -226,6 +188,8 @@ fn draw_preview(
     visible_cells: &[Axial],
     gizmos: &mut Gizmos,
 ) {
+    draw_push_front_edges(view, interaction, visible_cells, gizmos);
+
     if !interaction.preview.heatmap.is_empty() {
         for coordinate in visible_cells {
             let Some(density) = interaction.preview.heatmap.get(coordinate) else {
@@ -298,6 +262,64 @@ fn draw_preview(
             .arrow(center - direction * 1.2, center + direction * 1.7, SOURCE)
             .with_tip_length(0.34);
     }
+
+    if matches!(
+        interaction.mode,
+        OrderMode::PushFrontOrient { .. } | OrderMode::PushFrontPreview { .. }
+    ) && let Some(direction) = interaction.push_direction()
+        && let Some(center) = selection_center(view, &interaction.sources)
+    {
+        let direction = axial_to_world_direction(direction);
+        gizmos
+            .arrow(center - direction * 0.65, center + direction * 1.8, AMBER)
+            .with_tip_length(0.38);
+    }
+}
+
+fn draw_push_front_edges(
+    view: &MatchView,
+    interaction: &InteractionState,
+    visible_cells: &[Axial],
+    gizmos: &mut Gizmos,
+) {
+    for edge in &interaction.preview.front_edges {
+        if visible_cells.binary_search(&edge.source).is_err()
+            && visible_cells.binary_search(&edge.target).is_err()
+        {
+            continue;
+        }
+        let (Some(source), Some(target)) = (view.cell(edge.source), view.cell(edge.target)) else {
+            continue;
+        };
+        let Some(direction) = edge
+            .source
+            .neighbors()
+            .iter()
+            .position(|neighbor| *neighbor == edge.target)
+        else {
+            continue;
+        };
+        let color = if target.owner.is_some() {
+            HOSTILE
+        } else {
+            AMBER
+        };
+        let source_point = point(source, 0.155);
+        let target_point = point(target, 0.155);
+        draw_hex_edge(gizmos, source_point, direction, 1.025, color);
+        gizmos
+            .arrow(
+                source_point.lerp(target_point, 0.24),
+                source_point.lerp(target_point, 0.76),
+                color,
+            )
+            .with_tip_length(0.17);
+    }
+}
+
+fn axial_to_world_direction(direction: Axial) -> Vec3 {
+    let plane = crate::geometry::axial_to_plane(direction).normalize_or_zero();
+    Vec3::new(plane.x, 0.0, plane.y)
 }
 
 fn draw_committed_orders(view: &MatchView, elapsed: f32, gizmos: &mut Gizmos) {
@@ -414,20 +436,6 @@ fn selection_center(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hex_core::TerrainKind;
-
-    fn cell(coordinate: Axial, owner: u32) -> CellView {
-        CellView {
-            coordinate,
-            terrain: TerrainKind::Plains,
-            elevation: 0,
-            owner: Some(owner),
-            civilians: 0,
-            infantry: 0,
-            military_capacity: 100,
-            blocked: false,
-        }
-    }
 
     #[test]
     fn perimeter_counts_only_exposed_edges() {
@@ -444,37 +452,5 @@ mod tests {
             .chain([Axial::ZERO])
             .collect();
         assert_eq!(perimeter_edge_count(&center_and_neighbors), 18);
-    }
-
-    #[test]
-    fn destination_perimeter_exposes_friendly_hostile_transitions() {
-        let friendly = Axial::ZERO;
-        let hostile = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(friendly, cell(friendly, 1));
-        view.cells.insert(hostile, cell(hostile, 2));
-        let selection = BTreeSet::from([friendly, hostile]);
-
-        assert!(!perimeter_edge_is_exposed(
-            &view,
-            &selection,
-            view.cell(friendly).expect("friendly cell"),
-            hostile,
-            false,
-        ));
-        assert!(perimeter_edge_is_exposed(
-            &view,
-            &selection,
-            view.cell(friendly).expect("friendly cell"),
-            hostile,
-            true,
-        ));
-        assert!(perimeter_edge_is_exposed(
-            &view,
-            &selection,
-            view.cell(hostile).expect("hostile cell"),
-            friendly,
-            true,
-        ));
     }
 }

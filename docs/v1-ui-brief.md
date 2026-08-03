@@ -6,17 +6,25 @@ Design a readable native-desktop graybox interface for a two-player 2.5D hex RTS
 
 ## Player mental model
 
-Troops are scalar strength physically located on hexes. A player selects owned source hexes, selects destination hexes, previews an aggregate route and ETA, then confirms. Strength travels through the map subject to hex capacity, edge throughput, elevation, cliffs, and combat frontage. It never teleports.
+Troops are scalar strength physically located on hexes. A player selects one
+connected owned region, holds `P`, drags toward one of six directions, and
+previews the exact one-cell-deep front before confirming. Rear troops route
+only through selected cells and cross the displayed final edge. Strength moves
+subject to hex capacity, edge throughput, elevation, cliffs, and combat
+frontage. It never teleports.
 
 ## Required V1 interactions
 
 1. Join one of two human player slots and see connection/match status.
 2. Pan, rotate, and zoom an orthographic 3D camera over a stepped hex island.
 3. Hover a hex and inspect coordinate, terrain, elevation, owner, civilians, infantry, capacity, and occupancy percentage.
-4. Paint or toggle a set of owned source hexes.
-5. Paint or toggle destination hexes, including friendly staging areas and neutral/enemy attack goals.
-6. Preview reachable routes, excluded cells, estimated arrival time, bottlenecks, destination capacity, and requested troop amount.
-7. Confirm or cancel a source-to-destination transfer.
+4. Paint one connected owned source region, including a border section and any
+   reinforcement corridor extending backward into owned territory.
+5. Hold `P`, drag outward, and release to choose one exact hex direction.
+6. Preview one connected active front, exact final edges, selected-only routes,
+   estimated arrival time, bottlenecks, target capacity, and committed troop
+   amount.
+7. Confirm or cancel the one-cell-deep Push Front command.
 8. Select an owned region and issue one-shot Balance redistribution.
 9. Select an owned region, drag an orientation arrow, preview a directional target-density heatmap, and issue Front-load redistribution.
 10. Adjust a global mobilization target. Lowering it stops future conversion but does not demobilize existing troops.
@@ -27,7 +35,8 @@ Troops are scalar strength physically located on hexes. A player selects owned s
 - No production assets, fiction, unit portraits, minimap, fog of war, technology tree, or build menu.
 - The map is the primary surface and remains visible behind compact overlays.
 - Ownership and troop-density shading must remain distinguishable at far zoom.
-- Color cannot be the only signal for source, destination, blocked path, or combat.
+- Color cannot be the only signal for the selected region, active front,
+  blocked path, or combat.
 - The interface must explain authoritative rejection and congestion rather than silently doing nothing.
 - Prefer direct manipulation and a short, discoverable keyboard vocabulary.
 - Support two separate client windows on one machine during development.
@@ -46,10 +55,10 @@ Troops are scalar strength physically located on hexes. A player selects owned s
 Provide an implementation-oriented critique and one recommended layout/input model. Specify:
 
 - information hierarchy;
-- exact source/destination/redistribution gestures;
+- exact Push Front selection/orientation and redistribution gestures;
 - compact HUD regions and their contents;
 - overlay encodings that work together;
-- state transitions for transfer and oriented Front-load previews;
+- state transitions for Push Front and oriented Front-load previews;
 - rejection/error feedback;
 - the smallest viable onboarding hints;
 - major ambiguity or readability risks to test first.

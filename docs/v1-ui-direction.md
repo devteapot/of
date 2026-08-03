@@ -9,33 +9,25 @@ Provenance: derived from `docs/v1-ui-brief.md`, reviewed headlessly with Grok CL
 The client has one modal order state machine:
 
 ```text
-Idle -> Transfer -> Transfer preview -> Submit -> Idle
+Idle -> Push Front orient -> Push Front preview -> Submit -> Idle
 Idle -> Redistribute Balance -> Preview -> Submit -> Idle
 Idle -> Redistribute Front-load -> Orient -> Preview -> Submit -> Idle
 ```
 
-The same owned-region selection feeds transfers and both redistribution presets. Server intentions remain independent of input gestures:
+The same owned-region selection feeds Push Front and both redistribution presets. Server intentions remain independent of input gestures:
 
-- `Transfer { sources, destinations, amount }`
+- `PushFront { selected_cells, direction, commitment }`
 - `Redistribute { cells, preset, direction }`
 - `SetMobilization { target }`
 
-The next gameplay experiment adds `Expand { commitment }`: a neutral-only,
-all-front pulse whose committed infantry remains local and whose expansion
-speed is constrained by terrain and edge limits. It is intentionally separate
-from targeted transfers and hostile attacks. Its final gesture is not locked;
-the current left-drag selection must remain available while the prototype is
-evaluated.
-
-The corresponding focused command is `PushFront { sources, edges, direction,
-commitment }`. `X` activates Expand All without changing the cell selection.
-Push Front uses the ordinary connected owned-cell selection: cells on its
-neutral-facing boundary define one contiguous front, and the selection may be
-painted backward into owned territory to include its reinforcement pool and
-routes. Pressing and dragging `P` outward supplies a six-direction continuation
-heading and filters out the selection's back and side edges. The client previews
-and submits exact source cells and directed edge keys rather than a visual
-segment ID, so a changing border cannot silently retarget the command.
+Push Front is the player-facing V1 conquest command. It uses the ordinary
+connected owned-cell selection: cells on its boundary in one exact direction
+define one contiguous active front, and the selection may be painted backward
+into owned territory to include its reinforcement pool and routes. Hold `P`,
+drag outward, and release to choose one of six directions. The client derives
+the exact final edge for each participating boundary cell and submits the
+selected cells, direction, and commitment. The server independently derives
+and validates the same edges; visual segment IDs are never authoritative.
 
 ### Camera
 
@@ -44,19 +36,32 @@ segment ID, so a changing border cannot silently retarget the command.
 - Mouse wheel: orthographic zoom.
 - `Home`: frame the island.
 
-### Selection and transfer
+### Selection and Push Front
 
 - Left click or drag paints owned source hexes.
 - `Shift + left`: add; `Control + left`: subtract.
-- In source-selection mode, `[` / `]` resize both brush axes, `Shift` modifies
-  only width, and `Control` modifies only height. The brush uses odd dimensions
-  so it remains centered on the hovered hex.
+- In source-selection mode, `[` / `]` remove or add one complete six-neighbor
+  ring around the brush. `Shift` modifies only width, and `Control` modifies
+  only height. The rectangular core uses odd dimensions and the ring expansion
+  remains centered on the hovered hex.
 - `C` selects the hovered six-connected owned cluster; Shift adds that cluster
   and Control removes it. `Control/Command + A` selects every owned hex.
-- `T` locks the source selection and enters destination painting.
-- Left click or drag paints destination land; friendly destinations mean arrival, while neutral/enemy destinations mean staging and attack.
-- `[` / `]` changes requested strength by ten percentage points; the provisional default is 50%.
-- `Enter` confirms; `Escape` cancels the preview while retaining the source selection.
+- Hold `P`, drag outward, and release to quantize one exact hex direction. The
+  selected region must be connected and its active directional boundary must
+  be one connected front section.
+- The preview highlights only edges from a selected source to its immediate
+  non-owned neighbor in that direction. Side edges are never inferred.
+- Routes from rear cells remain entirely inside the selection until the exact
+  final frontier edge. The command advances only one cell deep; repeat it from
+  the resulting border to continue the push.
+- `[` / `]` changes commitment by ten percentage points; the provisional
+  default is 50%.
+- `Enter` confirms; `Escape` cancels the preview while retaining the source
+  selection.
+
+Painted destination transfer remains an internal aggregate-flow primitive and
+a possible future precision-logistics tool. It is not exposed in the V1 input
+loop.
 
 ### Redistribution
 
@@ -75,7 +80,8 @@ The global mobilization target remains visible in the bottom bar. The caption sa
 - Upper-right tactical panel: compact map-view status followed by coordinate,
   terrain, elevation, owner, civilians, infantry, military capacity, and
   occupancy.
-- Contextual right-side order panel: mode, selection totals, amount, reachable/excluded counts, estimated ETA, bottleneck, Confirm, and Cancel.
+- Contextual right-side order panel: mode, selection totals, commitment, active
+  edge count or invalid reason, estimated ETA, bottleneck, Confirm, and Cancel.
 - Bottom strip: mobilization target, active flow/front counts, and latest command result.
 - Transient bottom-center toast: authoritative rejection or important match event.
 
@@ -94,17 +100,20 @@ These overlays remain separate:
 
 - hover: thin white perimeter around the current brush footprint;
 - source: solid exposed perimeter around each selected component;
-- friendly destination: inner exposed perimeter;
-- hostile/neutral destination: exposed perimeter with attack ticks;
+- active Push Front: bold exact directional boundary edges, with hostile ticks
+  when they lead into enemy ownership;
 - populated land: one batched external cluster perimeter in Civilians view;
-- preview route: desaturated dashed arrows;
+- selected-only push route: desaturated dashed arrows terminating at the exact
+  frontier edge;
 - committed flow: solid animated arrows, thickness proportional to flow;
 - excluded/blocked: diagonal cross or hatch;
 - bottleneck: thick edge marker and source-side queue wedge;
 - combat: bold edge with opposing chevrons;
 - redistribution target: monochrome selection-only heatmap plus orientation arrow for Front-load.
 
-Color is never the only signal for source, destination, block, or combat. Multi-source routes should render as aggregated corridors, not every source/destination pair.
+Color is never the only signal for source, active front, block, or combat.
+Multi-source routes should render as aggregated corridors, not every
+source/front-edge pair.
 
 ## Submission and rejection behavior
 
@@ -123,18 +132,20 @@ Congestion is accepted state, not a rejection. It increases estimated arrival ti
 The first-session hint is limited to:
 
 ```text
-LMB paint owned hexes · T move · B balance · F drag front-load · Esc cancel · ? help
+LMB paint owned hexes · hold P + drag push · B balance · F drag front-load · Esc cancel · ? help
 ```
 
-Contextual first-use hints explain that enemy destinations stage an attack rather than teleporting, Front-load still moves troops physically, and lowering mobilization does not send soldiers home.
+Contextual first-use hints explain that Push Front uses only selected cells and
+crosses one exact edge, Front-load still moves troops physically, and lowering
+mobilization does not send soldiers home.
 
 ## First playtest risks
 
 Test these before adding visual polish:
 
 1. ownership remains readable under density shading at far zoom;
-2. adjacent source and destination regions remain distinct;
-3. attack staging cannot be mistaken for entering an enemy cell;
+2. the selected reinforcement corridor and active front remain distinct;
+3. the exact one-cell push cannot be mistaken for an automatic expansion wave;
 4. route aggregation avoids unreadable arrow clutter;
 5. live density and proposed redistribution heatmaps look different;
 6. height-aware picking selects the visible column at cliffs and camera pitch extremes;

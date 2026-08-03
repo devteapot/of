@@ -52,6 +52,7 @@ pub enum OrderKind {
     Transfer,
     Balance,
     FrontLoad,
+    PushFront,
 }
 
 #[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]

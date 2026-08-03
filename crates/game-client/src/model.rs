@@ -478,10 +478,6 @@ pub struct SourceReachability {
 }
 
 impl SourceReachability {
-    pub fn contains(&self, coordinate: Axial) -> bool {
-        self.previous.contains_key(&coordinate)
-    }
-
     pub fn route_to_any(&self, destinations: &BTreeSet<Axial>) -> Option<Vec<Axial>> {
         let destination = destinations
             .iter()

@@ -10,6 +10,7 @@ pub mod combat;
 pub mod connectivity;
 pub mod conquest;
 pub mod coord;
+pub mod front;
 pub mod map;
 pub mod movement;
 pub mod pathfinding;
@@ -21,6 +22,7 @@ pub use combat::{
 pub use connectivity::{connected_components, owned_components};
 pub use conquest::{ConquestError, ConquestProgress, ConquestRule};
 pub use coord::{Axial, ChunkAddress, ChunkCoord, Cube, HexDirection, HexEdge};
+pub use front::{DirectedFrontEdge, FrontSelectionError, selected_front_edges};
 pub use map::{
     Cell, EdgeLimits, ForceComposition, HexMap, LogisticsConfig, MovementConfig, PlayerId,
     Strength, TerrainKind, Traversal, ground_traversal,

@@ -13,7 +13,9 @@ This document records the architecture commitments for the first playable versio
 - Each match runs in its own logical SpacetimeDB database instance. This is isolation inside a SpacetimeDB host, not a requirement for one machine or process per match.
 - V1 starts with one manually provisioned development match database. A lobby database and external match orchestrator are added when concurrent public matches are needed.
 - One visible terrain hex is one authoritative gameplay cell. Terrain is static during a V1 match and is stored and rendered in chunks.
-- Troops are conserved aggregate strength, not individual infantry entities. Transfers and combat operate on active orders and active front edges rather than scanning every cell.
+- Troops are conserved aggregate strength, not individual infantry entities.
+  Push Front, lower-level transfers, and combat operate on active orders and
+  active front edges rather than scanning every cell.
 - Authoritative calculations use integers or explicit fixed-point values with stable iteration order. Floating point is reserved for client presentation.
 - Generated SpacetimeDB bindings define the client/server wire contract. Files
   below `match-bindings/src/module_bindings` are generated and never edited by
@@ -70,7 +72,7 @@ flowchart LR
     O["Future lobby and orchestrator"] -.->|"create, assign, archive"| M
 ```
 
-The client owns input, camera, rendering, local previews, interpolation, and UI. The match database owns player slots, authoritative terrain metadata, ownership, troop strength, orders, routing results, transfer progress, combat, and victory. The shared core contains deterministic rules used by both sides, but server execution always wins when a client preview differs.
+The client owns input, camera, rendering, local previews, interpolation, and UI. The match database owns player slots, authoritative terrain metadata, ownership, troop strength, orders, routing results, aggregate-flow progress, combat, and victory. The shared core contains deterministic rules used by both sides, but server execution always wins when a client preview differs.
 
 This architecture does not copy OpenFront's client-side lockstep or client-majority hash model. OpenFront remains interaction and game-design research only. SpacetimeDB transactions and reducers provide the authority boundary suited to this stack.
 
@@ -80,7 +82,7 @@ This architecture does not copy OpenFront's client-side lockstep or client-major
 
 Publish the match module manually as one development database, `of-match-dev` by
 default. It hosts exactly one two-player match at a time. This avoids building a
-lobby before the transfer and conquest loop has been validated.
+lobby before the Push Front and conquest loop has been validated.
 
 ### Concurrent matches
 
@@ -132,14 +134,20 @@ Clients send intentions such as:
 
 - join or reclaim a player slot;
 - set the player's global mobilization target;
-- issue or cancel an aggregate source-to-destination transfer;
+- issue or cancel a selected-region directional Push Front order;
 - issue a one-shot Balance or oriented Front-load redistribution order;
-- commit troops to a friendly destination, enemy destination, or active border.
+- use a lower-level precise transfer only through internal tools or a future
+  logistics interaction.
 
 Spawn selection, retargeting, reprioritization, readiness controls, and rematches
 are not part of the V1 reducer surface.
 
-An intention contains a stable player-scoped command ID. Its reducer verifies connection identity, player slot, match phase, source ownership, available strength, destination validity, and rule-specific constraints in one transaction. Accepted intentions create or change authoritative orders. Rejected gameplay intentions create only an idempotent receipt with a UI-suitable reason; they do not partially mutate gameplay state.
+An intention contains a stable player-scoped command ID. Its reducer verifies
+connection identity, player slot, match phase, source ownership, available
+strength, active-front or destination validity, and rule-specific constraints
+in one transaction. Accepted intentions create or change authoritative orders.
+Rejected gameplay intentions create only an idempotent receipt with a
+UI-suitable reason; they do not partially mutate gameplay state.
 
 The client never sends a resulting troop count, ownership result, casualty value, arrival time, or victory result. It may predict a path and ETA, but the reducer computes or validates the authoritative route and cost. Visual interpolation is allowed; speculative gameplay state must be clearly replaceable by the next subscription update.
 
@@ -161,7 +169,7 @@ When processing sets, sort by stable IDs or use ordered collections. Never let h
 
 Keep a logical simulation step counter in database state. A service interruption resumes from stored logical state rather than applying hours of combat instantly. If an optional wall-clock match limit is later enabled, its pause/recovery behavior must be an explicit game-mode rule.
 
-## Aggregate transfers, congestion, and combat
+## Aggregate flows, Push Front, congestion, and combat
 
 Every troop strength unit is accounted for as stationary, assigned to an aggregate order at a cell, or removed as a casualty. There is no entity or database row per infantry member.
 
@@ -173,9 +181,12 @@ The V1 model distinguishes:
 
 These share a common strength scale but remain separate values. A city may later increase staging capacity, a road may increase throughput, and a mountain pass may constrain throughput and frontage without conflating all three effects.
 
-An aggregate transfer order stores its owner, sources, destinations, requested
-and committed amounts, progress totals, kind, orientation, and status. Transit
-packets store deterministic fixed routes and scalar queues. V1 has no order
+The generic aggregate-flow schema retains the implementation names
+`transfer_order`, source, destination, and transit packet. An order stores its
+owner, sources, destinations, requested and committed amounts, progress totals,
+kind, orientation, and status. Transit packets store deterministic fixed routes
+and scalar queues. These tables are an execution substrate, not evidence that
+painted destination transfer is a player-facing V1 interaction. V1 has no order
 priorities or mid-route replanning. On each logical step, approved movement is
 bounded by:
 
@@ -184,6 +195,23 @@ min(queued strength, edge throughput * step duration, destination free capacity)
 ```
 
 Movement uses a two-phase calculation: approve outgoing flow first, then commit incoming flow atomically. This permits a full column to advance as a pipeline without violating end-of-step capacity. Opposite flows of identical friendly infantry may be netted rather than pointlessly swapping identities. Overflow stays in the preceding cell and remains visible as congestion; it is never dropped.
+
+Push Front is the primary V1 producer of aggregate flows. Its authoritative
+reducer accepts an exact selected cell set, one of six axial directions, and a
+commitment in basis points. It requires one six-connected owned source region
+and one connected active directional front. For each active boundary source,
+the final edge is exactly `(source, source + direction)`; adjacent directions
+are not inferred. Rear sources route to that boundary entirely within the
+submitted selection before crossing the final edge. The authority recomputes
+all derived edges and routes, so a client cannot redirect a push by submitting
+a visual segment or predicted result.
+
+A Push Front command is one cell deep. It does not automatically retarget after
+capture. Repeating the gesture from the advanced border creates continued
+momentum while keeping every new edge visible and authoritative. The generic
+precise-transfer reducer remains available as a friendly-territory-only
+compatibility and testing surface, but destination painting is deferred from
+the V1 client and it cannot be used to bypass Push Front for conquest.
 
 Hostile forces do not coexist in a V1 cell. Combat occurs on active hostile edges. Frontage limits the committed strength that can participate at once, and defenders are allocated once across simultaneous hostile edges rather than duplicated against every attacker. After defenders reach zero, attackers enter subject to edge throughput and destination capacity, then ownership changes according to the combat rule.
 
@@ -263,8 +291,8 @@ The initial material treatment exposes gameplay state clearly:
 - ownership tint and border emphasis;
 - absolute troop strength as a stable, normalized visual channel;
 - alternate Overview and civilian-population map views;
-- hover and source/destination selection;
-- transfer routes, direction, congestion, and ETA;
+- hover, selected reinforcement region, and exact active-front edges;
+- selected-only push routes, direction, commitment, congestion, and ETA;
 - active combat/front edges and blocked paths.
 
 Map-view shading is presentation only. Clamp and interpolate it client-side
@@ -283,18 +311,24 @@ so a future art direction does not require changing simulation state.
 Picking should resolve pointer rays to chunks and deterministic hex coordinates
 instead of creating a physics collider for every cell. Height-aware picking
 must choose the visible top surface in stepped terrain. The current client
-materializes selected cells, supports a centered rectangular brush, connected
-owned-component selection, and all-owned selection, while drawing only exposed
-edges from visible render chunks. Truly world-scale selection must move to
-symbolic chunk masks or region selectors that the authority revalidates rather
-than serializing millions of cell IDs. The UX is expected to iterate; the
-server intent model should not depend on one specific gesture.
+materializes selected cells, supports a centered rectangular core with complete
+hex-ring dilation, connected owned-component selection, and all-owned
+selection, while drawing only exposed edges from visible render chunks. Truly
+world-scale selection must move to symbolic chunk masks or region selectors
+that the authority revalidates rather than serializing millions of cell IDs.
+The UX is expected to iterate; the server intent model should not depend on one
+specific gesture.
 
-Bulk selections must not multiply pathfinding work. Transfer previews use
-deterministic multi-source forward and reverse reachability, cache results by
-selection and authoritative cell-state revisions, and classify all endpoints
-from a constant number of graph traversals. Every authority adapter must debit
-only source components that can actually reach the accepted destination.
+Bulk selections must not multiply pathfinding work. Push Front derives its
+exact directional boundary in shared pure code, validates one source component
+and one active-front component, and searches backward only through selected
+cells. Previews cache results by selection and authoritative cell-state
+revisions. Every V1 order preview and reducer rejects selections above 4,096
+cells before building heatmaps, routes, or payloads. This is a safety bound,
+not the world-scale selection design. The retained lower-level transfer preview uses deterministic
+multi-source forward and reverse reachability rather than one path search per
+endpoint. Every authority adapter must debit only source cells that can reach
+the accepted front or destination under that order's constraints.
 
 Native-only filesystem, windowing, and startup behavior belongs behind narrow
 boundaries where practical. A WASM compile gate is deferred with browser
@@ -342,8 +376,8 @@ High-value invariants include:
 ### Module and client integration
 
 The V1 headless two-identity smoke covers join, match start, subscription,
-idempotent command receipts, a real spatial transfer, progression, and
-token-based reconnect. Command rejection, simultaneous hostile orders, full
+idempotent command receipts, the lower-level aggregate-flow pipeline,
+progression, and token-based reconnect. Command rejection, simultaneous hostile orders, full
 Conquest completion, schedule fault injection, and completed-match immutability
 remain integration-test extensions; pure rule tests cover their deterministic
 building blocks where applicable.
@@ -367,7 +401,7 @@ Record reducer duration, rows read/written, active-set size, subscription bytes,
 
 ## Asset and UI production workflow
 
-The gameplay vertical slice uses procedural primitives, code-defined colors, and simple icons. Production assets are not a prerequisite for validating transfer, congestion, combat, or conquest.
+The gameplay vertical slice uses procedural primitives, code-defined colors, and simple icons. Production assets are not a prerequisite for validating Push Front, congestion, combat, or conquest.
 
 When custom assets or UI exploration begins:
 
@@ -385,12 +419,18 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
 1. **Compatibility gate:** pin the tested Rust, Bevy, SpacetimeDB, and code-generation toolchain; prove native connection and generated bindings. Browser/WASM compatibility is a later gate.
 2. **Workspace skeleton:** create `hex-core`, match module, generated-bindings crate, Bevy client, map tool, formatting/lint/test CI, and one tiny deterministic fixture map.
 3. **Network walking skeleton:** manually publish one match database; connect two native clients; claim two player slots; mutate one test cell through a validated reducer and subscription.
-4. **Map interaction slice:** load authoritative chunked terrain, render stepped graybox hexes, implement camera and height-aware picking, and select source and destination areas.
-5. **Troop-flow slice:** add cell capacity, one aggregate transfer order, authoritative routing/validation, scheduled active-set movement, congestion, density shading, route preview, and ETA feedback.
+4. **Map interaction slice:** load authoritative chunked terrain, render stepped
+   graybox hexes, implement camera and height-aware picking, and select connected
+   owned source regions.
+5. **Troop-flow slice:** add cell capacity, a one-cell-deep Push Front order,
+   authoritative selected-only routing/validation, scheduled active-set
+   movement, congestion, density shading, exact-edge preview, and ETA feedback.
 6. **Conflict slice:** add hostile edges, combat frontage, capture, elevation modifiers, disconnected components, and the Conquest win condition at 80% of capturable land.
 7. **Reliability slice:** add command idempotency, reconnect/reclaim, snapshot rebuild, scheduler recovery, deterministic replay fixtures, and completed-match handling.
 8. **Scale slice:** validate the 128 and 192 presets; retain 256, high-order-count traces, profiling, and soak gates as post-slice performance work.
-9. **Playable V1 pass:** curate several generated maps, improve legibility and transfer UX, add match setup/result screens, and use the asset workflow only where graybox presentation blocks evaluation.
+9. **Playable V1 pass:** curate several generated maps, improve Push Front
+   legibility and selection UX, add match setup/result screens, and use the
+   asset workflow only where graybox presentation blocks evaluation.
 
 Each stage should leave a playable or executable end-to-end path. Do not build the lobby/orchestrator, production art pipeline, or speculative unit systems before the two-client troop-flow slice is measurable and understandable.
 
@@ -401,8 +441,12 @@ The following questions stay open until profiling or playtesting supplies eviden
 - Exact chunk dimensions and whether terrain rendering uses combined meshes, instancing, GPU buffers, or a hybrid.
 - Full-map subscriptions versus chunk interest management for maps beyond the initial stretch target.
 - Database-host capacity: simultaneous match instances per host, provisioning latency, archival cost, and placement strategy.
-- One match-level scheduler wake versus sharded active-chunk wakes, and when uncontested transfers can become calculated arrival events.
+- One match-level scheduler wake versus sharded active-chunk wakes, and when uncontested flows can become calculated arrival events.
 - Routing strategy under congestion: cached paths, flow fields, hierarchical regions, explicit player routes, and replan thresholds.
+- Push packet compaction: the V1 reducer persists one packet and a duplicated
+  route per contributing source cell. Profile the F3 `FLOWS` count, then
+  coalesce shared route suffixes or represent the selected corridor as a route
+  DAG before raising command limits for world-scale maps.
 - Static map delivery through database rows versus content-addressed baked assets with hash verification.
 - Region-level summaries and level of detail for maps intended to represent a whole world.
 - Browser delivery, WebGPU/WebGL compatibility, download size, threading limits, and browser-specific SpacetimeDB behavior. WASM portability is retained, but web release work follows native V1.

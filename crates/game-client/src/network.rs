@@ -4,10 +4,13 @@
 //! online adapter and offline fixture both translate into this boundary, so
 //! camera, selection, overlays, and HUD systems remain transport-agnostic.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+};
 
 use bevy::prelude::*;
-use hex_core::Axial;
+use hex_core::{Axial, FrontSelectionError, selected_front_edges};
 
 use crate::{
     geometry::axial_to_plane,
@@ -24,6 +27,12 @@ pub enum RedistributionPreset {
 
 #[derive(Message, Clone, Debug)]
 pub enum ClientIntent {
+    PushFront {
+        sources: BTreeSet<Axial>,
+        direction: Axial,
+        commitment_percent: u8,
+    },
+    #[allow(dead_code)]
     Transfer {
         sources: BTreeSet<Axial>,
         destinations: BTreeSet<Axial>,
@@ -104,6 +113,11 @@ pub fn resolve_offline_intents(
 ) {
     for intent in intents.read() {
         let update = match intent {
+            ClientIntent::PushFront {
+                sources,
+                direction,
+                commitment_percent,
+            } => resolve_push_front(&view, sources, *direction, *commitment_percent),
             ClientIntent::Transfer {
                 sources,
                 destinations,
@@ -184,6 +198,249 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
     }
 }
 
+fn resolve_push_front(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    direction: Axial,
+    commitment_percent: u8,
+) -> ServerUpdate {
+    if let Some(invalid) = sources.iter().find(|coordinate| {
+        view.cell(**coordinate).is_none_or(|cell| {
+            !view.is_local_owned(**coordinate) || !cell.is_land() || cell.blocked
+        })
+    }) {
+        return rejection("Push sources must be owned passable ground", Some(*invalid));
+    }
+
+    let edges = match selected_front_edges(sources, direction, |source, target| {
+        let Some(source) = view.cell(source) else {
+            return false;
+        };
+        view.cell(target).is_some_and(|target| {
+            target.is_land()
+                && !target.blocked
+                && target.owner != Some(view.local_player)
+                && (i32::from(source.elevation) - i32::from(target.elevation)).unsigned_abs() <= 1
+        })
+    }) {
+        Ok(edges) => edges,
+        Err(error) => return rejection(front_error_message(error), sources.first().copied()),
+    };
+
+    let front_sources = edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    let assignments = selected_front_assignments(view, sources, &front_sources);
+    if assignments.len() != sources.len() {
+        let relevant = sources
+            .iter()
+            .find(|source| !assignments.contains_key(source))
+            .copied();
+        return rejection(
+            "Selected troops cannot reach the front inside the selected region",
+            relevant,
+        );
+    }
+
+    let percentage = u64::from(commitment_percent.clamp(10, 100));
+    let requested_by_source = sources
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| {
+            (
+                cell.coordinate,
+                cell.infantry.saturating_mul(percentage) / 100,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let requested = requested_by_source
+        .values()
+        .copied()
+        .fold(0_u64, u64::saturating_add);
+    if requested == 0 {
+        return rejection(
+            "Selected sources have no infantry to commit",
+            sources.first().copied(),
+        );
+    }
+
+    let target_by_boundary = edges
+        .iter()
+        .map(|edge| (edge.source, edge.target))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining_capacity = target_by_boundary
+        .values()
+        .filter_map(|target| {
+            view.cell(*target)
+                .map(|cell| (*target, cell.military_capacity))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut demands = BTreeMap::<Axial, u64>::new();
+    let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
+    let mut committed = 0_u64;
+    for (source, source_request) in &requested_by_source {
+        let boundary = assignments
+            .get(source)
+            .expect("every selected source was assigned to the front");
+        let target = target_by_boundary
+            .get(boundary)
+            .expect("assigned boundary has a directional target");
+        let capacity = remaining_capacity
+            .get_mut(target)
+            .expect("front target capacity was initialized");
+        let moved = (*source_request).min(*capacity);
+        if moved == 0 {
+            continue;
+        }
+        *capacity -= moved;
+        *demands.entry(*target).or_default() += moved;
+        committed = committed.saturating_add(moved);
+        let cell = view.cell(*source).expect("push source was validated");
+        changed.insert(*source, (cell.owner, cell.infantry.saturating_sub(moved)));
+    }
+    if committed == 0 {
+        return rejection(
+            "The selected front has no available military capacity",
+            target_by_boundary.values().next().copied(),
+        );
+    }
+
+    let mut captured = 0_u32;
+    let mut defender_losses = 0_u64;
+    for (target, attacking) in &demands {
+        let destination = view.cell(*target).expect("front target was validated");
+        let defenders = destination.infantry;
+        defender_losses = defender_losses.saturating_add(defenders.min(*attacking));
+        if *attacking > defenders {
+            captured = captured.saturating_add(1);
+            changed.insert(
+                *target,
+                (
+                    Some(view.local_player),
+                    attacking
+                        .saturating_sub(defenders)
+                        .min(destination.military_capacity),
+                ),
+            );
+        } else {
+            changed.insert(*target, (destination.owner, defenders - attacking));
+        }
+    }
+
+    let first_edge = edges[0];
+    let retained = requested.saturating_sub(committed);
+    let summary = if retained > 0 {
+        format!(
+            "Push Front accepted · {committed} committed · {retained} retained · {captured} cells captured"
+        )
+    } else {
+        format!(
+            "Push Front accepted · {committed} committed · {captured} cells captured · {defender_losses} defender losses"
+        )
+    };
+    ServerUpdate::Accepted {
+        command_id: None,
+        summary,
+        patches: changed
+            .into_iter()
+            .map(|(coordinate, (owner, infantry))| CellPatch {
+                coordinate,
+                owner,
+                infantry,
+            })
+            .collect(),
+        flow: Some(ActiveFlow {
+            route: vec![first_edge.source, first_edge.target],
+            strength: committed,
+            attacking: true,
+            age: 0.0,
+            lifetime: 10.0,
+        }),
+        front: Some(ActiveFront {
+            friendly: first_edge.source,
+            hostile: first_edge.target,
+            intensity: (committed as f32 / 100.0).clamp(0.25, 1.0),
+            age: 0.0,
+        }),
+    }
+}
+
+fn selected_front_assignments(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    front_sources: &BTreeSet<Axial>,
+) -> BTreeMap<Axial, Axial> {
+    // Mirror the authoritative reducer's reverse route tree: every selected
+    // source is assigned to one stable nearest boundary, so rear troops cannot
+    // teleport their commitment to an unrelated section of a wide front.
+    let mut labels = BTreeMap::<Axial, (u64, Axial)>::new();
+    let mut pending = BinaryHeap::<Reverse<(u64, Axial, Axial)>>::new();
+    for &boundary in front_sources {
+        labels.insert(boundary, (0, boundary));
+        pending.push(Reverse((0, boundary, boundary)));
+    }
+
+    while let Some(Reverse((cost, boundary, current))) = pending.pop() {
+        if labels.get(&current) != Some(&(cost, boundary)) {
+            continue;
+        }
+        let Some(current_cell) = view.cell(current) else {
+            continue;
+        };
+        let mut neighbors = current.neighbors();
+        neighbors.sort_unstable();
+        for neighbor in neighbors {
+            if !sources.contains(&neighbor) {
+                continue;
+            }
+            let Some(neighbor_cell) = view.cell(neighbor) else {
+                continue;
+            };
+            if !current_cell.is_land()
+                || !neighbor_cell.is_land()
+                || current_cell.blocked
+                || neighbor_cell.blocked
+                || (i32::from(current_cell.elevation) - i32::from(neighbor_cell.elevation))
+                    .unsigned_abs()
+                    > 1
+            {
+                continue;
+            }
+            let step_cost = if neighbor_cell.elevation < current_cell.elevation {
+                15
+            } else {
+                10
+            };
+            let candidate = (cost.saturating_add(step_cost), boundary);
+            if labels
+                .get(&neighbor)
+                .is_none_or(|existing| candidate < *existing)
+            {
+                labels.insert(neighbor, candidate);
+                pending.push(Reverse((candidate.0, candidate.1, neighbor)));
+            }
+        }
+    }
+
+    labels
+        .into_iter()
+        .map(|(coordinate, (_, boundary))| (coordinate, boundary))
+        .collect()
+}
+
+const fn front_error_message(error: FrontSelectionError) -> &'static str {
+    match error {
+        FrontSelectionError::EmptySelection => "Push selection is empty",
+        FrontSelectionError::DisconnectedSelection => "Push selection must be connected",
+        FrontSelectionError::InvalidDirection => "Push direction is invalid",
+        FrontSelectionError::NoEligibleFront => "No non-owned passable front faces that direction",
+        FrontSelectionError::DisconnectedFront => {
+            "The selected boundary creates separate front arcs"
+        }
+    }
+}
+
 fn resolve_transfer(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
@@ -199,11 +456,14 @@ fn resolve_transfer(
     {
         return rejection("Sources must be owned by the local player", Some(*invalid));
     }
-    if let Some(invalid) = destinations.iter().find(|coordinate| {
-        view.cell(**coordinate)
-            .is_none_or(|cell| cell.is_water() || cell.blocked)
-    }) {
-        return rejection("Destination is water or impassable", Some(*invalid));
+    if let Some(invalid) = destinations
+        .iter()
+        .find(|coordinate| !view.is_local_owned(**coordinate))
+    {
+        return rejection(
+            "Precise transfer destinations must be owned; use Push Front for conquest",
+            Some(*invalid),
+        );
     }
     let primary = *destinations.first().expect("validated destination");
     let primary_set = BTreeSet::from([primary]);
@@ -219,6 +479,15 @@ fn resolve_transfer(
             Some(primary),
         );
     };
+    if let Some(unowned) = route
+        .iter()
+        .find(|coordinate| !view.is_local_owned(**coordinate))
+    {
+        return rejection(
+            "Precise transfers cannot route through unowned territory",
+            Some(*unowned),
+        );
+    }
 
     let percent = u64::from(amount_percent.clamp(10, 100));
     let requested_by_source = reachable_sources
@@ -238,12 +507,7 @@ fn resolve_transfer(
     }
 
     let destination = view.cell(primary).expect("validated destination");
-    let attacking = destination.owner != Some(view.local_player);
-    let moved = if attacking {
-        requested
-    } else {
-        requested.min(destination.free_capacity())
-    };
+    let moved = requested.min(destination.free_capacity());
     if moved == 0 {
         return rejection("Destination has no free military capacity", Some(primary));
     }
@@ -284,45 +548,18 @@ fn resolve_transfer(
         changed.insert(source, (cell.owner, cell.infantry.saturating_sub(strength)));
     }
 
-    let mut front = None;
-    let summary;
-    if attacking {
-        let defenders = destination.infantry;
-        if requested > defenders {
-            let survivors = requested
-                .saturating_sub(defenders)
-                .min(destination.military_capacity);
-            changed.insert(primary, (Some(view.local_player), survivors));
-            summary = format!(
-                "Attack staged · {requested} moved · {} defenders removed · territory captured",
-                defenders.min(requested)
-            );
-        } else {
-            changed.insert(primary, (destination.owner, defenders - requested));
-            summary = format!("Attack staged · {requested} casualties inflicted · front holds");
-        }
-        if route.len() >= 2 {
-            front = Some(ActiveFront {
-                friendly: route[route.len() - 2],
-                hostile: primary,
-                intensity: (requested as f32 / 100.0).clamp(0.25, 1.0),
-                age: 0.0,
-            });
-        }
+    changed.insert(primary, (destination.owner, destination.infantry + moved));
+    let retained = requested.saturating_sub(moved);
+    let summary = if retained > 0 {
+        format!(
+            "Transfer accepted · {moved} infantry · {retained} retained at sources (capacity limit)"
+        )
     } else {
-        changed.insert(primary, (destination.owner, destination.infantry + moved));
-        let retained = requested.saturating_sub(moved);
-        summary = if retained > 0 {
-            format!(
-                "Transfer accepted · {moved} infantry · {retained} retained at sources (capacity limit)"
-            )
-        } else {
-            format!(
-                "Transfer accepted · {moved} infantry · ETA ≈ {}s",
-                route.len() * 2
-            )
-        };
-    }
+        format!(
+            "Transfer accepted · {moved} infantry · ETA ≈ {}s",
+            route.len() * 2
+        )
+    };
 
     ServerUpdate::Accepted {
         command_id: None,
@@ -338,11 +575,11 @@ fn resolve_transfer(
         flow: Some(ActiveFlow {
             route,
             strength: moved,
-            attacking,
+            attacking: false,
             age: 0.0,
             lifetime: 10.0,
         }),
-        front,
+        front: None,
     }
 }
 
@@ -465,6 +702,14 @@ mod tests {
         }
     }
 
+    fn neutral_cell(coordinate: Axial) -> CellView {
+        CellView {
+            owner: None,
+            infantry: 0,
+            ..cell(coordinate, 0)
+        }
+    }
+
     fn disconnected_transfer_view() -> MatchView {
         let mut view = MatchView::connecting(1);
         for cell in [
@@ -528,6 +773,26 @@ mod tests {
     }
 
     #[test]
+    fn offline_precise_transfer_cannot_capture_an_unowned_destination() {
+        let source = Axial::ZERO;
+        let destination = Axial::new(1, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(source, cell(source, 20));
+        view.cells.insert(destination, neutral_cell(destination));
+        view.rebuild_chunk_index();
+
+        assert!(matches!(
+            resolve_transfer(
+                &view,
+                &BTreeSet::from([source]),
+                &BTreeSet::from([destination]),
+                100,
+            ),
+            ServerUpdate::Rejected { .. }
+        ));
+    }
+
+    #[test]
     fn offline_friendly_transfer_retains_strength_that_exceeds_capacity() {
         let first = Axial::ZERO;
         let second = Axial::new(1, 0);
@@ -571,5 +836,71 @@ mod tests {
         );
         assert!(summary.contains("90 retained at sources"));
         assert_eq!(flow.expect("accepted transfer flow").strength, 10);
+    }
+
+    #[test]
+    fn offline_push_front_advances_every_edge_and_conserves_strength() {
+        let sources = BTreeSet::from([Axial::new(0, -1), Axial::new(0, 0), Axial::new(0, 1)]);
+        let targets = BTreeSet::from([Axial::new(1, -1), Axial::new(1, 0), Axial::new(1, 1)]);
+        let mut view = MatchView::connecting(1);
+        for source in &sources {
+            let cell = cell(*source, 30);
+            view.cells.insert(cell.coordinate, cell);
+        }
+        for target in &targets {
+            let cell = neutral_cell(*target);
+            view.cells.insert(cell.coordinate, cell);
+        }
+        view.rebuild_chunk_index();
+
+        let update = resolve_push_front(&view, &sources, Axial::new(1, 0), 50);
+        let ServerUpdate::Accepted { patches, flow, .. } = update else {
+            panic!("connected front should be accepted");
+        };
+        let infantry_after = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+                .expect("every participating cell has a patch")
+        };
+        assert!(sources.iter().all(|source| infantry_after(*source) == 15));
+        assert!(targets.iter().all(|target| infantry_after(*target) == 15));
+        assert!(targets.iter().all(|target| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == *target)
+                .is_some_and(|patch| patch.owner == Some(1))
+        }));
+        assert_eq!(
+            sources
+                .iter()
+                .chain(&targets)
+                .map(|coordinate| infantry_after(*coordinate))
+                .sum::<u64>(),
+            90
+        );
+        assert_eq!(flow.expect("push flow").strength, 45);
+    }
+
+    #[test]
+    fn offline_push_rejects_a_cliff_inside_the_selected_corridor() {
+        let sources = BTreeSet::from([Axial::ZERO, Axial::new(1, 0), Axial::new(2, 0)]);
+        let mut view = MatchView::connecting(1);
+        for source in &sources {
+            let mut cell = cell(*source, 20);
+            if *source == Axial::new(1, 0) {
+                cell.elevation = 3;
+            }
+            view.cells.insert(cell.coordinate, cell);
+        }
+        let target = neutral_cell(Axial::new(3, 0));
+        view.cells.insert(target.coordinate, target);
+        view.rebuild_chunk_index();
+
+        assert!(matches!(
+            resolve_push_front(&view, &sources, Axial::new(1, 0), 50),
+            ServerUpdate::Rejected { .. }
+        ));
     }
 }
