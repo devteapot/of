@@ -49,9 +49,10 @@ pub enum TerrainClass {
 
 #[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderKind {
-    Transfer,
     Balance,
     FrontLoad,
+    CoreLoad,
+    PerimeterLoad,
     PushFront,
 }
 
@@ -208,6 +209,9 @@ pub struct TransferOrder {
     pub requested_infantry: u64,
     pub committed_infantry: u64,
     pub in_transit_infantry: u64,
+    /// Surviving strength released from this order. For Push Front this
+    /// includes occupation garrisons, endpoint arrivals, and release-in-place
+    /// when a lane stops or the player cancels it.
     pub delivered_infantry: u64,
     pub casualty_infantry: u64,
     pub orientation_q: i32,
@@ -241,6 +245,8 @@ pub struct TransferDestination {
     #[primary_key]
     pub destination_key: String,
     pub order_id: u64,
+    /// Destination for redistribution orders; stable first-front lane anchor
+    /// for a sustained Push Front order.
     pub cell_id: u32,
     pub target_infantry: u64,
     pub received_infantry: u64,

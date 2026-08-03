@@ -5,7 +5,7 @@ use std::{
 
 use hex_core::{
     Axial, DistributionPreset, FrontSelectionError, HexMap, MovementConfig, ground_traversal,
-    redistribution_targets, selected_front_edges,
+    redistribution_targets_with_commitment, selected_front_edges,
 };
 use spacetimedb::{ReducerContext, Table};
 
@@ -31,7 +31,9 @@ struct PlannedLeg {
 }
 
 struct PlannedDistribution {
-    sources: Vec<u32>,
+    /// Maximum strength each source may contribute without crossing the
+    /// percentage-aware target's frozen per-cell lower bound.
+    source_limits: BTreeMap<u32, u64>,
     demands: BTreeMap<u32, u64>,
     amount: u64,
 }
@@ -123,36 +125,6 @@ pub fn set_mobilization_target(
     )
 }
 
-#[spacetimedb::reducer]
-pub fn issue_transfer(
-    ctx: &ReducerContext,
-    client_command_id: u64,
-    source_cells: Vec<u32>,
-    destination_cells: Vec<u32>,
-    infantry: u64,
-) -> Result<(), String> {
-    let player_id = require_running_player(ctx)?;
-    if command_was_seen(ctx, player_id, client_command_id) {
-        return Ok(());
-    }
-    let result = direct_destination_demands(ctx, player_id, &destination_cells, infantry).and_then(
-        |demands| {
-            create_order(
-                ctx,
-                player_id,
-                client_command_id,
-                OrderKind::Transfer,
-                source_cells,
-                demands,
-                infantry,
-                Axial::ZERO,
-            )
-            .map(Some)
-        },
-    );
-    receipt_result(ctx, player_id, client_command_id, "issue_transfer", result)
-}
-
 /// Commits a selected, connected owned region toward its exact directional
 /// boundary. Cells behind the boundary contribute infantry through routes that
 /// remain inside the submitted selection until their final frontier edge.
@@ -197,11 +169,13 @@ pub fn issue_balance(
     ctx: &ReducerContext,
     client_command_id: u64,
     selected_cells: Vec<u32>,
+    amount_bps: u32,
 ) -> Result<(), String> {
     issue_distribution(
         ctx,
         client_command_id,
         selected_cells,
+        amount_bps,
         OrderKind::Balance,
         DistributionPreset::Balance,
         Axial::ZERO,
@@ -216,12 +190,14 @@ pub fn issue_front_load(
     selected_cells: Vec<u32>,
     orientation_q: i32,
     orientation_r: i32,
+    amount_bps: u32,
 ) -> Result<(), String> {
     let direction = Axial::new(orientation_q, orientation_r);
     issue_distribution(
         ctx,
         client_command_id,
         selected_cells,
+        amount_bps,
         OrderKind::FrontLoad,
         DistributionPreset::front_load(direction),
         direction,
@@ -229,10 +205,50 @@ pub fn issue_front_load(
     )
 }
 
+#[spacetimedb::reducer]
+pub fn issue_core_load(
+    ctx: &ReducerContext,
+    client_command_id: u64,
+    selected_cells: Vec<u32>,
+    amount_bps: u32,
+) -> Result<(), String> {
+    issue_distribution(
+        ctx,
+        client_command_id,
+        selected_cells,
+        amount_bps,
+        OrderKind::CoreLoad,
+        DistributionPreset::CoreLoad,
+        Axial::ZERO,
+        "issue_core_load",
+    )
+}
+
+#[spacetimedb::reducer]
+pub fn issue_perimeter_load(
+    ctx: &ReducerContext,
+    client_command_id: u64,
+    selected_cells: Vec<u32>,
+    amount_bps: u32,
+) -> Result<(), String> {
+    issue_distribution(
+        ctx,
+        client_command_id,
+        selected_cells,
+        amount_bps,
+        OrderKind::PerimeterLoad,
+        DistributionPreset::PerimeterLoad,
+        Axial::ZERO,
+        "issue_perimeter_load",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn issue_distribution(
     ctx: &ReducerContext,
     client_command_id: u64,
     selected_cells: Vec<u32>,
+    amount_bps: u32,
     kind: OrderKind,
     preset: DistributionPreset,
     orientation: Axial,
@@ -242,89 +258,48 @@ fn issue_distribution(
     if command_was_seen(ctx, player_id, client_command_id) {
         return Ok(());
     }
-    let result = distribution_plan(ctx, player_id, &selected_cells, preset).and_then(|plan| {
-        if plan.amount == 0 {
-            Ok(None)
-        } else {
-            create_order(
-                ctx,
-                player_id,
-                client_command_id,
-                kind,
-                plan.sources,
-                plan.demands,
-                plan.amount,
-                orientation,
-            )
-            .map(Some)
-        }
-    });
+    let result =
+        distribution_plan(ctx, player_id, &selected_cells, preset, amount_bps).and_then(|plan| {
+            if plan.amount == 0 {
+                Ok(None)
+            } else {
+                create_order(
+                    ctx,
+                    player_id,
+                    client_command_id,
+                    kind,
+                    plan.source_limits,
+                    plan.demands,
+                    plan.amount,
+                    orientation,
+                )
+                .map(Some)
+            }
+        });
     receipt_result(ctx, player_id, client_command_id, command_name, result)
 }
 
 #[spacetimedb::reducer]
-pub fn cancel_transfer_order(
+pub fn cancel_push_fronts(
     ctx: &ReducerContext,
     client_command_id: u64,
-    order_id: u64,
+    selected_cells: Vec<u32>,
+    direction_q: i32,
+    direction_r: i32,
 ) -> Result<(), String> {
     let player_id = require_running_player(ctx)?;
     if command_was_seen(ctx, player_id, client_command_id) {
         return Ok(());
     }
-    let result = cancel_order(ctx, player_id, order_id).map(|()| Some(order_id));
+    let direction = Axial::new(direction_q, direction_r);
+    let result = cancel_matching_pushes(ctx, player_id, &selected_cells, direction);
     receipt_result(
         ctx,
         player_id,
         client_command_id,
-        "cancel_transfer_order",
+        "cancel_push_fronts",
         result,
     )
-}
-
-fn direct_destination_demands(
-    ctx: &ReducerContext,
-    player_id: u8,
-    destinations: &[u32],
-    requested: u64,
-) -> Result<BTreeMap<u32, u64>, String> {
-    if requested == 0 {
-        return Err("transfer infantry must be greater than zero".into());
-    }
-    let destinations = unique_selection(destinations, "destination")?;
-    let reservations = active_destination_reservations(ctx, player_id);
-
-    let mut remaining = requested;
-    let mut demands = BTreeMap::new();
-    for destination in destinations {
-        let terrain_row = terrain(ctx, destination)?;
-        if !terrain_row.passable || !terrain_row.capturable {
-            return Err(format!(
-                "destination cell {destination} is not passable ground"
-            ));
-        }
-        let cell = cell_state(ctx, destination)?;
-        if cell.owner_player_id != player_id {
-            return Err(format!(
-                "destination cell {destination} is not owned by the player; use Push Front for conquest"
-            ));
-        }
-        let capacity_before_reservations = cell.military_capacity.saturating_sub(cell.infantry);
-        let capacity = capacity_before_reservations
-            .saturating_sub(reservations.get(&destination).copied().unwrap_or(0));
-        let demand = remaining.min(capacity);
-        if demand > 0 {
-            demands.insert(destination, demand);
-            remaining -= demand;
-        }
-        if remaining == 0 {
-            break;
-        }
-    }
-    if demands.is_empty() {
-        return Err("the selected destinations have no available military capacity".into());
-    }
-    Ok(demands)
 }
 
 fn plan_push_front(
@@ -334,9 +309,7 @@ fn plan_push_front(
     direction: Axial,
     commitment_bps: u32,
 ) -> Result<(u64, Vec<PlannedLeg>), String> {
-    if !(1..=10_000).contains(&commitment_bps) {
-        return Err("push commitment must be between 1 and 10000 basis points".into());
-    }
+    validate_basis_points(commitment_bps, "push commitment")?;
     if !Axial::DIRECTIONS.contains(&direction) {
         return Err("push direction must be one of the six adjacent hex directions".into());
     }
@@ -404,19 +377,8 @@ fn plan_push_front(
         );
     }
 
-    let reservations = active_destination_reservations(ctx, player_id);
-    let mut remaining_capacity = BTreeMap::<u32, u64>::new();
-    for target_id in target_by_boundary.values().copied() {
-        let target = cell_state(ctx, target_id)?;
-        let capacity = target
-            .military_capacity
-            .saturating_sub(reservations.get(&target_id).copied().unwrap_or(0));
-        remaining_capacity.insert(target_id, capacity);
-    }
-
     let mut requested = 0_u64;
     let mut legs = Vec::new();
-    let matching_push_allocations = active_push_allocations(ctx, player_id, direction);
     for (&source_coordinate, &source_id) in &coordinate_to_id {
         let source = cell_state(ctx, source_id)?;
         let (boundary, route_coordinates) = routes
@@ -426,16 +388,8 @@ fn plan_push_front(
             .get(&boundary)
             .ok_or_else(|| "push route ended at an unknown boundary".to_string())?;
         let allocated = allocated_infantry_at_cell(ctx, player_id, source_id);
-        let matching_allocated = matching_push_allocations
-            .get(&(source_id, target_id))
-            .copied()
-            .unwrap_or(0);
-        let commitment = additional_commitment(
-            source.infantry,
-            allocated,
-            matching_allocated,
-            commitment_bps,
-        );
+        let available = source.infantry.saturating_sub(allocated);
+        let commitment = basis_point_share(available, commitment_bps);
         requested = requested
             .checked_add(commitment)
             .ok_or_else(|| "push requested infantry overflow".to_string())?;
@@ -443,14 +397,6 @@ fn plan_push_front(
             continue;
         }
 
-        let available_capacity = remaining_capacity
-            .get_mut(&target_id)
-            .ok_or_else(|| "push target capacity is missing".to_string())?;
-        let amount = commitment.min(*available_capacity);
-        if amount == 0 {
-            continue;
-        }
-        *available_capacity -= amount;
         let mut route = route_coordinates
             .into_iter()
             .map(|coordinate| {
@@ -464,7 +410,7 @@ fn plan_push_front(
         legs.push(PlannedLeg {
             source: source_id,
             destination: target_id,
-            amount,
+            amount: commitment,
             route,
         });
     }
@@ -473,7 +419,7 @@ fn plan_push_front(
         return Err("the push selection has no uncommitted infantry at this commitment".into());
     }
     if legs.is_empty() {
-        return Err("the push front has no unreserved destination capacity".into());
+        return Err("the push front has no committed infantry".into());
     }
     Ok((requested, legs))
 }
@@ -551,7 +497,9 @@ fn distribution_plan(
     player_id: u8,
     selected_cells: &[u32],
     preset: DistributionPreset,
+    amount_bps: u32,
 ) -> Result<PlannedDistribution, String> {
+    validate_basis_points(amount_bps, "redistribution amount")?;
     let selected = unique_selection(selected_cells, "redistribution")?;
     let mut map = HexMap::new();
     let mut by_coordinate = BTreeMap::new();
@@ -567,11 +515,17 @@ fn distribution_plan(
         by_coordinate.insert(cell.coordinate, cell_id);
         map.insert(cell);
     }
-    let targets =
-        redistribution_targets(&map, u32::from(player_id), map.coordinates(), total, preset)
-            .map_err(|error| format!("invalid redistribution: {error:?}"))?;
+    let targets = redistribution_targets_with_commitment(
+        &map,
+        u32::from(player_id),
+        map.coordinates(),
+        total,
+        preset,
+        amount_bps,
+    )
+    .map_err(|error| format!("invalid redistribution: {error:?}"))?;
 
-    let mut sources = Vec::new();
+    let mut source_limits = BTreeMap::new();
     let mut demands = BTreeMap::new();
     let mut total_demand = 0_u64;
     let reservations = active_destination_reservations(ctx, player_id);
@@ -579,7 +533,7 @@ fn distribution_plan(
         let cell_id = by_coordinate[&coordinate];
         let current = cell_state(ctx, cell_id)?.infantry;
         if current > target {
-            sources.push(cell_id);
+            source_limits.insert(cell_id, current - target);
         } else if target > current {
             let demand =
                 (target - current).saturating_sub(reservations.get(&cell_id).copied().unwrap_or(0));
@@ -590,16 +544,13 @@ fn distribution_plan(
         }
     }
     Ok(PlannedDistribution {
-        sources,
+        source_limits,
         demands,
         amount: total_demand,
     })
 }
 
-fn active_destination_reservations(
-    ctx: &ReducerContext,
-    player_id: u8,
-) -> BTreeMap<u32, u64> {
+fn active_destination_reservations(ctx: &ReducerContext, player_id: u8) -> BTreeMap<u32, u64> {
     let mut reservations = BTreeMap::<u32, u64>::new();
     for destination in ctx.db.transfer_destination().iter() {
         let active = ctx
@@ -608,7 +559,9 @@ fn active_destination_reservations(
             .order_id()
             .find(destination.order_id)
             .is_some_and(|order| {
-                order.status == OrderStatus::Active && order.player_id == player_id
+                order.status == OrderStatus::Active
+                    && order.player_id == player_id
+                    && order.kind != OrderKind::PushFront
             });
         if active {
             *reservations.entry(destination.cell_id).or_default() += destination
@@ -619,45 +572,20 @@ fn active_destination_reservations(
     reservations
 }
 
-fn active_push_allocations(
-    ctx: &ReducerContext,
-    player_id: u8,
-    direction: Axial,
-) -> BTreeMap<(u32, u32), u64> {
-    let matching_orders = ctx
-        .db
-        .transfer_order()
-        .iter()
-        .filter(|order| {
-            order.player_id == player_id
-                && order.status == OrderStatus::Active
-                && order.kind == OrderKind::PushFront
-                && order.orientation_q == direction.q
-                && order.orientation_r == direction.r
-        })
-        .map(|order| order.order_id)
-        .collect::<BTreeSet<_>>();
-    let mut allocations = BTreeMap::<(u32, u32), u64>::new();
-    for packet in ctx.db.transit_packet().iter().filter(|packet| {
-        packet.owner_player_id == player_id && matching_orders.contains(&packet.order_id)
-    }) {
-        *allocations
-            .entry((packet.origin_cell, packet.destination_cell))
-            .or_default() += packet.infantry;
-    }
-    allocations
+fn basis_point_share(value: u64, basis_points: u32) -> u64 {
+    (u128::from(value) * u128::from(basis_points) / 10_000) as u64
 }
 
-fn additional_commitment(
-    infantry: u64,
-    total_allocated: u64,
-    matching_allocated: u64,
-    commitment_bps: u32,
-) -> u64 {
-    let desired = (u128::from(infantry) * u128::from(commitment_bps) / 10_000) as u64;
-    desired
-        .saturating_sub(matching_allocated)
-        .min(infantry.saturating_sub(total_allocated))
+fn movable_redistribution_surplus(current: u64, allocated: u64, target_surplus: u64) -> u64 {
+    target_surplus.min(current).saturating_sub(allocated)
+}
+
+fn validate_basis_points(value: u32, label: &str) -> Result<(), String> {
+    if (1..=10_000).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{label} must be between 1 and 10000 basis points"))
+    }
 }
 
 fn unique_selection(cells: &[u32], label: &str) -> Result<BTreeSet<u32>, String> {
@@ -678,31 +606,38 @@ fn create_order(
     player_id: u8,
     client_command_id: u64,
     kind: OrderKind,
-    source_cells: Vec<u32>,
+    source_limits: BTreeMap<u32, u64>,
     mut destination_demands: BTreeMap<u32, u64>,
     requested: u64,
     orientation: Axial,
 ) -> Result<u64, String> {
-    let sources = unique_selection(&source_cells, "source")?;
+    if source_limits.is_empty() {
+        return Err("source selection is empty".into());
+    }
+    if source_limits.len() > MAX_SELECTION_CELLS {
+        return Err(format!(
+            "source selection exceeds the {MAX_SELECTION_CELLS}-cell command limit"
+        ));
+    }
     if destination_demands.is_empty() {
         return Err("destination selection is empty".into());
     }
-    if sources
-        .iter()
+    if source_limits
+        .keys()
         .any(|source| destination_demands.contains_key(source))
     {
         return Err("source and destination selections may not overlap".into());
     }
 
     let mut available_by_source = BTreeMap::new();
-    for source in sources {
+    for (source, source_limit) in source_limits {
         let terrain_row = terrain(ctx, source)?;
         let cell = cell_state(ctx, source)?;
         if !terrain_row.passable || cell.owner_player_id != player_id {
             return Err(format!("source cell {source} is not owned passable ground"));
         }
         let allocated = allocated_infantry_at_cell(ctx, player_id, source);
-        let available = cell.infantry.saturating_sub(allocated);
+        let available = movable_redistribution_surplus(cell.infantry, allocated, source_limit);
         if available > 0 {
             available_by_source.insert(source, available);
         }
@@ -855,31 +790,87 @@ fn persist_order(
     Ok(order.order_id)
 }
 
+fn cancel_matching_pushes(
+    ctx: &ReducerContext,
+    player_id: u8,
+    selected_cells: &[u32],
+    direction: Axial,
+) -> Result<Option<u64>, String> {
+    if !Axial::DIRECTIONS.contains(&direction) {
+        return Err("push direction must be one of the six adjacent hex directions".into());
+    }
+    let selected = unique_selection(selected_cells, "push cancellation")?;
+    let mut matching = ctx
+        .db
+        .transfer_order()
+        .iter()
+        .filter(|order| {
+            order.player_id == player_id
+                && order.status == OrderStatus::Active
+                && order.kind == OrderKind::PushFront
+                && order.orientation_q == direction.q
+                && order.orientation_r == direction.r
+        })
+        .filter_map(|order| {
+            let sources = ctx
+                .db
+                .transfer_source()
+                .source_by_order()
+                .filter(order.order_id)
+                .map(|source| source.cell_id)
+                .collect::<BTreeSet<_>>();
+            (!sources.is_empty() && sources.is_subset(&selected)).then_some(order.order_id)
+        })
+        .collect::<Vec<_>>();
+    matching.sort_unstable();
+    if matching.is_empty() {
+        return Err("no active push matches that selected source region and direction".into());
+    }
+    for order_id in matching.iter().copied() {
+        cancel_order(ctx, player_id, order_id)?;
+    }
+    Ok((matching.len() == 1).then_some(matching[0]))
+}
+
 fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<(), String> {
     let mut order = ctx
         .db
         .transfer_order()
         .order_id()
         .find(order_id)
-        .ok_or_else(|| format!("unknown transfer order {order_id}"))?;
+        .ok_or_else(|| format!("unknown order {order_id}"))?;
     if order.player_id != player_id {
-        return Err("the transfer order belongs to the other player".into());
+        return Err("the order belongs to the other player".into());
     }
     if order.status != OrderStatus::Active {
-        return Err("the transfer order is no longer active".into());
+        return Err("the order is no longer active".into());
     }
-    let packet_keys: Vec<_> = ctx
+    let packets: Vec<_> = ctx
         .db
         .transit_packet()
         .packet_by_order()
         .filter(order_id)
-        .map(|packet| packet.packet_key)
         .collect();
-    for key in packet_keys {
-        ctx.db.transit_packet().packet_key().delete(key);
+    let released = packets.iter().try_fold(0_u64, |total, packet| {
+        total
+            .checked_add(packet.infantry)
+            .ok_or_else(|| "cancelled push strength overflow".to_string())
+    })?;
+    let settled = cancelled_settled_strength(
+        order.committed_infantry,
+        order.delivered_infantry,
+        order.casualty_infantry,
+        released,
+    )?;
+    for packet in packets {
+        ctx.db
+            .transit_packet()
+            .packet_key()
+            .delete(&packet.packet_key);
     }
     order.status = OrderStatus::Cancelled;
     order.in_transit_infantry = 0;
+    order.delivered_infantry = settled;
     order.updated_step = state(ctx)?.logical_step;
     ctx.db.transfer_order().order_id().update(order);
     let source_keys: Vec<_> = ctx
@@ -896,6 +887,26 @@ fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<()
         }
     }
     Ok(())
+}
+
+fn cancelled_settled_strength(
+    committed: u64,
+    already_settled: u64,
+    casualties: u64,
+    released: u64,
+) -> Result<u64, String> {
+    let settled = already_settled
+        .checked_add(released)
+        .ok_or_else(|| "cancelled push settled strength overflow".to_string())?;
+    let accounted = settled
+        .checked_add(casualties)
+        .ok_or_else(|| "cancelled push accounting overflow".to_string())?;
+    if accounted != committed {
+        return Err(format!(
+            "cancelled push violates infantry conservation: committed {committed}, accounted {accounted}"
+        ));
+    }
+    Ok(settled)
 }
 
 #[cfg(test)]
@@ -976,17 +987,42 @@ mod tests {
     }
 
     #[test]
-    fn repeated_push_only_fills_the_remaining_commitment_target() {
-        assert_eq!(additional_commitment(100, 0, 0, 5_000), 50);
-        assert_eq!(additional_commitment(100, 20, 20, 5_000), 30);
-        assert_eq!(additional_commitment(100, 50, 50, 5_000), 0);
-        assert_eq!(additional_commitment(100, 80, 50, 5_000), 0);
+    fn push_commitment_is_a_snapshot_share_of_unallocated_strength() {
+        assert_eq!(basis_point_share(100, 5_000), 50);
+        assert_eq!(basis_point_share(30, 5_000), 15);
+        assert_eq!(basis_point_share(1, 5_000), 0);
+        assert_eq!(basis_point_share(u64::MAX, 10_000), u64::MAX);
     }
 
     #[test]
-    fn unrelated_allocations_limit_supply_without_satisfying_the_push_target() {
-        assert_eq!(additional_commitment(100, 50, 0, 5_000), 50);
-        assert_eq!(additional_commitment(100, 70, 0, 5_000), 30);
-        assert_eq!(additional_commitment(100, 70, 20, 5_000), 30);
+    fn command_percentages_reject_zero_and_out_of_range_values() {
+        assert!(validate_basis_points(1, "amount").is_ok());
+        assert!(validate_basis_points(10_000, "amount").is_ok());
+        assert_eq!(
+            validate_basis_points(0, "amount"),
+            Err("amount must be between 1 and 10000 basis points".into())
+        );
+        assert_eq!(
+            validate_basis_points(10_001, "amount"),
+            Err("amount must be between 1 and 10000 basis points".into())
+        );
+    }
+
+    #[test]
+    fn redistribution_never_moves_below_a_percentage_frozen_target() {
+        // A 25% solve may ask 35 -> 27 and 65 -> 49. Even when the first
+        // source is routed first, its contribution is capped at its own eight
+        // soldier surplus instead of the destination's full demand.
+        assert_eq!(movable_redistribution_surplus(35, 0, 35 - 27), 8);
+        assert_eq!(movable_redistribution_surplus(65, 0, 65 - 49), 16);
+        assert_eq!(movable_redistribution_surplus(35, 5, 35 - 27), 3);
+        assert_eq!(movable_redistribution_surplus(35, 30, 35 - 27), 0);
+    }
+
+    #[test]
+    fn cancelling_releases_the_fixed_pool_in_place_without_losing_strength() {
+        assert_eq!(cancelled_settled_strength(100, 15, 25, 60), Ok(75));
+        assert!(cancelled_settled_strength(100, 15, 25, 59).is_err());
+        assert!(cancelled_settled_strength(100, u64::MAX, 0, 1).is_err());
     }
 }

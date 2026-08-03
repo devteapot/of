@@ -132,40 +132,46 @@ V1 does not expose destination-cell painting as its conquest loop. The player
 selects the territory and troops that may participate, then chooses exactly one
 of the six hex directions in which its boundary should advance:
 
-1. Paint one connected owned source region. Begin with one contiguous border
-   section and continue backward into owned territory to include its
-   reinforcement corridor and troop pool.
+1. Paint one connected owned source region. Include the intended border section
+   and continue backward into owned territory to include its reinforcement
+   corridor and troop pool.
 2. Hold `P`, drag outward, and release. The client quantizes the gesture to one
    exact axial direction.
-3. Preview the exact active edges, selected routes, participating strength,
-   commitment, capacity, congestion, and any invalid condition.
+3. Preview the exact initial active edges, selected routes, participating
+   strength, commitment, capacity, congestion, and any invalid condition.
 4. Use `[` / `]` to change commitment, `Enter` to submit, or `Escape` to
    cancel while retaining the selected region.
 
 For every selected cell, only its neighbor in the chosen direction is
-considered. A valid active edge is therefore exactly `(selected source,
-source + direction)`: side and rear edges never join the command implicitly.
-The selected source region must be six-connected, and the selected cells that
-own active edges must form one connected front section. Targets must be
-capturable, traversable, and not already owned by the player. The same command
-expands into neutral land or attacks an enemy-held cell; ownership determines
-the resolution, not a separate targeting mode.
+considered. A selected cell whose outward neighbor is neutral or enemy
+territory is part of the **front**, and the corresponding initial active edge
+is exactly `(selected source, source + direction)`. Side and rear edges never
+join the command implicitly. The remaining selected cells are the
+**reinforcement corridor**: they must connect behind the front through the
+six-connected selected region, but they do not open outward lanes of their own.
+The front cells must form one connected section. Initial targets must be
+capturable and traversable. The same command expands into neutral land or
+attacks an enemy-held cell; ownership determines the resolution, not a separate
+targeting mode.
 
 Cells behind the boundary contribute only through routes that stay inside the
-submitted selection. The route's final step is the exact previewed frontier
-edge. A cell outside the selection cannot become a convenient shortcut, and an
+submitted selection until they reach an initial front cell. A cell outside the
+selection cannot become a convenient shortcut into the front, and an
 unselected friendly stack cannot be debited. Internal cliffs or other blocked
 edges that split the selected reinforcement corridor make the command invalid
 rather than silently changing its meaning.
 
-Each command is intentionally **one cell deep**. It moves toward or resolves
-only the currently previewed neighboring cells; it does not auto-retarget a
-new perimeter or run an invisible expansion wave after capture. The player may
-repeat Push Front from the newly advanced border. Its feeling of momentum comes
-from repeated high-level commands plus the physical infantry already moving
-through the selected corridor, constrained by capacity, throughput, frontage,
-terrain, and resistance—not from click-speed bonuses or a second expansion
-resource.
+After crossing an initial front edge, the committed force continues
+automatically through successive hex layers along that lane's exact axial ray.
+It does not spread sideways, bend toward an easier target, or absorb newly
+adjacent friendly stacks. Each lane has a fixed committed strength pool and
+resolves independently. Terrain and elevation affect travel, throughput and
+combat; frontage limits engagement; neutral or enemy forces resist; and every
+captured cell retains a terrain-scaled garrison that consumes momentum. A lane
+stops when its mobile pool is exhausted, it is blocked or defeated, it reaches
+the map edge, or the player manually cancels it. This creates momentum from the
+troops physically committed to the selected corridor rather than click-speed
+bonuses or a separate expansion resource.
 
 The authoritative `issue_push_front` reducer receives a stable command ID, the
 exact sorted selected cell IDs, one axial direction, and commitment in basis
@@ -183,25 +189,49 @@ therefore cannot ratchet the same stack toward 100%. Destination reservations
 are scoped to the issuing player; another player's pending attack cannot
 pre-claim neutral capacity before the forces physically meet.
 
+With the same front selection and direction previewed, `X` cancels matching
+active Push Front orders. Cancellation releases their remaining allocations at
+the cells where they currently exist; it does not rewind captures, return force
+to its original source, or erase casualties.
+
 The generic aggregate transfer machinery remains a useful implementation
-substrate for routes, queues, congestion, and delivery. Precise destination
-orders may return later as a lower-level logistics feature, but they are not a
-player-facing V1 conquest interaction. A neutral-only Expand All shortcut also
-remains a possible opening-flow experiment after the selected-front loop is
-validated; it must not replace the spatial commitment rules above.
+substrate for routes, queues, congestion, and delivery, but V1 has no public
+precise-infantry-transfer command. Exact cell targeting is reserved for possible
+future discrete units such as tanks or boats. A neutral-only Expand All
+shortcut also remains a possible opening-flow experiment after the
+selected-front loop is validated; it must not replace the spatial commitment
+rules above.
 
 ### One-shot redistribution
 
-A redistribution order applies a target density pattern to selected owned hexes. Surplus strength moves toward deficits through the ordinary route, throughput, and capacity rules; redistribution is never instantaneous.
+A redistribution order applies a target density pattern to selected owned
+hexes. Each order also has a participation percentage. For every selected cell,
+the unparticipating share of its current stack is frozen as a per-cell lower
+bound; only the participating share joins the redistribution pool. Surplus
+strength moves toward deficits through the ordinary route, throughput, and
+capacity rules, so redistribution is never instantaneous.
 
-V1 should test at least:
+V1 includes four presets:
 
 - **Balance**: equalize occupancy ratio (`strength / capacity`) over the selection.
 - **Front-load**: bias target density along a player-specified direction.
+- **Core-load**: bias target density inward toward the selected region's
+  geometric center.
+- **Perimeter-load**: bias target density outward toward the selected region's
+  outer rings.
 
-For a directional preset, the player selects a region and drags an orientation arrow. Each selected hex receives a weight based on its projection along that direction; the preview shows the resulting target-density heatmap. The direction is captured when the one-shot order is issued and does not rotate automatically as the border changes.
+For Front-load, the player selects a region and drags an orientation arrow.
+Each selected hex receives a weight based on its projection along that
+direction; the preview shows the resulting target-density heatmap. The
+direction is captured when the one-shot order is issued and does not rotate
+automatically as the border changes. Core-load and Perimeter-load use distance
+from the selected cells' geometric center, so they need no orientation. Plain
+`[` / `]` adjusts participation for every preset before submission.
 
-Possible future presets include rear reserve, center concentration, flank concentration, fill-to-percentage, and corridor weighting. Persistent policies such as “maintain 300 strength here” are deferred until one-shot orders are understood; they must not be necessary for V1.
+Possible future presets include rear reserve, flank concentration,
+fill-to-percentage, and corridor weighting. Persistent policies such as
+“maintain 300 strength here” are deferred until one-shot orders are understood;
+they must not be necessary for V1.
 
 ## Combat Placeholder
 
@@ -215,6 +245,9 @@ V1 combat is aggregate and edge-based:
 - Casualties remove force from the spatial-conservation total.
 - Ownership changes only after local resistance is overcome and occupying force can enter the destination within its capacity.
 - Multiple attack edges should make encirclement valuable by creating additional frontage, without duplicating defending strength.
+- A cell always has one authoritative controller and one authoritative local
+  infantry stack. Opposing forces remain on hostile edges until capture; V1
+  does not introduce dual occupancy or fractional ownership.
 
 Exact lethality, neutral resistance, retreat behavior, capture timing, multi-edge allocation, and elevation coefficients are provisional. The first model should be deterministic, inspectable, and easy to tune rather than feature-rich.
 
@@ -228,6 +261,7 @@ V1 uses intentionally simple graybox graphics:
 - clear borders and selection highlights;
 - selected-only push routes, exact active front edges, queues, and ETA;
 - redistribution target-density heatmaps;
+- pressure-blended contested-cell colors derived from active combat fronts;
 - absolute force-strength shading, with alternate civilian and ownership
   overview modes.
 
@@ -242,6 +276,8 @@ Later, the Bevy client may render a small deterministic sample of representative
 ## Explicit V1 Non-goals
 
 - Individual foot-soldier or squad selection and simulation.
+- Precise cell-to-cell commands for aggregate infantry; exact movement may be
+  revisited for future discrete vehicles or vessels.
 - Bots or NPC AI.
 - More than two players, teams, diplomacy, alliances, or betrayal.
 - Fog of war.
@@ -297,28 +333,35 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
 7. Players can select one connected owned region, hold-drag-release `P` to
    choose one exact direction, and preview one connected active front before
    confirmation.
-8. Push Front routes remain inside the exact selection until their final
-   one-cell frontier edge and obey spatial conservation, capacity, and edge
-   throughput; no command can teleport or duplicate strength.
+8. Push Front routes remain inside the exact selection until they feed an
+   initial front cell, then advance lane-by-lane along the chosen axial
+   direction using one fixed committed pool. Terrain-scaled garrisons consume
+   momentum, lanes stop independently, and no command can teleport or duplicate
+   strength.
 9. Cutting a corridor creates genuinely independent connected components whose existing population and forces remain usable locally but cannot transfer across the cut.
-10. Players can apply one-shot Balance and oriented Front-load redistribution orders, preview their target densities, and watch force physically redistribute.
+10. Players can apply percentage-aware one-shot Balance, oriented Front-load,
+    Core-load, and Perimeter-load orders, preview their target densities, and
+    watch the participating force physically redistribute while each cell's
+    unparticipating share remains in place.
 11. Combat is resolved across contested edges using frontage, elevation, capacity, and casualties, including attacks from more than one edge without double-counting defenders.
 12. Ownership changes through combat and expansion, and all authoritative state is fully visible to both players.
 13. Graybox overlays make ownership, force density, occupancy/capacity, Push
-    Front flows, queues, active edges, and blocked orders understandable without
-    production assets.
+    Front flows, queues, active edges, blocked orders, and contested pressure
+    understandable without implying dual occupancy or requiring production
+    assets.
 14. Core tuning values are configurable so playtests can adjust the model without changing its data or interaction foundations.
 
 ## Questions for Playtesting, Not Pre-production Blockers
 
 - Does selecting a front plus its backward reinforcement corridor feel direct,
-  and is repeating a one-cell-deep Push enough to create momentum without
-  excessive input?
+  and does fixed-pool sustained advancement create understandable momentum
+  without excessive input or opaque automation?
 - Would a neutral-only Expand All shortcut improve the opening without
   obscuring spatial logistics or rewarding click spam?
 - Which selection gestures make irregular connected source regions easy to express?
 - Is the local civilian-to-military mobilization model understandable before an explicit economy is introduced?
 - Do capacity, throughput, and frontage create clear bottlenecks rather than frustrating queues?
-- Does Balance solve post-push cleanup, and does an oriented density preset provide enough control?
+- Do Balance, Front-load, Core-load, and Perimeter-load plus participation
+  percentage provide enough post-push control without precise infantry micro?
 - What map density and match duration best expose troop travel time without creating long periods of inactivity?
 - Is combat readable and sufficiently predictable while still rewarding elevation and multi-edge attacks?

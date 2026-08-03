@@ -6,67 +6,57 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct IssueTransferArgs {
+pub(super) struct IssueCoreLoadArgs {
     pub client_command_id: u64,
-    pub source_cells: Vec<u32>,
-    pub destination_cells: Vec<u32>,
-    pub infantry: u64,
+    pub selected_cells: Vec<u32>,
+    pub amount_bps: u32,
 }
 
-impl From<IssueTransferArgs> for super::Reducer {
-    fn from(args: IssueTransferArgs) -> Self {
-        Self::IssueTransfer {
+impl From<IssueCoreLoadArgs> for super::Reducer {
+    fn from(args: IssueCoreLoadArgs) -> Self {
+        Self::IssueCoreLoad {
             client_command_id: args.client_command_id,
-            source_cells: args.source_cells,
-            destination_cells: args.destination_cells,
-            infantry: args.infantry,
+            selected_cells: args.selected_cells,
+            amount_bps: args.amount_bps,
         }
     }
 }
 
-impl __sdk::InModule for IssueTransferArgs {
+impl __sdk::InModule for IssueCoreLoadArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `issue_transfer`.
+/// Extension trait for access to the reducer `issue_core_load`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait issue_transfer {
-    /// Request that the remote module invoke the reducer `issue_transfer` to run as soon as possible.
+pub trait issue_core_load {
+    /// Request that the remote module invoke the reducer `issue_core_load` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`issue_transfer:issue_transfer_then`] to run a callback after the reducer completes.
-    fn issue_transfer(
+    /// /// Use [`issue_core_load:issue_core_load_then`] to run a callback after the reducer completes.
+    fn issue_core_load(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        destination_cells: Vec<u32>,
-        infantry: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
     ) -> __sdk::Result<()> {
-        self.issue_transfer_then(
-            client_command_id,
-            source_cells,
-            destination_cells,
-            infantry,
-            |_, _| {},
-        )
+        self.issue_core_load_then(client_command_id, selected_cells, amount_bps, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `issue_transfer` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `issue_core_load` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn issue_transfer_then(
+    fn issue_core_load_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        destination_cells: Vec<u32>,
-        infantry: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -76,13 +66,12 @@ pub trait issue_transfer {
     ) -> __sdk::Result<()>;
 }
 
-impl issue_transfer for super::RemoteReducers {
-    fn issue_transfer_then(
+impl issue_core_load for super::RemoteReducers {
+    fn issue_core_load_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        destination_cells: Vec<u32>,
-        infantry: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -91,11 +80,10 @@ impl issue_transfer for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            IssueTransferArgs {
+            IssueCoreLoadArgs {
                 client_command_id,
-                source_cells,
-                destination_cells,
-                infantry,
+                selected_cells,
+                amount_bps,
             },
             callback,
         )

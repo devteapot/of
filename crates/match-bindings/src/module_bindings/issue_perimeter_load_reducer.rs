@@ -6,49 +6,57 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct CancelTransferOrderArgs {
+pub(super) struct IssuePerimeterLoadArgs {
     pub client_command_id: u64,
-    pub order_id: u64,
+    pub selected_cells: Vec<u32>,
+    pub amount_bps: u32,
 }
 
-impl From<CancelTransferOrderArgs> for super::Reducer {
-    fn from(args: CancelTransferOrderArgs) -> Self {
-        Self::CancelTransferOrder {
+impl From<IssuePerimeterLoadArgs> for super::Reducer {
+    fn from(args: IssuePerimeterLoadArgs) -> Self {
+        Self::IssuePerimeterLoad {
             client_command_id: args.client_command_id,
-            order_id: args.order_id,
+            selected_cells: args.selected_cells,
+            amount_bps: args.amount_bps,
         }
     }
 }
 
-impl __sdk::InModule for CancelTransferOrderArgs {
+impl __sdk::InModule for IssuePerimeterLoadArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `cancel_transfer_order`.
+/// Extension trait for access to the reducer `issue_perimeter_load`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait cancel_transfer_order {
-    /// Request that the remote module invoke the reducer `cancel_transfer_order` to run as soon as possible.
+pub trait issue_perimeter_load {
+    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`cancel_transfer_order:cancel_transfer_order_then`] to run a callback after the reducer completes.
-    fn cancel_transfer_order(&self, client_command_id: u64, order_id: u64) -> __sdk::Result<()> {
-        self.cancel_transfer_order_then(client_command_id, order_id, |_, _| {})
+    /// /// Use [`issue_perimeter_load:issue_perimeter_load_then`] to run a callback after the reducer completes.
+    fn issue_perimeter_load(
+        &self,
+        client_command_id: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
+    ) -> __sdk::Result<()> {
+        self.issue_perimeter_load_then(client_command_id, selected_cells, amount_bps, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `cancel_transfer_order` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn cancel_transfer_order_then(
+    fn issue_perimeter_load_then(
         &self,
         client_command_id: u64,
-        order_id: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -58,11 +66,12 @@ pub trait cancel_transfer_order {
     ) -> __sdk::Result<()>;
 }
 
-impl cancel_transfer_order for super::RemoteReducers {
-    fn cancel_transfer_order_then(
+impl issue_perimeter_load for super::RemoteReducers {
+    fn issue_perimeter_load_then(
         &self,
         client_command_id: u64,
-        order_id: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -71,9 +80,10 @@ impl cancel_transfer_order for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            CancelTransferOrderArgs {
+            IssuePerimeterLoadArgs {
                 client_command_id,
-                order_id,
+                selected_cells,
+                amount_bps,
             },
             callback,
         )

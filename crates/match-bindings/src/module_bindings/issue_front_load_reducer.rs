@@ -11,6 +11,7 @@ pub(super) struct IssueFrontLoadArgs {
     pub selected_cells: Vec<u32>,
     pub orientation_q: i32,
     pub orientation_r: i32,
+    pub amount_bps: u32,
 }
 
 impl From<IssueFrontLoadArgs> for super::Reducer {
@@ -20,6 +21,7 @@ impl From<IssueFrontLoadArgs> for super::Reducer {
             selected_cells: args.selected_cells,
             orientation_q: args.orientation_q,
             orientation_r: args.orientation_r,
+            amount_bps: args.amount_bps,
         }
     }
 }
@@ -45,12 +47,14 @@ pub trait issue_front_load {
         selected_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
+        amount_bps: u32,
     ) -> __sdk::Result<()> {
         self.issue_front_load_then(
             client_command_id,
             selected_cells,
             orientation_q,
             orientation_r,
+            amount_bps,
             |_, _| {},
         )
     }
@@ -67,6 +71,7 @@ pub trait issue_front_load {
         selected_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
+        amount_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -83,6 +88,7 @@ impl issue_front_load for super::RemoteReducers {
         selected_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
+        amount_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -96,6 +102,7 @@ impl issue_front_load for super::RemoteReducers {
                 selected_cells,
                 orientation_q,
                 orientation_r,
+                amount_bps,
             },
             callback,
         )

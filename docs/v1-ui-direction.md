@@ -12,22 +12,27 @@ The client has one modal order state machine:
 Idle -> Push Front orient -> Push Front preview -> Submit -> Idle
 Idle -> Redistribute Balance -> Preview -> Submit -> Idle
 Idle -> Redistribute Front-load -> Orient -> Preview -> Submit -> Idle
+Idle -> Redistribute Core-load -> Preview -> Submit -> Idle
+Idle -> Redistribute Perimeter-load -> Preview -> Submit -> Idle
 ```
 
-The same owned-region selection feeds Push Front and both redistribution presets. Server intentions remain independent of input gestures:
+The same owned-region selection feeds Push Front and all four redistribution
+presets. Server intentions remain independent of input gestures:
 
 - `PushFront { selected_cells, direction, commitment }`
-- `Redistribute { cells, preset, direction }`
+- `CancelPushFront { selected_cells, direction }`
+- `Redistribute { cells, preset, direction?, participation }`
 - `SetMobilization { target }`
 
 Push Front is the player-facing V1 conquest command. It uses the ordinary
-connected owned-cell selection: cells on its boundary in one exact direction
-define one contiguous active front, and the selection may be painted backward
-into owned territory to include its reinforcement pool and routes. Hold `P`,
-drag outward, and release to choose one of six directions. The client derives
-the exact final edge for each participating boundary cell and submits the
-selected cells, direction, and commitment. The server independently derives
-and validates the same edges; visual segment IDs are never authoritative.
+connected owned-cell selection. After one exact direction is chosen, selected
+cells whose outward neighbor is neutral or enemy territory define one
+contiguous front. The remaining connected selected cells behind that front are
+its reinforcement corridor and troop pool. Hold `P`, drag outward, and release
+to choose one of six directions. The client derives the initial outward edge
+for each participating front cell and submits the selected cells, direction,
+and commitment. The server independently derives and validates the same front;
+visual segment IDs are never authoritative.
 
 ### Camera
 
@@ -51,22 +56,38 @@ and validates the same edges; visual segment IDs are never authoritative.
   be one connected front section.
 - The preview highlights only edges from a selected source to its immediate
   non-owned neighbor in that direction. Side edges are never inferred.
-- Routes from rear cells remain entirely inside the selection until the exact
-  final frontier edge. The command advances only one cell deep; repeat it from
-  the resulting border to continue the push.
+- Those outward-facing selected cells are the front. Every other selected cell
+  must connect behind them through the selected region and acts as the
+  reinforcement corridor; it does not create an outward lane of its own.
+- Routes from corridor cells remain entirely inside the selection until they
+  feed an initial front cell. From there, each lane advances automatically
+  through successive cells along the chosen axial direction. It never bends,
+  widens, or retargets to an adjacent lane.
 - `[` / `]` changes commitment by ten percentage points; the provisional
   default is 50%.
 - `Enter` confirms; `Escape` cancels the preview while retaining the source
   selection.
+- While the Push Front direction is previewed, `X` cancels matching active
+  pushes launched from the selected front in that direction. Cancellation
+  stops future advancement; surviving troops remain where they physically are.
 
-Painted destination transfer remains an internal aggregate-flow primitive and
-a possible future precision-logistics tool. It is not exposed in the V1 input
-loop.
+The committed strength is a fixed pool. Terrain, elevation, throughput,
+frontage, neutral or enemy resistance, and a terrain-scaled occupying garrison
+consume or delay that pool. Lanes advance, stall, exhaust, lose, become blocked,
+reach the map edge, or are manually cancelled independently. Precise infantry
+transfer is not part of the V1 command surface; exact cell movement is reserved
+for possible future discrete units such as tanks or boats.
 
 ### Redistribution
 
 - `B` previews Balance over the owned selection and `Enter` submits it.
 - Hold `F`, drag an arrow over the map plane, and release to preview Front-load in that orientation. A zero-length direction is invalid.
+- `G` previews Core-load, which favors cells nearest the selected region's
+  geometric center.
+- `R` previews Perimeter-load, which favors the selected region's outer rings.
+- `[` / `]` changes the participating percentage for every redistribution
+  preset. The unparticipating share of every cell's current stack is frozen in
+  that cell; only the selected share joins the redistributed pool.
 - The heatmap represents proposed target density, not strength that has already moved.
 - `Enter` submits and `Escape` cancels while retaining the region selection.
 
@@ -109,7 +130,13 @@ These overlays remain separate:
 - excluded/blocked: diagonal cross or hatch;
 - bottleneck: thick edge marker and source-side queue wedge;
 - combat: bold edge with opposing chevrons;
-- redistribution target: monochrome selection-only heatmap plus orientation arrow for Front-load.
+- contested cell: one authoritative controller remains, while the chunk's
+  vertex colors blend the controller and attacker colors according to pressure
+  derived from subscribed `CombatFront` state;
+- sustained push preview: initial edges plus a representative selected
+  reinforcement route; later layers remain outcome-dependent until simulated;
+- redistribution target: monochrome selection-only heatmap plus an orientation
+  arrow for Front-load and center/perimeter emphasis for radial presets.
 
 Color is never the only signal for source, active front, block, or combat.
 Multi-source routes should render as aggregated corridors, not every
@@ -132,12 +159,13 @@ Congestion is accepted state, not a rejection. It increases estimated arrival ti
 The first-session hint is limited to:
 
 ```text
-LMB paint owned hexes · hold P + drag push · B balance · F drag front-load · Esc cancel · ? help
+LMB paint · P push · B/F/G/R redistribute · [ ] amount · X stop push · ? help
 ```
 
 Contextual first-use hints explain that Push Front uses only selected cells and
-crosses one exact edge, Front-load still moves troops physically, and lowering
-mobilization does not send soldiers home.
+continues in one exact direction with a fixed force pool, every redistribution
+preset still moves troops physically, and lowering mobilization does not send
+soldiers home.
 
 ## First playtest risks
 
@@ -145,9 +173,12 @@ Test these before adding visual polish:
 
 1. ownership remains readable under density shading at far zoom;
 2. the selected reinforcement corridor and active front remain distinct;
-3. the exact one-cell push cannot be mistaken for an automatic expansion wave;
+3. each sustained lane's remaining momentum, resistance, and stop reason are
+   understandable without implying lateral retargeting;
 4. route aggregation avoids unreadable arrow clutter;
 5. live density and proposed redistribution heatmaps look different;
 6. height-aware picking selects the visible column at cliffs and camera pitch extremes;
 7. the two local client windows make their player slot unmistakable;
-8. ETA is labeled as an estimate and visibly corrects to authoritative state.
+8. ETA is labeled as an estimate and visibly corrects to authoritative state;
+9. contested color blending communicates pressure without implying that both
+   players authoritatively occupy the cell.

@@ -14,8 +14,8 @@ use hex_core::{Axial, ChunkCoord, TerrainKind};
 
 use crate::{
     geometry::{COLUMN_FLOOR, cell_top, corner, edge_index_for_direction, world_center},
-    map_view::{MapViewMode, normalized_cell_value},
-    model::{CellView, MatchView, PLAYER_ONE, PLAYER_TWO},
+    map_view::{MapViewMode, normalized_cell_value, normalized_soldier_strength},
+    model::{CellView, ContestedCellView, MatchView, PLAYER_ONE, PLAYER_TWO},
 };
 
 /// Mesh creation is deliberately amortized: a future world-scale map may
@@ -465,7 +465,7 @@ fn build_chunk_mesh(view: &MatchView, chunk: ChunkCoord, mode: MapViewMode) -> B
 fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, mode: MapViewMode) {
     let top_y = cell_top(cell.elevation, cell.is_water());
     let center = world_center(cell.coordinate, cell.elevation, cell.is_water());
-    let top_color = cell_color(cell, mode);
+    let top_color = cell_color(cell, view.contested_cells.get(&cell.coordinate), mode);
 
     let center_index = builder.vertex(cell.coordinate, center, Vec3::Y, top_color, 1.0);
     let top_corners = std::array::from_fn::<_, 6, _>(|index| {
@@ -541,8 +541,12 @@ fn recolor_chunk_mesh(
         .iter()
         .zip(&chunk.vertex_shades)
         .map(|(coordinate, factor)| {
-            view.cell(*coordinate)
-                .map(|cell| shade(cell_color(cell, mode), *factor))
+            view.cell(*coordinate).map(|cell| {
+                shade(
+                    cell_color(cell, view.contested_cells.get(coordinate), mode),
+                    *factor,
+                )
+            })
         })
         .collect::<Option<Vec<_>>>();
     let Some(colors) = colors else {
@@ -552,27 +556,34 @@ fn recolor_chunk_mesh(
     true
 }
 
-fn cell_color(cell: &CellView, mode: MapViewMode) -> [f32; 4] {
+fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapViewMode) -> [f32; 4] {
     let base = if cell.is_water() {
         Color::srgb(0.055, 0.16, 0.21)
     } else {
         match cell.owner {
-            Some(PLAYER_ONE) => Color::srgb(0.06, 0.48, 0.58),
-            Some(PLAYER_TWO) => Color::srgb(0.76, 0.24, 0.16),
-            _ => match cell.terrain {
-                TerrainKind::Plains => Color::srgb(0.39, 0.43, 0.30),
-                TerrainKind::Hills => Color::srgb(0.42, 0.38, 0.25),
-                TerrainKind::Mountain => Color::srgb(0.36, 0.35, 0.31),
-                TerrainKind::Water => Color::srgb(0.055, 0.16, 0.21),
-            },
+            Some(player) => player_color(player).unwrap_or_else(|| terrain_color(cell.terrain)),
+            None => terrain_color(cell.terrain),
         }
     };
-    let mut linear = LinearRgba::from(base);
+    let mut linear = contest.filter(|_| cell.is_land()).map_or_else(
+        || LinearRgba::from(base),
+        |contest| {
+            let controller = player_color(contest.controller_player).unwrap_or(base);
+            let attacker = player_color(contest.attacker_player).unwrap_or(base);
+            mix_linear_colors(
+                controller,
+                attacker,
+                normalized_share(contest.attacker_share),
+            )
+        },
+    );
     let intensity = match mode {
         MapViewMode::Overview => 0.42,
-        MapViewMode::Soldiers | MapViewMode::Civilians => {
-            normalized_cell_value(mode, cell).unwrap_or(0.0)
-        }
+        MapViewMode::Soldiers => normalized_soldier_strength(
+            cell.infantry
+                .saturating_add(contest.map_or(0, |contest| contest.attacker_strength)),
+        ),
+        MapViewMode::Civilians => normalized_cell_value(mode, cell).unwrap_or(0.0),
     };
     let terrain_light = match cell.terrain {
         TerrainKind::Plains => 1.0,
@@ -586,6 +597,43 @@ fn cell_color(cell: &CellView, mode: MapViewMode) -> [f32; 4] {
         (linear.green * ownership_readability * terrain_light + intensity * 0.045).min(1.0);
     linear.blue = (linear.blue * ownership_readability * terrain_light + intensity * 0.05).min(1.0);
     linear.to_f32_array()
+}
+
+fn player_color(player: u32) -> Option<Color> {
+    match player {
+        PLAYER_ONE => Some(Color::srgb(0.06, 0.48, 0.58)),
+        PLAYER_TWO => Some(Color::srgb(0.76, 0.24, 0.16)),
+        _ => None,
+    }
+}
+
+fn terrain_color(terrain: TerrainKind) -> Color {
+    match terrain {
+        TerrainKind::Plains => Color::srgb(0.39, 0.43, 0.30),
+        TerrainKind::Hills => Color::srgb(0.42, 0.38, 0.25),
+        TerrainKind::Mountain => Color::srgb(0.36, 0.35, 0.31),
+        TerrainKind::Water => Color::srgb(0.055, 0.16, 0.21),
+    }
+}
+
+fn normalized_share(share: f32) -> f32 {
+    if share.is_finite() {
+        share.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn mix_linear_colors(controller: Color, attacker: Color, attacker_share: f32) -> LinearRgba {
+    let controller = LinearRgba::from(controller);
+    let attacker = LinearRgba::from(attacker);
+    let controller_share = 1.0 - attacker_share;
+    LinearRgba::new(
+        controller.red * controller_share + attacker.red * attacker_share,
+        controller.green * controller_share + attacker.green * attacker_share,
+        controller.blue * controller_share + attacker.blue * attacker_share,
+        controller.alpha * controller_share + attacker.alpha * attacker_share,
+    )
 }
 
 fn sort_chunks_near_origin(chunks: &mut [ChunkCoord]) {
@@ -653,8 +701,8 @@ mod tests {
         let compact = test_cell(50, 0, 100);
         let spacious = test_cell(50, 0, 1_000);
 
-        let compact = cell_color(&compact, MapViewMode::Soldiers);
-        let spacious = cell_color(&spacious, MapViewMode::Soldiers);
+        let compact = cell_color(&compact, None, MapViewMode::Soldiers);
+        let spacious = cell_color(&spacious, None, MapViewMode::Soldiers);
         assert!(
             compact
                 .iter()
@@ -665,16 +713,16 @@ mod tests {
 
     #[test]
     fn civilian_shading_becomes_brighter_as_population_increases() {
-        let sparse = cell_color(&test_cell(0, 10, 100), MapViewMode::Civilians);
-        let dense = cell_color(&test_cell(0, 220, 100), MapViewMode::Civilians);
+        let sparse = cell_color(&test_cell(0, 10, 100), None, MapViewMode::Civilians);
+        let dense = cell_color(&test_cell(0, 220, 100), None, MapViewMode::Civilians);
 
         assert!(dense[..3].iter().sum::<f32>() > sparse[..3].iter().sum::<f32>());
     }
 
     #[test]
     fn overview_brightness_does_not_follow_force_composition() {
-        let empty = cell_color(&test_cell(0, 0, 100), MapViewMode::Overview);
-        let crowded = cell_color(&test_cell(100, 500, 100), MapViewMode::Overview);
+        let empty = cell_color(&test_cell(0, 0, 100), None, MapViewMode::Overview);
+        let crowded = cell_color(&test_cell(100, 500, 100), None, MapViewMode::Overview);
 
         assert!(
             empty
@@ -682,6 +730,76 @@ mod tests {
                 .zip(crowded)
                 .all(|(left, right)| (*left - right).abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn contested_color_tracks_attacker_share_between_player_colors() {
+        let controller_cell = test_cell(50, 0, 100);
+        let mut attacker_cell = controller_cell.clone();
+        attacker_cell.owner = Some(PLAYER_TWO);
+        let controller = cell_color(&controller_cell, None, MapViewMode::Overview);
+        let attacker = cell_color(&attacker_cell, None, MapViewMode::Overview);
+
+        let contest = |attacker_share| ContestedCellView {
+            controller_player: PLAYER_ONE,
+            attacker_player: PLAYER_TWO,
+            attacker_strength: 0,
+            attacker_share,
+        };
+        let zero = contest(0.0);
+        let half = contest(0.5);
+        let full = contest(1.0);
+        let zero = cell_color(&controller_cell, Some(&zero), MapViewMode::Overview);
+        let half = cell_color(&controller_cell, Some(&half), MapViewMode::Overview);
+        let full = cell_color(&controller_cell, Some(&full), MapViewMode::Overview);
+
+        assert_colors_close(zero, controller);
+        assert_colors_close(full, attacker);
+        for index in 0..4 {
+            assert!((half[index] - (controller[index] + attacker[index]) * 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn contested_color_clamps_invalid_network_shares() {
+        let cell = test_cell(50, 0, 100);
+        let controller = cell_color(&cell, None, MapViewMode::Overview);
+        let invalid = ContestedCellView {
+            controller_player: PLAYER_ONE,
+            attacker_player: PLAYER_TWO,
+            attacker_strength: 0,
+            attacker_share: f32::NAN,
+        };
+        let overfull = ContestedCellView {
+            attacker_share: 2.0,
+            ..invalid
+        };
+
+        assert_colors_close(
+            cell_color(&cell, Some(&invalid), MapViewMode::Overview),
+            controller,
+        );
+        let mut attacker_cell = cell.clone();
+        attacker_cell.owner = Some(PLAYER_TWO);
+        assert_colors_close(
+            cell_color(&cell, Some(&overfull), MapViewMode::Overview),
+            cell_color(&attacker_cell, None, MapViewMode::Overview),
+        );
+    }
+
+    #[test]
+    fn contested_soldier_shading_includes_attacker_pressure() {
+        let cell = test_cell(25, 0, 100);
+        let uncontested = cell_color(&cell, None, MapViewMode::Soldiers);
+        let contest = ContestedCellView {
+            controller_player: PLAYER_ONE,
+            attacker_player: PLAYER_TWO,
+            attacker_strength: 75,
+            attacker_share: 0.75,
+        };
+        let contested = cell_color(&cell, Some(&contest), MapViewMode::Soldiers);
+
+        assert!(contested[..3].iter().sum::<f32>() > uncontested[..3].iter().sum::<f32>());
     }
 
     #[test]
@@ -763,6 +881,76 @@ mod tests {
         assert_eq!(mesh.indices(), Some(&indices_before));
         assert_ne!(mesh.attribute(Mesh::ATTRIBUTE_COLOR), Some(&colors_before));
         assert_eq!(chunk.triangle_to_cell, picking_before);
+    }
+
+    #[test]
+    fn contest_recolor_changes_only_vertex_colors() {
+        let mut view = MatchView::offline_fixture();
+        let cell_coordinate = view
+            .cells
+            .values()
+            .find(|cell| cell.owner == Some(PLAYER_ONE) && cell.is_land())
+            .expect("fixture player one land")
+            .coordinate;
+        let chunk_coordinate = crate::geometry::chunk_of(cell_coordinate);
+        let built = build_chunk_mesh(&view, chunk_coordinate, MapViewMode::Overview);
+        let BuiltChunk {
+            mut mesh,
+            cells,
+            triangle_to_cell,
+            vertex_to_cell,
+            vertex_shades,
+            geometry_fingerprint,
+        } = built;
+        let chunk = TerrainChunk {
+            coordinate: chunk_coordinate,
+            cells,
+            triangle_to_cell,
+            vertex_to_cell,
+            vertex_shades,
+            geometry_fingerprint,
+        };
+        let positions_before = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("chunk positions")
+            .clone();
+        let indices_before = mesh.indices().expect("chunk indices").clone();
+        let colors_before = mesh
+            .attribute(Mesh::ATTRIBUTE_COLOR)
+            .expect("chunk colors")
+            .clone();
+
+        view.contested_cells.insert(
+            cell_coordinate,
+            ContestedCellView {
+                controller_player: PLAYER_ONE,
+                attacker_player: PLAYER_TWO,
+                attacker_strength: 50,
+                attacker_share: 0.5,
+            },
+        );
+
+        assert!(recolor_chunk_mesh(
+            &mut mesh,
+            &chunk,
+            &view,
+            MapViewMode::Overview
+        ));
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION),
+            Some(&positions_before)
+        );
+        assert_eq!(mesh.indices(), Some(&indices_before));
+        assert_ne!(mesh.attribute(Mesh::ATTRIBUTE_COLOR), Some(&colors_before));
+    }
+
+    fn assert_colors_close(left: [f32; 4], right: [f32; 4]) {
+        assert!(
+            left.iter()
+                .zip(right)
+                .all(|(left, right)| (*left - right).abs() < 1e-6),
+            "left={left:?}, right={right:?}"
+        );
     }
 
     #[test]

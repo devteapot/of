@@ -34,5 +34,5 @@ pub use movement::{
 pub use pathfinding::{Path, shortest_path};
 pub use redistribution::{
     DistributionError, DistributionPreset, TargetDistribution, distribution_weights,
-    redistribution_targets,
+    redistribution_targets, redistribution_targets_with_commitment,
 };

@@ -10,19 +10,22 @@ use std::{
 };
 
 use bevy::prelude::*;
-use hex_core::{Axial, FrontSelectionError, selected_front_edges};
+use hex_core::{
+    Axial, Cell, DistributionPreset as CoreDistributionPreset, ForceComposition,
+    FrontSelectionError, HexMap, redistribution_targets_with_commitment, selected_front_edges,
+};
 
 use crate::{
     geometry::axial_to_plane,
-    model::{
-        ActiveFlow, ActiveFront, MatchPhase, MatchView, ToastKind, reachability_to_destinations,
-    },
+    model::{ActiveFlow, ActiveFront, MatchPhase, MatchView, ToastKind},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RedistributionPreset {
     Balance,
     FrontLoad,
+    CoreLoad,
+    PerimeterLoad,
 }
 
 #[derive(Message, Clone, Debug)]
@@ -32,16 +35,15 @@ pub enum ClientIntent {
         direction: Axial,
         commitment_percent: u8,
     },
-    #[allow(dead_code)]
-    Transfer {
+    CancelPush {
         sources: BTreeSet<Axial>,
-        destinations: BTreeSet<Axial>,
-        amount_percent: u8,
+        direction: Axial,
     },
     Redistribute {
         cells: BTreeSet<Axial>,
         preset: RedistributionPreset,
         direction: Option<Vec2>,
+        amount_percent: u8,
     },
     SetMobilization {
         target: f32,
@@ -118,16 +120,19 @@ pub fn resolve_offline_intents(
                 direction,
                 commitment_percent,
             } => resolve_push_front(&view, sources, *direction, *commitment_percent),
-            ClientIntent::Transfer {
-                sources,
-                destinations,
-                amount_percent,
-            } => resolve_transfer(&view, sources, destinations, *amount_percent),
+            ClientIntent::CancelPush { .. } => ServerUpdate::Accepted {
+                command_id: None,
+                summary: "Matching active Push Front operations stopped".to_owned(),
+                patches: Vec::new(),
+                flow: None,
+                front: None,
+            },
             ClientIntent::Redistribute {
                 cells,
                 preset,
                 direction,
-            } => resolve_redistribution(&view, cells, *preset, *direction),
+                amount_percent,
+            } => resolve_redistribution(&view, cells, *preset, *direction, *amount_percent),
             ClientIntent::SetMobilization { target } => ServerUpdate::MobilizationChanged {
                 command_id: None,
                 target: target.clamp(0.0, 1.0),
@@ -269,76 +274,89 @@ fn resolve_push_front(
         .iter()
         .map(|edge| (edge.source, edge.target))
         .collect::<BTreeMap<_, _>>();
-    let mut remaining_capacity = target_by_boundary
-        .values()
-        .filter_map(|target| {
-            view.cell(*target)
-                .map(|cell| (*target, cell.military_capacity))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut demands = BTreeMap::<Axial, u64>::new();
     let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
-    let mut committed = 0_u64;
+    let mut committed_by_boundary = BTreeMap::<Axial, u64>::new();
     for (source, source_request) in &requested_by_source {
         let boundary = assignments
             .get(source)
             .expect("every selected source was assigned to the front");
-        let target = target_by_boundary
-            .get(boundary)
-            .expect("assigned boundary has a directional target");
-        let capacity = remaining_capacity
-            .get_mut(target)
-            .expect("front target capacity was initialized");
-        let moved = (*source_request).min(*capacity);
-        if moved == 0 {
-            continue;
-        }
-        *capacity -= moved;
-        *demands.entry(*target).or_default() += moved;
-        committed = committed.saturating_add(moved);
+        let committed = committed_by_boundary.entry(*boundary).or_default();
+        *committed = committed.saturating_add(*source_request);
         let cell = view.cell(*source).expect("push source was validated");
-        changed.insert(*source, (cell.owner, cell.infantry.saturating_sub(moved)));
+        changed.insert(
+            *source,
+            (cell.owner, cell.infantry.saturating_sub(*source_request)),
+        );
     }
+    let committed = committed_by_boundary.values().copied().sum();
     if committed == 0 {
         return rejection(
-            "The selected front has no available military capacity",
+            "The selected front has no infantry to commit",
             target_by_boundary.values().next().copied(),
         );
     }
 
     let mut captured = 0_u32;
     let mut defender_losses = 0_u64;
-    for (target, attacking) in &demands {
-        let destination = view.cell(*target).expect("front target was validated");
-        let defenders = destination.infantry;
-        defender_losses = defender_losses.saturating_add(defenders.min(*attacking));
-        if *attacking > defenders {
+    let mut representative_route = Vec::new();
+    for (boundary, mut mobile) in committed_by_boundary {
+        let mut current = boundary;
+        let mut occupied = assignments
+            .iter()
+            .filter_map(|(source, assigned)| (*assigned == boundary).then_some(*source))
+            .filter(|source| *source != boundary)
+            .collect::<Vec<_>>();
+        occupied.push(boundary);
+        let mut lane_route = vec![boundary];
+        while mobile > 0 {
+            let next = current + direction;
+            let Some(destination) = view.cell(next) else {
+                break;
+            };
+            let Some(from) = view.cell(current) else {
+                break;
+            };
+            if !destination.is_land()
+                || destination.blocked
+                || destination.owner == Some(view.local_player)
+                || (i32::from(from.elevation) - i32::from(destination.elevation)).unsigned_abs() > 1
+            {
+                break;
+            }
+
+            lane_route.push(next);
+            let (defender_owner, defenders) = changed
+                .get(&next)
+                .copied()
+                .unwrap_or((destination.owner, destination.infantry));
+            let exchanged = defenders.min(mobile);
+            defender_losses = defender_losses.saturating_add(exchanged);
+            mobile = mobile.saturating_sub(exchanged);
+            if mobile == 0 {
+                changed.insert(next, (defender_owner, defenders - exchanged));
+                break;
+            }
+
             captured = captured.saturating_add(1);
-            changed.insert(
-                *target,
-                (
-                    Some(view.local_player),
-                    attacking
-                        .saturating_sub(defenders)
-                        .min(destination.military_capacity),
-                ),
-            );
-        } else {
-            changed.insert(*target, (destination.owner, defenders - attacking));
+            let garrison = occupation_garrison(destination).min(mobile);
+            mobile -= garrison;
+            changed.insert(next, (Some(view.local_player), garrison));
+            current = next;
+            occupied.push(next);
+        }
+
+        if mobile > 0 {
+            station_offline_strength(view, &mut changed, &occupied, mobile);
+        }
+        if lane_route.len() > representative_route.len() {
+            representative_route = lane_route;
         }
     }
 
     let first_edge = edges[0];
-    let retained = requested.saturating_sub(committed);
-    let summary = if retained > 0 {
-        format!(
-            "Push Front accepted · {committed} committed · {retained} retained · {captured} cells captured"
-        )
-    } else {
-        format!(
-            "Push Front accepted · {committed} committed · {captured} cells captured · {defender_losses} defender losses"
-        )
-    };
+    let summary = format!(
+        "Sustained Push Front accepted · {committed} committed · {captured} cells captured · {defender_losses} defender losses"
+    );
     ServerUpdate::Accepted {
         command_id: None,
         summary,
@@ -351,7 +369,11 @@ fn resolve_push_front(
             })
             .collect(),
         flow: Some(ActiveFlow {
-            route: vec![first_edge.source, first_edge.target],
+            route: if representative_route.len() >= 2 {
+                representative_route
+            } else {
+                vec![first_edge.source, first_edge.target]
+            },
             strength: committed,
             attacking: true,
             age: 0.0,
@@ -429,6 +451,53 @@ fn selected_front_assignments(
         .collect()
 }
 
+fn occupation_garrison(cell: &crate::model::CellView) -> u64 {
+    if cell.military_capacity == 0 || !cell.is_land() {
+        return 0;
+    }
+    let multiplier = match cell.terrain {
+        hex_core::TerrainKind::Plains => 1,
+        hex_core::TerrainKind::Hills => 2,
+        hex_core::TerrainKind::Mountain => 3,
+        hex_core::TerrainKind::Water => 0,
+    };
+    cell.military_capacity
+        .div_ceil(20)
+        .max(1)
+        .saturating_mul(multiplier)
+        .min(cell.military_capacity)
+}
+
+fn station_offline_strength(
+    view: &MatchView,
+    changed: &mut BTreeMap<Axial, (Option<u32>, u64)>,
+    occupied: &[Axial],
+    mut strength: u64,
+) {
+    for &coordinate in occupied.iter().rev() {
+        if strength == 0 {
+            break;
+        }
+        let Some(cell) = view.cell(coordinate) else {
+            continue;
+        };
+        let (_, current) = changed
+            .get(&coordinate)
+            .copied()
+            .unwrap_or((cell.owner, cell.infantry));
+        let stationed = strength.min(cell.military_capacity.saturating_sub(current));
+        changed.insert(
+            coordinate,
+            (Some(view.local_player), current.saturating_add(stationed)),
+        );
+        strength -= stationed;
+    }
+    debug_assert_eq!(
+        strength, 0,
+        "a push lane must retain capacity for survivors"
+    );
+}
+
 const fn front_error_message(error: FrontSelectionError) -> &'static str {
     match error {
         FrontSelectionError::EmptySelection => "Push selection is empty",
@@ -441,153 +510,12 @@ const fn front_error_message(error: FrontSelectionError) -> &'static str {
     }
 }
 
-fn resolve_transfer(
-    view: &MatchView,
-    sources: &BTreeSet<Axial>,
-    destinations: &BTreeSet<Axial>,
-    amount_percent: u8,
-) -> ServerUpdate {
-    if sources.is_empty() || destinations.is_empty() {
-        return rejection("Select at least one source and destination", None);
-    }
-    if let Some(invalid) = sources
-        .iter()
-        .find(|coordinate| !view.is_local_owned(**coordinate))
-    {
-        return rejection("Sources must be owned by the local player", Some(*invalid));
-    }
-    if let Some(invalid) = destinations
-        .iter()
-        .find(|coordinate| !view.is_local_owned(**coordinate))
-    {
-        return rejection(
-            "Precise transfer destinations must be owned; use Push Front for conquest",
-            Some(*invalid),
-        );
-    }
-    let primary = *destinations.first().expect("validated destination");
-    let primary_set = BTreeSet::from([primary]);
-    let reverse = reachability_to_destinations(view, &primary_set);
-    let reachable_sources = reverse
-        .reachable_sources(sources)
-        .into_iter()
-        .filter(|source| *source != primary)
-        .collect::<BTreeSet<_>>();
-    let Some(route) = reverse.route_from_any(&reachable_sources) else {
-        return rejection(
-            "No traversable route; cliff or water blocks the corridor",
-            Some(primary),
-        );
-    };
-    if let Some(unowned) = route
-        .iter()
-        .find(|coordinate| !view.is_local_owned(**coordinate))
-    {
-        return rejection(
-            "Precise transfers cannot route through unowned territory",
-            Some(*unowned),
-        );
-    }
-
-    let percent = u64::from(amount_percent.clamp(10, 100));
-    let requested_by_source = reachable_sources
-        .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| (cell.coordinate, cell.infantry * percent / 100))
-        .collect::<BTreeMap<_, _>>();
-    let requested = requested_by_source
-        .values()
-        .copied()
-        .fold(0_u64, u64::saturating_add);
-    if requested == 0 {
-        return rejection(
-            "Selected sources have no movable infantry",
-            sources.first().copied(),
-        );
-    }
-
-    let destination = view.cell(primary).expect("validated destination");
-    let moved = requested.min(destination.free_capacity());
-    if moved == 0 {
-        return rejection("Destination has no free military capacity", Some(primary));
-    }
-
-    // Offline commands resolve immediately, so there is no authoritative queue
-    // that can safely own strength above the destination's free capacity. Debit
-    // exactly the accepted amount, spread proportionally and deterministically
-    // across the sorted reachable sources; every unaccepted soldier stays put.
-    let mut moved_by_source = BTreeMap::new();
-    let mut allocated = 0_u64;
-    for (coordinate, available) in &requested_by_source {
-        let share = if moved == requested {
-            *available
-        } else {
-            (u128::from(*available) * u128::from(moved) / u128::from(requested)) as u64
-        };
-        moved_by_source.insert(*coordinate, share);
-        allocated = allocated.saturating_add(share);
-    }
-    let mut remainder = moved.saturating_sub(allocated);
-    for (coordinate, available) in &requested_by_source {
-        if remainder == 0 {
-            break;
-        }
-        let share = moved_by_source
-            .get_mut(coordinate)
-            .expect("source allocation was initialized");
-        if *share < *available {
-            *share += 1;
-            remainder -= 1;
-        }
-    }
-    debug_assert_eq!(remainder, 0);
-
-    let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
-    for (source, strength) in moved_by_source {
-        let cell = view.cell(source).expect("validated source");
-        changed.insert(source, (cell.owner, cell.infantry.saturating_sub(strength)));
-    }
-
-    changed.insert(primary, (destination.owner, destination.infantry + moved));
-    let retained = requested.saturating_sub(moved);
-    let summary = if retained > 0 {
-        format!(
-            "Transfer accepted · {moved} infantry · {retained} retained at sources (capacity limit)"
-        )
-    } else {
-        format!(
-            "Transfer accepted · {moved} infantry · ETA ≈ {}s",
-            route.len() * 2
-        )
-    };
-
-    ServerUpdate::Accepted {
-        command_id: None,
-        summary,
-        patches: changed
-            .into_iter()
-            .map(|(coordinate, (owner, infantry))| CellPatch {
-                coordinate,
-                owner,
-                infantry,
-            })
-            .collect(),
-        flow: Some(ActiveFlow {
-            route,
-            strength: moved,
-            attacking: false,
-            age: 0.0,
-            lifetime: 10.0,
-        }),
-        front: None,
-    }
-}
-
 fn resolve_redistribution(
     view: &MatchView,
     cells: &BTreeSet<Axial>,
     preset: RedistributionPreset,
     direction: Option<Vec2>,
+    amount_percent: u8,
 ) -> ServerUpdate {
     if cells.len() < 2 {
         return rejection(
@@ -604,71 +532,78 @@ fn resolve_redistribution(
             Some(*invalid),
         );
     }
-    if preset == RedistributionPreset::FrontLoad
-        && direction.is_none_or(|value| value.length_squared() < 0.001)
-    {
-        return rejection("Front-load direction is too short", cells.first().copied());
-    }
-
-    let total: u64 = cells
-        .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| cell.infantry)
-        .sum();
-    let direction = direction.unwrap_or(Vec2::X).normalize_or_zero();
-    let projections: Vec<_> = cells
-        .iter()
-        .map(|coordinate| (*coordinate, axial_to_plane(*coordinate).dot(direction)))
-        .collect();
-    let min_projection = projections
-        .iter()
-        .map(|(_, projection)| *projection)
-        .fold(f32::INFINITY, f32::min);
-    let max_projection = projections
-        .iter()
-        .map(|(_, projection)| *projection)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let span = (max_projection - min_projection).max(0.001);
-
-    let weights: Vec<_> = projections
-        .iter()
-        .map(|(coordinate, projection)| {
-            let cell = view.cell(*coordinate).expect("validated cell");
-            let bias = match preset {
-                RedistributionPreset::Balance => 1.0,
-                RedistributionPreset::FrontLoad => {
-                    0.35 + 1.3 * ((*projection - min_projection) / span)
-                }
+    let core_preset = match preset {
+        RedistributionPreset::Balance => CoreDistributionPreset::Balance,
+        RedistributionPreset::FrontLoad => {
+            let Some(direction) = direction.and_then(world_direction_to_axial) else {
+                return rejection("Front-load direction is too short", cells.first().copied());
             };
-            (*coordinate, cell.military_capacity as f32 * bias)
-        })
-        .collect();
-    let total_weight: f32 = weights.iter().map(|(_, weight)| *weight).sum();
-    let mut remaining = total;
-    let mut patches = Vec::with_capacity(weights.len());
-    for (index, (coordinate, weight)) in weights.iter().enumerate() {
-        let cell = view.cell(*coordinate).expect("validated cell");
-        let target = if index + 1 == weights.len() {
-            remaining
-        } else {
-            ((total as f32 * *weight / total_weight).round() as u64).min(remaining)
+            CoreDistributionPreset::front_load(direction)
         }
-        .min(cell.military_capacity);
-        remaining = remaining.saturating_sub(target);
-        patches.push(CellPatch {
-            coordinate: *coordinate,
+        RedistributionPreset::CoreLoad => CoreDistributionPreset::CoreLoad,
+        RedistributionPreset::PerimeterLoad => CoreDistributionPreset::PerimeterLoad,
+    };
+
+    let mut map = HexMap::new();
+    let mut total = 0_u64;
+    for &coordinate in cells {
+        let cell = view.cell(coordinate).expect("selection was validated");
+        if !cell.is_land() || cell.blocked {
+            return rejection(
+                "Redistribution needs owned passable ground",
+                Some(coordinate),
+            );
+        }
+        total = total.saturating_add(cell.infantry);
+        map.insert(Cell {
+            coordinate,
+            terrain: cell.terrain,
+            elevation: cell.elevation,
+            capturable: true,
+            habitable: true,
             owner: cell.owner,
-            infantry: target,
+            civilian_population: cell.civilians,
+            civilian_capacity: cell.civilians,
+            forces: ForceComposition::infantry(cell.infantry),
+            military_capacity: cell.military_capacity,
         });
     }
+    let amount_bps = u32::from(amount_percent.clamp(10, 100)) * 100;
+    let Ok(distribution) = redistribution_targets_with_commitment(
+        &map,
+        view.local_player,
+        cells.iter().copied(),
+        total,
+        core_preset,
+        amount_bps,
+    ) else {
+        return rejection(
+            "This redistribution cannot be resolved",
+            cells.first().copied(),
+        );
+    };
+    let patches = distribution
+        .targets
+        .into_iter()
+        .map(|(coordinate, infantry)| CellPatch {
+            coordinate,
+            owner: Some(view.local_player),
+            infantry,
+        })
+        .collect();
 
     let label = match preset {
         RedistributionPreset::Balance => "Balance",
         RedistributionPreset::FrontLoad => "Front-load",
+        RedistributionPreset::CoreLoad => "Core-load",
+        RedistributionPreset::PerimeterLoad => "Perimeter-load",
     };
     ServerUpdate::Accepted {
         command_id: None,
-        summary: format!("{label} redistribution accepted · {total} infantry conserved"),
+        summary: format!(
+            "{label} redistribution accepted · {}% participation · {total} infantry conserved",
+            amount_percent.clamp(10, 100)
+        ),
         patches,
         flow: None,
         front: None,
@@ -681,6 +616,19 @@ fn rejection(reason: impl Into<String>, relevant_cell: Option<Axial>) -> ServerU
         reason: reason.into(),
         relevant_cell,
     }
+}
+
+fn world_direction_to_axial(direction: Vec2) -> Option<Axial> {
+    if direction.length_squared() < 0.001 {
+        return None;
+    }
+    let direction = direction.normalize();
+    Axial::DIRECTIONS.into_iter().max_by(|left, right| {
+        axial_to_plane(*left)
+            .normalize()
+            .dot(direction)
+            .total_cmp(&axial_to_plane(*right).normalize().dot(direction))
+    })
 }
 
 #[cfg(test)]
@@ -708,134 +656,6 @@ mod tests {
             infantry: 0,
             ..cell(coordinate, 0)
         }
-    }
-
-    fn disconnected_transfer_view() -> MatchView {
-        let mut view = MatchView::connecting(1);
-        for cell in [
-            cell(Axial::ZERO, 10),
-            cell(Axial::new(10, 0), 20),
-            cell(Axial::new(11, 0), 0),
-        ] {
-            view.cells.insert(cell.coordinate, cell);
-        }
-        view.rebuild_chunk_index();
-        view
-    }
-
-    #[test]
-    fn offline_transfer_uses_only_sources_that_reach_the_primary_destination() {
-        let view = disconnected_transfer_view();
-        let isolated = Axial::ZERO;
-        let reachable = Axial::new(10, 0);
-        let destination = Axial::new(11, 0);
-        let update = resolve_transfer(
-            &view,
-            &BTreeSet::from([isolated, reachable]),
-            &BTreeSet::from([destination]),
-            100,
-        );
-
-        let ServerUpdate::Accepted { patches, flow, .. } = update else {
-            panic!("reachable source should produce an accepted transfer");
-        };
-        assert!(!patches.iter().any(|patch| patch.coordinate == isolated));
-        assert_eq!(
-            patches
-                .iter()
-                .find(|patch| patch.coordinate == reachable)
-                .map(|patch| patch.infantry),
-            Some(0)
-        );
-        assert_eq!(
-            patches
-                .iter()
-                .find(|patch| patch.coordinate == destination)
-                .map(|patch| patch.infantry),
-            Some(20)
-        );
-        let flow = flow.expect("accepted transfer flow");
-        assert_eq!(flow.strength, 20);
-        assert_eq!(flow.route, vec![reachable, destination]);
-    }
-
-    #[test]
-    fn offline_transfer_rejects_when_no_source_reaches_the_primary_destination() {
-        let view = disconnected_transfer_view();
-        let update = resolve_transfer(
-            &view,
-            &BTreeSet::from([Axial::ZERO]),
-            &BTreeSet::from([Axial::new(11, 0)]),
-            100,
-        );
-
-        assert!(matches!(update, ServerUpdate::Rejected { .. }));
-    }
-
-    #[test]
-    fn offline_precise_transfer_cannot_capture_an_unowned_destination() {
-        let source = Axial::ZERO;
-        let destination = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(source, cell(source, 20));
-        view.cells.insert(destination, neutral_cell(destination));
-        view.rebuild_chunk_index();
-
-        assert!(matches!(
-            resolve_transfer(
-                &view,
-                &BTreeSet::from([source]),
-                &BTreeSet::from([destination]),
-                100,
-            ),
-            ServerUpdate::Rejected { .. }
-        ));
-    }
-
-    #[test]
-    fn offline_friendly_transfer_retains_strength_that_exceeds_capacity() {
-        let first = Axial::ZERO;
-        let second = Axial::new(1, 0);
-        let destination = Axial::new(2, 0);
-        let mut view = MatchView::connecting(1);
-        for cell in [cell(first, 60), cell(second, 40), cell(destination, 90)] {
-            view.cells.insert(cell.coordinate, cell);
-        }
-        view.rebuild_chunk_index();
-
-        let update = resolve_transfer(
-            &view,
-            &BTreeSet::from([first, second]),
-            &BTreeSet::from([destination]),
-            100,
-        );
-        let ServerUpdate::Accepted {
-            summary,
-            patches,
-            flow,
-            ..
-        } = update
-        else {
-            panic!("capacity-limited friendly transfer should be accepted");
-        };
-
-        let infantry_after = |coordinate| {
-            patches
-                .iter()
-                .find(|patch| patch.coordinate == coordinate)
-                .map(|patch| patch.infantry)
-                .expect("every changed cell has a patch")
-        };
-        assert_eq!(infantry_after(first), 54);
-        assert_eq!(infantry_after(second), 36);
-        assert_eq!(infantry_after(destination), 100);
-        assert_eq!(
-            infantry_after(first) + infantry_after(second) + infantry_after(destination),
-            190,
-            "friendly transfer must conserve infantry"
-        );
-        assert!(summary.contains("90 retained at sources"));
-        assert_eq!(flow.expect("accepted transfer flow").strength, 10);
     }
 
     #[test]
@@ -881,6 +701,82 @@ mod tests {
             90
         );
         assert_eq!(flow.expect("push flow").strength, 45);
+    }
+
+    #[test]
+    fn one_offline_push_command_advances_through_successive_layers() {
+        let source = Axial::ZERO;
+        let direction = Axial::new(1, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(source, cell(source, 40));
+        for distance in 1..=3 {
+            let coordinate = Axial::new(distance, 0);
+            view.cells.insert(coordinate, neutral_cell(coordinate));
+        }
+        view.rebuild_chunk_index();
+
+        let update = resolve_push_front(&view, &BTreeSet::from([source]), direction, 50);
+        let ServerUpdate::Accepted {
+            summary,
+            patches,
+            flow,
+            ..
+        } = update
+        else {
+            panic!("a clear directional lane should accept a sustained push");
+        };
+
+        assert!(summary.contains("3 cells captured"));
+        let infantry_after = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+                .expect("every occupied layer has a patch")
+        };
+        assert_eq!(infantry_after(source), 20);
+        assert_eq!(infantry_after(Axial::new(1, 0)), 5);
+        assert_eq!(infantry_after(Axial::new(2, 0)), 5);
+        assert_eq!(infantry_after(Axial::new(3, 0)), 10);
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 40);
+        assert_eq!(
+            flow.expect("sustained flow preview").route,
+            vec![
+                Axial::ZERO,
+                Axial::new(1, 0),
+                Axial::new(2, 0),
+                Axial::new(3, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_balance_respects_per_cell_participation_percentage() {
+        let left = Axial::ZERO;
+        let right = Axial::new(1, 0);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(left, cell(left, 100));
+        view.cells.insert(right, cell(right, 0));
+        view.rebuild_chunk_index();
+
+        let update = resolve_redistribution(
+            &view,
+            &BTreeSet::from([left, right]),
+            RedistributionPreset::Balance,
+            None,
+            25,
+        );
+        let ServerUpdate::Accepted { patches, .. } = update else {
+            panic!("percentage balance should be accepted");
+        };
+        let target = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .map(|patch| patch.infantry)
+        };
+        assert_eq!(target(left), Some(75));
+        assert_eq!(target(right), Some(25));
     }
 
     #[test]

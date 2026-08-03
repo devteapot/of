@@ -17,9 +17,9 @@ use match_bindings::{
     CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, CommandReceipt,
     CommandReceiptTableAccess, DbConnection, MatchPhase, MatchStateTableAccess,
     MobilizationPolicyTableAccess, OrderKind, OrderStatus, PlayerSlotTableAccess, ReceiptStatus,
-    TransferDestinationTableAccess, TransferOrder, TransferOrderTableAccess,
-    TransferSourceTableAccess, TransitPacket, TransitPacketTableAccess, issue_push_front as _,
-    join_match as _, set_mobilization_target as _,
+    TerrainClass, TransferDestinationTableAccess, TransferOrder, TransferOrderTableAccess,
+    TransferSourceTableAccess, TransitPacket, TransitPacketTableAccess, cancel_push_fronts as _,
+    issue_push_front as _, join_match as _, set_mobilization_target as _,
 };
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
@@ -27,8 +27,11 @@ const PLAYER_ONE: u8 = 1;
 const PLAYER_TWO: u8 = 2;
 const SINGLETON_ID: u8 = 0;
 const COMMAND_ID_FLOOR: u64 = 9_000_000_000;
-const PUSH_COMMITMENT_BPS: u32 = 1_000;
+const PUSH_COMMITMENT_BPS: u32 = 5_000;
 const MAX_PUSH_CORRIDOR_CELLS: usize = 5;
+const REQUIRED_LANE_CELLS: usize = 4;
+const OBSERVED_CAPTURE_LAYERS: usize = 2;
+const POST_CANCEL_STEPS: u64 = 2;
 
 #[derive(Debug, Parser)]
 #[command(about = "Exercise a live V1 match with two persistent anonymous identities")]
@@ -210,6 +213,29 @@ impl Client {
         wait_for_reducer(&rx, timeout, "issue_push_front")
     }
 
+    fn cancel_push_fronts(
+        &self,
+        command_id: u64,
+        selected_cells: &[u32],
+        direction: Axial,
+        timeout: Duration,
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.conn
+            .reducers
+            .cancel_push_fronts_then(
+                command_id,
+                selected_cells.to_vec(),
+                direction.q,
+                direction.r,
+                move |_, result| {
+                    let _ = tx.send(flatten_reducer_result(result));
+                },
+            )
+            .context("send cancel_push_fronts")?;
+        wait_for_reducer(&rx, timeout, "cancel_push_fronts")
+    }
+
     fn disconnect(&mut self, timeout: Duration) -> Result<()> {
         if self.stopped {
             return Ok(());
@@ -265,7 +291,7 @@ impl Drop for Client {
 struct PushFrontCandidate {
     selected_cells: Vec<u32>,
     front_cell: u32,
-    destination_cell: u32,
+    lane_cells: Vec<u32>,
     direction: Axial,
     commitment_bps: u32,
     expected_requested: u64,
@@ -371,14 +397,6 @@ fn main() -> Result<()> {
 
     println!("[4/6] issuing an authoritative directional front push");
     let candidate = select_push_front_candidate(&player_one.conn, PLAYER_ONE)?;
-    let destination_before = player_one
-        .conn
-        .db
-        .cell_state()
-        .cell_id()
-        .find(&candidate.destination_cell)
-        .context("selected destination state disappeared")?
-        .infantry;
     let push_id = unused_command_id(
         &player_one.conn,
         PLAYER_ONE,
@@ -452,9 +470,9 @@ fn main() -> Result<()> {
             .collect();
         ensure!(
             destinations.len() == 1
-                && destinations[0].cell_id == candidate.destination_cell
+                && destinations[0].cell_id == candidate.lane_cells[0]
                 && destinations[0].target_infantry == order.committed_infantry,
-            "front-push order did not persist its exact directional destination"
+            "front-push order did not persist its stable first-layer lane anchor"
         );
         Ok(Some(()))
     })?;
@@ -485,9 +503,9 @@ fn main() -> Result<()> {
         "idempotent front-push retry produced {matching_receipts} receipts and {matching_orders} orders"
     );
 
-    println!("[5/6] observing front-push progression and strength conservation");
+    println!("[5/6] observing sustained progression, then cancelling the active push");
     let mut observed_packet_progress = false;
-    let completed_order = wait_until("front-push completion", timeout, poll, || {
+    let active_order = wait_until("two successive front-push captures", timeout, poll, || {
         let Some(order) = player_one
             .conn
             .db
@@ -499,59 +517,185 @@ fn main() -> Result<()> {
         };
         assert_push_order(&order, &candidate, push_id)?;
         assert_order_conservation(&order)?;
-        observed_packet_progress |= player_one
+        let packets: Vec<_> = player_one
             .conn
             .db
             .transit_packet()
             .iter()
             .filter(|packet| packet.order_id == order.order_id)
+            .collect();
+        observed_packet_progress |= packets
+            .iter()
             .any(|packet| packet.route_index > 0 || packet.updated_step > order.created_step);
-        if order.status != OrderStatus::Completed {
+        if !packets.is_empty() {
+            assert_push_routes(&player_one.conn, &candidate, &order, &packets)?;
+        }
+
+        let captured_layers = candidate.lane_cells[..OBSERVED_CAPTURE_LAYERS]
+            .iter()
+            .filter(|cell_id| {
+                player_one
+                    .conn
+                    .db
+                    .cell_state()
+                    .cell_id()
+                    .find(cell_id)
+                    .is_some_and(|cell| cell.owner_player_id == PLAYER_ONE && cell.infantry > 0)
+            })
+            .count();
+        if captured_layers < OBSERVED_CAPTURE_LAYERS {
+            ensure!(
+                order.status == OrderStatus::Active,
+                "front push stopped after {captured_layers} layer(s), before proving sustained progression; use a fresh default fixture with a clear neutral lane"
+            );
             return Ok(None);
         }
         ensure!(
-            observed_packet_progress || order.updated_step > order.created_step,
-            "front-push order completed without observable route progression"
+            order.status == OrderStatus::Active && order.in_transit_infantry > 0,
+            "front push exhausted at the second layer, leaving no active operation to cancel; use a fixture with a longer lane and more source infantry"
+        );
+        ensure!(
+            observed_packet_progress && order.updated_step > order.created_step,
+            "two captured layers were not accompanied by observable packet progression"
         );
         Ok(Some(order))
     })?;
     ensure!(
-        completed_order.committed_infantry > 0,
-        "front push completed without committing infantry"
-    );
-    ensure!(
-        completed_order.delivered_infantry == completed_order.committed_infantry,
-        "neutral front push delivered {} of {} committed infantry",
-        completed_order.delivered_infantry,
-        completed_order.committed_infantry
-    );
-    ensure!(
-        completed_order.casualty_infantry == 0,
+        active_order.casualty_infantry == 0,
         "neutral front push unexpectedly recorded {} casualties",
-        completed_order.casualty_infantry
+        active_order.casualty_infantry
     );
     ensure!(
-        completed_order.updated_step > completed_order.created_step,
-        "front push never progressed beyond creation step {}",
-        completed_order.created_step
-    );
-    ensure!(
-        completed_order.created_step >= running_step,
+        active_order.created_step >= running_step,
         "front-push order predates the observed running match"
     );
-    let destination_after = player_one
-        .conn
-        .db
-        .cell_state()
-        .cell_id()
-        .find(&candidate.destination_cell)
-        .context("selected destination state disappeared after front push")?
-        .infantry;
+
+    let cancel_id = unused_command_id(
+        &player_one.conn,
+        PLAYER_ONE,
+        push_id.checked_add(1).context("push command ID overflow")?,
+    )?;
+    player_one.cancel_push_fronts(
+        cancel_id,
+        &candidate.selected_cells,
+        candidate.direction,
+        timeout,
+    )?;
+    let cancel_receipt = wait_for_receipt(
+        &player_one,
+        PLAYER_ONE,
+        cancel_id,
+        "cancel_push_fronts",
+        timeout,
+        poll,
+    )?;
     ensure!(
-        destination_after >= destination_before.saturating_add(completed_order.delivered_infantry),
-        "destination infantry did not reflect delivery: before={destination_before}, after={destination_after}, delivered={}",
-        completed_order.delivered_infantry
+        cancel_receipt.order_id == push_receipt.order_id,
+        "cancellation receipt referenced order {} instead of the unique sustained push {}; use a fresh database if older active pushes overlap this selection",
+        cancel_receipt.order_id,
+        push_receipt.order_id
     );
+
+    let (cancelled_order, owners_at_cancel) =
+        wait_until("front-push cancellation", timeout, poll, || {
+            let Some(order) = player_one
+                .conn
+                .db
+                .transfer_order()
+                .order_id()
+                .find(&push_receipt.order_id)
+            else {
+                return Ok(None);
+            };
+            if order.status != OrderStatus::Cancelled {
+                return Ok(None);
+            }
+            assert_push_order(&order, &candidate, push_id)?;
+            assert_order_conservation(&order)?;
+            ensure!(
+                order.in_transit_infantry == 0,
+                "cancelled push retained {} in-transit infantry",
+                order.in_transit_infantry
+            );
+            ensure!(
+                !player_one
+                    .conn
+                    .db
+                    .transit_packet()
+                    .iter()
+                    .any(|packet| packet.order_id == order.order_id),
+                "cancelled push retained transit packets"
+            );
+            let sources: Vec<_> = player_one
+                .conn
+                .db
+                .transfer_source()
+                .iter()
+                .filter(|source| source.order_id == order.order_id)
+                .collect();
+            ensure!(
+                sources.len() == candidate.selected_cells.len()
+                    && sources.iter().all(|source| source.queued_infantry == 0),
+                "cancellation did not release every selected source allocation"
+            );
+            let owners = lane_owners(&player_one.conn, &candidate.lane_cells)?;
+            Ok(Some((order, owners)))
+        })?;
+    ensure!(
+        cancelled_order.delivered_infantry > active_order.delivered_infantry,
+        "cancellation did not settle any of the {} infantry that were still in transit",
+        active_order.in_transit_infantry
+    );
+    ensure!(
+        cancelled_order.casualty_infantry == 0,
+        "neutral sustained push unexpectedly recorded casualties before cancellation"
+    );
+
+    wait_until("post-cancellation simulation steps", timeout, poll, || {
+        let Some(state) = player_one
+            .conn
+            .db
+            .match_state()
+            .singleton_id()
+            .find(&SINGLETON_ID)
+        else {
+            return Ok(None);
+        };
+        if state.logical_step
+            < cancelled_order
+                .updated_step
+                .saturating_add(POST_CANCEL_STEPS)
+        {
+            return Ok(None);
+        }
+        let order = player_one
+            .conn
+            .db
+            .transfer_order()
+            .order_id()
+            .find(&push_receipt.order_id)
+            .context("cancelled push order disappeared")?;
+        ensure!(
+            order.status == OrderStatus::Cancelled,
+            "cancelled push changed status after later simulation steps"
+        );
+        assert_order_conservation(&order)?;
+        ensure!(
+            !player_one
+                .conn
+                .db
+                .transit_packet()
+                .iter()
+                .any(|packet| packet.order_id == order.order_id),
+            "cancelled push emitted a later transit packet"
+        );
+        ensure!(
+            lane_owners(&player_one.conn, &candidate.lane_cells)? == owners_at_cancel,
+            "the cancelled operation continued acquiring cells along its original lane"
+        );
+        Ok(Some(()))
+    })?;
+
     let progressed_step = player_one
         .conn
         .db
@@ -620,7 +764,7 @@ fn main() -> Result<()> {
     reconnected.disconnect(timeout)?;
     player_two.disconnect(timeout)?;
     println!(
-        "PASS: receipts, idempotency, front-push direction/routing/conservation, and token reuse verified"
+        "PASS: receipts, idempotency, sustained front-push routing/conservation/cancellation, and token reuse verified"
     );
     Ok(())
 }
@@ -832,24 +976,6 @@ fn select_push_front_candidate(conn: &DbConnection, player_id: u8) -> Result<Pus
         .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
         .collect();
 
-    let active_orders: HashSet<u64> = conn
-        .db
-        .transfer_order()
-        .iter()
-        .filter(|order| order.status == OrderStatus::Active)
-        .map(|order| order.order_id)
-        .collect();
-    let mut reserved_by_destination = HashMap::<u32, u64>::new();
-    for destination in conn.db.transfer_destination().iter() {
-        if active_orders.contains(&destination.order_id) {
-            let outstanding = destination
-                .target_infantry
-                .saturating_sub(destination.received_infantry);
-            *reserved_by_destination
-                .entry(destination.cell_id)
-                .or_default() += outstanding;
-        }
-    }
     let mut allocated_by_source = HashMap::<u32, u64>::new();
     for packet in conn
         .db
@@ -878,35 +1004,29 @@ fn select_push_front_candidate(conn: &DbConnection, player_id: u8) -> Result<Pus
             continue;
         }
         for direction in Axial::DIRECTIONS {
-            let destination_coordinate = front_coordinate + direction;
-            let Some(destination_id) = cell_by_coordinate.get(&destination_coordinate).copied()
-            else {
-                continue;
-            };
-            let Some(destination) = cell_by_id.get(&destination_id) else {
-                continue;
-            };
-            let Some(destination_terrain) = terrain_by_id.get(&destination_id) else {
-                continue;
-            };
-            if destination.owner_player_id != 0
-                || destination.infantry != 0
-                || !destination_terrain.passable
-                || !destination_terrain.capturable
-                || front_terrain
-                    .elevation
-                    .abs_diff(destination_terrain.elevation)
-                    > 1
-            {
-                continue;
+            let mut lane_cells = Vec::new();
+            let mut previous_terrain = front_terrain;
+            let mut next_coordinate = front_coordinate + direction;
+            while let Some(next_id) = cell_by_coordinate.get(&next_coordinate).copied() {
+                let Some(next_state) = cell_by_id.get(&next_id) else {
+                    break;
+                };
+                let Some(next_terrain) = terrain_by_id.get(&next_id) else {
+                    break;
+                };
+                if next_state.owner_player_id != 0
+                    || next_state.infantry != 0
+                    || !next_terrain.passable
+                    || !next_terrain.capturable
+                    || previous_terrain.elevation.abs_diff(next_terrain.elevation) > 1
+                {
+                    break;
+                }
+                lane_cells.push(next_id);
+                previous_terrain = next_terrain;
+                next_coordinate = next_coordinate + direction;
             }
-            let free_capacity = destination.military_capacity.saturating_sub(
-                reserved_by_destination
-                    .get(&destination_id)
-                    .copied()
-                    .unwrap_or(0),
-            );
-            if free_capacity == 0 {
+            if lane_cells.len() < REQUIRED_LANE_CELLS {
                 continue;
             }
 
@@ -968,13 +1088,26 @@ fn select_push_front_candidate(conn: &DbConnection, player_id: u8) -> Result<Pus
                 let Some(expected_requested) = expected_requested else {
                     continue;
                 };
-                if expected_requested > free_capacity {
+                let garrison_buffer = lane_cells[..REQUIRED_LANE_CELLS - 1]
+                    .iter()
+                    .map(|cell_id| {
+                        expected_occupation_garrison(
+                            terrain_by_id
+                                .get(cell_id)
+                                .expect("lane terrain was validated above"),
+                            cell_by_id
+                                .get(cell_id)
+                                .expect("lane state was validated above"),
+                        )
+                    })
+                    .try_fold(0_u64, u64::checked_add);
+                if garrison_buffer.is_none_or(|minimum| expected_requested <= minimum) {
                     continue;
                 }
                 candidates.push(PushFrontCandidate {
                     selected_cells,
                     front_cell: front_id,
-                    destination_cell: destination_id,
+                    lane_cells: lane_cells.clone(),
                     direction,
                     commitment_bps: PUSH_COMMITMENT_BPS,
                     expected_requested,
@@ -986,15 +1119,47 @@ fn select_push_front_candidate(conn: &DbConnection, player_id: u8) -> Result<Pus
     candidates.sort_unstable_by_key(|candidate| {
         (
             std::cmp::Reverse(candidate.selected_cells.len()),
+            std::cmp::Reverse(candidate.lane_cells.len()),
             std::cmp::Reverse(candidate.expected_requested),
             candidate.front_cell,
-            candidate.destination_cell,
+            candidate.lane_cells[0],
             candidate.direction,
         )
     });
     candidates.into_iter().next().context(
-        "no connected owned corridor has infantry and an empty neutral front in one exact direction",
+        "no connected owned corridor has enough unallocated infantry and four traversable neutral cells in one exact direction; run against a fresh default fixture",
     )
+}
+
+fn expected_occupation_garrison(terrain: &CellTerrain, cell: &CellState) -> u64 {
+    if cell.military_capacity == 0 || terrain.terrain == TerrainClass::Water {
+        return 0;
+    }
+    let multiplier = match terrain.terrain {
+        TerrainClass::Plains => 1,
+        TerrainClass::Hills => 2,
+        TerrainClass::Mountain => 3,
+        TerrainClass::Water => 0,
+    };
+    cell.military_capacity
+        .div_ceil(20)
+        .max(1)
+        .saturating_mul(multiplier)
+        .min(cell.military_capacity)
+}
+
+fn lane_owners(conn: &DbConnection, lane_cells: &[u32]) -> Result<Vec<u8>> {
+    lane_cells
+        .iter()
+        .map(|cell_id| {
+            conn.db
+                .cell_state()
+                .cell_id()
+                .find(cell_id)
+                .map(|cell| cell.owner_player_id)
+                .with_context(|| format!("lane cell {cell_id} disappeared"))
+        })
+        .collect()
 }
 
 fn assert_push_order(
@@ -1058,24 +1223,42 @@ fn assert_push_routes(
             "front-push packet originated outside the submitted corridor"
         );
         ensure!(
-            packet.route.first() == Some(&packet.origin_cell)
-                && packet.route.last() == Some(&candidate.destination_cell),
-            "front-push packet route did not connect its selected origin to the directional target"
+            packet.destination_cell == candidate.lane_cells[0],
+            "front-push packet did not retain the first layer as its stable lane anchor"
+        );
+        ensure!(
+            packet.route.first() == Some(&packet.origin_cell),
+            "front-push packet route did not begin at its selected origin"
         );
         let route_index = usize::try_from(packet.route_index).context("route index overflow")?;
         ensure!(
             packet.route.get(route_index) == Some(&packet.current_cell),
             "front-push packet current cell does not match its route index"
         );
+        let anchor_index = packet
+            .route
+            .iter()
+            .position(|cell_id| *cell_id == candidate.lane_cells[0])
+            .context("front-push route omitted its stable first-layer lane anchor")?;
         ensure!(
-            packet.route[..packet.route.len() - 1]
-                .iter()
-                .all(|cell_id| selected.contains(cell_id)),
-            "front-push packet escaped the submitted corridor before its final edge"
+            anchor_index > 0
+                && packet.route[..anchor_index]
+                    .iter()
+                    .all(|cell_id| selected.contains(cell_id)),
+            "front-push packet escaped the submitted corridor before entering its lane"
         );
         ensure!(
-            packet.route.get(packet.route.len() - 2) == Some(&candidate.front_cell),
+            packet.route.get(anchor_index - 1) == Some(&candidate.front_cell),
             "front-push packet did not leave through the selected front cell"
+        );
+        let lane_suffix = &packet.route[anchor_index..];
+        ensure!(
+            lane_suffix.len() <= candidate.lane_cells.len()
+                && lane_suffix
+                    .iter()
+                    .zip(&candidate.lane_cells)
+                    .all(|(actual, expected)| actual == expected),
+            "front-push packet route did not extend along the submitted axial ray"
         );
         for cells in packet.route.windows(2) {
             let from = terrain_by_id
@@ -1089,19 +1272,19 @@ fn assert_push_routes(
                 "front-push route contains a non-adjacent step"
             );
         }
-        let boundary = terrain_by_id
-            .get(&candidate.front_cell)
-            .context("front terrain disappeared")?;
-        let destination = terrain_by_id
-            .get(&candidate.destination_cell)
-            .context("destination terrain disappeared")?;
-        ensure!(
-            Axial::new(destination.q, destination.r) - Axial::new(boundary.q, boundary.r)
-                == candidate.direction,
-            "front-push route's final edge does not match the submitted direction"
-        );
-        has_rear_corridor_route |=
-            packet.origin_cell != candidate.front_cell && packet.route.len() >= 3;
+        for cells in packet.route[anchor_index - 1..].windows(2) {
+            let from = terrain_by_id
+                .get(&cells[0])
+                .with_context(|| format!("route terrain {} disappeared", cells[0]))?;
+            let to = terrain_by_id
+                .get(&cells[1])
+                .with_context(|| format!("route terrain {} disappeared", cells[1]))?;
+            ensure!(
+                Axial::new(to.q, to.r) - Axial::new(from.q, from.r) == candidate.direction,
+                "front-push lane changed direction after leaving the selected corridor"
+            );
+        }
+        has_rear_corridor_route |= packet.origin_cell != candidate.front_cell && anchor_index >= 2;
         packet_total = packet_total
             .checked_add(packet.infantry)
             .context("front-push packet accounting overflow")?;

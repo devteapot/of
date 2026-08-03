@@ -7,12 +7,12 @@ use hex_core::{
 use spacetimedb::{ReducerContext, Table};
 
 use crate::rules::{
-    cell_state, config, coordinate_for_cell, core_cell, edge_runtime_limits, packet_key, state,
-    terrain,
+    allocated_infantry_at_cell, cell_id_for_coordinate, cell_state, config, coordinate_for_cell,
+    core_cell, edge_runtime_limits, packet_key, state, terrain,
 };
 use crate::schema::{
-    CellState, CombatFront, MatchPhase, NEUTRAL_PLAYER, OrderStatus, PLAYER_ONE, PLAYER_TWO,
-    TransferOrder, TransitPacket,
+    CellState, CombatFront, MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus, PLAYER_ONE,
+    PLAYER_TWO, TerrainClass, TransferOrder, TransitPacket,
 };
 use crate::schema::{
     cell_state as cell_state_table, combat_front, match_state, mobilization_policy,
@@ -240,6 +240,10 @@ fn resolve_combats(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         if state(ctx)?.phase != MatchPhase::Running {
             break;
         }
+        let attackers = refresh_target_attackers(ctx, target_cell, attackers)?;
+        if attackers.is_empty() {
+            continue;
+        }
         let defender = cell_state(ctx, target_cell)?;
         let selected_attacker = if defender.owner_player_id == NEUTRAL_PLAYER {
             attackers
@@ -284,6 +288,43 @@ fn resolve_combats(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         resolve_target_combat(ctx, defender, fronts, logical_step)?;
     }
     Ok(())
+}
+
+fn refresh_target_attackers(
+    ctx: &ReducerContext,
+    target_cell: u32,
+    candidates: BTreeMap<u8, BTreeMap<u32, Vec<TransitPacket>>>,
+) -> Result<BTreeMap<u8, BTreeMap<u32, Vec<TransitPacket>>>, String> {
+    let mut current = BTreeMap::<u8, BTreeMap<u32, Vec<TransitPacket>>>::new();
+    for (player, fronts) in candidates {
+        for (from_cell, packets) in fronts {
+            for snapshot in packets {
+                let Some(packet) = ctx
+                    .db
+                    .transit_packet()
+                    .packet_key()
+                    .find(&snapshot.packet_key)
+                else {
+                    continue;
+                };
+                let next_cell = packet.route.get(packet.route_index as usize + 1).copied();
+                if packet.owner_player_id != player
+                    || packet.current_cell != from_cell
+                    || next_cell != Some(target_cell)
+                    || cell_state(ctx, from_cell)?.owner_player_id != player
+                {
+                    continue;
+                }
+                current
+                    .entry(player)
+                    .or_default()
+                    .entry(from_cell)
+                    .or_default()
+                    .push(packet);
+            }
+        }
+    }
+    Ok(current)
 }
 
 fn resolve_target_combat(
@@ -485,6 +526,7 @@ fn occupy_after_combat(
         advance_packet(ctx, &packet, moved, logical_step)?;
         remaining -= moved;
     }
+    station_capture_garrison(ctx, target.cell_id, front.attacker, logical_step)?;
     record_capture(ctx, target.cell_id, old_owner, front.attacker)?;
     Ok(())
 }
@@ -533,6 +575,14 @@ fn advance_packet(
     moved: u64,
     logical_step: u64,
 ) -> Result<(), String> {
+    let Some(mut packet) = ctx
+        .db
+        .transit_packet()
+        .packet_key()
+        .find(&packet.packet_key)
+    else {
+        return Ok(());
+    };
     if moved == 0 || moved > packet.infantry {
         return Err("invalid packet movement amount".into());
     }
@@ -541,6 +591,16 @@ fn advance_packet(
         .route
         .get(next_index as usize)
         .ok_or_else(|| "packet route ended before movement".to_string())?;
+
+    if next_index as usize + 1 == packet.route.len() {
+        extend_push_lane(ctx, &packet, next_cell, logical_step)?;
+        packet = ctx
+            .db
+            .transit_packet()
+            .packet_key()
+            .find(&packet.packet_key)
+            .ok_or_else(|| "push packet disappeared while extending its lane".to_string())?;
+    }
 
     if moved == packet.infantry {
         ctx.db
@@ -559,6 +619,7 @@ fn advance_packet(
 
     if next_index as usize + 1 == packet.route.len() {
         increment_destination_received(ctx, packet.order_id, packet.destination_cell, moved)?;
+        settle_stopped_push_lane(ctx, packet.order_id, packet.destination_cell, logical_step)?;
         return Ok(());
     }
 
@@ -591,6 +652,93 @@ fn advance_packet(
         });
     }
     Ok(())
+}
+
+/// Extends every packet in one push lane by exactly one outward cell.
+///
+/// `destination_cell` is deliberately kept as the stable lane anchor. This
+/// allows packets from different selected source cells to share one advancing
+/// ray without rewriting packet keys or destination metadata every layer.
+fn extend_push_lane(
+    ctx: &ReducerContext,
+    packet: &TransitPacket,
+    reached_cell: u32,
+    logical_step: u64,
+) -> Result<bool, String> {
+    let Some(order) = ctx.db.transfer_order().order_id().find(packet.order_id) else {
+        return Err("push order is missing while extending a lane".into());
+    };
+    if order.status != OrderStatus::Active || order.kind != OrderKind::PushFront {
+        return Ok(false);
+    }
+
+    let current = ctx
+        .db
+        .transit_packet()
+        .packet_key()
+        .find(&packet.packet_key)
+        .ok_or_else(|| "push packet is missing while extending a lane".to_string())?;
+    if current.route.last().copied() != Some(reached_cell) {
+        return Ok(true);
+    }
+
+    let direction = hex_core::Axial::new(order.orientation_q, order.orientation_r);
+    if !hex_core::Axial::DIRECTIONS.contains(&direction) {
+        return Err("active push order has an invalid direction".into());
+    }
+    let match_config = config(ctx)?;
+    let next_coordinate = coordinate_for_cell(ctx, reached_cell)? + direction;
+    let Some(next_cell) = cell_id_for_coordinate(&match_config, next_coordinate) else {
+        return Ok(false);
+    };
+    let next_terrain = terrain(ctx, next_cell)?;
+    let next_state = cell_state(ctx, next_cell)?;
+    let traversable = edge_runtime_limits(ctx, reached_cell, next_cell)?.is_some();
+    if !push_target_is_eligible(
+        order.player_id,
+        next_state.owner_player_id,
+        next_terrain.passable,
+        next_terrain.capturable,
+        traversable,
+    ) {
+        return Ok(false);
+    }
+
+    let packets = ctx
+        .db
+        .transit_packet()
+        .packet_by_order()
+        .filter(order.order_id)
+        .filter(|candidate| candidate.destination_cell == packet.destination_cell)
+        .collect::<Vec<_>>();
+    let mut extended = false;
+    for mut candidate in packets {
+        if !append_lane_layer(&mut candidate.route, reached_cell, next_cell) {
+            continue;
+        }
+        candidate.updated_step = logical_step;
+        ctx.db.transit_packet().packet_key().update(candidate);
+        extended = true;
+    }
+    Ok(extended)
+}
+
+fn push_target_is_eligible(
+    player_id: u8,
+    target_owner: u8,
+    passable: bool,
+    capturable: bool,
+    traversable: bool,
+) -> bool {
+    passable && capturable && traversable && target_owner != player_id
+}
+
+fn append_lane_layer(route: &mut Vec<u32>, reached_cell: u32, next_cell: u32) -> bool {
+    if route.last().copied() != Some(reached_cell) {
+        return false;
+    }
+    route.push(next_cell);
+    true
 }
 
 fn decrement_source_queue(
@@ -639,6 +787,145 @@ fn increment_destination_received(
         .find(order_id)
         .ok_or_else(|| "transfer order is missing".to_string())?;
     order.delivered_infantry = order.delivered_infantry.saturating_add(amount);
+    ctx.db.transfer_order().order_id().update(order);
+    Ok(())
+}
+
+fn station_capture_garrison(
+    ctx: &ReducerContext,
+    cell_id: u32,
+    owner_player_id: u8,
+    logical_step: u64,
+) -> Result<(), String> {
+    let cell = cell_state(ctx, cell_id)?;
+    let terrain_class = terrain(ctx, cell_id)?.terrain;
+    let required = occupation_garrison(cell.military_capacity, terrain_class).min(cell.infantry);
+    let allocated = allocated_infantry_at_cell(ctx, owner_player_id, cell_id);
+    let mut remaining = additional_garrison_required(required, cell.infantry, allocated);
+    if remaining == 0 {
+        return Ok(());
+    }
+
+    let mut packets = ctx
+        .db
+        .transit_packet()
+        .packet_by_cell()
+        .filter(cell_id)
+        .filter(|packet| packet.owner_player_id == owner_player_id)
+        .filter(|packet| {
+            ctx.db
+                .transfer_order()
+                .order_id()
+                .find(packet.order_id)
+                .is_some_and(|order| order.status == OrderStatus::Active)
+        })
+        .collect::<Vec<_>>();
+    packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    for packet in packets {
+        if remaining == 0 {
+            break;
+        }
+        let stationed = remaining.min(packet.infantry);
+        station_packet_allocation(ctx, &packet, stationed, logical_step)?;
+        remaining -= stationed;
+    }
+    Ok(())
+}
+
+fn additional_garrison_required(required: u64, total: u64, allocated: u64) -> u64 {
+    required.saturating_sub(total.saturating_sub(allocated))
+}
+
+fn occupation_garrison(military_capacity: u64, terrain: TerrainClass) -> u64 {
+    if military_capacity == 0 || terrain == TerrainClass::Water {
+        return 0;
+    }
+    let base = military_capacity.div_ceil(20).max(1);
+    let multiplier = match terrain {
+        TerrainClass::Plains => 1,
+        TerrainClass::Hills => 2,
+        TerrainClass::Mountain => 3,
+        TerrainClass::Water => 0,
+    };
+    base.saturating_mul(multiplier).min(military_capacity)
+}
+
+/// Releases every still-allocated survivor in a lane where the directional
+/// ray reached friendly territory, the map boundary, or an impassable edge.
+/// The underlying infantry remains in its current cell; only the operation's
+/// allocation metadata is retired.
+fn settle_stopped_push_lane(
+    ctx: &ReducerContext,
+    order_id: u64,
+    lane_anchor: u32,
+    logical_step: u64,
+) -> Result<(), String> {
+    let Some(order) = ctx.db.transfer_order().order_id().find(order_id) else {
+        return Err("order is missing while settling a stopped push lane".into());
+    };
+    if order.kind != OrderKind::PushFront {
+        return Ok(());
+    }
+    let mut packets = ctx
+        .db
+        .transit_packet()
+        .packet_by_order()
+        .filter(order_id)
+        .filter(|packet| packet.destination_cell == lane_anchor)
+        .collect::<Vec<_>>();
+    packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    for packet in packets {
+        station_packet_allocation(ctx, &packet, packet.infantry, logical_step)?;
+    }
+    Ok(())
+}
+
+/// Retires an allocation without removing infantry from the cell. The public
+/// `delivered_infantry` counter therefore means all surviving strength that
+/// has left this operation: endpoint arrivals, occupation garrisons, and
+/// release-in-place at an automatic stop.
+fn station_packet_allocation(
+    ctx: &ReducerContext,
+    packet: &TransitPacket,
+    amount: u64,
+    logical_step: u64,
+) -> Result<(), String> {
+    let Some(mut current) = ctx
+        .db
+        .transit_packet()
+        .packet_key()
+        .find(&packet.packet_key)
+    else {
+        return Ok(());
+    };
+    let stationed = amount.min(current.infantry);
+    if stationed == 0 {
+        return Ok(());
+    }
+    if stationed == current.infantry {
+        ctx.db
+            .transit_packet()
+            .packet_key()
+            .delete(&current.packet_key);
+    } else {
+        current.infantry -= stationed;
+        current.updated_step = logical_step;
+        ctx.db.transit_packet().packet_key().update(current.clone());
+    }
+    if current.route_index == 0 {
+        decrement_source_queue(ctx, current.order_id, current.origin_cell, stationed)?;
+    }
+    let mut order = ctx
+        .db
+        .transfer_order()
+        .order_id()
+        .find(current.order_id)
+        .ok_or_else(|| "order is missing while stationing infantry".to_string())?;
+    order.delivered_infantry = order
+        .delivered_infantry
+        .checked_add(stationed)
+        .ok_or_else(|| "stationed infantry overflow".to_string())?;
+    order.updated_step = logical_step;
     ctx.db.transfer_order().order_id().update(order);
     Ok(())
 }
@@ -749,4 +1036,59 @@ fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         ctx.db.transfer_order().order_id().update(order);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_lane_extends_through_successive_layers_without_touching_its_neighbor() {
+        let mut first_lane = vec![1, 2, 3];
+        let mut second_lane = vec![10, 11];
+
+        assert!(append_lane_layer(&mut first_lane, 3, 4));
+        assert!(append_lane_layer(&mut first_lane, 4, 5));
+        assert!(!append_lane_layer(&mut second_lane, 3, 4));
+        assert_eq!(first_lane, vec![1, 2, 3, 4, 5]);
+        assert_eq!(second_lane, vec![10, 11]);
+    }
+
+    #[test]
+    fn a_push_stops_before_friendly_impassable_or_uncapturable_ground() {
+        assert!(push_target_is_eligible(1, 0, true, true, true));
+        assert!(push_target_is_eligible(1, 2, true, true, true));
+        assert!(!push_target_is_eligible(1, 1, true, true, true));
+        assert!(!push_target_is_eligible(1, 0, false, true, true));
+        assert!(!push_target_is_eligible(1, 0, true, false, true));
+        assert!(!push_target_is_eligible(1, 0, true, true, false));
+    }
+
+    #[test]
+    fn occupation_garrison_is_terrain_scaled_and_capacity_bounded() {
+        assert_eq!(occupation_garrison(100, TerrainClass::Plains), 5);
+        assert_eq!(occupation_garrison(80, TerrainClass::Hills), 8);
+        assert_eq!(occupation_garrison(60, TerrainClass::Mountain), 9);
+        assert_eq!(occupation_garrison(1, TerrainClass::Mountain), 1);
+        assert_eq!(occupation_garrison(0, TerrainClass::Plains), 0);
+        assert_eq!(occupation_garrison(100, TerrainClass::Water), 0);
+    }
+
+    #[test]
+    fn garrison_and_surplus_exactly_partition_a_captured_wave() {
+        for occupancy in 0..=100_u64 {
+            let stationed = occupancy.min(occupation_garrison(100, TerrainClass::Plains));
+            let continuing = occupancy - stationed;
+            assert_eq!(stationed + continuing, occupancy);
+            assert!(stationed <= 5);
+        }
+    }
+
+    #[test]
+    fn existing_unallocated_strength_counts_toward_a_capture_garrison() {
+        assert_eq!(additional_garrison_required(10, 30, 30), 10);
+        assert_eq!(additional_garrison_required(10, 30, 25), 5);
+        assert_eq!(additional_garrison_required(10, 30, 20), 0);
+        assert_eq!(additional_garrison_required(10, 30, 0), 0);
+    }
 }

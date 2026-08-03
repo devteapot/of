@@ -14,8 +14,8 @@ This document records the architecture commitments for the first playable versio
 - V1 starts with one manually provisioned development match database. A lobby database and external match orchestrator are added when concurrent public matches are needed.
 - One visible terrain hex is one authoritative gameplay cell. Terrain is static during a V1 match and is stored and rendered in chunks.
 - Troops are conserved aggregate strength, not individual infantry entities.
-  Push Front, lower-level transfers, and combat operate on active orders and
-  active front edges rather than scanning every cell.
+  Push Front, redistribution, and combat operate on active orders and active
+  front edges rather than scanning every cell.
 - Authoritative calculations use integers or explicit fixed-point values with stable iteration order. Floating point is reserved for client presentation.
 - Generated SpacetimeDB bindings define the client/server wire contract. Files
   below `match-bindings/src/module_bindings` are generated and never edited by
@@ -128,6 +128,15 @@ schema. Generated files carry a prominent generated marker, are committed, and
 are never manually edited. CI regenerates the bindings and fails on an
 unexpected diff so schema drift is visible.
 
+The sustained-Push and four-preset redistribution cutover changes both the
+persisted schema and public reducer API. SpacetimeDB 2.7.1 cannot migrate this
+development schema in place; after pulling the cutover, recreate the local
+database and regenerate bindings with:
+
+```bash
+./scripts/publish-local.sh --fresh --confirm-delete-of-match-dev
+```
+
 ## Authoritative command and state flow
 
 Clients send intentions such as:
@@ -135,9 +144,8 @@ Clients send intentions such as:
 - join or reclaim a player slot;
 - set the player's global mobilization target;
 - issue or cancel a selected-region directional Push Front order;
-- issue a one-shot Balance or oriented Front-load redistribution order;
-- use a lower-level precise transfer only through internal tools or a future
-  logistics interaction.
+- issue a percentage-aware one-shot Balance, oriented Front-load, Core-load, or
+  Perimeter-load redistribution order.
 
 Spawn selection, retargeting, reprioritization, readiness controls, and rematches
 are not part of the V1 reducer surface.
@@ -184,11 +192,12 @@ These share a common strength scale but remain separate values. A city may later
 The generic aggregate-flow schema retains the implementation names
 `transfer_order`, source, destination, and transit packet. An order stores its
 owner, sources, destinations, requested and committed amounts, progress totals,
-kind, orientation, and status. Transit packets store deterministic fixed routes
-and scalar queues. These tables are an execution substrate, not evidence that
-painted destination transfer is a player-facing V1 interaction. V1 has no order
-priorities or mid-route replanning. On each logical step, approved movement is
-bounded by:
+kind, orientation, and status. Transit packets store deterministic routes and
+scalar queues. These tables are an execution substrate, not a public precise
+infantry-transfer API. Selected-corridor routes are fixed when accepted; a Push
+packet may extend only along its stored exact axial ray after capture. V1 has no
+order priorities or adaptive mid-route replanning. On each logical step,
+approved movement is bounded by:
 
 ```text
 min(queued strength, edge throughput * step duration, destination free capacity)
@@ -199,21 +208,41 @@ Movement uses a two-phase calculation: approve outgoing flow first, then commit 
 Push Front is the primary V1 producer of aggregate flows. Its authoritative
 reducer accepts an exact selected cell set, one of six axial directions, and a
 commitment in basis points. It requires one six-connected owned source region
-and one connected active directional front. For each active boundary source,
-the final edge is exactly `(source, source + direction)`; adjacent directions
-are not inferred. Rear sources route to that boundary entirely within the
-submitted selection before crossing the final edge. The authority recomputes
-all derived edges and routes, so a client cannot redirect a push by submitting
-a visual segment or predicted result.
+and one connected active directional front. A selected cell is part of that
+front exactly when `source + direction` is neutral or enemy territory. The
+other connected selected cells form its reinforcement corridor; they route to
+the front entirely within the submitted selection and do not create outward
+lanes. Adjacent directions are never inferred. The authority recomputes all
+derived edges and routes, so a client cannot redirect a push by submitting a
+visual segment or predicted result.
 
-A Push Front command is one cell deep. It does not automatically retarget after
-capture. Repeating the gesture from the advanced border creates continued
-momentum while keeping every new edge visible and authoritative. The generic
-precise-transfer reducer remains available as a friendly-territory-only
-compatibility and testing surface, but destination painting is deferred from
-the V1 client and it cannot be used to bypass Push Front for conquest.
+After the initial edge, each front lane advances through successive cells only
+along the stored axial direction. Its committed percentage becomes a fixed
+mobile strength pool. Terrain, elevation, throughput, frontage, and resistance
+may slow or defeat it, while every capture retains a terrain-scaled garrison
+and sends only the surplus onward. Lanes stop independently when exhausted,
+blocked, defeated, at the map edge, or manually cancelled. Cancellation
+releases remaining allocations where they physically are; it is not a rewind.
+The public precise-infantry-transfer reducer has been removed. Exact cell
+movement is reserved for possible future discrete tanks, boats, or other units.
 
-Hostile forces do not coexist in a V1 cell. Combat occurs on active hostile edges. Frontage limits the committed strength that can participate at once, and defenders are allocated once across simultaneous hostile edges rather than duplicated against every attacker. After defenders reach zero, attackers enter subject to edge throughput and destination capacity, then ownership changes according to the combat rule.
+Balance, Front-load, Core-load, and Perimeter-load share one deterministic
+integer target allocator. Their basis-point participation value freezes the
+unparticipating share of each selected cell's current infantry as a local lower
+bound, then redistributes only the participating pool subject to capacity and
+exact conservation. Balance uses capacity-relative density, Front-load uses an
+axial projection, and the radial presets use distance from the selection's
+geometric center. Client previews call the same pure rule, while the module
+remains authoritative for routes and execution.
+
+Hostile forces do not coexist in a V1 cell. Combat occurs on active hostile
+edges. Frontage limits the committed strength that can participate at once,
+and defenders are allocated once across simultaneous hostile edges rather than
+duplicated against every attacker. After defenders reach zero, attackers enter
+subject to edge throughput and destination capacity, then ownership changes
+according to the combat rule. `CellState` retains one controller and one local
+infantry stack throughout; `CombatFront` rows expose edge pressure rather than
+fractional ownership or dual occupancy.
 
 ### Scheduled and active-set processing
 
@@ -293,7 +322,7 @@ The initial material treatment exposes gameplay state clearly:
 - alternate Overview and civilian-population map views;
 - hover, selected reinforcement region, and exact active-front edges;
 - selected-only push routes, direction, commitment, congestion, and ETA;
-- active combat/front edges and blocked paths.
+- active combat/front edges, contested pressure, and blocked paths.
 
 Map-view shading is presentation only. Clamp and interpolate it client-side
 from authoritative integer values against stable reference values, not a live
@@ -307,6 +336,13 @@ populated land into one viewport-bounded mesh. Camera, projection,
 visible-chunk, topology, and cell-state signatures must short-circuit unchanged
 presentation frames before scanning individual cells. Keep overlays separable
 so a future art direction does not require changing simulation state.
+
+For a contested target, the client derives attacker pressure from subscribed
+`CombatFront` rows and compares it with the defending local infantry. The
+combined terrain mesh blends the controller and attacker colors by that ratio.
+This is a scalable presentation channel embedded in existing chunk vertex
+colors, not a per-cell UI entity, and it never changes the cell's single
+authoritative controller.
 
 Picking should resolve pointer rays to chunks and deterministic hex coordinates
 instead of creating a physics collider for every cell. Height-aware picking
@@ -325,10 +361,9 @@ and one active-front component, and searches backward only through selected
 cells. Previews cache results by selection and authoritative cell-state
 revisions. Every V1 order preview and reducer rejects selections above 4,096
 cells before building heatmaps, routes, or payloads. This is a safety bound,
-not the world-scale selection design. The retained lower-level transfer preview uses deterministic
-multi-source forward and reverse reachability rather than one path search per
-endpoint. Every authority adapter must debit only source cells that can reach
-the accepted front or destination under that order's constraints.
+not the world-scale selection design. Every authority adapter must debit only
+source cells that can reach the accepted front or redistribution deficit under
+that order's constraints.
 
 Native-only filesystem, windowing, and startup behavior belongs behind narrow
 boundaries where practical. A WASM compile gate is deferred with browser
@@ -376,8 +411,8 @@ High-value invariants include:
 ### Module and client integration
 
 The V1 headless two-identity smoke covers join, match start, subscription,
-idempotent command receipts, the lower-level aggregate-flow pipeline,
-progression, and token-based reconnect. Command rejection, simultaneous hostile orders, full
+idempotent command receipts, sustained multi-layer Push progression,
+cancellation, and token-based reconnect. Command rejection, simultaneous hostile orders, full
 Conquest completion, schedule fault injection, and completed-match immutability
 remain integration-test extensions; pure rule tests cover their deterministic
 building blocks where applicable.
@@ -422,9 +457,10 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
 4. **Map interaction slice:** load authoritative chunked terrain, render stepped
    graybox hexes, implement camera and height-aware picking, and select connected
    owned source regions.
-5. **Troop-flow slice:** add cell capacity, a one-cell-deep Push Front order,
-   authoritative selected-only routing/validation, scheduled active-set
-   movement, congestion, density shading, exact-edge preview, and ETA feedback.
+5. **Troop-flow slice:** add cell capacity, a fixed-pool sustained Push Front
+   order, authoritative selected-corridor routing/validation, scheduled
+   lane-by-lane movement, terrain-scaled garrisons, congestion, density shading,
+   exact initial-edge preview, and ETA feedback.
 6. **Conflict slice:** add hostile edges, combat frontage, capture, elevation modifiers, disconnected components, and the Conquest win condition at 80% of capturable land.
 7. **Reliability slice:** add command idempotency, reconnect/reclaim, snapshot rebuild, scheduler recovery, deterministic replay fixtures, and completed-match handling.
 8. **Scale slice:** validate the 128 and 192 presets; retain 256, high-order-count traces, profiling, and soak gates as post-slice performance work.

@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bevy::{picking::pointer::PointerInteraction, prelude::*};
-use hex_core::{Axial, DirectedFrontEdge, FrontSelectionError, selected_front_edges};
+use hex_core::{
+    Axial, Cell, DirectedFrontEdge, DistributionPreset as CoreDistributionPreset, ForceComposition,
+    FrontSelectionError, HexMap, redistribution_targets_with_commitment, selected_front_edges,
+};
 
 use crate::{
     camera::GameCamera,
@@ -32,6 +35,8 @@ pub enum OrderMode {
     BalancePreview,
     FrontLoadOrient { start: Vec3, current: Vec3 },
     FrontLoadPreview { direction: Vec2 },
+    CoreLoadPreview,
+    PerimeterLoadPreview,
     Submitting { _label: &'static str },
 }
 
@@ -44,6 +49,8 @@ impl OrderMode {
             Self::BalancePreview => "BALANCE PREVIEW",
             Self::FrontLoadOrient { .. } => "FRONT-LOAD · ORIENT",
             Self::FrontLoadPreview { .. } => "FRONT-LOAD PREVIEW",
+            Self::CoreLoadPreview => "CORE-LOAD PREVIEW",
+            Self::PerimeterLoadPreview => "PERIMETER-LOAD PREVIEW",
             Self::Submitting { .. } => "SUBMITTING",
         }
     }
@@ -174,6 +181,8 @@ enum PreviewModeKey {
     PushFront { direction: Option<Axial> },
     Balance,
     FrontLoad { direction: Option<(u32, u32)> },
+    CoreLoad,
+    PerimeterLoad,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,6 +316,9 @@ pub enum UiAction {
     Balance,
     FrontLoad,
     FrontLoadKey,
+    CoreLoad,
+    PerimeterLoad,
+    CancelPush,
     Confirm,
     Cancel,
     AmountDown,
@@ -444,6 +456,15 @@ fn process_order_input(
     }
     if keyboard.just_pressed(KeyCode::KeyB) {
         requested_actions.push(UiAction::Balance);
+    }
+    if keyboard.just_pressed(KeyCode::KeyG) {
+        requested_actions.push(UiAction::CoreLoad);
+    }
+    if keyboard.just_pressed(KeyCode::KeyR) {
+        requested_actions.push(UiAction::PerimeterLoad);
+    }
+    if keyboard.just_pressed(KeyCode::KeyX) {
+        requested_actions.push(UiAction::CancelPush);
     }
     if keyboard.just_pressed(KeyCode::Enter) {
         requested_actions.push(UiAction::Confirm);
@@ -652,6 +673,26 @@ fn handle_action(
                 interaction.mode = OrderMode::BalancePreview;
             }
         }
+        UiAction::CoreLoad => {
+            if interaction.sources.len() < 2 {
+                view.show_toast(
+                    "Core-load needs at least two owned hexes",
+                    ToastKind::Rejection,
+                );
+            } else if matches!(interaction.mode, OrderMode::Idle) {
+                interaction.mode = OrderMode::CoreLoadPreview;
+            }
+        }
+        UiAction::PerimeterLoad => {
+            if interaction.sources.len() < 2 {
+                view.show_toast(
+                    "Perimeter-load needs at least two owned hexes",
+                    ToastKind::Rejection,
+                );
+            } else if matches!(interaction.mode, OrderMode::Idle) {
+                interaction.mode = OrderMode::PerimeterLoadPreview;
+            }
+        }
         action @ (UiAction::FrontLoad | UiAction::FrontLoadKey) => {
             if interaction.sources.len() < 2 {
                 view.show_toast(
@@ -680,6 +721,7 @@ fn handle_action(
             }
         }
         UiAction::Confirm => submit_current(interaction, view, intents),
+        UiAction::CancelPush => cancel_matching_push(interaction, view, intents),
         UiAction::Cancel => {
             if matches!(interaction.mode, OrderMode::Idle) {
                 if !interaction.sources.is_empty() {
@@ -692,16 +734,58 @@ fn handle_action(
             }
         }
         UiAction::AmountDown => {
-            if matches!(interaction.mode, OrderMode::PushFrontPreview { .. }) {
+            if is_percentage_preview(&interaction.mode) {
                 interaction.amount_percent = interaction.amount_percent.saturating_sub(10).max(10);
             }
         }
         UiAction::AmountUp => {
-            if matches!(interaction.mode, OrderMode::PushFrontPreview { .. }) {
+            if is_percentage_preview(&interaction.mode) {
                 interaction.amount_percent = interaction.amount_percent.saturating_add(10).min(100);
             }
         }
     }
+}
+
+fn is_percentage_preview(mode: &OrderMode) -> bool {
+    matches!(
+        mode,
+        OrderMode::PushFrontPreview { .. }
+            | OrderMode::BalancePreview
+            | OrderMode::FrontLoadPreview { .. }
+            | OrderMode::CoreLoadPreview
+            | OrderMode::PerimeterLoadPreview
+    )
+}
+
+fn cancel_matching_push(
+    interaction: &mut InteractionState,
+    view: &mut MatchView,
+    intents: &mut MessageWriter<ClientIntent>,
+) {
+    let OrderMode::PushFrontPreview { direction } = &interaction.mode else {
+        view.show_toast(
+            "Select and orient a front first, then X stops matching pushes",
+            ToastKind::Info,
+        );
+        return;
+    };
+    if interaction.sources.is_empty() {
+        view.show_toast(
+            "Select the push's source region first",
+            ToastKind::Rejection,
+        );
+        return;
+    }
+    let direction = *direction;
+    interaction.return_after_rejection = Some(OrderMode::PushFrontPreview { direction });
+    interaction.submitting_command_id = None;
+    interaction.mode = OrderMode::Submitting {
+        _label: "STOP PUSH",
+    };
+    intents.write(ClientIntent::CancelPush {
+        sources: interaction.sources.clone(),
+        direction,
+    });
 }
 
 fn submit_current(
@@ -735,6 +819,7 @@ fn submit_current(
                 cells: interaction.sources.clone(),
                 preset: RedistributionPreset::Balance,
                 direction: None,
+                amount_percent: interaction.amount_percent,
             },
             "BALANCE",
             OrderMode::BalancePreview,
@@ -744,11 +829,32 @@ fn submit_current(
                 cells: interaction.sources.clone(),
                 preset: RedistributionPreset::FrontLoad,
                 direction: Some(*direction),
+                amount_percent: interaction.amount_percent,
             },
             "FRONT-LOAD",
             OrderMode::FrontLoadPreview {
                 direction: *direction,
             },
+        ),
+        OrderMode::CoreLoadPreview => (
+            ClientIntent::Redistribute {
+                cells: interaction.sources.clone(),
+                preset: RedistributionPreset::CoreLoad,
+                direction: None,
+                amount_percent: interaction.amount_percent,
+            },
+            "CORE-LOAD",
+            OrderMode::CoreLoadPreview,
+        ),
+        OrderMode::PerimeterLoadPreview => (
+            ClientIntent::Redistribute {
+                cells: interaction.sources.clone(),
+                preset: RedistributionPreset::PerimeterLoad,
+                direction: None,
+                amount_percent: interaction.amount_percent,
+            },
+            "PERIMETER-LOAD",
+            OrderMode::PerimeterLoadPreview,
         ),
         OrderMode::PushFrontPreview { .. } => {
             view.show_toast(
@@ -857,6 +963,8 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
                     .map(|value| (value.x.to_bits(), value.y.to_bits())),
             }
         }
+        OrderMode::CoreLoadPreview => PreviewModeKey::CoreLoad,
+        OrderMode::PerimeterLoadPreview => PreviewModeKey::PerimeterLoad,
         OrderMode::Submitting { .. } => return None,
     };
     Some(OrderPreviewKey {
@@ -1077,52 +1185,124 @@ fn update_order_preview(view: Res<MatchView>, mut interaction: ResMut<Interactio
                 preview.invalid_reason = Some("Drag farther to choose one of six directions");
             }
         }
-        OrderMode::BalancePreview => {
-            let (strength, capacity, _) = view.selected_totals(&interaction.sources);
-            let target = if capacity == 0 {
-                0.0
-            } else {
-                strength as f32 / capacity as f32
-            };
-            preview.heatmap.extend(
-                interaction
-                    .sources
-                    .iter()
-                    .map(|coordinate| (*coordinate, target)),
-            );
-            preview.requested_strength = strength;
-            preview.eta_seconds = interaction.sources.len() as u32 / 3 + 3;
-        }
+        OrderMode::BalancePreview => build_redistribution_preview(
+            &view,
+            &interaction.sources,
+            CoreDistributionPreset::Balance,
+            interaction.amount_percent,
+            &mut preview,
+        ),
         OrderMode::FrontLoadOrient { .. } | OrderMode::FrontLoadPreview { .. } => {
             if let Some(direction) = interaction.frontload_direction() {
-                let projections: Vec<_> = interaction
-                    .sources
-                    .iter()
-                    .map(|coordinate| (*coordinate, axial_to_plane(*coordinate).dot(direction)))
-                    .collect();
-                let min = projections
-                    .iter()
-                    .map(|(_, value)| *value)
-                    .fold(f32::INFINITY, f32::min);
-                let max = projections
-                    .iter()
-                    .map(|(_, value)| *value)
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let span = (max - min).max(0.001);
-                preview.heatmap.extend(
-                    projections.into_iter().map(|(coordinate, value)| {
-                        (coordinate, 0.18 + 0.78 * (value - min) / span)
-                    }),
-                );
-                preview.requested_strength = view.selected_totals(&interaction.sources).0;
-                preview.eta_seconds = interaction.sources.len() as u32 / 2 + 4;
+                if let Some(direction) = quantize_world_direction(direction) {
+                    build_redistribution_preview(
+                        &view,
+                        &interaction.sources,
+                        CoreDistributionPreset::front_load(direction),
+                        interaction.amount_percent,
+                        &mut preview,
+                    );
+                } else {
+                    preview.invalid_reason = Some("Front-load direction is too short");
+                }
             }
         }
+        OrderMode::CoreLoadPreview => build_redistribution_preview(
+            &view,
+            &interaction.sources,
+            CoreDistributionPreset::CoreLoad,
+            interaction.amount_percent,
+            &mut preview,
+        ),
+        OrderMode::PerimeterLoadPreview => build_redistribution_preview(
+            &view,
+            &interaction.sources,
+            CoreDistributionPreset::PerimeterLoad,
+            interaction.amount_percent,
+            &mut preview,
+        ),
         OrderMode::Idle => {}
         OrderMode::Submitting { .. } => unreachable!("submitting previews return before rebuild"),
     }
     interaction.preview = preview;
     interaction.preview_key = Some(key);
+}
+
+fn build_redistribution_preview(
+    view: &MatchView,
+    selected: &BTreeSet<Axial>,
+    preset: CoreDistributionPreset,
+    amount_percent: u8,
+    preview: &mut OrderPreview,
+) {
+    if selected.len() < 2 {
+        preview.invalid_reason = Some("Redistribution needs at least two owned hexes");
+        return;
+    }
+
+    let mut map = HexMap::new();
+    let mut total = 0_u64;
+    for &coordinate in selected {
+        let Some(cell) = view.cell(coordinate) else {
+            preview.invalid_reason = Some("Redistribution contains an unknown hex");
+            return;
+        };
+        if cell.owner != Some(view.local_player) || !cell.is_land() || cell.blocked {
+            preview.invalid_reason = Some("Redistribution needs owned passable ground");
+            return;
+        }
+        total = total.saturating_add(cell.infantry);
+        map.insert(Cell {
+            coordinate,
+            terrain: cell.terrain,
+            elevation: cell.elevation,
+            capturable: true,
+            habitable: true,
+            owner: cell.owner,
+            civilian_population: cell.civilians,
+            civilian_capacity: cell.civilians,
+            forces: ForceComposition::infantry(cell.infantry),
+            military_capacity: cell.military_capacity,
+        });
+    }
+
+    let amount_bps = u32::from(amount_percent.clamp(10, 100)) * 100;
+    let Ok(distribution) = redistribution_targets_with_commitment(
+        &map,
+        view.local_player,
+        selected.iter().copied(),
+        total,
+        preset,
+        amount_bps,
+    ) else {
+        preview.invalid_reason = Some("This redistribution cannot be resolved");
+        return;
+    };
+
+    for (&coordinate, &target) in &distribution.targets {
+        let capacity = view
+            .cell(coordinate)
+            .map_or(0, |cell| cell.military_capacity);
+        preview.heatmap.insert(
+            coordinate,
+            if capacity == 0 {
+                0.0
+            } else {
+                target as f32 / capacity as f32
+            },
+        );
+    }
+    preview.requested_strength = selected
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| cell.infantry.saturating_mul(u64::from(amount_bps)) / 10_000)
+        .sum();
+    preview.destination_capacity = selected
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| cell.military_capacity)
+        .sum();
+    preview.eta_seconds = selected.len() as u32 / 3 + 3;
 }
 
 fn finish_submission(

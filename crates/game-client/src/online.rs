@@ -19,8 +19,8 @@ use match_bindings::{
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
     PlayerSlotTableAccess, ReceiptStatus, TransferDestinationTableAccess, TransferOrder,
     TransferOrderTableAccess, TransferSource, TransferSourceTableAccess, TransitPacket,
-    TransitPacketTableAccess, issue_balance, issue_front_load, issue_push_front, issue_transfer,
-    join_match, set_mobilization_target,
+    TransitPacketTableAccess, cancel_push_fronts, issue_balance, issue_core_load, issue_front_load,
+    issue_perimeter_load, issue_push_front, join_match, set_mobilization_target,
 };
 use spacetimedb_sdk::__codegen::InternalError;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
@@ -30,8 +30,8 @@ use crate::{
     geometry::{HEX_RADIUS, chunk_of},
     map_view::MapViewMode,
     model::{
-        ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, MatchPhase, MatchView,
-        ToastKind,
+        ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, ContestedCellView,
+        MatchPhase, MatchView, ToastKind,
     },
     network::{ClientIntent, NetworkSet, RedistributionPreset, ServerUpdate},
 };
@@ -92,9 +92,11 @@ impl SharedSignals {
 #[derive(Clone, Debug)]
 enum PendingCommand {
     PushFront,
-    Transfer,
+    CancelPush,
     Balance,
     FrontLoad,
+    CoreLoad,
+    PerimeterLoad,
     Mobilization { target: f32 },
 }
 
@@ -102,9 +104,11 @@ impl PendingCommand {
     const fn label(&self) -> &'static str {
         match self {
             Self::PushFront => "Push Front",
-            Self::Transfer => "Transfer",
+            Self::CancelPush => "Stop Push",
             Self::Balance => "Balance",
             Self::FrontLoad => "Front-load",
+            Self::CoreLoad => "Core-load",
+            Self::PerimeterLoad => "Perimeter-load",
             Self::Mobilization { .. } => "Mobilization",
         }
     }
@@ -112,9 +116,11 @@ impl PendingCommand {
     const fn receipt_name(&self) -> &'static str {
         match self {
             Self::PushFront => "issue_push_front",
-            Self::Transfer => "issue_transfer",
+            Self::CancelPush => "cancel_push_fronts",
             Self::Balance => "issue_balance",
             Self::FrontLoad => "issue_front_load",
+            Self::CoreLoad => "issue_core_load",
+            Self::PerimeterLoad => "issue_perimeter_load",
             Self::Mobilization { .. } => "set_mobilization_target",
         }
     }
@@ -472,7 +478,7 @@ fn send_online_intents(
 
 fn invoke_intent(
     transport: &OnlineTransport,
-    view: &MatchView,
+    _view: &MatchView,
     command_id: u64,
     intent: &ClientIntent,
 ) -> Result<PendingCommand, String> {
@@ -506,33 +512,33 @@ fn invoke_intent(
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::PushFront)
         }
-        ClientIntent::Transfer {
-            sources,
-            destinations,
-            amount_percent,
-        } => {
-            let source_ids = ids_for_selection(transport, sources)?;
-            let destination_ids = ids_for_selection(transport, destinations)?;
-            let percentage = u64::from((*amount_percent).clamp(10, 100));
-            let infantry = sources
-                .iter()
-                .filter_map(|coordinate| view.cell(*coordinate))
-                .map(|cell| cell.infantry.saturating_mul(percentage) / 100)
-                .sum();
+        ClientIntent::CancelPush { sources, direction } => {
             connection
                 .reducers
-                .issue_transfer_then(command_id, source_ids, destination_ids, infantry, callback)
+                .cancel_push_fronts_then(
+                    command_id,
+                    ids_for_selection(transport, sources)?,
+                    direction.q,
+                    direction.r,
+                    callback,
+                )
                 .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::Transfer)
+            Ok(PendingCommand::CancelPush)
         }
         ClientIntent::Redistribute {
             cells,
             preset: RedistributionPreset::Balance,
+            amount_percent,
             ..
         } => {
             connection
                 .reducers
-                .issue_balance_then(command_id, ids_for_selection(transport, cells)?, callback)
+                .issue_balance_then(
+                    command_id,
+                    ids_for_selection(transport, cells)?,
+                    u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    callback,
+                )
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::Balance)
         }
@@ -540,6 +546,7 @@ fn invoke_intent(
             cells,
             preset: RedistributionPreset::FrontLoad,
             direction,
+            amount_percent,
         } => {
             let (orientation_q, orientation_r) = direction
                 .and_then(world_direction_to_axial)
@@ -551,10 +558,45 @@ fn invoke_intent(
                     ids_for_selection(transport, cells)?,
                     orientation_q,
                     orientation_r,
+                    u32::from((*amount_percent).clamp(1, 100)) * 100,
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::FrontLoad)
+        }
+        ClientIntent::Redistribute {
+            cells,
+            preset: RedistributionPreset::CoreLoad,
+            amount_percent,
+            ..
+        } => {
+            connection
+                .reducers
+                .issue_core_load_then(
+                    command_id,
+                    ids_for_selection(transport, cells)?,
+                    u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::CoreLoad)
+        }
+        ClientIntent::Redistribute {
+            cells,
+            preset: RedistributionPreset::PerimeterLoad,
+            amount_percent,
+            ..
+        } => {
+            connection
+                .reducers
+                .issue_perimeter_load_then(
+                    command_id,
+                    ids_for_selection(transport, cells)?,
+                    u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::PerimeterLoad)
         }
         ClientIntent::SetMobilization { target } => {
             let target = target.clamp(0.0, 1.0);
@@ -721,7 +763,9 @@ fn synchronize_authoritative_view(
         view.active_flows = packets_to_flows(&transport, &view, packets);
     }
     if let Some(fronts) = snapshot.fronts {
-        view.active_fronts = fronts_to_overlays(&transport, &view, fronts);
+        let (active_fronts, contested_cells) = fronts_to_overlays(&transport, &view, fronts);
+        view.active_fronts = active_fronts;
+        view.set_contested_cells(contested_cells);
     }
     if let (Some(orders), Some(sources)) = (snapshot.orders, snapshot.sources) {
         view.active_orders = orders
@@ -1149,33 +1193,78 @@ fn fronts_to_overlays(
     transport: &OnlineTransport,
     view: &MatchView,
     fronts: Vec<CombatFront>,
-) -> Vec<ActiveFront> {
-    fronts
+) -> (Vec<ActiveFront>, BTreeMap<Axial, ContestedCellView>) {
+    let mut overlays = Vec::new();
+    let mut pressure_by_target = BTreeMap::<Axial, BTreeMap<u32, u64>>::new();
+    for front in fronts {
+        let Some(from) = transport.id_to_coordinate.get(&front.from_cell).copied() else {
+            continue;
+        };
+        let Some(to) = transport.id_to_coordinate.get(&front.to_cell).copied() else {
+            continue;
+        };
+        let attacker_player = u32::from(front.attacker_player_id);
+        let defender_player = u32::from(front.defender_player_id);
+        let (friendly, hostile) = if attacker_player == view.local_player {
+            (from, to)
+        } else if defender_player == view.local_player {
+            (to, from)
+        } else {
+            (from, to)
+        };
+        let engaged = front.attacker_engaged.max(front.defender_engaged);
+        let intensity = if front.frontage == 0 {
+            0.25
+        } else {
+            (engaged as f32 / front.frontage as f32).clamp(0.15, 1.0)
+        };
+        overlays.push(ActiveFront {
+            friendly,
+            hostile,
+            intensity,
+            age: 0.0,
+        });
+
+        let attacker_pressure = front
+            .queued_infantry
+            .saturating_add(front.attacker_engaged)
+            .saturating_sub(front.attacker_casualties);
+        let player_pressure = pressure_by_target
+            .entry(to)
+            .or_default()
+            .entry(attacker_player)
+            .or_default();
+        *player_pressure = player_pressure.saturating_add(attacker_pressure);
+    }
+
+    let contested = pressure_by_target
         .into_iter()
-        .filter_map(|front| {
-            let from = transport.id_to_coordinate.get(&front.from_cell).copied()?;
-            let to = transport.id_to_coordinate.get(&front.to_cell).copied()?;
-            let (friendly, hostile) = if u32::from(front.attacker_player_id) == view.local_player {
-                (from, to)
-            } else if u32::from(front.defender_player_id) == view.local_player {
-                (to, from)
-            } else {
-                (from, to)
-            };
-            let engaged = front.attacker_engaged.max(front.defender_engaged);
-            let intensity = if front.frontage == 0 {
-                0.25
-            } else {
-                (engaged as f32 / front.frontage as f32).clamp(0.15, 1.0)
-            };
-            Some(ActiveFront {
-                friendly,
-                hostile,
-                intensity,
-                age: 0.0,
-            })
+        .filter_map(|(coordinate, pressure_by_player)| {
+            let (attacker_player, attacker_pressure) = pressure_by_player.into_iter().max_by(
+                |(left_player, left_pressure), (right_player, right_pressure)| {
+                    left_pressure
+                        .cmp(right_pressure)
+                        .then_with(|| right_player.cmp(left_player))
+                },
+            )?;
+            let cell = view.cell(coordinate)?;
+            if cell.owner == Some(attacker_player) {
+                return None;
+            }
+            let defender_pressure = cell.infantry;
+            let total = attacker_pressure.saturating_add(defender_pressure);
+            (total > 0).then_some((
+                coordinate,
+                ContestedCellView {
+                    controller_player: cell.owner.unwrap_or(0),
+                    attacker_player,
+                    attacker_strength: attacker_pressure,
+                    attacker_share: attacker_pressure as f32 / total as f32,
+                },
+            ))
         })
-        .collect()
+        .collect();
+    (overlays, contested)
 }
 
 fn reducer_failure(result: Result<Result<(), String>, InternalError>) -> Option<String> {
@@ -1269,6 +1358,62 @@ mod tests {
     #[test]
     fn empty_front_load_direction_is_rejected() {
         assert_eq!(world_direction_to_axial(Vec2::ZERO), None);
+    }
+
+    #[test]
+    fn combat_fronts_project_a_percentage_contested_cell() {
+        let mut transport = OnlineTransport::new(test_config());
+        let from = Axial::ZERO;
+        let to = Axial::new(1, 0);
+        transport.id_to_coordinate.insert(10, from);
+        transport.id_to_coordinate.insert(12, Axial::new(0, 1));
+        transport.id_to_coordinate.insert(11, to);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(
+            to,
+            CellView {
+                coordinate: to,
+                terrain: TerrainKind::Plains,
+                elevation: 0,
+                owner: Some(2),
+                civilians: 0,
+                infantry: 65,
+                military_capacity: 100,
+                blocked: false,
+            },
+        );
+
+        let first = CombatFront {
+            front_key: "10:11:1".to_owned(),
+            attacker_player_id: 1,
+            defender_player_id: 2,
+            from_cell: 10,
+            to_cell: 11,
+            queued_infantry: 30,
+            attacker_engaged: 10,
+            defender_engaged: 10,
+            attacker_casualties: 5,
+            defender_casualties: 4,
+            frontage: 25,
+            uphill: false,
+            logical_step: 7,
+        };
+        let second = CombatFront {
+            front_key: "12:11:1".to_owned(),
+            from_cell: 12,
+            queued_infantry: 15,
+            attacker_engaged: 0,
+            attacker_casualties: 0,
+            ..first.clone()
+        };
+        let (overlays, contested) = fronts_to_overlays(&transport, &view, vec![first, second]);
+
+        assert_eq!(overlays.len(), 2);
+        let contest = contested.get(&to).expect("target should be contested");
+        assert_eq!(contest.controller_player, 2);
+        assert_eq!(contest.attacker_player, 1);
+        assert_eq!(contest.attacker_strength, 50);
+        assert!((contest.attacker_share - (50.0 / 115.0)).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -35,6 +35,14 @@ terrain, population, mobilization, ownership, force state, orders, routes,
 movement, congestion, combat, capture, victory, receipts, and persistence.
 Generated bindings are the typed wire contract and must not be edited manually.
 
+This gameplay cutover changes the persisted order kind and public reducer
+signatures. An older local development database cannot be migrated in place;
+recreate it and regenerate bindings before connecting clients:
+
+```bash
+./scripts/publish-local.sh --fresh --confirm-delete-of-match-dev
+```
+
 The match starts after both identity-bound player slots are claimed. A private
 scheduled table advances the simulation every 250 milliseconds. Movement and
 combat operate on active packets/fronts/orders; the provisional one-second
@@ -63,7 +71,8 @@ Public state is split by read/update pattern:
 - `cell_state` holds mutable ownership, population, infantry, and capacities;
 - `command_receipt` records accepted and rejected idempotent commands;
 - `transfer_order`, `transfer_source`, `transfer_destination`, and
-  `transit_packet` expose generic aggregate-flow progress and congestion;
+  `transit_packet` expose generic internal aggregate-flow progress and
+  congestion;
 - `combat_front` exposes the current contested edges and casualties.
 
 `simulation_schedule` is private. Clients cannot call the scheduled reducer as
@@ -75,16 +84,22 @@ a player identity.
 - `join_match` — claim or reclaim one of the two player slots.
 - `set_mobilization_target` — change the global target in basis points.
 - `issue_push_front` — commit a percentage of one connected selected region
-  through its one connected directional front, using routes that stay selected
-  until the exact final edge.
-- `issue_transfer` — lower-level friendly-territory-only aggregate transfer
-  primitive retained for compatibility, testing, and future precision
-  logistics; the V1 client does not expose destination painting and the
-  reducer rejects unowned destinations.
-- `issue_balance` — create a physical one-shot density equalization order.
-- `issue_front_load` — create a physical one-shot directional density order.
-- `cancel_transfer_order` — release the remaining allocation of an active
+  through its one connected directional front. Corridor routes stay selected
+  until the initial outward edge, after which each lane sustains movement along
+  the exact stored axial direction using its fixed committed pool.
+- `cancel_push_fronts` — stop matching active directional pushes and release
+  remaining allocations where the troops currently are.
+- `issue_balance` — create a percentage-aware physical density equalization
   order.
+- `issue_front_load` — create a percentage-aware physical directional density
+  order.
+- `issue_core_load` — create a percentage-aware physical inward radial density
+  order.
+- `issue_perimeter_load` — create a percentage-aware physical outward radial
+  density order.
+There is no public precise-infantry-transfer reducer. The generic transfer
+tables are execution machinery shared by Push Front and redistribution, not a
+cell-targeting player command.
 
 Rejected gameplay commands still create an authoritative receipt with a reason;
 they do not partially mutate match state.
@@ -112,6 +127,12 @@ Each triangle retains its authoritative axial cell so ray picking selects the
 visible stepped surface. Ownership hue and the active map-view intensity are
 encoded in vertex colors; separate overlays communicate selection, target
 density, route, bottlenecks, active flow, and combat fronts.
+
+Contested targets still have exactly one authoritative controller and one local
+infantry stack. The client aggregates subscribed `CombatFront` pressure, derives
+an attacker share, and blends the controller and attacker colors in the
+existing chunk vertex-color buffer. This adds no UI node, entity, or unique
+material per contested cell and does not imply dual occupancy.
 
 The default Soldiers view shades cells by absolute infantry strength rather
 than capacity occupancy. Overview removes force-dependent luminance, and the
@@ -149,9 +170,8 @@ is viewport-bounded and emits only exposed edges. Order previews are keyed by
 selection and cell-state revisions. Push Front uses shared deterministic rules
 to derive only the exact chosen-direction boundary, then checks reachability
 backward through the selected region; it does not perform a route search for
-every possible map destination. The retained lower-level transfer preview uses
-constant-count multi-source graph traversals. This keeps presentation work tied
-primarily to the viewport and real state changes. World-scale maps will still
+every possible map destination. This keeps presentation work tied primarily to
+the viewport and real state changes. World-scale maps will still
 require symbolic region selections plus chunk-interest subscriptions or
 regional summaries so the client does not retain or transmit every
 authoritative cell.
@@ -164,12 +184,22 @@ for the server.
 
 The V1 conquest interaction is Push Front: paint one connected owned region,
 hold `P`, drag outward, and release to preview one exact direction. Plain
-brackets adjust commitment and `Enter` submits. The server routes only through
-the submitted cells before crossing the exact final edge, and each command is
-one cell deep so continuing momentum requires repeating the high-level push.
-Balance and Front-load remain modal redistribution previews. Exact gestures and
-presentation remain playtest material, but painted destination transfer is not
-part of the exposed V1 loop.
+brackets adjust commitment and `Enter` submits. Selected cells facing non-owned
+territory in that direction are the front; the other connected selected cells
+are its reinforcement corridor. The server routes through that corridor, then
+extends each lane through successive layers only along the chosen direction.
+Terrain, elevation, throughput, frontage, enemies, and terrain-scaled garrisons
+consume or delay its fixed committed pool. Lanes stop independently when
+exhausted, blocked, defeated, at the map edge, or cancelled. With the same
+front and direction previewed, `X` stops matching active pushes.
+
+`B`, `F`, `G`, and `R` preview Balance, directional Front-load, Core-load, and
+Perimeter-load. Brackets adjust percentage participation for all four. The
+unparticipating share of each selected cell's current stack remains frozen in
+that cell; the shared integer allocator redistributes only the participating
+pool and provides the client heatmap as well as the authoritative target plan.
+Precise infantry destination painting is not part of the V1 loop; exact
+cell-to-cell control is reserved for possible future discrete units.
 
 ## Tests and current evidence
 
@@ -181,8 +211,8 @@ part of the exposed V1 loop.
 - The module's native tests pin preset metadata; module compilation validates
   the SpacetimeDB schema and WASM target.
 - The headless real-server smoke test uses two identities to cover slot claims,
-  match start, subscriptions, idempotent receipts, the lower-level aggregate
-  flow pipeline, progression, and token-based reconnect.
+  match start, subscriptions, idempotent receipts, sustained multi-layer Push
+  progression, cancellation, and token-based reconnect.
 - The Bevy client has coordinate/fixture/route tests and a native launch smoke.
 - CI repeats formatting, workspace tests/lints, module tests/lints/build, and
   generated-binding drift detection.
@@ -191,10 +221,11 @@ part of the exposed V1 loop.
 
 - Infantry is the only force composition serialized by the module.
 - The second join auto-starts the match; there is no lobby UI or ready toggle.
-- Routes are deterministic and fixed when an order is accepted; active orders
-  do not dynamically replan around later ownership changes.
+- Corridor routes and axial lane directions are deterministic and fixed when an
+  order is accepted; sustained Push packets extend only along that ray and do
+  not dynamically replan around later ownership changes.
 - Push Front converts the chosen commitment percentage to authoritative basis
-  points. Accepted routes are fixed and there are no order priorities.
+  points. There are no order priorities or adaptive lane retargeting.
 - Population/mobilization uses a provisional full-state cadence. Movement and
   combat use active sets, but nominal/stress performance gates still need
   representative playtest measurement.

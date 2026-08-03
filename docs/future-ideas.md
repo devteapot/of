@@ -6,19 +6,21 @@ The intended extension point is the same throughout: troops, resources, and infr
 
 ## Logistics and infrastructure
 
-### Precise redeployment and targeted logistics
+### Precise movement for future discrete units
 
-The generic aggregate-transfer substrate can later support a lower-level order
-that paints exact friendly destinations for reserves, evacuation, or carefully
-staged attacks. It is intentionally absent from the V1 player loop: selected
-region plus directional Push Front must first prove that ordinary conquest does
-not require destination-cell micromanagement. Any later precision tool must keep
-spatial conservation, expose its route and ETA, and avoid becoming a way to
-teleport pressure between borders.
+Aggregate infantry intentionally has no precise cell-to-cell command. Balance,
+directional Front-load, Core-load, Perimeter-load, and sustained Push Front
+should first prove that ordinary infantry logistics can stay expressive without
+destination micromanagement. Exact targeting may return for genuinely discrete
+units such as a tank formation, boat, transport, or specialist whose position
+and route are individually meaningful. Such movement must still preserve
+spatial conservation, expose route and ETA, and respect clearance, congestion,
+and interception. The generic aggregate-transfer tables remain an internal
+execution substrate, not a promise to restore precise infantry transfer.
 
-**Depends on:** validated Push Front cadence, a demonstrated need for finer
-redeployment, route readability, order priorities, and interactions that remain
-usable on large maps.
+**Depends on:** a discrete-unit model that earns direct control, validated
+aggregate-infantry interactions, route readability, order priorities, and
+controls that remain usable on large maps.
 
 ### Neutral Expand All shortcut
 
@@ -28,9 +30,9 @@ expansion without attacking enemies, creating global army power, or rewarding
 click spam. This remains separate from the exact selected-front command until
 playtests show whether its convenience is needed.
 
-**Depends on:** validated one-cell Push Front behavior, clear commitment and
-momentum feedback, deterministic same-cell contention, and safeguards against
-opaque automation.
+**Depends on:** validated sustained Push Front behavior, clear commitment,
+garrison, lane-stop, and momentum feedback, deterministic contention, and
+safeguards against opaque automation.
 
 ### Roads and paths
 

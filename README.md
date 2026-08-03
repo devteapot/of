@@ -1,10 +1,11 @@
 # Hex RTS V1
 
 A native two-player RTS prototype about moving conserved aggregate forces across
-a stepped 2.5D hex world. Players select a connected owned region, then push one
-exact section of its border instead of selecting individual soldiers or painting
-destination cells. Terrain height, military capacity, edge throughput, combat
-frontage, and travel time determine where pressure can be applied.
+a stepped 2.5D hex world. Players select a connected owned region, then sustain
+a push from one exact section of its border instead of selecting individual
+soldiers or painting destination cells. Terrain height, military capacity, edge
+throughput, combat frontage, garrisons, resistance, and travel time determine
+how far each lane advances.
 
 The project intentionally has no settled title, fiction, or production art yet.
 V1 is a graybox built to test the Push Front, troop-flow, and redistribution
@@ -17,13 +18,16 @@ loop.
 - Deterministic 64×64, 128×128, and 192×192 stepped-island map presets.
 - Per-hex civilians, infantry, civilian capacity, and military capacity.
 - A global mobilization target that converts population locally over time.
-- Directional Push Front orders with spatial conservation and congestion.
-- One-shot Balance and oriented Front-load redistribution.
+- Sustained directional Push Front orders with spatial conservation,
+  lane-by-lane resistance, congestion, and manual cancellation.
+- Percentage-aware one-shot Balance, oriented Front-load, Core-load, and
+  Perimeter-load redistribution.
 - Height-aware movement, impassable cliffs, uphill combat penalties, edge
   frontage, casualties, capture, and disconnected pockets.
 - A native Bevy client with chunked 3D terrain, switchable soldier/civilian
   shading and readable close-zoom totals, selection, route/front overlays, HUD,
-  inspector, previews, rejections, and reconnectable SpacetimeDB profiles.
+  inspector, previews, rejections, pressure-blended contested cells, and
+  reconnectable SpacetimeDB profiles.
 - An explicit offline fixture for fast interaction and rendering work.
 
 ## Pinned toolchain
@@ -72,8 +76,11 @@ Use separate terminals from the repository root.
    ./scripts/publish-local.sh --fresh --confirm-delete-of-match-dev
    ```
 
-   For later module updates that must preserve an in-progress match, use
-   `./scripts/publish-local.sh` without arguments instead.
+   For later schema-compatible module updates that must preserve an in-progress
+   match, use `./scripts/publish-local.sh` without arguments instead. The
+   sustained-Push and redistribution API cutover changes the persisted schema
+   and reducer surface, so an older local database must be recreated with the
+   fresh command above.
 
 3. Before either player joins, optionally choose a map preset. The development
    map is already the default:
@@ -118,11 +125,14 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 | `C` | Select the connected owned cluster under the cursor |
 | Shift / Control + `C` | Add or remove that cluster |
 | Control/Command + `A` | Select all locally owned hexes |
-| Hold `P`, drag outward, release | Preview a one-cell-deep push from the selected region in one exact hex direction |
+| Hold `P`, drag outward, release | Preview a sustained push from the selected front in one exact hex direction |
 | Click `P PUSH FRONT`, then click outward on the map | Mouse-only alternative for orienting the same Push Front preview |
-| `[` / `]` during Push Front preview | Lower or raise troop commitment |
+| `[` / `]` during an order preview | Lower or raise the participating troop percentage |
 | `B` | Preview Balance over the selected region |
 | Hold `F`, drag, release | Orient and preview Front-load |
+| `G` | Preview Core-load toward the selected region's center |
+| `R` | Preview Perimeter-load toward the selected region's outside rings |
+| `X` during an oriented Push Front preview | Cancel matching active pushes from the selected front and direction |
 | Enter | Confirm the current preview |
 | Escape | Cancel the current mode; in idle, clear selection |
 | Middle drag or Space + left drag | Pan |
@@ -135,6 +145,14 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 | `V` | Cycle map views |
 | `?` | Toggle help |
 | `F3` | Toggle the performance overlay |
+
+After a Push direction is chosen, selected cells that face neutral or enemy
+territory in that direction are the front. The other connected selected cells
+are its reinforcement corridor. The committed percentage becomes a fixed pool
+that feeds independent straight lanes; terrain, elevation, throughput,
+frontage, resistance, and terrain-scaled garrisons determine how far each lane
+travels. Contested cells keep one authoritative controller while their terrain
+color blends controller and attacker pressure for readability.
 
 ## Verification
 

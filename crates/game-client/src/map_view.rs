@@ -75,7 +75,7 @@ impl MapViewMode {
     const fn legend(self) -> &'static str {
         match self {
             Self::Overview => "OWNER + TERRAIN",
-            Self::Soldiers => "ABSOLUTE STRENGTH 0–100+",
+            Self::Soldiers => "ABSOLUTE STRENGTH / CONTEST PRESSURE 0–100+",
             Self::Civilians => "ABSOLUTE POPULATION 0–240+",
         }
     }
@@ -106,15 +106,17 @@ impl MapViewMode {
 pub(crate) fn normalized_cell_value(mode: MapViewMode, cell: &CellView) -> Option<f32> {
     match mode {
         MapViewMode::Overview => None,
-        MapViewMode::Soldiers => Some(
-            ((cell.infantry as f32) / SOLDIER_REFERENCE)
-                .sqrt()
-                .clamp(0.0, 1.0),
-        ),
+        MapViewMode::Soldiers => Some(normalized_soldier_strength(cell.infantry)),
         MapViewMode::Civilians => {
             Some(((cell.civilians as f32).ln_1p() / CIVILIAN_REFERENCE.ln_1p()).clamp(0.0, 1.0))
         }
     }
+}
+
+pub(crate) fn normalized_soldier_strength(strength: u64) -> f32 {
+    ((strength as f32) / SOLDIER_REFERENCE)
+        .sqrt()
+        .clamp(0.0, 1.0)
 }
 
 #[derive(Component)]
@@ -231,7 +233,9 @@ pub(crate) fn map_view_status_bundle() -> impl Bundle {
     (
         Name::new("Map view status"),
         MapViewStatus,
-        Text::new("MAP VIEW  //  SOLDIERS\nABSOLUTE STRENGTH 0-100+ | 1/2/3 SELECT | V CYCLE"),
+        Text::new(
+            "MAP VIEW  //  SOLDIERS\nABSOLUTE STRENGTH / CONTEST PRESSURE 0-100+ | 1/2/3 SELECT | V CYCLE",
+        ),
         TextFont::from_font_size(10.5),
         TextColor(SOLDIER_TEXT),
         Pickable::IGNORE,
@@ -380,9 +384,14 @@ fn update_map_value_batch(
             if !inside_viewport(projected, viewport, LABEL_SCREEN_MARGIN_PX) {
                 continue;
             }
-            let Some(value) = mode.value(cell) else {
+            let Some(mut value) = mode.value(cell) else {
                 continue;
             };
+            if *mode == MapViewMode::Soldiers
+                && let Some(contest) = view.contested_cells.get(coordinate)
+            {
+                value = value.saturating_add(contest.attacker_strength);
+            }
             candidates.push(LabelCandidate {
                 coordinate: *coordinate,
                 elevation: cell.elevation,

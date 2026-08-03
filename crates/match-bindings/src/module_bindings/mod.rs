@@ -6,7 +6,7 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
-pub mod cancel_transfer_order_reducer;
+pub mod cancel_push_fronts_reducer;
 pub mod cell_state_table;
 pub mod cell_state_type;
 pub mod cell_terrain_table;
@@ -17,9 +17,10 @@ pub mod command_receipt_table;
 pub mod command_receipt_type;
 pub mod configure_map_reducer;
 pub mod issue_balance_reducer;
+pub mod issue_core_load_reducer;
 pub mod issue_front_load_reducer;
+pub mod issue_perimeter_load_reducer;
 pub mod issue_push_front_reducer;
-pub mod issue_transfer_reducer;
 pub mod join_match_reducer;
 pub mod map_preset_type;
 pub mod match_config_table;
@@ -46,7 +47,7 @@ pub mod transfer_source_type;
 pub mod transit_packet_table;
 pub mod transit_packet_type;
 
-pub use cancel_transfer_order_reducer::cancel_transfer_order;
+pub use cancel_push_fronts_reducer::cancel_push_fronts;
 pub use cell_state_table::*;
 pub use cell_state_type::CellState;
 pub use cell_terrain_table::*;
@@ -57,9 +58,10 @@ pub use command_receipt_table::*;
 pub use command_receipt_type::CommandReceipt;
 pub use configure_map_reducer::configure_map;
 pub use issue_balance_reducer::issue_balance;
+pub use issue_core_load_reducer::issue_core_load;
 pub use issue_front_load_reducer::issue_front_load;
+pub use issue_perimeter_load_reducer::issue_perimeter_load;
 pub use issue_push_front_reducer::issue_push_front;
-pub use issue_transfer_reducer::issue_transfer;
 pub use join_match_reducer::join_match;
 pub use map_preset_type::MapPreset;
 pub use match_config_table::*;
@@ -94,9 +96,11 @@ pub use transit_packet_type::TransitPacket;
 /// to indicate which reducer caused the event.
 
 pub enum Reducer {
-    CancelTransferOrder {
+    CancelPushFronts {
         client_command_id: u64,
-        order_id: u64,
+        selected_cells: Vec<u32>,
+        direction_q: i32,
+        direction_r: i32,
     },
     ConfigureMap {
         preset: MapPreset,
@@ -104,12 +108,24 @@ pub enum Reducer {
     IssueBalance {
         client_command_id: u64,
         selected_cells: Vec<u32>,
+        amount_bps: u32,
+    },
+    IssueCoreLoad {
+        client_command_id: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
     },
     IssueFrontLoad {
         client_command_id: u64,
         selected_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
+        amount_bps: u32,
+    },
+    IssuePerimeterLoad {
+        client_command_id: u64,
+        selected_cells: Vec<u32>,
+        amount_bps: u32,
     },
     IssuePushFront {
         client_command_id: u64,
@@ -117,12 +133,6 @@ pub enum Reducer {
         direction_q: i32,
         direction_r: i32,
         commitment_bps: u32,
-    },
-    IssueTransfer {
-        client_command_id: u64,
-        source_cells: Vec<u32>,
-        destination_cells: Vec<u32>,
-        infantry: u64,
     },
     JoinMatch {
         preferred_player_id: u8,
@@ -141,12 +151,13 @@ impl __sdk::InModule for Reducer {
 impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
-            Reducer::CancelTransferOrder { .. } => "cancel_transfer_order",
+            Reducer::CancelPushFronts { .. } => "cancel_push_fronts",
             Reducer::ConfigureMap { .. } => "configure_map",
             Reducer::IssueBalance { .. } => "issue_balance",
+            Reducer::IssueCoreLoad { .. } => "issue_core_load",
             Reducer::IssueFrontLoad { .. } => "issue_front_load",
+            Reducer::IssuePerimeterLoad { .. } => "issue_perimeter_load",
             Reducer::IssuePushFront { .. } => "issue_push_front",
-            Reducer::IssueTransfer { .. } => "issue_transfer",
             Reducer::JoinMatch { .. } => "join_match",
             Reducer::SetMobilizationTarget { .. } => "set_mobilization_target",
             _ => unreachable!(),
@@ -155,12 +166,16 @@ impl __sdk::Reducer for Reducer {
     #[allow(clippy::clone_on_copy)]
     fn args_bsatn(&self) -> Result<Vec<u8>, __sats::bsatn::EncodeError> {
         match self {
-            Reducer::CancelTransferOrder {
+            Reducer::CancelPushFronts {
                 client_command_id,
-                order_id,
-            } => __sats::bsatn::to_vec(&cancel_transfer_order_reducer::CancelTransferOrderArgs {
+                selected_cells,
+                direction_q,
+                direction_r,
+            } => __sats::bsatn::to_vec(&cancel_push_fronts_reducer::CancelPushFrontsArgs {
                 client_command_id: client_command_id.clone(),
-                order_id: order_id.clone(),
+                selected_cells: selected_cells.clone(),
+                direction_q: direction_q.clone(),
+                direction_r: direction_r.clone(),
             }),
             Reducer::ConfigureMap { preset } => {
                 __sats::bsatn::to_vec(&configure_map_reducer::ConfigureMapArgs {
@@ -170,20 +185,42 @@ impl __sdk::Reducer for Reducer {
             Reducer::IssueBalance {
                 client_command_id,
                 selected_cells,
+                amount_bps,
             } => __sats::bsatn::to_vec(&issue_balance_reducer::IssueBalanceArgs {
                 client_command_id: client_command_id.clone(),
                 selected_cells: selected_cells.clone(),
+                amount_bps: amount_bps.clone(),
+            }),
+            Reducer::IssueCoreLoad {
+                client_command_id,
+                selected_cells,
+                amount_bps,
+            } => __sats::bsatn::to_vec(&issue_core_load_reducer::IssueCoreLoadArgs {
+                client_command_id: client_command_id.clone(),
+                selected_cells: selected_cells.clone(),
+                amount_bps: amount_bps.clone(),
             }),
             Reducer::IssueFrontLoad {
                 client_command_id,
                 selected_cells,
                 orientation_q,
                 orientation_r,
+                amount_bps,
             } => __sats::bsatn::to_vec(&issue_front_load_reducer::IssueFrontLoadArgs {
                 client_command_id: client_command_id.clone(),
                 selected_cells: selected_cells.clone(),
                 orientation_q: orientation_q.clone(),
                 orientation_r: orientation_r.clone(),
+                amount_bps: amount_bps.clone(),
+            }),
+            Reducer::IssuePerimeterLoad {
+                client_command_id,
+                selected_cells,
+                amount_bps,
+            } => __sats::bsatn::to_vec(&issue_perimeter_load_reducer::IssuePerimeterLoadArgs {
+                client_command_id: client_command_id.clone(),
+                selected_cells: selected_cells.clone(),
+                amount_bps: amount_bps.clone(),
             }),
             Reducer::IssuePushFront {
                 client_command_id,
@@ -197,17 +234,6 @@ impl __sdk::Reducer for Reducer {
                 direction_q: direction_q.clone(),
                 direction_r: direction_r.clone(),
                 commitment_bps: commitment_bps.clone(),
-            }),
-            Reducer::IssueTransfer {
-                client_command_id,
-                source_cells,
-                destination_cells,
-                infantry,
-            } => __sats::bsatn::to_vec(&issue_transfer_reducer::IssueTransferArgs {
-                client_command_id: client_command_id.clone(),
-                source_cells: source_cells.clone(),
-                destination_cells: destination_cells.clone(),
-                infantry: infantry.clone(),
             }),
             Reducer::JoinMatch {
                 preferred_player_id,

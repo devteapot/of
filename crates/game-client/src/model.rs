@@ -116,10 +116,6 @@ impl CellView {
             (self.infantry as f32 / self.military_capacity as f32).clamp(0.0, 1.0)
         }
     }
-
-    pub const fn free_capacity(&self) -> u64 {
-        self.military_capacity.saturating_sub(self.infantry)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +133,22 @@ pub struct ActiveFront {
     pub hostile: Axial,
     pub intensity: f32,
     pub age: f32,
+}
+
+/// Compact presentation state for a cell whose control is actively disputed.
+///
+/// Combat remains edge-based and authoritative ownership stays on [`CellView`].
+/// This projection only gives the chunk renderer enough information to show
+/// the relative forces without introducing per-cell render entities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContestedCellView {
+    pub controller_player: u32,
+    pub attacker_player: u32,
+    /// Surviving hostile strength represented by the edge-combat snapshot.
+    pub attacker_strength: u64,
+    /// Attacker share of the currently represented force, in the inclusive
+    /// range `0.0..=1.0`. Rendering clamps network interpolation defensively.
+    pub attacker_share: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +195,10 @@ pub struct MatchView {
     pub queued_infantry: u64,
     pub active_flows: Vec<ActiveFlow>,
     pub active_fronts: Vec<ActiveFront>,
+    /// Only cells with an active hostile front are present. Callers replacing
+    /// this projection must dirty the chunks containing removed and inserted
+    /// coordinates so their vertex colors are refreshed.
+    pub contested_cells: BTreeMap<Axial, ContestedCellView>,
     pub latest_result: String,
     pub order_log: VecDeque<String>,
     pub toast: Option<Toast>,
@@ -210,6 +226,7 @@ impl MatchView {
             queued_infantry: 0,
             active_flows: Vec::new(),
             active_fronts: Vec::new(),
+            contested_cells: BTreeMap::new(),
             latest_result: "Connecting to authoritative match…".to_owned(),
             order_log: VecDeque::new(),
             toast: None,
@@ -337,6 +354,7 @@ impl MatchView {
                 intensity: 0.55,
                 age: 0.0,
             }],
+            contested_cells: BTreeMap::new(),
             latest_result: "Offline fixture loaded · commands resolve locally".to_owned(),
             order_log,
             toast: Some(Toast {
@@ -360,6 +378,23 @@ impl MatchView {
 
     pub fn mark_cell_state_changed(&mut self) {
         self.cell_state_revision = self.cell_state_revision.wrapping_add(1);
+    }
+
+    /// Replaces the transient combat projection and schedules both newly
+    /// contested and newly cleared cells for chunk recoloring.
+    pub fn set_contested_cells(&mut self, contested_cells: BTreeMap<Axial, ContestedCellView>) {
+        if self.contested_cells == contested_cells {
+            return;
+        }
+        self.dirty_chunks.extend(
+            self.contested_cells
+                .keys()
+                .chain(contested_cells.keys())
+                .copied()
+                .map(chunk_of),
+        );
+        self.contested_cells = contested_cells;
+        self.mark_cell_state_changed();
     }
 
     /// Rebuilds the spatial index after a wholesale authoritative map update.
@@ -503,63 +538,12 @@ impl SourceReachability {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct DestinationReachability {
-    next: BTreeMap<Axial, Axial>,
-    distance: BTreeMap<Axial, u32>,
-}
-
-impl DestinationReachability {
-    pub fn contains(&self, coordinate: Axial) -> bool {
-        self.next.contains_key(&coordinate)
-    }
-
-    pub fn reachable_sources(&self, sources: &BTreeSet<Axial>) -> BTreeSet<Axial> {
-        sources
-            .iter()
-            .filter(|coordinate| self.contains(**coordinate))
-            .copied()
-            .collect()
-    }
-
-    pub fn route_from_any(&self, sources: &BTreeSet<Axial>) -> Option<Vec<Axial>> {
-        let source = sources
-            .iter()
-            .filter_map(|coordinate| {
-                self.distance
-                    .get(coordinate)
-                    .map(|distance| (*distance, *coordinate))
-            })
-            .min()
-            .map(|(_, coordinate)| coordinate)?;
-        let mut current = source;
-        let mut route = vec![current];
-        loop {
-            let next = self.next[&current];
-            if next == current {
-                break;
-            }
-            current = next;
-            route.push(current);
-        }
-        Some(route)
-    }
-}
-
 pub fn reachability_from_sources(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
 ) -> SourceReachability {
     let (previous, distance) = traverse(view, sources, false);
     SourceReachability { previous, distance }
-}
-
-pub fn reachability_to_destinations(
-    view: &MatchView,
-    destinations: &BTreeSet<Axial>,
-) -> DestinationReachability {
-    let (next, distance) = traverse(view, destinations, true);
-    DestinationReachability { next, distance }
 }
 
 fn traverse(
@@ -676,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn route_search_seeds_every_source_and_reverse_search_filters_components() {
+    fn route_search_seeds_every_source_and_selects_the_reachable_component() {
         let view = disconnected_route_fixture();
         let isolated = Axial::ZERO;
         let reachable = Axial::new(10, 0);
@@ -686,15 +670,6 @@ mod tests {
 
         assert_eq!(
             find_route(&view, &sources, &destinations),
-            Some(vec![reachable, destination])
-        );
-        let reverse = reachability_to_destinations(&view, &destinations);
-        assert_eq!(
-            reverse.reachable_sources(&sources),
-            BTreeSet::from([reachable])
-        );
-        assert_eq!(
-            reverse.route_from_any(&sources),
             Some(vec![reachable, destination])
         );
     }
@@ -749,5 +724,36 @@ mod tests {
             .civilians += 1;
 
         assert_eq!(fixture.cell_state_revision, before.wrapping_add(1));
+    }
+
+    #[test]
+    fn replacing_contests_dirties_both_cleared_and_added_chunks() {
+        let mut view = MatchView::connecting(1);
+        let cleared = Axial::new(-40, 0);
+        let added = Axial::new(40, 0);
+        view.contested_cells.insert(
+            cleared,
+            ContestedCellView {
+                controller_player: PLAYER_ONE,
+                attacker_player: PLAYER_TWO,
+                attacker_strength: 25,
+                attacker_share: 0.25,
+            },
+        );
+
+        view.set_contested_cells(BTreeMap::from([(
+            added,
+            ContestedCellView {
+                controller_player: PLAYER_TWO,
+                attacker_player: PLAYER_ONE,
+                attacker_strength: 75,
+                attacker_share: 0.75,
+            },
+        )]));
+
+        assert!(view.dirty_chunks.contains(&chunk_of(cleared)));
+        assert!(view.dirty_chunks.contains(&chunk_of(added)));
+        assert!(!view.contested_cells.contains_key(&cleared));
+        assert!(view.contested_cells.contains_key(&added));
     }
 }

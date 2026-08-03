@@ -177,6 +177,14 @@ fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
                 spawn_button(buttons, "P  PUSH FRONT", UiAction::PushFront, false);
                 spawn_button(buttons, "B  BALANCE", UiAction::Balance, false);
                 spawn_button(buttons, "F  FRONT-LOAD", UiAction::FrontLoad, false);
+                spawn_button(buttons, "G  CORE-LOAD", UiAction::CoreLoad, false);
+                spawn_button(
+                    buttons,
+                    "R  PERIMETER-LOAD",
+                    UiAction::PerimeterLoad,
+                    false,
+                );
+                spawn_button(buttons, "X  STOP PUSH", UiAction::CancelPush, false);
                 spawn_button(buttons, "[  −10%", UiAction::AmountDown, true);
                 spawn_button(buttons, "]  +10%", UiAction::AmountUp, true);
             });
@@ -194,7 +202,7 @@ fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
             });
         panel.spawn((
             Text::new(
-                "MAP KEY\nouter perimeter     selected region\namber/red edge      push front\n× marker            blocked\nopposing chevrons   combat",
+                "MAP KEY\nouter perimeter     selected region\namber/red edge      push front\nmixed player fill   contested pressure\n× marker            blocked\nopposing chevrons   combat",
             ),
             TextFont::from_font_size(10.5),
             TextColor(MUTED),
@@ -340,7 +348,7 @@ fn spawn_onboarding(root: &mut ChildSpawnerCommands) {
     .with_children(|hint| {
         hint.spawn((
             Text::new(
-                "LMB paint  ·  [ / ] brush  ·  C cluster  ·  Ctrl/Cmd+A all  ·  P push  ·  B balance  ·  F front-load  ·  ? help",
+                "LMB paint  ·  [ / ] brush  ·  C cluster  ·  Ctrl/Cmd+A all  ·  P push  ·  B/F/G/R redistribute  ·  ? help",
             ),
             TextFont::from_font_size(11.0),
             TextColor(MUTED),
@@ -400,7 +408,7 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
         help.spawn(section_title("FIELD MANUAL  //  ? TO CLOSE"));
         help.spawn((
             Text::new(
-                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts. In source mode, [ / ] removes or adds one complete hex ring around the brush, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes.\n\nPUSH FRONT\nSelect one connected border section and continue painting backward to include its reinforcement corridor. Hold P, drag outward, and release to choose one of six directions; after clicking the HUD button, click outward on the map instead. Plain [ / ] changes commitment; Enter confirms. The server keeps routes inside the selection until troops cross the displayed front edge.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters.\n\nREDISTRIBUTE\nB previews an even target density. Hold F and drag over the map to orient front-load. The pale nested outlines are proposed density, not troops that already moved.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. It affects future recruitment only; lowering it does not demobilize existing soldiers.",
+                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts. In source mode, [ / ] removes or adds one complete hex ring around the brush, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes.\n\nPUSH FRONT\nThe outward-facing selected cells form the front; connected selected cells behind them are its reinforcement corridor. Hold P, drag outward, and release to choose one of six directions; Enter starts a sustained push. Each lane advances until committed troops are spent, defeated, blocked, or stopped. Recreate the selection and direction, then X stops matching pushes.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters. Contested cells mix both player colors by relative force.\n\nREDISTRIBUTE\nB balances density, F orients front-load, G loads toward the selection core, and R loads toward its perimeter. Plain [ / ] changes how much of every selected stack participates; Enter confirms. Pale nested outlines show the resulting target density.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. It affects future recruitment only; lowering it does not demobilize existing soldiers.",
             ),
             TextFont::from_font_size(12.0),
             TextColor(TEXT),
@@ -530,8 +538,20 @@ fn update_hud(
             let owner = cell
                 .owner
                 .map_or_else(|| "UNCLAIMED".to_owned(), |owner| format!("PLAYER {owner}"));
+            let contest = view.contested_cells.get(&coordinate).map_or_else(
+                String::new,
+                |contest| {
+                    format!(
+                        "\nCONTEST P{} {:>4}  ·  SHARE {:>3.0}%  ·  TOTAL {:>4}",
+                        contest.attacker_player,
+                        contest.attacker_strength,
+                        contest.attacker_share * 100.0,
+                        cell.infantry.saturating_add(contest.attacker_strength),
+                    )
+                },
+            );
             format!(
-                "INSPECTOR\nHEX {:+03},{:+03}  ·  {:?}\nELEVATION {:02}  ·  OWNER {}\nCIVILIANS {:>4}  ·  INFANTRY {:>4}\nCAPACITY {:>4}  ·  OCCUPANCY {:>3.0}%{}",
+                "INSPECTOR\nHEX {:+03},{:+03}  ·  {:?}\nELEVATION {:02}  ·  OWNER {}\nCIVILIANS {:>4}  ·  CONTROL INF {:>4}\nCAPACITY {:>4}  ·  OCCUPANCY {:>3.0}%{}{}",
                 coordinate.q,
                 coordinate.r,
                 cell.terrain,
@@ -542,6 +562,7 @@ fn update_hud(
                 cell.military_capacity,
                 cell.density() * 100.0,
                 if cell.blocked { "  ·  × BLOCKED" } else { "" },
+                contest,
             )
         })
     });
@@ -590,15 +611,23 @@ fn update_hud(
             "Choose outward · release P or click map to quantize".to_owned()
         }
         OrderMode::PushFrontPreview { .. } => interaction.preview.invalid_reason.map_or_else(
-            || "Up to shown strength · queued flows may reduce it · Enter confirms".to_owned(),
+            || "Sustained by shown commitment · Enter starts · X stops matching".to_owned(),
             |reason| format!("INVALID · {reason}"),
         ),
-        OrderMode::BalancePreview => "Nested outlines show target density".to_owned(),
+        OrderMode::BalancePreview => {
+            "Nested outlines show percentage-aware target density".to_owned()
+        }
         OrderMode::FrontLoadOrient { .. } => {
             "Choose direction · release F or click map to preview".to_owned()
         }
         OrderMode::FrontLoadPreview { .. } => {
-            "Arrow shows orientation · Enter to confirm".to_owned()
+            "Arrow shows orientation · [/] participation · Enter confirms".to_owned()
+        }
+        OrderMode::CoreLoadPreview => {
+            "Loads inward from the selection centroid · [/] participation".to_owned()
+        }
+        OrderMode::PerimeterLoadPreview => {
+            "Loads outward toward the selection perimeter · [/] participation".to_owned()
         }
         OrderMode::Submitting { .. } => "Waiting for authoritative response…".to_owned(),
     };
