@@ -211,13 +211,16 @@ Movement uses a two-phase calculation: approve outgoing flow first, then commit 
 Push Front is the primary V1 producer of aggregate flows. Its authoritative
 reducer accepts an exact selected cell set, one of six axial directions, and a
 commitment in basis points. It requires one six-connected owned source region
-and one connected active directional front. A selected cell is part of that
-front exactly when `source + direction` is neutral or enemy territory. The
-other connected selected cells form its reinforcement corridor; they route to
-the front entirely within the submitted selection and do not create outward
-lanes. Adjacent directions are never inferred. The authority recomputes all
-derived edges and routes, so a client cannot redirect a push by submitting a
-visual segment or predicted result.
+but allows its active directional boundary to contain multiple disconnected
+arcs. A selected cell is part of that front exactly when `source + direction`
+is neutral or enemy territory. Every eligible arc becomes an independent
+outward seed. The other selected cells form the reinforcement corridor; each
+must route to at least one seed entirely within the submitted selection and
+does not create an outward lane of its own. A command is rejected if a selected
+cell cannot reach any seed across traversable selected-only edges. Adjacent
+directions are never inferred. The authority recomputes all derived edges and
+routes, so a client cannot redirect a push by submitting a visual segment or
+predicted result.
 
 After the initial edge, each front lane advances through successive cells only
 along the stored axial direction. Its committed percentage becomes a fixed
@@ -407,9 +410,10 @@ The UX is expected to iterate; the server intent model should not depend on one
 specific gesture.
 
 Bulk selections must not multiply pathfinding work. Push Front derives its
-exact directional boundary in shared pure code, validates one source component
-and one active-front component, and searches backward only through selected
-cells. Expand All derives its perimeter and two multi-source breadth-first depth
+exact directional boundary in shared pure code, validates one source component,
+then performs one multi-source search backward from every eligible front arc
+through selected cells. The route labels must cover the whole selection.
+Expand All derives its perimeter and two multi-source breadth-first depth
 fields once when accepted. Runtime work is proportional to active resting and
 one-edge packets: contributions merge by current node, and no complete
 source-by-exit paths are persisted. The private outside-depth and cursor vectors

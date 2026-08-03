@@ -1206,9 +1206,7 @@ fn build_expand_all_preview(
                 preview.invalid_reason = Some("The selection has no passable neutral frontier");
                 return;
             }
-            Err(ExpandWaveError::Front(
-                FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront,
-            )) => {
+            Err(ExpandWaveError::Front(FrontSelectionError::InvalidDirection)) => {
                 preview.invalid_reason = Some("Expand All frontier is invalid");
                 return;
             }
@@ -1285,9 +1283,6 @@ const fn front_selection_error_text(error: FrontSelectionError) -> &'static str 
         FrontSelectionError::DisconnectedSelection => "Push selection must be one connected region",
         FrontSelectionError::InvalidDirection => "Push direction must match one hex direction",
         FrontSelectionError::NoEligibleFront => "No non-owned passable front faces that direction",
-        FrontSelectionError::DisconnectedFront => {
-            "The chosen boundary contains separate front arcs"
-        }
     }
 }
 
@@ -1814,6 +1809,48 @@ mod tests {
                 .strength_upper_bound,
             30
         );
+    }
+
+    #[test]
+    fn push_preview_accepts_multiple_eligible_boundary_arcs() {
+        let direction = Axial::new(1, 0);
+        let sources = BTreeSet::from([Axial::new(0, -1), Axial::ZERO, Axial::new(0, 1)]);
+        let upper_target = Axial::new(1, -1);
+        let blocked_gap = Axial::new(1, 0);
+        let lower_target = Axial::new(1, 1);
+        let mut view = MatchView::connecting(1);
+        for &source in &sources {
+            view.cells
+                .insert(source, preview_cell(source, Some(1), 20, 0));
+        }
+        view.cells
+            .insert(upper_target, preview_cell(upper_target, None, 0, 0));
+        view.cells
+            .insert(blocked_gap, preview_cell(blocked_gap, Some(1), 0, 0));
+        view.cells
+            .insert(lower_target, preview_cell(lower_target, None, 0, 0));
+        view.rebuild_chunk_index();
+
+        let mut preview = OrderPreview::default();
+        build_push_front_preview(&view, &sources, direction, 50, &mut preview);
+
+        assert_eq!(preview.invalid_reason, None);
+        assert_eq!(
+            preview.front_edges,
+            vec![
+                DirectedFrontEdge {
+                    source: Axial::new(0, -1),
+                    target: upper_target,
+                },
+                DirectedFrontEdge {
+                    source: Axial::new(0, 1),
+                    target: lower_target,
+                },
+            ]
+        );
+        assert_eq!(preview.strength_upper_bound, 30);
+        assert_eq!(preview.destination_capacity, 200);
+        assert!(preview.excluded.is_empty());
     }
 
     #[test]

@@ -134,9 +134,10 @@ pub fn set_mobilization_target(
     )
 }
 
-/// Commits a selected, connected owned region toward its exact directional
-/// boundary. Cells behind the boundary contribute infantry through routes that
-/// remain inside the submitted selection until their final frontier edge.
+/// Commits a selected, connected owned region toward every eligible arc of its
+/// exact directional boundary. Cells behind the boundary contribute infantry
+/// through routes that remain inside the submitted selection until their final
+/// frontier edge.
 #[spacetimedb::reducer]
 pub fn issue_push_front(
     ctx: &ReducerContext,
@@ -751,9 +752,7 @@ fn expand_selection_message(error: FrontSelectionError) -> String {
         FrontSelectionError::NoEligibleFront => {
             "the selected region has no adjacent neutral passable ground"
         }
-        FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront => {
-            "invalid all-front expansion boundary"
-        }
+        FrontSelectionError::InvalidDirection => "invalid all-front expansion boundary",
     }
     .into()
 }
@@ -767,9 +766,6 @@ fn front_selection_message(error: FrontSelectionError) -> String {
         }
         FrontSelectionError::NoEligibleFront => {
             "the selected region has no non-owned passable front in that direction"
-        }
-        FrontSelectionError::DisconnectedFront => {
-            "the selected directional front is split into disconnected sections"
         }
     }
     .into()
@@ -1404,6 +1400,83 @@ mod tests {
         assert_eq!(
             routes.route_to_boundary(origin),
             Some((first, vec![origin, first]))
+        );
+    }
+
+    #[test]
+    fn separated_directional_arcs_route_every_connected_source_to_a_front() {
+        let coordinates = (-2..=2).map(|r| Axial::new(0, r)).collect::<BTreeSet<_>>();
+        let direction = Axial::new(1, 0);
+        let edges = selected_front_edges(&coordinates, direction, |source, _| {
+            source.r.unsigned_abs() == 2
+        })
+        .expect("separated eligible arcs are one directional push");
+        let front_seeds = edges
+            .iter()
+            .map(|edge| edge.source)
+            .collect::<BTreeSet<_>>();
+
+        let mut map = HexMap::new();
+        for coordinate in &coordinates {
+            map.insert(selected_cell(*coordinate, 0));
+        }
+        let routes = front_route_tree(&map, &front_seeds, &MovementConfig::default());
+
+        assert_eq!(
+            front_seeds,
+            BTreeSet::from([Axial::new(0, -2), Axial::new(0, 2)])
+        );
+        assert_eq!(routes.labels.len(), coordinates.len());
+        for coordinate in coordinates {
+            let (front, route) = routes
+                .route_to_boundary(coordinate)
+                .expect("every selected source reaches one active arc internally");
+            assert!(front_seeds.contains(&front));
+            assert_eq!(route.first(), Some(&coordinate));
+            assert_eq!(route.last(), Some(&front));
+        }
+    }
+
+    #[test]
+    fn separated_front_seeds_cover_every_component_split_by_an_internal_cliff() {
+        let lower_rear = Axial::new(0, -1);
+        let lower_front = Axial::new(0, 0);
+        let upper_rear = Axial::new(0, 1);
+        let upper_front = Axial::new(0, 2);
+        let coordinates = BTreeSet::from([lower_rear, lower_front, upper_rear, upper_front]);
+        let direction = Axial::new(1, 0);
+        let edges = selected_front_edges(&coordinates, direction, |source, _| {
+            source == lower_front || source == upper_front
+        })
+        .expect("each cliff-separated component has an eligible directional arc");
+        let front_seeds = edges
+            .iter()
+            .map(|edge| edge.source)
+            .collect::<BTreeSet<_>>();
+
+        let mut map = HexMap::new();
+        map.insert(selected_cell(lower_rear, 0));
+        map.insert(selected_cell(lower_front, 0));
+        map.insert(selected_cell(upper_rear, 2));
+        map.insert(selected_cell(upper_front, 2));
+        let routes = front_route_tree(&map, &front_seeds, &MovementConfig::default());
+
+        assert_eq!(routes.labels.len(), coordinates.len());
+        assert_eq!(
+            routes.route_to_boundary(lower_rear),
+            Some((lower_front, vec![lower_rear, lower_front]))
+        );
+        assert_eq!(
+            routes.route_to_boundary(lower_front),
+            Some((lower_front, vec![lower_front]))
+        );
+        assert_eq!(
+            routes.route_to_boundary(upper_rear),
+            Some((upper_front, vec![upper_rear, upper_front]))
+        );
+        assert_eq!(
+            routes.route_to_boundary(upper_front),
+            Some((upper_front, vec![upper_front]))
         );
     }
 

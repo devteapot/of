@@ -1065,9 +1065,6 @@ const fn front_error_message(error: FrontSelectionError) -> &'static str {
         FrontSelectionError::DisconnectedSelection => "Push selection must be connected",
         FrontSelectionError::InvalidDirection => "Push direction is invalid",
         FrontSelectionError::NoEligibleFront => "No non-owned passable front faces that direction",
-        FrontSelectionError::DisconnectedFront => {
-            "The selected boundary creates separate front arcs"
-        }
     }
 }
 
@@ -1078,9 +1075,7 @@ const fn expand_error_message(error: FrontSelectionError) -> &'static str {
             "Expand All selection must be one connected region"
         }
         FrontSelectionError::NoEligibleFront => "The selection has no passable neutral frontier",
-        FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront => {
-            "Expand All frontier is invalid"
-        }
+        FrontSelectionError::InvalidDirection => "Expand All frontier is invalid",
     }
 }
 
@@ -1282,6 +1277,44 @@ mod tests {
             90
         );
         assert_eq!(flow.expect("push flow").strength, 45);
+    }
+
+    #[test]
+    fn offline_push_front_feeds_disconnected_boundary_arcs_independently() {
+        let direction = Axial::new(1, 0);
+        let sources = BTreeSet::from([Axial::new(0, -1), Axial::ZERO, Axial::new(0, 1)]);
+        let upper_target = Axial::new(1, -1);
+        let blocked_gap = Axial::new(1, 0);
+        let lower_target = Axial::new(1, 1);
+        let mut view = MatchView::connecting(1);
+        for &source in &sources {
+            view.cells.insert(source, cell(source, 20));
+        }
+        view.cells.insert(upper_target, neutral_cell(upper_target));
+        view.cells.insert(blocked_gap, cell(blocked_gap, 0));
+        view.cells.insert(lower_target, neutral_cell(lower_target));
+        view.rebuild_chunk_index();
+
+        let ServerUpdate::Accepted { patches, flow, .. } =
+            resolve_push_front(&view, &sources, direction, 50)
+        else {
+            panic!("separate eligible boundary arcs should share one connected corridor");
+        };
+        let patch = |coordinate| {
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == coordinate)
+                .expect("participating cell should be patched")
+        };
+
+        assert!(sources.iter().all(|source| patch(*source).infantry == 10));
+        assert_eq!(patch(upper_target).owner, Some(1));
+        assert_eq!(patch(lower_target).owner, Some(1));
+        let mut arc_strengths = [patch(upper_target).infantry, patch(lower_target).infantry];
+        arc_strengths.sort_unstable();
+        assert_eq!(arc_strengths, [10, 20]);
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 60);
+        assert_eq!(flow.expect("representative offline flow").strength, 30);
     }
 
     #[test]

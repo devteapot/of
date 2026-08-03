@@ -90,9 +90,11 @@ identity.
 - `join_match` — claim or reclaim one of the two player slots.
 - `set_mobilization_target` — change the global target in basis points.
 - `issue_push_front` — commit a percentage of one connected selected region
-  through its one connected directional front. Corridor routes stay selected
-  until the initial outward edge, after which each lane sustains movement along
-  the exact stored axial direction using its fixed committed pool.
+  through every eligible front arc in one direction. Disconnected arcs are
+  independent seeds; every selected cell must reach at least one through a
+  traversable selected-only route. After the initial outward edge, each lane
+  sustains movement along the exact stored axial direction using its fixed
+  committed pool.
 - `cancel_push_fronts` — stop matching active directional pushes and release
   remaining allocations where the troops currently are.
 - `issue_expand_all` — commit a percentage of one connected selected region's
@@ -198,9 +200,12 @@ for the server.
 The V1 conquest interaction is Push Front: paint one connected owned region,
 hold `P`, drag outward, and release to preview one exact direction. Plain
 brackets adjust commitment and `Enter` submits. Selected cells facing non-owned
-territory in that direction are the front; the other connected selected cells
-are its reinforcement corridor. The server routes through that corridor, then
-extends each lane through successive layers only along the chosen direction.
+territory in that direction are the front; selection geometry or target
+eligibility may split them into several disconnected arcs. Every arc seeds
+independent outward lanes. The other selected cells are their reinforcement
+corridor, and each must have a traversable selected-only route to at least one
+arc. The server routes through that corridor, then extends each lane through
+successive layers only along the chosen direction.
 Terrain, elevation, throughput, frontage, enemies, and terrain-scaled garrisons
 consume or delay its fixed committed pool. Lanes stop independently when
 exhausted, blocked, defeated, at the map edge, or cancelled. With the same

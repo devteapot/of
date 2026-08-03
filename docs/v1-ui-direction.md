@@ -29,13 +29,15 @@ redistribution presets. Server intentions remain independent of input gestures:
 
 Push Front is the player-facing V1 conquest command. It uses the ordinary
 connected owned-cell selection. After one exact direction is chosen, selected
-cells whose outward neighbor is neutral or enemy territory define one
-contiguous front. The remaining connected selected cells behind that front are
-its reinforcement corridor and troop pool. Hold `P`, drag outward, and release
-to choose one of six directions. The client derives the initial outward edge
-for each participating front cell and submits the selected cells, direction,
-and commitment. The server independently derives and validates the same front;
-visual segment IDs are never authoritative.
+cells whose outward neighbor is neutral or enemy territory define the active
+front. Selection geometry or target eligibility may divide it into several
+disconnected arcs; every arc seeds independent outward lanes. The remaining
+selected cells behind those arcs are their reinforcement corridor and troop
+pool. Every selected cell must reach at least one arc across traversable
+selected-only edges. Hold `P`, drag outward, and release to choose one of six
+directions. The client derives every initial outward edge and submits the
+selected cells, direction, and commitment. The server independently derives
+and validates the same front; visual segment IDs are never authoritative.
 
 ### Camera
 
@@ -55,13 +57,15 @@ visual segment IDs are never authoritative.
 - `C` selects the hovered six-connected owned cluster; Shift adds that cluster
   and Control removes it. `Control/Command + A` selects every owned hex.
 - Hold `P`, drag outward, and release to quantize one exact hex direction. The
-  selected region must be connected and its active directional boundary must
-  be one connected front section.
+  selected region must be connected. Its active directional boundary may
+  contain multiple disconnected arcs.
 - The preview highlights only edges from a selected source to its immediate
   non-owned neighbor in that direction. Side edges are never inferred.
 - Those outward-facing selected cells are the front. Every other selected cell
-  must connect behind them through the selected region and acts as the
-  reinforcement corridor; it does not create an outward lane of its own.
+  acts as the reinforcement corridor; it does not create an outward lane of its
+  own. Every selected cell must reach at least one active arc across traversable
+  selected-only edges; cliffs may divide sources between arcs, but cannot leave
+  a source with no reachable arc.
 - Routes from corridor cells remain entirely inside the selection until they
   feed an initial front cell. From there, each lane advances automatically
   through successive cells along the chosen axial direction. It never bends,
@@ -158,8 +162,8 @@ These overlays remain separate:
 
 - hover: thin white perimeter around the current brush footprint;
 - source: solid exposed perimeter around each selected component;
-- active Push Front: bold exact directional boundary edges, with hostile ticks
-  when they lead into enemy ownership;
+- active Push Front: bold exact directional boundary edges across every
+  eligible arc, with hostile ticks when they lead into enemy ownership;
 - Expand All preview: amber entry edges plus a bounded translucent forecast of
   successive split-and-merge perimeter depths; disconnected arcs and
   independently progressing branches are allowed, and forecast truncation is

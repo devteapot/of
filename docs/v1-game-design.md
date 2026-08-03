@@ -12,9 +12,9 @@ The defining mechanic is **spatially conserved troop flow**:
 
 Army strength cannot be reassigned instantly from one border to another. Troops have a location, routes take time, destinations have finite capacity, and terrain creates bottlenecks. This should preserve high-level RTS control while making geography and logistics matter.
 
-V1 exists to answer one question: is selecting regions, pushing connected front
-sections, redistributing aggregate strength, and fighting over a height-aware
-hex map understandable and fun?
+V1 exists to answer one question: is selecting connected regions, pushing their
+directional front arcs, redistributing aggregate strength, and fighting over a
+height-aware hex map understandable and fun?
 
 ## Locked V1 Scope
 
@@ -132,8 +132,8 @@ V1 does not expose destination-cell painting as its conquest loop. The player
 selects the territory and troops that may participate, then chooses exactly one
 of the six hex directions in which its boundary should advance:
 
-1. Paint one connected owned source region. Include the intended border section
-   and continue backward into owned territory to include its reinforcement
+1. Paint one connected owned source region. Include the intended border arcs
+   and continue backward into owned territory to include their reinforcement
    corridor and troop pool.
 2. Hold `P`, drag outward, and release. The client quantizes the gesture to one
    exact axial direction.
@@ -149,17 +149,20 @@ is exactly `(selected source, source + direction)`. Side and rear edges never
 join the command implicitly. The remaining selected cells are the
 **reinforcement corridor**: they must connect behind the front through the
 six-connected selected region, but they do not open outward lanes of their own.
-The front cells must form one connected section. Initial targets must be
-capturable and traversable. The same command expands into neutral land or
-attacks an enemy-held cell; ownership determines the resolution, not a separate
-targeting mode.
+Selection geometry or target eligibility may divide the front cells into
+several disconnected arcs. That is valid: all eligible edges are included, and
+each arc is an independent outward seed for the same command. Initial targets
+must be capturable and traversable. The same command expands into neutral land
+or attacks an enemy-held cell; ownership determines the resolution, not a
+separate targeting mode.
 
 Cells behind the boundary contribute only through routes that stay inside the
 submitted selection until they reach an initial front cell. A cell outside the
 selection cannot become a convenient shortcut into the front, and an
-unselected friendly stack cannot be debited. Internal cliffs or other blocked
-edges that split the selected reinforcement corridor make the command invalid
-rather than silently changing its meaning.
+unselected friendly stack cannot be debited. Every selected cell must be able
+to reach at least one initial front cell through traversable selected-only
+edges. Internal cliffs may split those routes between different front arcs,
+but the command is invalid if they isolate any selected cell from every arc.
 
 After crossing an initial front edge, the committed force continues
 automatically through successive hex layers along that lane's exact axial ray.
@@ -176,10 +179,10 @@ bonuses or a separate expansion resource.
 The authoritative `issue_push_front` reducer receives a stable command ID, the
 exact sorted selected cell IDs, one axial direction, and commitment in basis
 points. It revalidates ownership, source connectivity, active-front
-connectivity, traversal, available unallocated infantry, target capacity, and
-selected-only routes in one transaction. Accepted strength becomes ordinary
-aggregate transit packets; rejected commands create a receipt without partial
-gameplay mutation.
+eligibility, selected-only reachability to at least one active arc, traversal,
+available unallocated infantry, and target capacity in one transaction.
+Accepted strength becomes ordinary aggregate transit packets; rejected
+commands create a receipt without partial gameplay mutation.
 
 Commitment is a one-time share of the currently unallocated strength in each
 selected source when the command is accepted. Existing allocations reduce the
@@ -374,8 +377,9 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
 5. Civilian population grows locally and a global mobilization target converts it into local infantry strength over time.
 6. Lowering the mobilization target does not instantly demobilize existing force.
 7. Players can select one connected owned region, hold-drag-release `P` to
-   choose one exact direction, and preview one connected active front before
-   confirmation.
+   choose one exact direction, and preview every eligible active front arc
+   before confirmation. Disconnected arcs are valid, but every selected cell
+   must reach at least one through traversable selected-only edges.
 8. Push Front routes remain inside the exact selection until they feed an
    initial front cell, then advance lane-by-lane along the chosen axial
    direction using one fixed committed pool. Terrain-scaled garrisons consume

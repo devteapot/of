@@ -2,8 +2,9 @@
 
 A native two-player RTS prototype about moving conserved aggregate forces across
 a stepped 2.5D hex world. Players select a connected owned region, then either
-push one oriented section of its border or expand across every neutral boundary
-instead of selecting individual soldiers or painting destination cells. Terrain
+push its eligible boundary arcs in one chosen direction or expand across every
+neutral boundary instead of selecting individual soldiers or painting
+destination cells. Terrain
 height, military capacity, edge throughput, combat frontage, garrisons,
 resistance, and travel time determine how far each Push lane or wave branch
 advances.
@@ -152,12 +153,16 @@ disconnected identity. The defaults are `http://127.0.0.1:3000` and
 | `F3` | Toggle the performance overlay |
 
 After a Push direction is chosen, selected cells that face neutral or enemy
-territory in that direction are the front. The other connected selected cells
-are its reinforcement corridor. The committed percentage becomes a fixed pool
-that feeds independent straight lanes; terrain, elevation, throughput,
-frontage, resistance, and terrain-scaled garrisons determine how far each lane
-travels. Contested cells keep one authoritative controller while their terrain
-color blends controller and attacker pressure for readability.
+territory in that direction are the front. Selection geometry or target
+eligibility may split that front into several disconnected arcs; every arc is
+an independent outward seed. The other selected cells are their reinforcement
+corridor, and every selected cell must reach at least one front cell through
+traversable selected-only edges. The
+committed percentage becomes a fixed pool that feeds independent straight
+lanes; terrain, elevation, throughput, frontage, resistance, and terrain-scaled
+garrisons determine how far each lane travels. Contested cells keep one
+authoritative controller while their terrain color blends controller and
+attacker pressure for readability.
 
 Expand All uses the same connected selection without an orientation. Every
 selected cell contributes the chosen dispatch percentage of its currently

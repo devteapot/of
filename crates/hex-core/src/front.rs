@@ -14,15 +14,15 @@ pub enum FrontSelectionError {
     DisconnectedSelection,
     InvalidDirection,
     NoEligibleFront,
-    DisconnectedFront,
 }
 
 /// Derives the exact outward-facing edge set for a selected source region.
 ///
 /// Only the chosen axial direction is considered. This is important for deep
 /// selections: cells painted backward supply strength and routes, but their
-/// side edges do not silently become additional fronts. Both the whole source
-/// region and its active boundary must be six-connected.
+/// side edges do not silently become additional fronts. The whole source
+/// region must be six-connected, while target eligibility may split its active
+/// boundary into several independent arcs.
 pub fn selected_front_edges(
     sources: &BTreeSet<Axial>,
     direction: Axial,
@@ -53,22 +53,17 @@ pub fn selected_front_edges(
     if edges.is_empty() {
         return Err(FrontSelectionError::NoEligibleFront);
     }
-
-    let active_sources = edges.iter().map(|edge| edge.source).collect();
-    if !is_connected(&active_sources) {
-        return Err(FrontSelectionError::DisconnectedFront);
-    }
     Ok(edges)
 }
 
 /// Derives every eligible outward edge around a selected source region.
 ///
-/// Unlike [`selected_front_edges`], this operation has no orientation and its
-/// active boundary is allowed to contain multiple disconnected arcs. The
-/// selected source region itself must still be six-connected. Callers decide
-/// eligibility, which lets the authoritative simulation restrict expansion to
-/// neutral, passable, capturable ground without coupling this pure crate to a
-/// particular ownership policy.
+/// Unlike [`selected_front_edges`], this operation has no orientation and
+/// considers all six sides. Its active boundary may contain multiple
+/// disconnected arcs, while the selected source region itself must still be
+/// six-connected. Callers decide eligibility, which lets the authoritative
+/// simulation restrict expansion to neutral, passable, capturable ground
+/// without coupling this pure crate to a particular ownership policy.
 pub fn selected_all_front_edges(
     sources: &BTreeSet<Axial>,
     mut target_is_eligible: impl FnMut(Axial, Axial) -> bool,
@@ -164,19 +159,31 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_source_or_front_is_rejected() {
+    fn a_disconnected_source_region_is_rejected() {
         let disconnected_sources = BTreeSet::from([Axial::ZERO, Axial::new(2, 0)]);
         assert_eq!(
             selected_front_edges(&disconnected_sources, Axial::new(1, 0), |_, _| true),
             Err(FrontSelectionError::DisconnectedSelection)
         );
+    }
 
+    #[test]
+    fn separated_eligible_arcs_share_one_connected_source_region() {
         let connected_sources =
             BTreeSet::from([Axial::new(0, -1), Axial::new(0, 0), Axial::new(0, 1)]);
         assert_eq!(
             selected_front_edges(&connected_sources, Axial::new(1, 0), |source, _| source.r
                 != 0,),
-            Err(FrontSelectionError::DisconnectedFront)
+            Ok(vec![
+                DirectedFrontEdge {
+                    source: Axial::new(0, -1),
+                    target: Axial::new(1, -1),
+                },
+                DirectedFrontEdge {
+                    source: Axial::new(0, 1),
+                    target: Axial::new(1, 1),
+                },
+            ])
         );
     }
 

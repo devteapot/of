@@ -10,8 +10,10 @@ Troops are scalar strength physically located on hexes. A player selects one
 connected owned region, holds `P`, drags toward one of six directions, and
 previews the initial edges of a sustained front before confirming. Selected
 cells facing neutral or enemy territory in that direction form the front; the
-other connected selected cells behind it form the reinforcement corridor. Rear
-troops route only through that corridor before feeding fixed-direction lanes.
+eligible cells may form several disconnected arcs, each of which seeds
+fixed-direction lanes independently. The other selected cells behind them form
+the reinforcement corridor. Rear troops route only through that corridor and
+must be able to reach at least one active arc before feeding its lanes.
 Strength moves subject to hex capacity, edge throughput, elevation, cliffs,
 combat frontage, resistance, and terrain-scaled garrisons. It never teleports.
 
@@ -20,12 +22,13 @@ combat frontage, resistance, and terrain-scaled garrisons. It never teleports.
 1. Join one of two human player slots and see connection/match status.
 2. Pan, rotate, and zoom an orthographic 3D camera over a stepped hex island.
 3. Hover a hex and inspect coordinate, terrain, elevation, owner, civilians, infantry, capacity, and occupancy percentage.
-4. Paint one connected owned source region, including a border section and any
-   reinforcement corridor extending backward into owned territory.
+4. Paint one connected owned source region, including its intended border arcs
+   and any reinforcement corridor extending backward into owned territory.
 5. Hold `P`, drag outward, and release to choose one exact hex direction.
-6. Preview one connected active front, its exact initial edges, selected-only
-   corridor routes, estimated arrival time, bottlenecks, resistance, garrison
-   cost, and committed troop amount.
+6. Preview every eligible active front arc, its exact initial edges,
+   selected-only corridor routes, estimated arrival time, bottlenecks,
+   resistance, garrison cost, and committed troop amount. Disconnected arcs are
+   valid when every selected cell can reach at least one of them internally.
 7. Confirm the sustained Push Front command or stop a matching active push.
    Each axial lane continues independently until its committed pool is
    exhausted, blocked, defeated, reaches the map edge, or is manually cancelled.
