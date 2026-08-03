@@ -5,7 +5,8 @@ a stepped 2.5D hex world. Players select a connected owned region, then either
 push one oriented section of its border or expand across every neutral boundary
 instead of selecting individual soldiers or painting destination cells. Terrain
 height, military capacity, edge throughput, combat frontage, garrisons,
-resistance, and travel time determine how far each lane advances.
+resistance, and travel time determine how far each Push lane or wave branch
+advances.
 
 The project intentionally has no settled title, fiction, or production art yet.
 V1 is a graybox built to test the Push Front, troop-flow, and redistribution
@@ -21,8 +22,8 @@ loop.
 - Sustained directional Push Front orders with spatial conservation,
   lane-by-lane resistance, congestion, and manual cancellation.
 - Neutral-only Expand All orders that dispatch one selected percentage, route
-  rear troops to their nearest boundary, split local forks evenly, and let each
-  resulting lane advance independently.
+  strength outward through a branching selected-region flow, merge converging
+  contributions, and continue as an independently advancing perimeter wave.
 - Percentage-aware one-shot Balance, oriented Front-load, Core-load, and
   Perimeter-load redistribution.
 - Height-aware movement, impassable cliffs, uphill combat penalties, edge
@@ -160,10 +161,14 @@ color blends controller and attacker pressure for readability.
 
 Expand All uses the same connected selection without an orientation. Every
 selected cell contributes the chosen dispatch percentage of its currently
-unallocated soldiers once; rear strength routes to its nearest eligible neutral
-boundary, each local boundary pool is divided evenly among its exits, and the
-straight lanes continue independently.
-Expand All never attacks: a lane stops before enemy territory. Use directional
+unallocated soldiers once. Inside the selection, each local pool splits evenly
+among every traversable neighbor one depth closer to an eligible neutral
+boundary; contributions merge wherever those branches meet. Boundary pools
+then split across their neutral exits, and repeat the same split-and-merge rule
+through successive outward perimeter layers. Local branches advance
+independently, so terrain, throughput, capacity, and garrison costs may make the
+wave bulge rather than form a globally even ring.
+Expand All never attacks: a branch stops before enemy territory. Use directional
 Push Front when enemy contact or a deliberate direction is intended. The
 mobilization slider controls future civilian recruitment and does not change
 the percentage dispatched by an order.

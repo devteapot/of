@@ -1,12 +1,11 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
 };
 
 use hex_core::{
     Axial, DistributionPreset, FrontSelectionError, HexMap, MovementConfig, ground_traversal,
     redistribution_targets_with_commitment, selected_all_front_edges, selected_front_edges,
-    unique_target_front_edges,
 };
 use spacetimedb::{ReducerContext, Table};
 
@@ -16,11 +15,12 @@ use crate::rules::{
     route_to, state, terrain, write_receipt,
 };
 use crate::schema::{
-    NEUTRAL_PLAYER, OrderKind, OrderStatus, ReceiptStatus, TransferDestination, TransferOrder,
-    TransferSource, TransitPacket,
+    EXPANSION_AGGREGATE_ORIGIN, ExpansionWave, NEUTRAL_PLAYER, OrderKind, OrderStatus,
+    ReceiptStatus, TransferDestination, TransferOrder, TransferSource, TransitPacket,
 };
 use crate::schema::{
-    mobilization_policy, transfer_destination, transfer_order, transfer_source, transit_packet,
+    expansion_wave, mobilization_policy, transfer_destination, transfer_order, transfer_source,
+    transit_packet,
 };
 
 #[derive(Clone)]
@@ -39,10 +39,12 @@ struct PlannedDistribution {
     amount: u64,
 }
 
-struct ExpandContribution {
-    source: u32,
-    internal_route: Vec<u32>,
-    amount: u64,
+struct PlannedExpansion {
+    selected_cells: Vec<u32>,
+    seed_depths: Vec<u16>,
+    outside_depths: Vec<u16>,
+    commitments: BTreeMap<u32, u64>,
+    requested: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -172,8 +174,7 @@ pub fn issue_push_front(
 }
 
 /// Commits one fixed share of every selected cell's currently unallocated
-/// infantry to all eligible neutral boundaries around the selected region.
-/// Each resulting lane sustains its initial outward direction independently.
+/// infantry to a branching perimeter wave around the selected region.
 #[spacetimedb::reducer]
 pub fn issue_expand_all(
     ctx: &ReducerContext,
@@ -185,20 +186,8 @@ pub fn issue_expand_all(
     if command_was_seen(ctx, player_id, client_command_id) {
         return Ok(());
     }
-    let result = plan_expand_all(ctx, player_id, &selected_cells, commitment_bps).and_then(
-        |(requested, legs)| {
-            persist_order(
-                ctx,
-                player_id,
-                client_command_id,
-                OrderKind::ExpandAll,
-                requested,
-                Axial::ZERO,
-                legs,
-            )
-            .map(Some)
-        },
-    );
+    let result = plan_expand_all(ctx, player_id, &selected_cells, commitment_bps)
+        .and_then(|plan| persist_expand_order(ctx, player_id, client_command_id, plan).map(Some));
     receipt_result(
         ctx,
         player_id,
@@ -493,13 +482,14 @@ fn plan_expand_all(
     player_id: u8,
     selected_cells: &[u32],
     commitment_bps: u32,
-) -> Result<(u64, Vec<PlannedLeg>), String> {
+) -> Result<PlannedExpansion, String> {
     validate_basis_points(commitment_bps, "expand commitment")?;
 
     let selected_ids = unique_selection(selected_cells, "expand source")?;
-    let mut selected_map = HexMap::new();
     let mut coordinate_to_id = BTreeMap::new();
-    for cell_id in selected_ids {
+    let mut commitments = BTreeMap::new();
+    let mut requested = 0_u64;
+    for cell_id in selected_ids.iter().copied() {
         let terrain_row = terrain(ctx, cell_id)?;
         let cell = core_cell(ctx, cell_id)?;
         if !terrain_row.passable || cell.owner != Some(u32::from(player_id)) {
@@ -508,7 +498,12 @@ fn plan_expand_all(
             ));
         }
         coordinate_to_id.insert(cell.coordinate, cell_id);
-        selected_map.insert(cell);
+        let allocated = allocated_infantry_at_cell(ctx, player_id, cell_id);
+        let commitment = basis_point_share(cell.force().saturating_sub(allocated), commitment_bps);
+        requested = requested
+            .checked_add(commitment)
+            .ok_or_else(|| "expand requested infantry overflow".to_string())?;
+        commitments.insert(cell_id, commitment);
     }
     let selected_coordinates = coordinate_to_id.keys().copied().collect::<BTreeSet<_>>();
     let match_config = config(ctx)?;
@@ -542,109 +537,136 @@ fn plan_expand_all(
         eligible_targets.contains_key(&(source, target))
     })
     .map_err(expand_selection_message)?;
-    let edges = unique_target_front_edges(&edges);
-    let mut outgoing_by_boundary = BTreeMap::<Axial, Vec<(Axial, u32)>>::new();
-    for edge in edges {
-        outgoing_by_boundary
-            .entry(edge.source)
-            .or_default()
-            .push((edge.target, eligible_targets[&(edge.source, edge.target)]));
-    }
-    for outgoing in outgoing_by_boundary.values_mut() {
-        outgoing.sort_unstable();
-    }
-
-    let movement = MovementConfig {
-        max_elevation_step: u16::from(match_config.max_elevation_step),
-        level_cost: 10,
-        uphill_cost: 15,
-        downhill_cost: 10,
-    };
-    let boundary_sources = outgoing_by_boundary
-        .keys()
-        .copied()
+    let boundary_cells = edges
+        .iter()
+        .map(|edge| coordinate_to_id[&edge.source])
         .collect::<BTreeSet<_>>();
-    let routes = front_route_tree(&selected_map, &boundary_sources, &movement);
-    if routes.labels.len() != selected_coordinates.len() {
-        return Err(
-            "expand selection is split from its neutral boundary by an internal cliff".into(),
-        );
-    }
+    let first_ring = edges
+        .iter()
+        .map(|edge| eligible_targets[&(edge.source, edge.target)])
+        .collect::<BTreeSet<_>>();
+    let seed_depth_by_id =
+        seed_inward_depths(ctx, &coordinate_to_id, &boundary_cells, &selected_ids)?;
 
-    let mut requested = 0_u64;
-    let mut contributions_by_boundary = BTreeMap::<Axial, Vec<ExpandContribution>>::new();
-    for (&source_coordinate, &source_id) in &coordinate_to_id {
-        let source = cell_state(ctx, source_id)?;
-        let (boundary, route_coordinates) = routes
-            .route_to_boundary(source_coordinate)
-            .ok_or_else(|| format!("expand source cell {source_id} cannot reach a boundary"))?;
-        let allocated = allocated_infantry_at_cell(ctx, player_id, source_id);
-        let available = source.infantry.saturating_sub(allocated);
-        let commitment = basis_point_share(available, commitment_bps);
-        requested = requested
-            .checked_add(commitment)
-            .ok_or_else(|| "expand requested infantry overflow".to_string())?;
-        if commitment == 0 {
-            continue;
-        }
-
-        let internal_route = route_coordinates
-            .into_iter()
-            .map(|coordinate| {
-                coordinate_to_id
-                    .get(&coordinate)
-                    .copied()
-                    .ok_or_else(|| "expand route escaped the selected region".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        contributions_by_boundary
-            .entry(boundary)
-            .or_default()
-            .push(ExpandContribution {
-                source: source_id,
-                internal_route,
-                amount: commitment,
-            });
-    }
+    let cell_count = usize::from(match_config.map_width)
+        .checked_mul(usize::from(match_config.map_height))
+        .ok_or_else(|| "map cell count overflow".to_string())?;
+    let outside_depths = outside_wave_depths(
+        ctx,
+        &match_config,
+        player_id,
+        &selected_ids,
+        &first_ring,
+        cell_count,
+    )?;
 
     if requested == 0 {
         return Err("the expand selection has no uncommitted infantry at this commitment".into());
     }
-    let mut legs = Vec::new();
-    for (boundary, contributions) in contributions_by_boundary {
-        let outgoing = outgoing_by_boundary
-            .get(&boundary)
-            .ok_or_else(|| "expand route ended at an unknown boundary".to_string())?;
-        let amounts = contributions
-            .iter()
-            .map(|contribution| contribution.amount)
-            .collect::<Vec<_>>();
-        for (contribution_index, lane_index, amount) in
-            aggregate_lane_allocations(&amounts, outgoing.len())?
-        {
-            let contribution = &contributions[contribution_index];
-            let target_id = outgoing[lane_index].1;
-            let mut route = contribution.internal_route.clone();
-            route.push(target_id);
-            legs.push(PlannedLeg {
-                source: contribution.source,
-                destination: target_id,
-                amount,
-                route,
-            });
+    let selected_cells = selected_ids.into_iter().collect::<Vec<_>>();
+    let seed_depths = selected_cells
+        .iter()
+        .map(|cell_id| seed_depth_by_id[cell_id])
+        .collect();
+    Ok(PlannedExpansion {
+        selected_cells,
+        seed_depths,
+        outside_depths,
+        commitments,
+        requested,
+    })
+}
+
+fn seed_inward_depths(
+    ctx: &ReducerContext,
+    coordinate_to_id: &BTreeMap<Axial, u32>,
+    boundary_cells: &BTreeSet<u32>,
+    selected_ids: &BTreeSet<u32>,
+) -> Result<BTreeMap<u32, u16>, String> {
+    let mut depths = BTreeMap::new();
+    let mut pending = VecDeque::new();
+    for &cell_id in boundary_cells {
+        depths.insert(cell_id, 0_u16);
+        pending.push_back(cell_id);
+    }
+    while let Some(current_id) = pending.pop_front() {
+        let current_depth = depths[&current_id];
+        let current_coordinate = coordinate_for_cell(ctx, current_id)?;
+        let mut neighbors = current_coordinate.neighbors();
+        neighbors.sort_unstable();
+        for neighbor_coordinate in neighbors {
+            let Some(&neighbor_id) = coordinate_to_id.get(&neighbor_coordinate) else {
+                continue;
+            };
+            if depths.contains_key(&neighbor_id)
+                || edge_runtime_limits(ctx, neighbor_id, current_id)?.is_none()
+            {
+                continue;
+            }
+            let depth = current_depth
+                .checked_add(1)
+                .ok_or_else(|| "expand seed depth overflow".to_string())?;
+            depths.insert(neighbor_id, depth);
+            pending.push_back(neighbor_id);
         }
     }
-    let committed = legs.iter().try_fold(0_u64, |total, leg| {
-        total
-            .checked_add(leg.amount)
-            .ok_or_else(|| "expand committed infantry overflow".to_string())
-    })?;
-    if committed != requested {
-        return Err(format!(
-            "expand planning violates infantry conservation: requested {requested}, committed {committed}"
-        ));
+    if depths.len() != selected_ids.len() {
+        return Err("expand selection is split from its perimeter by an internal cliff".into());
     }
-    Ok((requested, legs))
+    Ok(depths)
+}
+
+fn outside_wave_depths(
+    ctx: &ReducerContext,
+    match_config: &crate::schema::MatchConfig,
+    player_id: u8,
+    selected_ids: &BTreeSet<u32>,
+    first_ring: &BTreeSet<u32>,
+    cell_count: usize,
+) -> Result<Vec<u16>, String> {
+    let mut depths = vec![u16::MAX; cell_count];
+    let mut pending = VecDeque::new();
+    for &cell_id in first_ring {
+        let index =
+            usize::try_from(cell_id).map_err(|_| "cell id does not fit usize".to_string())?;
+        let depth = depths
+            .get_mut(index)
+            .ok_or_else(|| format!("first-ring cell {cell_id} is outside the map"))?;
+        *depth = 1;
+        pending.push_back(cell_id);
+    }
+    while let Some(current_id) = pending.pop_front() {
+        let current_depth = depths[current_id as usize];
+        let current_coordinate = coordinate_for_cell(ctx, current_id)?;
+        let mut neighbors = current_coordinate.neighbors();
+        neighbors.sort_unstable();
+        for neighbor_coordinate in neighbors {
+            let Some(neighbor_id) =
+                crate::rules::cell_id_for_coordinate(match_config, neighbor_coordinate)
+            else {
+                continue;
+            };
+            if selected_ids.contains(&neighbor_id) || depths[neighbor_id as usize] != u16::MAX {
+                continue;
+            }
+            let target = terrain(ctx, neighbor_id)?;
+            let target_owner = cell_state(ctx, neighbor_id)?.owner_player_id;
+            if !target.passable
+                || !target.capturable
+                || !matches!(target_owner, NEUTRAL_PLAYER) && target_owner != player_id
+                || edge_runtime_limits(ctx, current_id, neighbor_id)?.is_none()
+            {
+                continue;
+            }
+            let depth = current_depth
+                .checked_add(1)
+                .filter(|depth| *depth != u16::MAX)
+                .ok_or_else(|| "expand outside depth overflow".to_string())?;
+            depths[neighbor_id as usize] = depth;
+            pending.push_back(neighbor_id);
+        }
+    }
+    Ok(depths)
 }
 
 fn expand_target_is_eligible(
@@ -656,6 +678,7 @@ fn expand_target_is_eligible(
     target_owner == NEUTRAL_PLAYER && passable && capturable && traversable
 }
 
+#[cfg(test)]
 fn even_partition_at(total: u64, parts: usize, index: usize) -> u64 {
     debug_assert!(parts > 0);
     debug_assert!(index < parts);
@@ -663,13 +686,23 @@ fn even_partition_at(total: u64, parts: usize, index: usize) -> u64 {
     total / parts_u64 + u64::from((index as u64) < total % parts_u64)
 }
 
-/// Splits the aggregate boundary pool into even lane quotas, then consumes the
-/// sorted source contributions into those quotas. Taking remainders only once
-/// per boundary prevents many small sources from all favoring the first lane.
+/// Splits one aggregate wave-node pool into even child quotas, then consumes
+/// sorted contributions into those quotas. The persisted cursor rotates the
+/// integer remainder so asynchronous small arrivals remain unbiased over time.
+#[cfg(test)]
 fn aggregate_lane_allocations(
     contribution_amounts: &[u64],
     lane_count: usize,
 ) -> Result<Vec<(usize, usize, u64)>, String> {
+    aggregate_lane_allocations_rotated(contribution_amounts, lane_count, 0)
+        .map(|(allocations, _)| allocations)
+}
+
+pub(crate) fn aggregate_lane_allocations_rotated(
+    contribution_amounts: &[u64],
+    lane_count: usize,
+    start_cursor: usize,
+) -> Result<(LaneAllocations, usize), String> {
     if lane_count == 0 {
         return Err("expand boundary has no outgoing lanes".into());
     }
@@ -677,9 +710,13 @@ fn aggregate_lane_allocations(
         sum.checked_add(*amount)
             .ok_or_else(|| "expand boundary pool overflow".to_string())
     })?;
-    let mut lane_remaining = (0..lane_count)
-        .map(|index| even_partition_at(total, lane_count, index))
-        .collect::<Vec<_>>();
+    let base = total / lane_count as u64;
+    let remainder = (total % lane_count as u64) as usize;
+    let cursor = start_cursor % lane_count;
+    let mut lane_remaining = vec![base; lane_count];
+    for offset in 0..remainder {
+        lane_remaining[(cursor + offset) % lane_count] += 1;
+    }
     let mut allocations = Vec::new();
     let mut lane_index = 0;
     for (contribution_index, &amount) in contribution_amounts.iter().enumerate() {
@@ -700,8 +737,10 @@ fn aggregate_lane_allocations(
     if lane_remaining.iter().any(|remaining| *remaining != 0) {
         return Err("expand lane quotas left committed strength unassigned".into());
     }
-    Ok(allocations)
+    Ok((allocations, (cursor + remainder) % lane_count))
 }
+
+pub(crate) type LaneAllocations = Vec<(usize, usize, u64)>;
 
 fn expand_selection_message(error: FrontSelectionError) -> String {
     match error {
@@ -1085,6 +1124,76 @@ fn persist_order(
     Ok(order.order_id)
 }
 
+fn persist_expand_order(
+    ctx: &ReducerContext,
+    player_id: u8,
+    client_command_id: u64,
+    plan: PlannedExpansion,
+) -> Result<u64, String> {
+    if plan.requested == 0 {
+        return Err("expand order has no committed infantry".into());
+    }
+    if plan.selected_cells.len() != plan.seed_depths.len() {
+        return Err("expand topology has mismatched seed vectors".into());
+    }
+    if plan.selected_cells.contains(&EXPANSION_AGGREGATE_ORIGIN) {
+        return Err("map cell id collides with the expansion aggregate sentinel".into());
+    }
+
+    let logical_step = state(ctx)?.logical_step;
+    let order = ctx.db.transfer_order().insert(TransferOrder {
+        order_id: 0,
+        player_id,
+        client_command_id,
+        kind: OrderKind::ExpandAll,
+        status: OrderStatus::Active,
+        requested_infantry: plan.requested,
+        committed_infantry: plan.requested,
+        in_transit_infantry: plan.requested,
+        delivered_infantry: 0,
+        casualty_infantry: 0,
+        orientation_q: 0,
+        orientation_r: 0,
+        created_step: logical_step,
+        updated_step: logical_step,
+    });
+
+    for &cell_id in &plan.selected_cells {
+        let infantry = plan.commitments.get(&cell_id).copied().unwrap_or(0);
+        ctx.db.transfer_source().insert(TransferSource {
+            source_key: format!("{}:{cell_id}", order.order_id),
+            order_id: order.order_id,
+            cell_id,
+            committed_infantry: infantry,
+            queued_infantry: infantry,
+        });
+        if infantry == 0 {
+            continue;
+        }
+        let key = packet_key(order.order_id, cell_id, cell_id, cell_id, 0);
+        ctx.db.transit_packet().insert(TransitPacket {
+            packet_key: key,
+            order_id: order.order_id,
+            owner_player_id: player_id,
+            origin_cell: cell_id,
+            current_cell: cell_id,
+            destination_cell: cell_id,
+            infantry,
+            route_index: 0,
+            route: vec![cell_id],
+            updated_step: logical_step,
+        });
+    }
+    ctx.db.expansion_wave().insert(ExpansionWave {
+        order_id: order.order_id,
+        selected_cells: plan.selected_cells,
+        seed_depths: plan.seed_depths,
+        split_cursors: vec![0; plan.outside_depths.len()],
+        outside_depths: plan.outside_depths,
+    });
+    Ok(order.order_id)
+}
+
 fn cancel_matching_pushes(
     ctx: &ReducerContext,
     player_id: u8,
@@ -1217,6 +1326,7 @@ fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<()
             ctx.db.transfer_source().source_key().update(source);
         }
     }
+    ctx.db.expansion_wave().order_id().delete(order_id);
     Ok(())
 }
 
@@ -1411,5 +1521,37 @@ mod tests {
 
         assert_eq!(lane_totals, [34, 34, 33]);
         assert!(source_totals.iter().all(|amount| *amount == 1));
+    }
+
+    #[test]
+    fn central_wave_node_splits_equally_across_all_six_neighbors() {
+        let allocations = aggregate_lane_allocations(&[600], 6).unwrap();
+        let mut totals = [0_u64; 6];
+        for (_, lane, amount) in allocations {
+            totals[lane] += amount;
+        }
+        assert_eq!(totals, [100; 6]);
+    }
+
+    #[test]
+    fn asynchronous_single_strength_arrivals_rotate_across_every_child() {
+        let mut cursor = 0;
+        let mut totals = [0_u64; 6];
+        for _ in 0..6 {
+            let (allocations, next_cursor) =
+                aggregate_lane_allocations_rotated(&[1], 6, cursor).unwrap();
+            for (_, lane, amount) in allocations {
+                totals[lane] += amount;
+            }
+            cursor = next_cursor;
+        }
+        assert_eq!(totals, [1; 6]);
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn perfectly_divisible_split_does_not_dirty_the_remainder_cursor() {
+        let (_, next_cursor) = aggregate_lane_allocations_rotated(&[12], 6, 4).unwrap();
+        assert_eq!(next_cursor, 4);
     }
 }

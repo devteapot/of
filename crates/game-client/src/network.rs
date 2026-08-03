@@ -6,14 +6,14 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
 };
 
 use bevy::prelude::*;
 use hex_core::{
     Axial, Cell, DirectedFrontEdge, DistributionPreset as CoreDistributionPreset, ForceComposition,
     FrontSelectionError, HexMap, redistribution_targets_with_commitment, selected_all_front_edges,
-    selected_front_edges, unique_target_front_edges,
+    selected_front_edges,
 };
 
 use crate::{
@@ -417,7 +417,7 @@ pub(crate) fn expand_all_front_edges(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
 ) -> Result<Vec<DirectedFrontEdge>, FrontSelectionError> {
-    let edges = selected_all_front_edges(sources, |source, target| {
+    selected_all_front_edges(sources, |source, target| {
         let Some(source_cell) = view.cell(source) else {
             return false;
         };
@@ -429,10 +429,326 @@ pub(crate) fn expand_all_front_edges(
                     .unsigned_abs()
                     <= 1
         })
-    })?;
-    // Concave selections can expose the same target from more than one source.
-    // Match the authoritative target-keyed lane identity exactly.
-    Ok(unique_target_front_edges(&edges))
+    })
+}
+
+pub(crate) const MAX_WAVE_PREVIEW_RINGS: u16 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpandWaveError {
+    Front(FrontSelectionError),
+    InternalRoute,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExpandWaveTopology {
+    initial_edges: Vec<DirectedFrontEdge>,
+    selected_depth: BTreeMap<Axial, u16>,
+    outside_depth: BTreeMap<Axial, u16>,
+    outgoing: BTreeMap<Axial, Vec<Axial>>,
+    parents: BTreeMap<Axial, Vec<Axial>>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExpandWaveForecast {
+    pub initial_edges: Vec<DirectedFrontEdge>,
+    pub reached_depth: BTreeMap<Axial, u16>,
+    pub max_internal_depth: u16,
+    pub strength_upper_bound: u64,
+    pub first_ring_capacity: u64,
+    pub truncated: bool,
+}
+
+fn build_expand_wave_topology(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    max_rings: Option<u16>,
+) -> Result<ExpandWaveTopology, ExpandWaveError> {
+    let initial_edges = expand_all_front_edges(view, sources).map_err(ExpandWaveError::Front)?;
+    let boundary = initial_edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    let selected_depth = selected_depths_to_boundary(view, sources, &boundary);
+    if selected_depth.len() != sources.len() {
+        return Err(ExpandWaveError::InternalRoute);
+    }
+
+    let mut topology = ExpandWaveTopology {
+        initial_edges: initial_edges.clone(),
+        selected_depth,
+        ..Default::default()
+    };
+
+    // Inside the selected seed, strength moves down every shortest local
+    // depth. A central pool can therefore branch, and equal-depth routes merge
+    // naturally before reaching the outside perimeter.
+    for &source in sources {
+        let depth = topology.selected_depth[&source];
+        if depth == 0 {
+            continue;
+        }
+        for neighbor in source.neighbors() {
+            if topology.selected_depth.get(&neighbor) == Some(&(depth - 1))
+                && wave_edge_is_traversable(view, source, neighbor)
+            {
+                topology.outgoing.entry(source).or_default().push(neighbor);
+            }
+        }
+    }
+
+    let mut first_ring = BTreeSet::new();
+    for edge in initial_edges {
+        topology
+            .outgoing
+            .entry(edge.source)
+            .or_default()
+            .push(edge.target);
+        topology.outside_depth.insert(edge.target, 1);
+        first_ring.insert(edge.target);
+    }
+
+    let ring_limit = max_rings.unwrap_or(u16::MAX);
+    let mut depth = 1_u16;
+    let mut frontier = first_ring;
+    while !frontier.is_empty() {
+        let candidates = next_wave_ring(view, sources, &topology.outside_depth, &frontier);
+        if candidates.is_empty() {
+            break;
+        }
+        if depth >= ring_limit {
+            topology.truncated = true;
+            break;
+        }
+        let next_depth = depth.saturating_add(1);
+        let mut next_frontier = BTreeSet::new();
+        for (target, parents) in candidates {
+            topology.outside_depth.insert(target, next_depth);
+            next_frontier.insert(target);
+            for parent in parents {
+                topology.outgoing.entry(parent).or_default().push(target);
+            }
+        }
+        frontier = next_frontier;
+        depth = next_depth;
+    }
+
+    for children in topology.outgoing.values_mut() {
+        children.sort_unstable();
+        children.dedup();
+    }
+    for (&parent, children) in &topology.outgoing {
+        for &child in children {
+            topology.parents.entry(child).or_default().push(parent);
+        }
+    }
+    for parents in topology.parents.values_mut() {
+        parents.sort_unstable();
+        parents.dedup();
+    }
+    Ok(topology)
+}
+
+fn selected_depths_to_boundary(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    boundary: &BTreeSet<Axial>,
+) -> BTreeMap<Axial, u16> {
+    let mut depths = BTreeMap::new();
+    let mut pending = VecDeque::new();
+    for &coordinate in boundary {
+        depths.insert(coordinate, 0_u16);
+        pending.push_back(coordinate);
+    }
+    while let Some(current) = pending.pop_front() {
+        let next_depth = depths[&current].saturating_add(1);
+        for neighbor in current.neighbors() {
+            if sources.contains(&neighbor)
+                && !depths.contains_key(&neighbor)
+                && wave_edge_is_traversable(view, current, neighbor)
+            {
+                depths.insert(neighbor, next_depth);
+                pending.push_back(neighbor);
+            }
+        }
+    }
+    depths
+}
+
+fn next_wave_ring(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    visited: &BTreeMap<Axial, u16>,
+    frontier: &BTreeSet<Axial>,
+) -> BTreeMap<Axial, BTreeSet<Axial>> {
+    let mut candidates = BTreeMap::<Axial, BTreeSet<Axial>>::new();
+    for &parent in frontier {
+        for target in parent.neighbors() {
+            if sources.contains(&target)
+                || visited.contains_key(&target)
+                || !wave_continuation_target_is_eligible(view, parent, target)
+            {
+                continue;
+            }
+            candidates.entry(target).or_default().insert(parent);
+        }
+    }
+    candidates
+}
+
+fn wave_edge_is_traversable(view: &MatchView, from: Axial, to: Axial) -> bool {
+    view.cell(from)
+        .zip(view.cell(to))
+        .is_some_and(|(from, to)| {
+            from.is_land()
+                && to.is_land()
+                && !from.blocked
+                && !to.blocked
+                && (i32::from(from.elevation) - i32::from(to.elevation)).unsigned_abs() <= 1
+        })
+}
+
+fn wave_continuation_target_is_eligible(view: &MatchView, from: Axial, target: Axial) -> bool {
+    wave_edge_is_traversable(view, from, target)
+        && view
+            .cell(target)
+            .is_some_and(|cell| cell.owner.is_none() || cell.owner == Some(view.local_player))
+}
+
+fn boundary_strength_pools(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    commitment_percent: u8,
+    topology: &ExpandWaveTopology,
+) -> (u64, BTreeMap<Axial, u64>, BTreeMap<Axial, u64>) {
+    let percentage = u64::from(commitment_percent.clamp(10, 100));
+    let requested_by_source = sources
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| {
+            (
+                cell.coordinate,
+                cell.infantry.saturating_mul(percentage) / 100,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let requested = requested_by_source.values().copied().sum();
+    let mut pools = requested_by_source.clone();
+    let max_depth = topology.selected_depth.values().copied().max().unwrap_or(0);
+    for depth in (1..=max_depth).rev() {
+        let layer = topology
+            .selected_depth
+            .iter()
+            .filter_map(|(&coordinate, &coordinate_depth)| {
+                (coordinate_depth == depth).then_some(coordinate)
+            })
+            .collect::<Vec<_>>();
+        for coordinate in layer {
+            let amount = pools.remove(&coordinate).unwrap_or(0);
+            distribute_evenly(
+                amount,
+                topology
+                    .outgoing
+                    .get(&coordinate)
+                    .map_or(&[][..], Vec::as_slice),
+                &mut pools,
+            );
+        }
+    }
+    (requested, requested_by_source, pools)
+}
+
+fn distribute_evenly(total: u64, targets: &[Axial], incoming: &mut BTreeMap<Axial, u64>) {
+    if total == 0 || targets.is_empty() {
+        return;
+    }
+    let count = u64::try_from(targets.len()).expect("wave branch count fits u64");
+    let base = total / count;
+    let remainder = total % count;
+    for (index, &target) in targets.iter().enumerate() {
+        let share =
+            base + u64::from(u64::try_from(index).expect("wave branch index fits u64") < remainder);
+        let target_pool = incoming.entry(target).or_default();
+        *target_pool = target_pool.saturating_add(share);
+    }
+}
+
+pub(crate) fn forecast_expand_wave(
+    view: &MatchView,
+    sources: &BTreeSet<Axial>,
+    commitment_percent: u8,
+    max_rings: u16,
+) -> Result<ExpandWaveForecast, ExpandWaveError> {
+    let topology = build_expand_wave_topology(view, sources, Some(max_rings))?;
+    let (strength_upper_bound, _, boundary_pools) =
+        boundary_strength_pools(view, sources, commitment_percent, &topology);
+    let mut incoming = BTreeMap::new();
+    for (boundary, amount) in boundary_pools {
+        distribute_evenly(
+            amount,
+            topology
+                .outgoing
+                .get(&boundary)
+                .map_or(&[][..], Vec::as_slice),
+            &mut incoming,
+        );
+    }
+
+    let mut reached_cells = BTreeMap::new();
+    let mut forecast_truncated = false;
+    let max_depth = topology.outside_depth.values().copied().max().unwrap_or(0);
+    for depth in 1..=max_depth {
+        let current = std::mem::take(&mut incoming);
+        for (coordinate, amount) in current {
+            if amount == 0 || topology.outside_depth.get(&coordinate) != Some(&depth) {
+                continue;
+            }
+            reached_cells.insert(coordinate, depth);
+            let cell = view.cell(coordinate).expect("wave topology cell exists");
+            let mobile = if cell.owner.is_none() {
+                amount.saturating_sub(occupation_garrison(cell).min(amount))
+            } else {
+                amount
+            };
+            let children = topology
+                .outgoing
+                .get(&coordinate)
+                .map_or(&[][..], Vec::as_slice);
+            if children.is_empty() {
+                forecast_truncated |= topology.truncated && depth == max_depth && mobile > 0;
+            } else {
+                distribute_evenly(mobile, children, &mut incoming);
+            }
+        }
+    }
+
+    // Draw complete geometric bands through the furthest depth that any
+    // forecast strength reaches. This keeps the preview a continuous
+    // perimeter wave instead of turning low integer shares into radial dots.
+    let reached_max_depth = reached_cells.values().copied().max().unwrap_or(0);
+    let reached_depth = topology
+        .outside_depth
+        .iter()
+        .filter_map(|(&coordinate, &depth)| {
+            (depth <= reached_max_depth).then_some((coordinate, depth))
+        })
+        .collect();
+    let first_ring_capacity = topology
+        .outside_depth
+        .iter()
+        .filter_map(|(&coordinate, &depth)| (depth == 1).then_some(coordinate))
+        .filter_map(|coordinate| view.cell(coordinate))
+        .map(|cell| cell.military_capacity)
+        .sum();
+    Ok(ExpandWaveForecast {
+        initial_edges: topology.initial_edges,
+        reached_depth,
+        max_internal_depth: topology.selected_depth.values().copied().max().unwrap_or(0),
+        strength_upper_bound,
+        first_ring_capacity,
+        truncated: forecast_truncated,
+    })
 }
 
 fn resolve_expand_all(
@@ -454,42 +770,20 @@ fn resolve_expand_all(
         );
     }
 
-    let edges = match expand_all_front_edges(view, sources) {
-        Ok(edges) => edges,
-        Err(error) => {
+    let topology = match build_expand_wave_topology(view, sources, None) {
+        Ok(topology) => topology,
+        Err(ExpandWaveError::Front(error)) => {
             return rejection(expand_error_message(error), sources.first().copied());
         }
+        Err(ExpandWaveError::InternalRoute) => {
+            return rejection(
+                "Every selected source must reach the perimeter inside the selection",
+                sources.first().copied(),
+            );
+        }
     };
-    let front_sources = edges
-        .iter()
-        .map(|edge| edge.source)
-        .collect::<BTreeSet<_>>();
-    let assignments = selected_front_assignments(view, sources, &front_sources);
-    if assignments.len() != sources.len() {
-        let relevant = sources
-            .iter()
-            .find(|source| !assignments.contains_key(source))
-            .copied();
-        return rejection(
-            "Every selected source must reach a neutral frontier inside the selection",
-            relevant,
-        );
-    }
-
-    // Snapshot one percentage of each selected stack exactly once. Boundary
-    // forks split this fixed pool; they never clone the commitment per edge.
-    let percentage = u64::from(commitment_percent.clamp(10, 100));
-    let requested_by_source = sources
-        .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| {
-            (
-                cell.coordinate,
-                cell.infantry.saturating_mul(percentage) / 100,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let committed = requested_by_source.values().copied().sum::<u64>();
+    let (committed, requested_by_source, boundary_pools) =
+        boundary_strength_pools(view, sources, commitment_percent, &topology);
     if committed == 0 {
         return rejection(
             "Selected sources have no infantry to dispatch",
@@ -498,13 +792,7 @@ fn resolve_expand_all(
     }
 
     let mut changed = BTreeMap::<Axial, (Option<u32>, u64)>::new();
-    let mut committed_by_boundary = BTreeMap::<Axial, u64>::new();
     for (source, source_request) in &requested_by_source {
-        let boundary = assignments
-            .get(source)
-            .expect("every selected source was assigned to a neutral frontier");
-        let boundary_commitment = committed_by_boundary.entry(*boundary).or_default();
-        *boundary_commitment = boundary_commitment.saturating_add(*source_request);
         let cell = view.cell(*source).expect("expand source was validated");
         changed.insert(
             *source,
@@ -512,94 +800,53 @@ fn resolve_expand_all(
         );
     }
 
-    let mut edges_by_boundary = BTreeMap::<Axial, Vec<DirectedFrontEdge>>::new();
-    for edge in &edges {
-        edges_by_boundary
-            .entry(edge.source)
-            .or_default()
-            .push(*edge);
+    let mut incoming = BTreeMap::new();
+    for (boundary, amount) in boundary_pools {
+        distribute_evenly(
+            amount,
+            topology
+                .outgoing
+                .get(&boundary)
+                .map_or(&[][..], Vec::as_slice),
+            &mut incoming,
+        );
     }
 
     let mut captured = 0_u32;
-    let mut representative_route = Vec::new();
-    for (boundary, boundary_commitment) in committed_by_boundary {
-        let boundary_edges = edges_by_boundary
-            .get(&boundary)
-            .expect("assigned boundary has at least one outward edge");
-        let lane_count = u64::try_from(boundary_edges.len()).expect("edge count fits u64");
-        let lane_base = boundary_commitment / lane_count;
-        let lane_remainder = boundary_commitment % lane_count;
-        let rear_sources = assignments
-            .iter()
-            .filter_map(|(source, assigned)| {
-                (*assigned == boundary && *source != boundary).then_some(*source)
-            })
-            .collect::<Vec<_>>();
-
-        for (edge_index, edge) in boundary_edges.iter().enumerate() {
-            let mut mobile = lane_base
-                + u64::from(
-                    u64::try_from(edge_index).expect("edge index fits u64") < lane_remainder,
-                );
+    let mut terminal_strength = Vec::<(Axial, u64)>::new();
+    let max_depth = topology.outside_depth.values().copied().max().unwrap_or(0);
+    for depth in 1..=max_depth {
+        let current = std::mem::take(&mut incoming);
+        for (coordinate, amount) in current {
+            if amount == 0 || topology.outside_depth.get(&coordinate) != Some(&depth) {
+                continue;
+            }
+            let cell = view.cell(coordinate).expect("wave topology cell exists");
+            let mobile = if cell.owner.is_none() {
+                captured = captured.saturating_add(1);
+                let garrison = occupation_garrison(cell).min(amount);
+                changed.insert(coordinate, (Some(view.local_player), garrison));
+                amount - garrison
+            } else {
+                amount
+            };
             if mobile == 0 {
                 continue;
             }
-            let direction = edge.target - edge.source;
-            let mut current = boundary;
-            let mut occupied = rear_sources.clone();
-            occupied.push(boundary);
-            let mut lane_route = vec![boundary];
-
-            while mobile > 0 {
-                let next = current + direction;
-                let Some(destination) = view.cell(next) else {
-                    break;
-                };
-                let Some(from) = view.cell(current) else {
-                    break;
-                };
-                let current_owner = changed
-                    .get(&next)
-                    .map_or(destination.owner, |state| state.0);
-                if !destination.is_land()
-                    || destination.blocked
-                    || (i32::from(from.elevation) - i32::from(destination.elevation)).unsigned_abs()
-                        > 1
-                {
-                    break;
-                }
-                if current_owner.is_some_and(|owner| owner != view.local_player) {
-                    break;
-                }
-
-                lane_route.push(next);
-                if current_owner == Some(view.local_player) {
-                    // An all-front lane can cross friendly ground without
-                    // paying another occupation garrison, then continue into
-                    // neutral territory on the far side.
-                    current = next;
-                    occupied.push(next);
-                    continue;
-                }
-                debug_assert!(current_owner.is_none());
-                captured = captured.saturating_add(1);
-                let garrison = occupation_garrison(destination).min(mobile);
-                mobile -= garrison;
-                changed.insert(next, (Some(view.local_player), garrison));
-                current = next;
-                occupied.push(next);
-            }
-
-            if mobile > 0 {
-                station_offline_strength(view, &mut changed, &occupied, mobile);
-            }
-            if lane_route.len() > representative_route.len() {
-                representative_route = lane_route;
+            let children = topology
+                .outgoing
+                .get(&coordinate)
+                .map_or(&[][..], Vec::as_slice);
+            if children.is_empty() {
+                terminal_strength.push((coordinate, mobile));
+            } else {
+                distribute_evenly(mobile, children, &mut incoming);
             }
         }
     }
 
-    let first_edge = edges[0];
+    settle_wave_strength(view, &topology, &mut changed, &terminal_strength);
+
     ServerUpdate::Accepted {
         command_id: None,
         summary: format!(
@@ -614,24 +861,92 @@ fn resolve_expand_all(
                 infantry,
             })
             .collect(),
-        flow: Some(ActiveFlow {
-            route: if representative_route.len() >= 2 {
-                representative_route
-            } else {
-                vec![first_edge.source, first_edge.target]
-            },
-            strength: committed,
-            attacking: false,
-            age: 0.0,
-            lifetime: 10.0,
-        }),
-        front: Some(ActiveFront {
-            friendly: first_edge.source,
-            hostile: first_edge.target,
-            intensity: (committed as f32 / 100.0).clamp(0.25, 1.0),
-            age: 0.0,
-        }),
+        // A wave is a branching/merging region, not a representative ray.
+        flow: None,
+        front: None,
     }
+}
+
+fn settle_wave_strength(
+    view: &MatchView,
+    topology: &ExpandWaveTopology,
+    changed: &mut BTreeMap<Axial, (Option<u32>, u64)>,
+    terminals: &[(Axial, u64)],
+) {
+    // Preserve the spatial split first: surplus remains in the terminal cell
+    // that carried it whenever that cell has capacity. Only true overflow is
+    // pooled backward through the merged ancestry graph.
+    let mut overflow = Vec::new();
+    for &(coordinate, amount) in terminals {
+        let Some(cell) = view.cell(coordinate) else {
+            continue;
+        };
+        let (owner, current) = changed
+            .get(&coordinate)
+            .copied()
+            .unwrap_or((cell.owner, cell.infantry));
+        let stationed = if owner == Some(view.local_player) {
+            amount.min(cell.military_capacity.saturating_sub(current))
+        } else {
+            0
+        };
+        if stationed > 0 {
+            changed.insert(
+                coordinate,
+                (Some(view.local_player), current.saturating_add(stationed)),
+            );
+        }
+        if amount > stationed {
+            overflow.push((coordinate, amount - stationed));
+        }
+    }
+    let mut strength: u64 = overflow.iter().map(|(_, strength)| *strength).sum();
+    if strength == 0 {
+        return;
+    }
+    let mut candidates = Vec::new();
+    let mut visited = overflow
+        .iter()
+        .map(|(coordinate, _)| *coordinate)
+        .collect::<BTreeSet<_>>();
+    let mut pending = visited.iter().copied().collect::<VecDeque<_>>();
+    while let Some(current) = pending.pop_front() {
+        candidates.push(current);
+        for &parent in topology
+            .parents
+            .get(&current)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            if visited.insert(parent) {
+                pending.push_back(parent);
+            }
+        }
+    }
+
+    for coordinate in candidates {
+        if strength == 0 {
+            break;
+        }
+        let Some(cell) = view.cell(coordinate) else {
+            continue;
+        };
+        let (owner, current) = changed
+            .get(&coordinate)
+            .copied()
+            .unwrap_or((cell.owner, cell.infantry));
+        if owner != Some(view.local_player) {
+            continue;
+        }
+        let stationed = strength.min(cell.military_capacity.saturating_sub(current));
+        if stationed > 0 {
+            changed.insert(
+                coordinate,
+                (Some(view.local_player), current.saturating_add(stationed)),
+            );
+            strength -= stationed;
+        }
+    }
+    debug_assert_eq!(strength, 0, "wave ancestry must retain committed capacity");
 }
 
 fn selected_front_assignments(
@@ -917,6 +1232,13 @@ mod tests {
         }
     }
 
+    fn hex_disk(radius: i32) -> Vec<Axial> {
+        (-radius..=radius)
+            .flat_map(|q| (-radius..=radius).map(move |r| Axial::new(q, r)))
+            .filter(|coordinate| coordinate.distance(Axial::ZERO) <= radius as u64)
+            .collect()
+    }
+
     #[test]
     fn offline_push_front_advances_every_edge_and_conserves_strength() {
         let sources = BTreeSet::from([Axial::new(0, -1), Axial::new(0, 0), Axial::new(0, 1)]);
@@ -1043,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_expand_all_advances_each_lane_through_successive_neutral_layers() {
+    fn offline_expand_all_advances_through_successive_neutral_rings() {
         let source = Axial::ZERO;
         let mut view = MatchView::connecting(1);
         view.cells.insert(source, cell(source, 40));
@@ -1061,7 +1383,7 @@ mod tests {
             ..
         } = update
         else {
-            panic!("a clear neutral lane should accept Expand All");
+            panic!("a clear neutral corridor should accept the perimeter wave");
         };
         let infantry_after = |coordinate| {
             patches
@@ -1077,15 +1399,7 @@ mod tests {
         assert_eq!(infantry_after(Axial::new(2, 0)), 5);
         assert_eq!(infantry_after(Axial::new(3, 0)), 10);
         assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 40);
-        assert_eq!(
-            flow.expect("sustained expand flow").route,
-            vec![
-                Axial::ZERO,
-                Axial::new(1, 0),
-                Axial::new(2, 0),
-                Axial::new(3, 0),
-            ]
-        );
+        assert!(flow.is_none(), "a perimeter wave must not emit a fake ray");
     }
 
     #[test]
@@ -1125,14 +1439,11 @@ mod tests {
         assert_eq!(infantry_after(friendly_transit), None);
         assert_eq!(infantry_after(far_neutral), Some(15));
         assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 40);
-        assert_eq!(
-            flow.expect("friendly transit flow").route,
-            vec![source, first_neutral, friendly_transit, far_neutral]
-        );
+        assert!(flow.is_none(), "friendly transit is still part of a wave");
     }
 
     #[test]
-    fn expand_all_keeps_one_lane_for_a_shared_concave_target() {
+    fn expand_all_merges_multiple_boundary_parents_at_a_shared_target() {
         let left = Axial::ZERO;
         let right = Axial::new(1, 0);
         let shared_target = Axial::new(0, 1);
@@ -1145,11 +1456,11 @@ mod tests {
         let sources = BTreeSet::from([left, right]);
 
         let edges = expand_all_front_edges(&view, &sources).expect("connected neutral frontier");
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].target, shared_target);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|edge| edge.target == shared_target));
 
         let ServerUpdate::Accepted { patches, .. } = resolve_expand_all(&view, &sources, 50) else {
-            panic!("deduplicated shared target should be accepted");
+            panic!("shared perimeter target should merge its incoming strength");
         };
         assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 40);
         assert_eq!(
@@ -1158,6 +1469,83 @@ mod tests {
                 .find(|patch| patch.coordinate == shared_target)
                 .map(|patch| patch.infantry),
             Some(20)
+        );
+    }
+
+    #[test]
+    fn offline_expand_all_forms_complete_successive_offset_rings() {
+        let source = Axial::ZERO;
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(source, cell(source, 100));
+        for coordinate in hex_disk(2).into_iter().filter(|cell| *cell != source) {
+            view.cells.insert(coordinate, neutral_cell(coordinate));
+        }
+        view.rebuild_chunk_index();
+
+        let ServerUpdate::Accepted {
+            summary,
+            patches,
+            flow,
+            ..
+        } = resolve_expand_all(&view, &BTreeSet::from([source]), 100)
+        else {
+            panic!("a two-ring neutral disk should accept the perimeter wave");
+        };
+
+        assert!(summary.contains("18 neutral cells captured"));
+        assert!(flow.is_none());
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 100);
+        assert_eq!(
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == source)
+                .map(|patch| patch.infantry),
+            Some(0)
+        );
+        assert!(
+            hex_disk(2)
+                .into_iter()
+                .filter(|cell| *cell != source)
+                .all(|coordinate| patches
+                    .iter()
+                    .find(|patch| patch.coordinate == coordinate)
+                    .is_some_and(|patch| patch.owner == Some(1) && patch.infantry > 0))
+        );
+    }
+
+    #[test]
+    fn central_strength_branches_through_the_selected_seed_and_merges_on_ring_one() {
+        let selected = hex_disk(1).into_iter().collect::<BTreeSet<_>>();
+        let mut view = MatchView::connecting(1);
+        for &coordinate in &selected {
+            let infantry = if coordinate == Axial::ZERO { 60 } else { 0 };
+            view.cells.insert(coordinate, cell(coordinate, infantry));
+        }
+        for coordinate in hex_disk(2)
+            .into_iter()
+            .filter(|coordinate| !selected.contains(coordinate))
+        {
+            view.cells.insert(coordinate, neutral_cell(coordinate));
+        }
+        view.rebuild_chunk_index();
+
+        let ServerUpdate::Accepted {
+            summary, patches, ..
+        } = resolve_expand_all(&view, &selected, 100)
+        else {
+            panic!("central strength should reach every selected boundary branch");
+        };
+
+        assert!(summary.contains("12 neutral cells captured"));
+        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 60);
+        assert!(
+            hex_disk(2)
+                .into_iter()
+                .filter(|coordinate| coordinate.distance(Axial::ZERO) == 2)
+                .all(|coordinate| patches
+                    .iter()
+                    .find(|patch| patch.coordinate == coordinate)
+                    .is_some_and(|patch| patch.owner == Some(1) && patch.infantry > 0))
         );
     }
 

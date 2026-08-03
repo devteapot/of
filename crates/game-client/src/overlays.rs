@@ -47,6 +47,7 @@ fn draw_world_overlays(
 ) {
     let needs_visible_cells = !interaction.sources.is_empty()
         || !interaction.preview.front_edges.is_empty()
+        || !interaction.preview.wave_depth.is_empty()
         || !interaction.preview.heatmap.is_empty()
         || !interaction.preview.excluded.is_empty();
     let visible_cells = if needs_visible_cells {
@@ -188,7 +189,11 @@ fn draw_preview(
     visible_cells: &[Axial],
     gizmos: &mut Gizmos,
 ) {
-    draw_push_front_edges(view, interaction, visible_cells, gizmos);
+    if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
+        draw_expand_wave(view, interaction, visible_cells, gizmos);
+    } else {
+        draw_push_front_edges(view, interaction, visible_cells, gizmos);
+    }
 
     if !interaction.preview.heatmap.is_empty() {
         for coordinate in visible_cells {
@@ -231,14 +236,16 @@ fn draw_preview(
         }
     }
 
-    let route_points = interaction
-        .preview
-        .route
-        .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| point(cell, 0.19))
-        .collect::<Vec<_>>();
-    draw_dashed_route(gizmos, &route_points, AMBER);
+    if !matches!(interaction.mode, OrderMode::ExpandAllPreview) {
+        let route_points = interaction
+            .preview
+            .route
+            .iter()
+            .filter_map(|coordinate| view.cell(*coordinate))
+            .map(|cell| point(cell, 0.19))
+            .collect::<Vec<_>>();
+        draw_dashed_route(gizmos, &route_points, AMBER);
+    }
 
     if let Some((from, to)) = interaction.preview.bottleneck
         && let (Some(from), Some(to)) = (view.cell(from), view.cell(to))
@@ -273,6 +280,57 @@ fn draw_preview(
         gizmos
             .arrow(center - direction * 0.65, center + direction * 1.8, AMBER)
             .with_tip_length(0.38);
+    }
+}
+
+fn draw_expand_wave(
+    view: &MatchView,
+    interaction: &InteractionState,
+    visible_cells: &[Axial],
+    gizmos: &mut Gizmos,
+) {
+    let max_depth = interaction
+        .preview
+        .wave_depth
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(1);
+    for depth in 1..=max_depth {
+        let ring = interaction
+            .preview
+            .wave_depth
+            .iter()
+            .filter_map(|(&coordinate, &coordinate_depth)| {
+                (coordinate_depth == depth).then_some(coordinate)
+            })
+            .collect::<BTreeSet<_>>();
+        if ring.is_empty() {
+            continue;
+        }
+        let progress = if max_depth <= 1 {
+            0.0
+        } else {
+            f32::from(depth - 1) / f32::from(max_depth - 1)
+        };
+        let alpha = 0.94 - progress * 0.58;
+        let color = Color::srgba(
+            1.0 - progress * 0.22,
+            0.69 + progress * 0.14,
+            0.25 + progress * 0.48,
+            alpha,
+        );
+        draw_region_perimeter(
+            view,
+            &ring,
+            visible_cells,
+            PerimeterStyle {
+                lift: 0.15 + f32::from(depth) * 0.002,
+                scale: 0.91,
+            },
+            |_| color,
+            gizmos,
+        );
     }
 }
 

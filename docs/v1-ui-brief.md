@@ -31,9 +31,10 @@ combat frontage, resistance, and terrain-scaled garrisons. It never teleports.
    exhausted, blocked, defeated, reaches the map edge, or is manually cancelled.
 8. From the same connected selection, preview and confirm a neutral-only Expand
    All operation. The chosen dispatch share is taken once from each selected
-   unallocated stack, rear troops feed their nearest boundary, local forks split
-   evenly, and each direction advances independently until it stops before an
-   enemy, exhausts, blocks, reaches the edge, or is cancelled.
+   unallocated stack. Combined strength splits evenly at each outward local
+   branch, merges at shared children, and continues through successive perimeter
+   layers. Each branch advances independently until it stops before an enemy,
+   exhausts, blocks, reaches the edge, or is cancelled.
 9. Select an owned region and issue percentage-aware one-shot Balance,
    Core-load, or Perimeter-load redistribution.
 10. Select an owned region, drag an orientation arrow, preview a directional

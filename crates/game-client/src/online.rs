@@ -1203,14 +1203,15 @@ fn packets_to_flows(
                 .iter()
                 .filter_map(|cell_id| transport.id_to_coordinate.get(cell_id).copied())
                 .collect::<Vec<_>>();
-            if route.is_empty() {
+            if route.len() < 2 {
                 return None;
             }
             let attacking = transport
                 .id_to_coordinate
                 .get(&packet.destination_cell)
                 .and_then(|coordinate| view.cell(*coordinate))
-                .is_some_and(|cell| cell.owner != Some(u32::from(packet.owner_player_id)));
+                .and_then(|cell| cell.owner)
+                .is_some_and(|owner| owner != u32::from(packet.owner_player_id));
             Some(ActiveFlow {
                 route,
                 strength: packet.infantry,
@@ -1391,6 +1392,74 @@ mod tests {
     #[test]
     fn empty_front_load_direction_is_rejected() {
         assert_eq!(world_direction_to_axial(Vec2::ZERO), None);
+    }
+
+    #[test]
+    fn expand_wave_edge_packets_project_while_resting_packets_are_omitted() {
+        let mut transport = OnlineTransport::new(test_config());
+        transport.id_to_coordinate.insert(10, Axial::ZERO);
+        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
+        transport.id_to_coordinate.insert(12, Axial::new(0, 1));
+
+        let mut view = MatchView::connecting(1);
+        for (coordinate, owner) in [(Axial::new(1, 0), None), (Axial::new(0, 1), Some(2))] {
+            view.cells.insert(
+                coordinate,
+                CellView {
+                    coordinate,
+                    terrain: TerrainKind::Plains,
+                    elevation: 0,
+                    owner,
+                    civilians: 0,
+                    infantry: 0,
+                    military_capacity: 100,
+                    blocked: false,
+                },
+            );
+        }
+
+        let edge = TransitPacket {
+            packet_key: "7:10:11".to_owned(),
+            order_id: 7,
+            owner_player_id: 1,
+            origin_cell: u32::MAX,
+            current_cell: 10,
+            destination_cell: 11,
+            infantry: 7,
+            route_index: 0,
+            route: vec![10, 11],
+            updated_step: 1,
+        };
+        let hostile_edge = TransitPacket {
+            packet_key: "8:10:12".to_owned(),
+            order_id: 8,
+            owner_player_id: 1,
+            origin_cell: 10,
+            current_cell: 10,
+            destination_cell: 12,
+            infantry: 9,
+            route_index: 0,
+            route: vec![10, 12],
+            updated_step: 1,
+        };
+        let resting = TransitPacket {
+            packet_key: "7:11:11".to_owned(),
+            order_id: 7,
+            owner_player_id: 1,
+            origin_cell: u32::MAX,
+            current_cell: 11,
+            destination_cell: 11,
+            infantry: 8,
+            route_index: 0,
+            route: vec![11],
+            updated_step: 1,
+        };
+
+        let flows = packets_to_flows(&transport, &view, vec![edge, hostile_edge, resting]);
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0].route, vec![Axial::ZERO, Axial::new(1, 0)]);
+        assert!(!flows[0].attacking, "neutral expansion is not hostile");
+        assert!(flows[1].attacking, "enemy-targeted movement stays hostile");
     }
 
     #[test]

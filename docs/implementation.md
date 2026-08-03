@@ -75,8 +75,14 @@ Public state is split by read/update pattern:
   congestion;
 - `combat_front` exposes the current contested edges and casualties.
 
-`simulation_schedule` is private. Clients cannot call the scheduled reducer as
-a player identity.
+`simulation_schedule`, `expansion_wave`, and `expansion_garrison_debt` are
+private. The wave row holds per-order inward/outward depth fields and fair-split
+cursors. Sparse cell-keyed garrison debt ensures partial asynchronous arrivals
+finish the full occupation cost before later wave strength branches, even when
+another overlapping expansion supplies it. Pre-existing friendly transit cells
+create no debt. Clients see only the resulting source accounting and
+resting/one-edge packets. Clients cannot call the scheduled reducer as a player
+identity.
 
 ## Public reducer surface
 
@@ -91,8 +97,9 @@ a player identity.
   remaining allocations where the troops currently are.
 - `issue_expand_all` — commit a percentage of one connected selected region's
   currently unallocated infantry to every eligible neutral boundary. Sources
-  route to the nearest boundary, local forks split evenly, and each stable lane
-  sustains its own initial direction.
+  split and merge through a depth-directed flow inside the selection, then
+  continue through successive outward perimeter layers without retaining an
+  axial direction.
 - `cancel_expand_all` — stop matching active all-front expansion orders for the
   submitted source region and release their remaining allocations in place.
 - `issue_balance` — create a percentage-aware physical density equalization
@@ -203,14 +210,19 @@ Shift+`P` (or `EXPAND ALL` in the HUD) skips orientation and previews every
 eligible neutral edge around the connected selection. Plain brackets change
 the order's dispatch percentage; this is independent of the mobilization
 slider, which controls future recruitment. Each selected cell contributes that
-share of its currently unallocated infantry once. Rear sources use a shared
-nearest-boundary route tree, each boundary's combined pool is split evenly
-among its unique outward targets, and those lanes sustain their initial
-directions independently. Enemy targets are excluded initially and rechecked
-during execution, so Expand All stops rather than becoming an implicit attack.
-Intersecting rays may traverse already-friendly cells without capturing or
-regarrisoning them. From the same preview, `X` cancels matching Expand All
-orders.
+share of its currently unallocated infantry once. Inside the selection, every
+cell combines its local and incoming pools, then divides that strength evenly
+among all traversable neighbors one depth closer to an eligible boundary.
+Shared children merge contributions before splitting again. Boundary cells use
+the same rule across their eligible neutral exits, and captured surplus repeats
+it from perimeter depth `d` to `d + 1`. Branches progress independently, so the
+result can bulge, but depth always moves monotonically and the operation cannot
+cycle, skip layers, or preserve a straight-ray heading. Enemy targets are
+excluded initially and rechecked during execution, so Expand All stops rather
+than becoming an implicit attack. A captured cell consumes its full
+terrain-scaled occupation garrison across partial arrivals before surplus
+continues; already-friendly transit cells do not pay that cost. From the same
+preview, `X` cancels matching Expand All orders.
 
 `B`, `F`, `G`, and `R` preview Balance, directional Front-load, Core-load, and
 Perimeter-load. Brackets adjust percentage participation for all four. The
@@ -232,8 +244,9 @@ cell-to-cell control is reserved for possible future discrete units.
   the SpacetimeDB schema and WASM target.
 - The headless real-server smoke test uses two identities to cover slot claims,
   match start, subscriptions, idempotent receipts, sustained multi-layer Push
-  progression, multi-direction neutral Expand All, cancellation, and
-  token-based reconnect.
+  progression, branching and direction-changing neutral Expand All wave
+  progression, cancellation, and token-based reconnect. Deterministic module
+  and client cases pin shared-child merging and asynchronous split fairness.
 - The Bevy client has coordinate/fixture/route tests and a native launch smoke.
 - CI repeats formatting, workspace tests/lints, module tests/lints/build, and
   generated-binding drift detection.
@@ -244,7 +257,9 @@ cell-to-cell control is reserved for possible future discrete units.
 - The second join auto-starts the match; there is no lobby UI or ready toggle.
 - Corridor routes and axial lane directions are deterministic and fixed when an
   order is accepted; sustained Push packets extend only along that ray and do
-  not dynamically replan around later ownership changes.
+  not dynamically replan around later ownership changes. Expand All instead
+  uses a deterministic depth-directed wave topology fixed by the accepted seed
+  state; it has no retained axial heading.
 - Push Front and Expand All convert the chosen dispatch percentage to
   authoritative basis points. There are no order priorities or adaptive lane
   retargeting. Expand All applies only to the submitted connected selection;

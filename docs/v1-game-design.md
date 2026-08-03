@@ -205,22 +205,35 @@ remains the command for attacks.
 
 Each selected cell snapshots the chosen share of its currently unallocated
 infantry exactly once. It is not multiplied by the number of adjacent edges.
-Rear cells route within the selected region to their nearest eligible neutral
-boundary. Where one boundary cell has several outward exits, their combined
-local pool is divided as evenly as integer strength permits before source
-contributions fill those lane quotas. This makes each fork use the same effort
-without letting rounding repeatedly favor one exit.
+The authority assigns every selected cell an internal depth from the eligible
+neutral perimeter. A cell combines its local commitment with incoming strength,
+then divides that pool as evenly as integer strength permits among all
+traversable selected neighbors one depth closer to the perimeter. Contributions
+from several parents merge before the receiving cell makes its own split. This
+forms one deterministic acyclic flow through the selected region rather than
+routing every source to one nearest boundary.
 
-Every unique first target becomes a stable lane anchor. Concave boundaries that
-reach the same outside target are deterministically deduplicated, then each
-lane continues along its own initial axial direction under the same capacity,
-throughput, elevation, and terrain-scaled garrison rules as Push Front. A lane
-may cross already-friendly traversable cells without recapturing or
-regarrisoning them, which prevents intersecting independent rays from blocking
-one another. It stops independently when its mobile pool is exhausted, blocked,
-reaches the map edge, is cancelled, or would enter enemy territory. Ownership
-is rechecked during execution, so a neutral target that becomes hostile is not
-attacked by an already-issued Expand All operation.
+At depth zero, the same rule divides each boundary pool among all eligible
+neutral exits. A concave outside target can receive and merge contributions
+from several boundary cells. After capture, surplus strength repeats the local
+split-and-merge rule across successive morphological perimeter layers: every
+step moves from outside depth `d` to `d + 1`, but it does not retain an axial
+heading. The result is a topology-preserving outward wave, not a set of straight
+rays or a promise of globally equal ring totals. Branching topology and path
+multiplicity can give different exits different amounts even though every local
+fork is divided evenly.
+
+Branches advance asynchronously under the same capacity, throughput,
+elevation, and terrain-scaled garrison rules as Push Front. A fast branch may
+bulge ahead while another stalls, but no branch may cycle back into the seed,
+skip an outward layer, or tunnel through an uncleared cell. Friendly traversable
+cells may carry the wave without another capture or occupation garrison. If a
+partial arrival captures a neutral cell with less than its full terrain-scaled
+garrison, later wave arrivals finish that cost before surplus continues. A
+branch stops when its mobile pool is exhausted, blocked, reaches the map edge,
+is cancelled, or would enter enemy territory. Ownership is rechecked during
+execution, so a neutral target that becomes hostile is not attacked by an
+already-issued Expand All operation.
 
 The dispatch percentage belongs to the current order. It is deliberately
 separate from the global mobilization target, which governs future conversion
@@ -370,8 +383,8 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
    strength.
 9. Players can preview Expand All over a connected owned selection, choose an
    order dispatch percentage independently of mobilization, and advance every
-   eligible neutral boundary with conserved, locally split, independent lanes
-   that stop before enemy territory.
+   eligible neutral boundary with a conserved, locally split-and-merged
+   perimeter wave whose branches stop before enemy territory.
 10. Cutting a corridor creates genuinely independent connected components whose existing population and forces remain usable locally but cannot transfer across the cut.
 11. Players can apply percentage-aware one-shot Balance, oriented Front-load,
     Core-load, and Perimeter-load orders, preview their target densities, and
@@ -391,9 +404,10 @@ The vertical slice is ready for gameplay evaluation when all of the following ar
   and does fixed-pool sustained advancement create understandable momentum
   without excessive input or opaque automation?
 - Does Expand All make neutral opening expansion faster without obscuring which
-  local troops feed each independent lane or encouraging repeated click spam?
-- Is nearest-boundary routing with even local fork splitting understandable,
-  or does the preview need stronger lane-allocation feedback?
+  local troops feed each independent branch or encouraging repeated click spam?
+- Is node-local splitting and merging understandable when topology gives
+  different perimeter exits different totals, or does the preview need stronger
+  branch-allocation and wave-depth feedback?
 - Which selection gestures make irregular connected source regions easy to express?
 - Is the local civilian-to-military mobilization model understandable before an explicit economy is introduced?
 - Do capacity, throughput, and frontage create clear bottlenecks rather than frustrating queues?

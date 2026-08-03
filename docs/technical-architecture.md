@@ -192,12 +192,14 @@ These share a common strength scale but remain separate values. A city may later
 
 The generic aggregate-flow schema retains the implementation names
 `transfer_order`, source, destination, and transit packet. An order stores its
-owner, sources, destinations, requested and committed amounts, progress totals,
-kind, orientation, and status. Transit packets store deterministic routes and
-scalar queues. These tables are an execution substrate, not a public precise
-infantry-transfer API. Selected-corridor routes are fixed when accepted; a Push
-packet may extend only along its stored exact axial ray after capture. V1 has no
-order priorities or adaptive mid-route replanning. On each logical step,
+owner, requested and committed amounts, progress totals, kind, orientation, and
+status. Source rows account for initial commitments. Destination rows represent
+fixed targets for redistribution or the stable first-layer anchor of a Push;
+Expand All deliberately creates none. Transit packets store scalar queues and
+their current local route. These tables are an execution substrate, not a public
+precise infantry-transfer API. Selected-corridor routes are fixed when accepted;
+a Push packet may extend only along its stored exact axial ray after capture. V1
+has no order priorities or adaptive mid-route replanning. On each logical step,
 approved movement is bounded by:
 
 ```text
@@ -230,14 +232,42 @@ movement is reserved for possible future discrete tanks, boats, or other units.
 Expand All is the neutral-only companion producer. Its reducer accepts one
 six-connected owned selection and a basis-point dispatch share, with no
 orientation. It snapshots that share from every cell's currently unallocated
-infantry once, routes each source within the selection to its nearest eligible
-neutral boundary, aggregates contributions locally per boundary, and divides
-each boundary pool evenly among its outward exits. Shared concave targets are
-deduplicated into one stable lane anchor. Each lane derives its own initial
-axial direction and then uses the same sustained throughput, capacity,
-elevation, and garrison machinery as Push Front. Runtime ownership is checked
-before movement: friendly cells remain valid transit, neutral cells may be
-captured, and enemy cells stop and release the lane without combat.
+infantry once. A private `expansion_wave` row stores the accepted topology as
+parallel sorted selected-cell/inward-depth vectors, a map-indexed outside-depth
+vector, and a map-indexed rotating split cursor. A separate sparse private
+`expansion_garrison_debt` row is keyed by each under-garrisoned captured cell.
+Selected depth decreases toward zero; the first neutral ring is outside depth
+one; every later outward edge must increase that depth by exactly one. Enemy
+territory is excluded when those outside depths are built, so a shorter path
+through an enemy cannot suppress a valid neutral route around it.
+
+Each nonzero source commitment begins as a resting packet at its real selected
+cell; all selected cells, including zero commitments, retain source rows for an
+exact command/cancellation identity. On a simulation step, all resting
+contributions at one node are pooled and divided evenly among its sorted
+monotonic children. A per-node rotating remainder cursor prevents asynchronous
+one-unit arrivals from repeatedly favoring the first child. Each allocation
+becomes a one-edge packet. Arrivals merge into one aggregate sentinel-origin
+resting packet, so provenance is discarded after the first source departure
+instead of materializing every complete source-to-exit path. This same local
+split-and-merge operation applies inside the seed, across its neutral exits, and
+through successive morphological outside layers. There is no stable lane
+anchor or retained axial heading for Expand All.
+
+Branches use the ordinary throughput, capacity, elevation, capture, and
+terrain-scaled garrison machinery and advance asynchronously, so the wave may
+bulge. When a partial first arrival cannot fill a captured cell's complete
+terrain-scaled garrison, its sparse cell debt is paid from later same-owner
+Expand All arrivals before any surplus branches. The debt belongs to the cell,
+so an overlapping wave can finish it after the capturing order completes; an
+ownership flip deletes the prior owner's debt. Merely crossing territory that
+was already friendly creates no debt. Runtime ownership is checked before each
+edge: friendly cells remain valid transit, neutral cells may be captured, and
+an enemy flip stations that branch's assigned quota locally without combat or
+rerouting it into a sibling. Cancellation deletes the per-order topology and
+releases every remaining packet at its physical cell, but preserves valid
+capture-scoped cell debt. The usual committed equals in-transit plus delivered
+plus casualties invariant remains exact.
 
 Expand All means every neutral boundary of the submitted six-connected
 selection, not every disconnected territory component owned by the player.
@@ -379,15 +409,18 @@ specific gesture.
 Bulk selections must not multiply pathfinding work. Push Front derives its
 exact directional boundary in shared pure code, validates one source component
 and one active-front component, and searches backward only through selected
-cells. Expand All derives every eligible neutral boundary in one pass and uses
-one multi-source nearest-boundary route tree; sustained packets are indexed by
-their stable `(order, lane anchor)` rather than rescanning every packet in a
-broad order for one lane. Previews cache results by selection and authoritative
-cell-state revisions. Every V1 order preview and reducer rejects selections
-above 4,096 cells before building heatmaps, routes, or payloads. This is a
-safety bound, not the world-scale selection design. Every authority adapter
-must debit only source cells that can reach the accepted front or
-redistribution deficit under that order's constraints.
+cells. Expand All derives its perimeter and two multi-source breadth-first depth
+fields once when accepted. Runtime work is proportional to active resting and
+one-edge packets: contributions merge by current node, and no complete
+source-by-exit paths are persisted. The private outside-depth and cursor vectors
+are linear in map cells per active Expand All order, a deliberate V1 bound that
+must be profiled before global policies or much larger maps. Previews cache
+results by selection and authoritative cell-state revisions. Every V1 order
+preview and reducer rejects selections above 4,096 cells before building
+heatmaps, routes, or payloads. This is a safety bound, not the world-scale
+selection design. Every authority adapter must debit only source cells that can
+reach the accepted front or redistribution deficit under that order's
+constraints.
 
 Native-only filesystem, windowing, and startup behavior belongs behind narrow
 boundaries where practical. A WASM compile gate is deferred with browser
@@ -412,7 +445,8 @@ command IDs. UI-only preferences may remain local; no gameplay-critical state
 may exist only in Bevy.
 
 Simulation progress needed after a host restart is stored in tables: logical
-step, active orders, transit routes and queues, fronts, the scheduled wake,
+step, active orders, transit routes and queues, private Expand All wave depths
+and split cursors, sparse capture-garrison debt, fronts, the scheduled wake,
 match phase, and map seed. The persisted scheduled row resumes the fixed logical
 cadence. Explicit repair of a missing schedule row and duplicate-wake fault
 injection remain reliability-hardening work.
@@ -436,11 +470,13 @@ High-value invariants include:
 
 The V1 headless two-identity smoke covers join, match start, subscription,
 idempotent command receipts, sustained multi-layer Push progression,
-multi-direction neutral Expand All progression, both cancellation paths, and
-token-based reconnect. Command rejection, simultaneous hostile orders, full
-Conquest completion, schedule fault injection, and completed-match immutability
-remain integration-test extensions; pure rule tests cover their deterministic
-building blocks where applicable.
+multi-branch and direction-changing neutral Expand All perimeter-wave
+progression, both cancellation paths, and token-based reconnect. Deterministic
+module and client cases pin shared-child merging and asynchronous split
+fairness. Command rejection, simultaneous hostile orders, full Conquest
+completion, schedule fault injection, and completed-match immutability remain
+integration-test extensions; pure rule tests cover their deterministic building
+blocks where applicable.
 
 Run the headless smoke against a fresh local match database. A native Bevy launch
 and two-window connection smoke complement it. Generated-binding CI detects
@@ -484,9 +520,9 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
    owned source regions.
 5. **Troop-flow slice:** add cell capacity, fixed-pool sustained Push Front and
    neutral-only Expand All orders, authoritative selected-corridor
-   routing/validation, scheduled lane-by-lane movement, terrain-scaled
-   garrisons, congestion, density shading, exact initial-edge preview, and ETA
-   feedback.
+   routing/validation, scheduled Push lanes and branching perimeter-wave
+   movement, terrain-scaled garrisons, congestion, density shading, exact
+   initial-edge preview, and ETA feedback.
 6. **Conflict slice:** add hostile edges, combat frontage, capture, elevation modifiers, disconnected components, and the Conquest win condition at 80% of capturable land.
 7. **Reliability slice:** add command idempotency, reconnect/reclaim, snapshot rebuild, scheduler recovery, deterministic replay fixtures, and completed-match handling.
 8. **Scale slice:** validate the 128 and 192 presets; retain 256, high-order-count traces, profiling, and soak gates as post-slice performance work.

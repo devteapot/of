@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
@@ -34,7 +34,7 @@ const MAX_PUSH_CORRIDOR_CELLS: usize = 5;
 const REQUIRED_LANE_CELLS: usize = 4;
 const OBSERVED_CAPTURE_LAYERS: usize = 2;
 const POST_CANCEL_STEPS: u64 = 2;
-const MIN_EXPAND_LANE_ALLOCATION: u64 = 4;
+const EXPANSION_AGGREGATE_ORIGIN: u32 = u32::MAX;
 
 #[derive(Debug, Parser)]
 #[command(about = "Exercise a live V1 match with two persistent anonymous identities")]
@@ -338,20 +338,17 @@ struct PushFrontCandidate {
     expected_requested: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ExpandLane {
-    boundary_cell: u32,
-    anchor_cell: u32,
-    direction: Axial,
-}
-
 #[derive(Clone, Debug)]
 struct ExpandAllCandidate {
     selected_cells: Vec<u32>,
     commitment_bps: u32,
     expected_requested: u64,
     expected_source_commitments: HashMap<u32, u64>,
-    eligible_lanes: HashMap<u32, ExpandLane>,
+    seed_depths: HashMap<u32, u16>,
+    outside_depths: HashMap<u32, u16>,
+    children: HashMap<u32, Vec<u32>>,
+    first_ring: HashSet<u32>,
+    turning_second_ring: HashSet<u32>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -762,6 +759,7 @@ fn main() -> Result<()> {
 
     println!("[6/8] issuing one fixed-percentage neutral expansion across all fronts");
     let expand_candidate = select_expand_all_candidate(&player_one.conn, PLAYER_ONE)?;
+    let expand_owners_before = owner_snapshot(&player_one.conn);
     let expand_id = unused_command_id(
         &player_one.conn,
         PLAYER_ONE,
@@ -834,7 +832,7 @@ fn main() -> Result<()> {
     );
 
     let active_expand = wait_until(
-        "independent all-front lane progression",
+        "branching all-front perimeter-wave progression",
         timeout,
         poll,
         || {
@@ -849,39 +847,60 @@ fn main() -> Result<()> {
             assert_order_conservation(&order)?;
             ensure!(
                 order.status == OrderStatus::Active && order.in_transit_infantry > 0,
-                "all-front expansion exhausted before two independent lane directions progressed; use a fresh default fixture with a larger connected source pool"
+                "all-front expansion exhausted before its branching perimeter wave progressed; use a fresh default fixture with a larger connected source pool"
             );
-            let progressed_anchors = player_one
+            let current_owners = player_one
                 .conn
                 .db
-                .transfer_destination()
+                .cell_state()
                 .iter()
-                .filter(|destination| destination.order_id == order.order_id)
-                .filter(|destination| {
-                    player_one
-                        .conn
-                        .db
-                        .cell_state()
-                        .cell_id()
-                        .find(&destination.cell_id)
-                        .is_some_and(|cell| cell.owner_player_id == PLAYER_ONE)
+                .map(|cell| (cell.cell_id, cell.owner_player_id))
+                .collect::<HashMap<_, _>>();
+            let captured = current_owners
+                .iter()
+                .filter_map(|(&cell_id, &owner)| {
+                    (owner == PLAYER_ONE
+                        && expand_owners_before.get(&cell_id).copied() != Some(PLAYER_ONE))
+                    .then_some(cell_id)
                 })
-                .map(|destination| destination.cell_id)
                 .collect::<HashSet<_>>();
-            let progressed_directions = progressed_anchors
-                .iter()
-                .filter_map(|anchor| expand_candidate.eligible_lanes.get(anchor))
-                .map(|lane| lane.direction)
-                .collect::<HashSet<_>>();
-            if progressed_anchors.len() < 2 || progressed_directions.len() < 2 {
+            ensure!(
+                !captured.iter().any(|cell_id| {
+                    expand_owners_before.get(cell_id).copied() == Some(PLAYER_TWO)
+                }),
+                "neutral-only all-front wave captured enemy territory"
+            );
+            let first_ring_captures = captured.intersection(&expand_candidate.first_ring).count();
+            let turning_captures = captured
+                .intersection(&expand_candidate.turning_second_ring)
+                .count();
+            if first_ring_captures < 2 || turning_captures == 0 {
                 return Ok(None);
+            }
+            for &cell_id in &captured {
+                let Some(&depth) = expand_candidate.outside_depths.get(&cell_id) else {
+                    continue;
+                };
+                if depth <= 1 {
+                    continue;
+                }
+                let has_owned_parent =
+                    expand_candidate.children.iter().any(|(&parent, children)| {
+                        children.contains(&cell_id)
+                            && current_owners.get(&parent).copied() == Some(PLAYER_ONE)
+                    });
+                ensure!(
+                    has_owned_parent,
+                    "all-front wave captured outside depth {depth} cell {cell_id} without owning a depth {} parent",
+                    depth - 1
+                );
             }
             assert_expand_persistence(&player_one.conn, &expand_candidate, &order)?;
             Ok(Some(order))
         },
     )?;
 
-    println!("[7/8] cancelling every expansion lane and proving it remains stopped");
+    println!("[7/8] cancelling the perimeter wave and proving it remains stopped");
     let expand_cancel_id = unused_command_id(
         &player_one.conn,
         PLAYER_ONE,
@@ -905,7 +924,7 @@ fn main() -> Result<()> {
         expand_receipt.order_id
     );
 
-    let (cancelled_expand, owners_at_expand_cancel, destinations_at_expand_cancel) =
+    let (cancelled_expand, owners_at_expand_cancel) =
         wait_until("all-front expansion cancellation", timeout, poll, || {
             let Some(order) = player_one
                 .conn
@@ -936,11 +955,7 @@ fn main() -> Result<()> {
                 "cancelled all-front expansion retained transit packets"
             );
             assert_expand_sources(&player_one.conn, &expand_candidate, order.order_id, true)?;
-            Ok(Some((
-                order.clone(),
-                owner_snapshot(&player_one.conn),
-                destination_snapshot(&player_one.conn, order.order_id),
-            )))
+            Ok(Some((order.clone(), owner_snapshot(&player_one.conn))))
         })?;
     ensure!(
         cancelled_expand.delivered_infantry > active_expand.delivered_infantry,
@@ -1002,11 +1017,6 @@ fn main() -> Result<()> {
             ensure!(
                 owner_snapshot(&player_one.conn) == owners_at_expand_cancel,
                 "cell ownership changed after all-front cancellation"
-            );
-            ensure!(
-                destination_snapshot(&player_one.conn, order.order_id)
-                    == destinations_at_expand_cancel,
-                "a cancelled all-front lane received infantry during a later simulation step"
             );
             Ok(Some(()))
         },
@@ -1506,6 +1516,7 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u8) -> Result<Exp
             .iter()
             .map(|coordinate| cell_by_coordinate[coordinate])
             .collect::<Vec<_>>();
+        let selected_ids = selected_cells.iter().copied().collect::<BTreeSet<_>>();
         let mut expected_source_commitments = HashMap::new();
         let mut expected_requested = 0_u64;
         for &cell_id in &selected_cells {
@@ -1514,9 +1525,7 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u8) -> Result<Exp
                 .infantry
                 .saturating_sub(allocated_by_cell.get(&cell_id).copied().unwrap_or(0));
             let committed = basis_point_share(available, EXPAND_COMMITMENT_BPS);
-            if committed > 0 {
-                expected_source_commitments.insert(cell_id, committed);
-            }
+            expected_source_commitments.insert(cell_id, committed);
             expected_requested = expected_requested
                 .checked_add(committed)
                 .context("all-front candidate commitment overflow")?;
@@ -1525,85 +1534,77 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u8) -> Result<Exp
             continue;
         }
 
-        // Match the authoritative target deduplication: the lowest source
-        // coordinate wins when a concavity exposes one neutral target twice.
-        let mut lane_by_target = BTreeMap::<Axial, ExpandLane>::new();
+        let mut boundary = BTreeSet::new();
+        let mut first_ring = BTreeSet::new();
         for &source_coordinate in &component {
             let source_id = cell_by_coordinate[&source_coordinate];
-            let source_terrain = &terrain_by_id[&source_id];
-            for direction in Axial::DIRECTIONS {
-                let target_coordinate = source_coordinate + direction;
+            for target_coordinate in source_coordinate.neighbors() {
                 if component.contains(&target_coordinate) {
                     continue;
                 }
                 let Some(&target_id) = cell_by_coordinate.get(&target_coordinate) else {
                     continue;
                 };
-                let target_terrain = &terrain_by_id[&target_id];
                 let target_state = &cell_by_id[&target_id];
-                if target_state.owner_player_id != 0
-                    || !target_terrain.passable
-                    || !target_terrain.capturable
-                    || source_terrain.elevation.abs_diff(target_terrain.elevation) > 1
+                let target_terrain = &terrain_by_id[&target_id];
+                if target_state.owner_player_id == 0
+                    && target_terrain.passable
+                    && target_terrain.capturable
+                    && terrain_edge_is_traversable(&terrain_by_id, source_id, target_id)
                 {
-                    continue;
+                    boundary.insert(source_id);
+                    first_ring.insert(target_id);
                 }
-                lane_by_target
-                    .entry(target_coordinate)
-                    .or_insert(ExpandLane {
-                        boundary_cell: source_id,
-                        anchor_cell: target_id,
-                        direction,
-                    });
             }
         }
-        if lane_by_target.len() < 2 {
-            continue;
-        }
-        let eligible_lanes = lane_by_target
-            .into_values()
-            .map(|lane| (lane.anchor_cell, lane))
-            .collect::<HashMap<_, _>>();
-        let directions = eligible_lanes
-            .values()
-            .map(|lane| lane.direction)
-            .collect::<HashSet<_>>();
-        if directions.len() < 2 {
+        if first_ring.len() < 2 {
             continue;
         }
 
-        let outgoing_per_boundary =
-            eligible_lanes
-                .values()
-                .fold(HashMap::<u32, usize>::new(), |mut counts, lane| {
-                    *counts.entry(lane.boundary_cell).or_default() += 1;
-                    counts
-                });
-        if outgoing_per_boundary.iter().any(|(boundary, outgoing)| {
-            expected_source_commitments
-                .get(boundary)
-                .copied()
-                .unwrap_or(0)
-                < *outgoing as u64
-        }) {
+        let seed_depths = wave_seed_depths(
+            &selected_ids,
+            &boundary,
+            &terrain_by_id,
+            &cell_by_coordinate,
+        );
+        if seed_depths.len() != selected_cells.len() {
             continue;
         }
-        let sustainable_lanes = eligible_lanes
-            .values()
-            .filter(|lane| {
-                let boundary_commitment = expected_source_commitments
-                    .get(&lane.boundary_cell)
-                    .copied()
-                    .unwrap_or(0);
-                let outgoing = outgoing_per_boundary[&lane.boundary_cell] as u64;
-                outgoing > 0 && boundary_commitment / outgoing >= MIN_EXPAND_LANE_ALLOCATION
-            })
-            .collect::<Vec<_>>();
-        let sustainable_directions = sustainable_lanes
+        let outside_depths = wave_outside_depths(
+            player_id,
+            &selected_ids,
+            &first_ring,
+            &terrain_by_id,
+            &cell_by_id,
+            &cell_by_coordinate,
+        );
+        let children = wave_children(
+            &seed_depths,
+            &outside_depths,
+            &terrain_by_id,
+            &cell_by_coordinate,
+        );
+        if !children.values().any(|targets| targets.len() >= 2) {
+            continue;
+        }
+
+        let turning_second_ring =
+            turning_second_ring_cells(&seed_depths, &outside_depths, &children, &terrain_by_id);
+        let reached = forecast_wave_reach(
+            &expected_source_commitments,
+            &seed_depths,
+            &outside_depths,
+            &children,
+            &terrain_by_id,
+            &cell_by_id,
+            u16::try_from(OBSERVED_CAPTURE_LAYERS).expect("observed capture layer count fits u16"),
+        );
+        let reached_first_ring = first_ring
             .iter()
-            .map(|lane| lane.direction)
-            .collect::<HashSet<_>>();
-        if sustainable_lanes.len() < 2 || sustainable_directions.len() < 2 {
+            .filter(|cell_id| reached.contains(cell_id))
+            .count();
+        let reached_turns = turning_second_ring.intersection(&reached).count();
+        if reached_first_ring < 2 || reached_turns == 0 {
             continue;
         }
 
@@ -1612,19 +1613,251 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u8) -> Result<Exp
             commitment_bps: EXPAND_COMMITMENT_BPS,
             expected_requested,
             expected_source_commitments,
-            eligible_lanes,
+            seed_depths,
+            outside_depths,
+            children,
+            first_ring: first_ring.into_iter().collect(),
+            turning_second_ring,
         });
     }
     candidates.sort_unstable_by_key(|candidate| {
         (
             std::cmp::Reverse(candidate.expected_requested),
-            std::cmp::Reverse(candidate.eligible_lanes.len()),
+            std::cmp::Reverse(candidate.turning_second_ring.len()),
+            std::cmp::Reverse(candidate.first_ring.len()),
             std::cmp::Reverse(candidate.selected_cells.len()),
         )
     });
     candidates.into_iter().next().context(
-        "no traversably connected owned region has enough unallocated infantry for at least two independent neutral all-front lanes; run against a fresh default fixture",
+        "no traversably connected owned region can sustain a multi-branch, direction-changing neutral perimeter wave; run against a fresh default fixture",
     )
+}
+
+fn terrain_edge_is_traversable(
+    terrain_by_id: &HashMap<u32, CellTerrain>,
+    from_cell: u32,
+    to_cell: u32,
+) -> bool {
+    terrain_by_id
+        .get(&from_cell)
+        .zip(terrain_by_id.get(&to_cell))
+        .is_some_and(|(from, to)| {
+            from.passable && to.passable && from.elevation.abs_diff(to.elevation) <= 1
+        })
+}
+
+fn wave_seed_depths(
+    selected: &BTreeSet<u32>,
+    boundary: &BTreeSet<u32>,
+    terrain_by_id: &HashMap<u32, CellTerrain>,
+    cell_by_coordinate: &HashMap<Axial, u32>,
+) -> HashMap<u32, u16> {
+    let mut depths = HashMap::new();
+    let mut pending = VecDeque::new();
+    for &cell_id in boundary {
+        depths.insert(cell_id, 0_u16);
+        pending.push_back(cell_id);
+    }
+    while let Some(current_id) = pending.pop_front() {
+        let depth = depths[&current_id];
+        let current = &terrain_by_id[&current_id];
+        for neighbor in Axial::new(current.q, current.r).neighbors() {
+            let Some(&neighbor_id) = cell_by_coordinate.get(&neighbor) else {
+                continue;
+            };
+            if !selected.contains(&neighbor_id)
+                || depths.contains_key(&neighbor_id)
+                || !terrain_edge_is_traversable(terrain_by_id, current_id, neighbor_id)
+            {
+                continue;
+            }
+            depths.insert(neighbor_id, depth.saturating_add(1));
+            pending.push_back(neighbor_id);
+        }
+    }
+    depths
+}
+
+fn wave_outside_depths(
+    player_id: u8,
+    selected: &BTreeSet<u32>,
+    first_ring: &BTreeSet<u32>,
+    terrain_by_id: &HashMap<u32, CellTerrain>,
+    cell_by_id: &HashMap<u32, CellState>,
+    cell_by_coordinate: &HashMap<Axial, u32>,
+) -> HashMap<u32, u16> {
+    let mut depths = HashMap::new();
+    let mut pending = VecDeque::new();
+    for &cell_id in first_ring {
+        depths.insert(cell_id, 1_u16);
+        pending.push_back(cell_id);
+    }
+    while let Some(current_id) = pending.pop_front() {
+        let depth = depths[&current_id];
+        let current = &terrain_by_id[&current_id];
+        for neighbor in Axial::new(current.q, current.r).neighbors() {
+            let Some(&neighbor_id) = cell_by_coordinate.get(&neighbor) else {
+                continue;
+            };
+            if selected.contains(&neighbor_id) || depths.contains_key(&neighbor_id) {
+                continue;
+            }
+            let terrain = &terrain_by_id[&neighbor_id];
+            let owner = cell_by_id[&neighbor_id].owner_player_id;
+            if !terrain.capturable
+                || !matches!(owner, 0) && owner != player_id
+                || !terrain_edge_is_traversable(terrain_by_id, current_id, neighbor_id)
+            {
+                continue;
+            }
+            depths.insert(neighbor_id, depth.saturating_add(1));
+            pending.push_back(neighbor_id);
+        }
+    }
+    depths
+}
+
+fn wave_children(
+    seed_depths: &HashMap<u32, u16>,
+    outside_depths: &HashMap<u32, u16>,
+    terrain_by_id: &HashMap<u32, CellTerrain>,
+    cell_by_coordinate: &HashMap<Axial, u32>,
+) -> HashMap<u32, Vec<u32>> {
+    let mut result = HashMap::new();
+    for (&cell_id, &depth) in seed_depths {
+        let wanted_seed = depth.checked_sub(1);
+        let current = &terrain_by_id[&cell_id];
+        let mut targets = Axial::new(current.q, current.r)
+            .neighbors()
+            .into_iter()
+            .filter_map(|coordinate| cell_by_coordinate.get(&coordinate).copied())
+            .filter(|target| terrain_edge_is_traversable(terrain_by_id, cell_id, *target))
+            .filter(|target| {
+                wanted_seed.map_or_else(
+                    || outside_depths.get(target) == Some(&1),
+                    |wanted| seed_depths.get(target) == Some(&wanted),
+                )
+            })
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        result.insert(cell_id, targets);
+    }
+    for (&cell_id, &depth) in outside_depths {
+        let current = &terrain_by_id[&cell_id];
+        let mut targets = Axial::new(current.q, current.r)
+            .neighbors()
+            .into_iter()
+            .filter_map(|coordinate| cell_by_coordinate.get(&coordinate).copied())
+            .filter(|target| terrain_edge_is_traversable(terrain_by_id, cell_id, *target))
+            .filter(|target| outside_depths.get(target) == Some(&depth.saturating_add(1)))
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        result.insert(cell_id, targets);
+    }
+    result
+}
+
+fn turning_second_ring_cells(
+    seed_depths: &HashMap<u32, u16>,
+    outside_depths: &HashMap<u32, u16>,
+    children: &HashMap<u32, Vec<u32>>,
+    terrain_by_id: &HashMap<u32, CellTerrain>,
+) -> HashSet<u32> {
+    outside_depths
+        .iter()
+        .filter_map(|(&target, &depth)| (depth == 2).then_some(target))
+        .filter(|target| {
+            let target_coordinate = axial_for_cell(terrain_by_id, *target);
+            children
+                .iter()
+                .filter(|(parent, targets)| {
+                    outside_depths.get(parent) == Some(&1) && targets.contains(target)
+                })
+                .any(|(&parent, _)| {
+                    let parent_coordinate = axial_for_cell(terrain_by_id, parent);
+                    let outward = target_coordinate - parent_coordinate;
+                    children.iter().any(|(&boundary, targets)| {
+                        seed_depths.get(&boundary) == Some(&0)
+                            && targets.contains(&parent)
+                            && parent_coordinate - axial_for_cell(terrain_by_id, boundary)
+                                != outward
+                    })
+                })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forecast_wave_reach(
+    commitments: &HashMap<u32, u64>,
+    seed_depths: &HashMap<u32, u16>,
+    outside_depths: &HashMap<u32, u16>,
+    children: &HashMap<u32, Vec<u32>>,
+    terrain_by_id: &HashMap<u32, CellTerrain>,
+    cell_by_id: &HashMap<u32, CellState>,
+    max_depth: u16,
+) -> HashSet<u32> {
+    let mut pools = commitments.clone();
+    let max_seed_depth = seed_depths.values().copied().max().unwrap_or(0);
+    for depth in (1..=max_seed_depth).rev() {
+        let cells = seed_depths
+            .iter()
+            .filter_map(|(&cell_id, &candidate)| (candidate == depth).then_some(cell_id))
+            .collect::<Vec<_>>();
+        for cell_id in cells {
+            let amount = pools.remove(&cell_id).unwrap_or(0);
+            distribute_wave_pool(amount, children.get(&cell_id), &mut pools);
+        }
+    }
+    let boundary = seed_depths
+        .iter()
+        .filter_map(|(&cell_id, &depth)| (depth == 0).then_some(cell_id))
+        .collect::<Vec<_>>();
+    let mut incoming = HashMap::new();
+    for cell_id in boundary {
+        let amount = pools.remove(&cell_id).unwrap_or(0);
+        distribute_wave_pool(amount, children.get(&cell_id), &mut incoming);
+    }
+
+    let mut reached = HashSet::new();
+    for depth in 1..=max_depth {
+        let current = std::mem::take(&mut incoming);
+        for (cell_id, amount) in current {
+            if amount == 0 || outside_depths.get(&cell_id) != Some(&depth) {
+                continue;
+            }
+            reached.insert(cell_id);
+            let state = &cell_by_id[&cell_id];
+            let mobile = if state.owner_player_id == 0 {
+                amount.saturating_sub(expected_occupation_garrison(
+                    &terrain_by_id[&cell_id],
+                    state,
+                ))
+            } else {
+                amount
+            };
+            distribute_wave_pool(mobile, children.get(&cell_id), &mut incoming);
+        }
+    }
+    reached
+}
+
+fn distribute_wave_pool(total: u64, targets: Option<&Vec<u32>>, incoming: &mut HashMap<u32, u64>) {
+    let Some(targets) = targets.filter(|targets| !targets.is_empty()) else {
+        return;
+    };
+    let parts = targets.len() as u64;
+    for (index, &target) in targets.iter().enumerate() {
+        let amount = total / parts + u64::from((index as u64) < total % parts);
+        *incoming.entry(target).or_default() += amount;
+    }
+}
+
+fn axial_for_cell(terrain_by_id: &HashMap<u32, CellTerrain>, cell_id: u32) -> Axial {
+    let terrain = &terrain_by_id[&cell_id];
+    Axial::new(terrain.q, terrain.r)
 }
 
 fn basis_point_share(value: u64, basis_points: u32) -> u64 {
@@ -1883,7 +2116,6 @@ fn assert_expand_sources(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn assert_expand_persistence(
     conn: &DbConnection,
     candidate: &ExpandAllCandidate,
@@ -1895,69 +2127,13 @@ fn assert_expand_persistence(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    let terrain_by_id = conn
-        .db
-        .cell_terrain()
-        .iter()
-        .map(|terrain| (terrain.cell_id, terrain))
-        .collect::<HashMap<_, _>>();
-    let destinations = conn
-        .db
-        .transfer_destination()
-        .iter()
-        .filter(|destination| destination.order_id == order.order_id)
-        .collect::<Vec<_>>();
-    let actual_anchors = destinations
-        .iter()
-        .map(|destination| destination.cell_id)
-        .collect::<HashSet<_>>();
-    let expected_anchors = candidate
-        .eligible_lanes
-        .keys()
-        .copied()
-        .collect::<HashSet<_>>();
     ensure!(
-        actual_anchors == expected_anchors,
-        "all-front order did not persist exactly one stable anchor for every eligible neutral target"
-    );
-    let directions = destinations
-        .iter()
-        .map(|destination| candidate.eligible_lanes[&destination.cell_id].direction)
-        .collect::<HashSet<_>>();
-    ensure!(
-        destinations.len() >= 2 && directions.len() >= 2,
-        "all-front fixture produced {} stable anchors in {} directions instead of at least two independent lanes",
-        destinations.len(),
-        directions.len()
-    );
-    let target_total = destinations.iter().try_fold(0_u64, |total, destination| {
-        ensure!(
-            destination.target_infantry > 0
-                && destination.received_infantry <= destination.target_infantry,
-            "all-front lane {} has invalid received/target accounting {}/{}",
-            destination.cell_id,
-            destination.received_infantry,
-            destination.target_infantry
-        );
-        let target_state = conn
+        !conn
             .db
-            .cell_state()
-            .cell_id()
-            .find(&destination.cell_id)
-            .with_context(|| format!("all-front anchor {} disappeared", destination.cell_id))?;
-        ensure!(
-            target_state.owner_player_id == 0 || target_state.owner_player_id == PLAYER_ONE,
-            "neutral-only expansion persisted enemy cell {} as a target",
-            destination.cell_id
-        );
-        total
-            .checked_add(destination.target_infantry)
-            .context("all-front destination accounting overflow")
-    })?;
-    ensure!(
-        target_total == order.committed_infantry,
-        "all-front lane targets total {target_total} instead of committed infantry {}",
-        order.committed_infantry
+            .transfer_destination()
+            .iter()
+            .any(|destination| destination.order_id == order.order_id),
+        "branching all-front wave unexpectedly exposed stable destination anchors"
     );
 
     let packets = conn
@@ -1971,64 +2147,39 @@ fn assert_expand_persistence(
         "active all-front order has no transit packets"
     );
     let mut packet_total = 0_u64;
+    let mut queued_by_source = HashMap::<u32, u64>::new();
     for packet in packets {
         ensure!(
-            packet.owner_player_id == PLAYER_ONE && selected.contains(&packet.origin_cell),
-            "all-front packet belongs to another player or originated outside the selection"
-        );
-        let lane = candidate
-            .eligible_lanes
-            .get(&packet.destination_cell)
-            .with_context(|| {
-                format!(
-                    "all-front packet references unknown lane anchor {}",
-                    packet.destination_cell
-                )
-            })?;
-        ensure!(
-            packet.route.first() == Some(&packet.origin_cell),
-            "all-front packet route did not begin at its selected origin"
-        );
-        let route_index = usize::try_from(packet.route_index).context("route index overflow")?;
-        ensure!(
-            packet.route.get(route_index) == Some(&packet.current_cell),
-            "all-front packet current cell does not match its route index"
-        );
-        let anchor_index = packet
-            .route
-            .iter()
-            .position(|cell_id| *cell_id == lane.anchor_cell)
-            .context("all-front packet route omitted its stable lane anchor")?;
-        ensure!(
-            anchor_index > 0
-                && packet.route[..anchor_index]
-                    .iter()
-                    .all(|cell_id| selected.contains(cell_id)),
-            "all-front packet escaped the selected source region before its neutral anchor"
+            packet.owner_player_id == PLAYER_ONE,
+            "all-front packet belongs to another player"
         );
         ensure!(
-            packet.route.get(anchor_index - 1) == Some(&lane.boundary_cell),
-            "all-front packet did not leave through its deterministic boundary cell"
+            packet.route_index == 0 && packet.route.first() == Some(&packet.current_cell),
+            "all-front packet is not positioned at the start of its local route"
         );
-        for cells in packet.route.windows(2) {
-            let from = terrain_by_id
-                .get(&cells[0])
-                .with_context(|| format!("route terrain {} disappeared", cells[0]))?;
-            let to = terrain_by_id
-                .get(&cells[1])
-                .with_context(|| format!("route terrain {} disappeared", cells[1]))?;
+        let resting = packet.route.as_slice() == [packet.current_cell]
+            && packet.destination_cell == packet.current_cell;
+        let crossing = packet.route.len() == 2
+            && packet.route[1] == packet.destination_cell
+            && candidate
+                .children
+                .get(&packet.current_cell)
+                .is_some_and(|children| children.contains(&packet.destination_cell));
+        ensure!(
+            resting || crossing,
+            "all-front packet must be one resting node or one monotonic wave edge"
+        );
+        ensure!(
+            candidate.seed_depths.contains_key(&packet.current_cell)
+                || candidate.outside_depths.contains_key(&packet.current_cell),
+            "all-front packet rests outside its accepted seed/wave topology"
+        );
+        if packet.origin_cell != EXPANSION_AGGREGATE_ORIGIN {
             ensure!(
-                Axial::new(from.q, from.r).distance(Axial::new(to.q, to.r)) == 1,
-                "all-front route contains a non-adjacent step"
+                selected.contains(&packet.origin_cell) && packet.current_cell == packet.origin_cell,
+                "unmerged all-front packet left or misidentified its selected source"
             );
-        }
-        for cells in packet.route[anchor_index - 1..].windows(2) {
-            let from = &terrain_by_id[&cells[0]];
-            let to = &terrain_by_id[&cells[1]];
-            ensure!(
-                Axial::new(to.q, to.r) - Axial::new(from.q, from.r) == lane.direction,
-                "all-front lane changed direction after leaving its selected boundary"
-            );
+            *queued_by_source.entry(packet.origin_cell).or_default() += packet.infantry;
         }
         packet_total = packet_total
             .checked_add(packet.infantry)
@@ -2039,6 +2190,20 @@ fn assert_expand_persistence(
         "all-front packet total {packet_total} differs from order in-transit infantry {}",
         order.in_transit_infantry
     );
+    for source in conn
+        .db
+        .transfer_source()
+        .iter()
+        .filter(|source| source.order_id == order.order_id)
+    {
+        ensure!(
+            source.queued_infantry == queued_by_source.get(&source.cell_id).copied().unwrap_or(0),
+            "all-front source {} reports {} queued but has {} source-backed packet strength",
+            source.cell_id,
+            source.queued_infantry,
+            queued_by_source.get(&source.cell_id).copied().unwrap_or(0)
+        );
+    }
     Ok(())
 }
 
@@ -2047,20 +2212,6 @@ fn owner_snapshot(conn: &DbConnection) -> HashMap<u32, u8> {
         .cell_state()
         .iter()
         .map(|cell| (cell.cell_id, cell.owner_player_id))
-        .collect()
-}
-
-fn destination_snapshot(conn: &DbConnection, order_id: u64) -> HashMap<u32, (u64, u64)> {
-    conn.db
-        .transfer_destination()
-        .iter()
-        .filter(|destination| destination.order_id == order_id)
-        .map(|destination| {
-            (
-                destination.cell_id,
-                (destination.target_infantry, destination.received_infantry),
-            )
-        })
         .collect()
 }
 

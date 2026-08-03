@@ -203,7 +203,7 @@ fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
             });
         panel.spawn((
             Text::new(
-                "MAP KEY\nouter perimeter     selected region\namber edge          neutral expansion\nred edge            attack front\nmixed player fill   contested pressure\n× marker            blocked\nopposing chevrons   combat",
+                "MAP KEY\nouter perimeter     selected region\namber rings         expansion wave\nred edge            attack front\nmixed player fill   contested pressure\n× marker            blocked\nopposing chevrons   combat",
             ),
             TextFont::from_font_size(10.5),
             TextColor(MUTED),
@@ -409,7 +409,7 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
         help.spawn(section_title("FIELD MANUAL  //  ? TO CLOSE"));
         help.spawn((
             Text::new(
-                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts. In source mode, [ / ] removes or adds one complete hex ring around the brush, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes.\n\nPUSH FRONTS\nThe outward-facing selected cells form the front; connected selected cells behind them are its reinforcement corridor. Hold P, drag outward, and release to choose one of six directions; Enter starts a sustained directional push. Shift+P instead previews every passable neutral edge around the selection and expands all of them with independent lanes. Enemy borders are never included in Expand All. Plain [ / ] changes the share requested from each selected cell. The UP TO estimate uses visible infantry; the authority subtracts troops already allocated to active orders, so acceptance can be lower. Recreate the matching directional or all-front selection, then X stops those active operations.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters. Contested cells mix both player colors by relative force.\n\nREDISTRIBUTE\nB balances density, F orients front-load, G loads toward the selection core, and R loads toward its perimeter. Plain [ / ] changes how much of every selected stack participates; Enter confirms. Pale nested outlines show the estimated target density.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. Mobilization is the future recruitment/conversion target; it is separate from the order dispatch share. Lowering it does not demobilize existing soldiers.",
+                "SELECT\nLMB drag paints owned source hexes. Shift adds; Control subtracts. In source mode, [ / ] removes or adds one complete hex ring around the brush, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes.\n\nPUSH FRONTS\nThe outward-facing selected cells form the front; connected selected cells behind them are its reinforcement corridor. Hold P, drag outward, and release to choose one of six directions; Enter starts a sustained directional push. Shift+P instead treats the connected selection as one seed and previews a perimeter wave. Central strength branches through selected neighbors, merges at shared boundary cells, and then advances through successive one-cell offset rings. It stops rather than attacking enemy territory. Plain [ / ] changes the share requested from each selected cell. The UP TO estimate uses visible infantry; the authority subtracts troops already allocated to active orders, so acceptance can be lower. Recreate the matching directional or all-front selection, then X stops those active operations.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters. Contested cells mix both player colors by relative force.\n\nREDISTRIBUTE\nB balances density, F orients front-load, G loads toward the selection core, and R loads toward its perimeter. Plain [ / ] changes how much of every selected stack participates; Enter confirms. Pale nested outlines show the estimated target density.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. Mobilization is the future recruitment/conversion target; it is separate from the order dispatch share. Lowering it does not demobilize existing soldiers.",
             ),
             TextFont::from_font_size(12.0),
             TextColor(TEXT),
@@ -620,7 +620,7 @@ fn update_hud(
         ),
         OrderMode::ExpandAllPreview => interaction.preview.invalid_reason.map_or_else(
             || {
-                "Every amber edge expands independently · UP TO may be reduced by active allocations · Enter starts · X stops"
+                "Amber bands are successive branching/merging rings · UP TO may be reduced by active allocations · Enter starts · X stops"
                     .to_owned()
             },
             |reason| format!("INVALID · {reason}"),
@@ -653,23 +653,59 @@ fn update_hud(
         | OrderMode::PerimeterLoadPreview => "PARTICIPATE",
         OrderMode::Idle | OrderMode::Submitting { .. } => "ORDER SHARE",
     };
+    let (boundary_label, boundary_count) =
+        if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
+            (
+                "PERIMETER",
+                interaction
+                    .preview
+                    .wave_depth
+                    .values()
+                    .filter(|depth| **depth == 1)
+                    .count(),
+            )
+        } else {
+            ("FRONT", interaction.preview.front_edges.len())
+        };
+    let movement_extent = if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
+        let rings = interaction
+            .preview
+            .wave_depth
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        format!(
+            "WAVE {:>2} RING{}{}",
+            rings,
+            if rings == 1 { "" } else { "S" },
+            if interaction.preview.wave_truncated {
+                "+"
+            } else {
+                ""
+            }
+        )
+    } else {
+        format!("ROUTE {:>3} HEXES", interaction.preview.route.len())
+    };
     {
         let mut order = texts.p2();
         set_text(
             &mut order,
             format!(
-                "ORDER  //  {}\nSOURCE {:>3} HEXES  ·  INF {:>5} / {:>5}\nCIVILIANS {:>5}  ·  DENSITY {:>3.0}%\nFRONT {:>3} EDGES  ·  UP TO EST. {:>5}\n{} {:>3}%  ·  ROUTE {:>3} HEXES  ·  EXCLUDED {:>2}\nETA ≈ {:>3}s  ·  BOTTLENECK {}\n\n{}",
+                "ORDER  //  {}\nSOURCE {:>3} HEXES  ·  INF {:>5} / {:>5}\nCIVILIANS {:>5}  ·  DENSITY {:>3.0}%\n{} {:>3} CELLS  ·  UP TO EST. {:>5}\n{} {:>3}%  ·  {}  ·  EXCLUDED {:>2}\nETA ≈ {:>3}s  ·  BOTTLENECK {}\n\n{}",
                 interaction.mode.label(),
                 interaction.sources.len(),
                 strength,
                 capacity,
                 civilians,
                 occupancy,
-                interaction.preview.front_edges.len(),
+                boundary_label,
+                boundary_count,
                 interaction.preview.strength_upper_bound,
                 percentage_label,
                 interaction.amount_percent,
-                interaction.preview.route.len(),
+                movement_extent,
                 interaction.preview.excluded.len(),
                 interaction.preview.eta_seconds,
                 bottleneck,

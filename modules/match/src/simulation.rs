@@ -6,17 +6,20 @@ use hex_core::{
 };
 use spacetimedb::{ReducerContext, Table};
 
+use crate::orders::aggregate_lane_allocations_rotated;
 use crate::rules::{
     allocated_infantry_at_cell, cell_id_for_coordinate, cell_state, config, coordinate_for_cell,
     core_cell, edge_runtime_limits, packet_key, state, terrain,
 };
 use crate::schema::{
-    CellState, CombatFront, MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus, PLAYER_ONE,
-    PLAYER_TWO, TerrainClass, TransferOrder, TransitPacket,
+    CellState, CombatFront, EXPANSION_AGGREGATE_ORIGIN, ExpansionGarrisonDebt, ExpansionWave,
+    MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus, PLAYER_ONE, PLAYER_TWO, TerrainClass,
+    TransferOrder, TransitPacket,
 };
 use crate::schema::{
-    cell_state as cell_state_table, combat_front, match_state, mobilization_policy,
-    transfer_destination, transfer_order, transfer_source, transit_packet,
+    cell_state as cell_state_table, combat_front, expansion_garrison_debt, expansion_wave,
+    match_state, mobilization_policy, transfer_destination, transfer_order, transfer_source,
+    transit_packet,
 };
 
 pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
@@ -33,7 +36,8 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
 
     clear_combat_fronts(ctx);
     trim_all_overallocated_packets(ctx, logical_step)?;
-    stop_blocked_expand_lanes(ctx, logical_step)?;
+    branch_expand_waves(ctx, logical_step)?;
+    stop_blocked_expand_edges(ctx, logical_step)?;
     move_friendly_packets(ctx, logical_step)?;
     resolve_combats(ctx, logical_step)?;
     finalize_orders(ctx, logical_step)?;
@@ -46,9 +50,9 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
 }
 
 /// Expansion is neutral-only even if ownership changes after the command was
-/// accepted. Friendly cells remain valid transit, but a lane is released in
+/// accepted. Friendly cells remain valid transit, but an edge is released in
 /// place before crossing any cell currently owned by an enemy.
-fn stop_blocked_expand_lanes(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+fn stop_blocked_expand_edges(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
     let expand_orders = ctx
         .db
         .transfer_order()
@@ -61,7 +65,7 @@ fn stop_blocked_expand_lanes(ctx: &ReducerContext, logical_step: u64) -> Result<
         return Ok(());
     }
 
-    let mut blocked_lanes = BTreeMap::<(u64, u32), TransitPacket>::new();
+    let mut blocked_packets = Vec::new();
     for (order_id, player_id) in expand_orders {
         for packet in ctx.db.transit_packet().packet_by_order().filter(order_id) {
             let next_index = packet.route_index as usize + 1;
@@ -70,20 +74,359 @@ fn stop_blocked_expand_lanes(ctx: &ReducerContext, logical_step: u64) -> Result<
             };
             let next_owner = cell_state(ctx, next_cell)?.owner_player_id;
             if expand_next_owner_is_blocked(player_id, next_owner) {
-                blocked_lanes
-                    .entry((packet.order_id, packet.destination_cell))
-                    .or_insert(packet);
+                blocked_packets.push(packet);
             }
         }
     }
-    for ((order_id, lane_anchor), _) in blocked_lanes {
-        settle_stopped_sustained_lane(ctx, order_id, lane_anchor, logical_step)?;
+    blocked_packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    for packet in blocked_packets {
+        station_packet_allocation(ctx, &packet, packet.infantry, logical_step)?;
     }
     Ok(())
 }
 
 fn expand_next_owner_is_blocked(player_id: u8, next_owner: u8) -> bool {
     next_owner != NEUTRAL_PLAYER && next_owner != player_id
+}
+
+fn branch_expand_waves(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+    let orders = ctx
+        .db
+        .transfer_order()
+        .order_by_status()
+        .filter(OrderStatus::Active)
+        .filter(|order| order.kind == OrderKind::ExpandAll)
+        .collect::<Vec<_>>();
+    for order in orders {
+        let mut wave = ctx
+            .db
+            .expansion_wave()
+            .order_id()
+            .find(order.order_id)
+            .ok_or_else(|| format!("expand order {} has no topology", order.order_id))?;
+        let mut resting_by_cell = BTreeMap::<u32, Vec<TransitPacket>>::new();
+        for packet in ctx
+            .db
+            .transit_packet()
+            .packet_by_order()
+            .filter(order.order_id)
+        {
+            if expansion_packet_is_resting(&packet) {
+                resting_by_cell
+                    .entry(packet.current_cell)
+                    .or_default()
+                    .push(packet);
+            }
+        }
+        let mut topology_changed = false;
+        for (cell_id, mut contributions) in resting_by_cell {
+            contributions.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+            topology_changed |= branch_expand_node(
+                ctx,
+                &order,
+                &mut wave,
+                cell_id,
+                &contributions,
+                logical_step,
+            )?;
+        }
+        if topology_changed {
+            ctx.db.expansion_wave().order_id().update(wave);
+        }
+    }
+    Ok(())
+}
+
+fn expansion_packet_is_resting(packet: &TransitPacket) -> bool {
+    packet.route_index == 0
+        && packet.route.as_slice() == [packet.current_cell]
+        && packet.destination_cell == packet.current_cell
+}
+
+fn branch_expand_node(
+    ctx: &ReducerContext,
+    order: &TransferOrder,
+    wave: &mut ExpansionWave,
+    cell_id: u32,
+    contributions: &[TransitPacket],
+    logical_step: u64,
+) -> Result<bool, String> {
+    let contributions =
+        pay_expansion_garrison_debt(ctx, order, cell_id, contributions, logical_step)?;
+    if contributions.is_empty() {
+        return Ok(false);
+    }
+
+    let children = expansion_children(ctx, wave, cell_id)?;
+    if children.is_empty() {
+        for contribution in &contributions {
+            station_packet_allocation(ctx, contribution, contribution.infantry, logical_step)?;
+        }
+        return Ok(false);
+    }
+
+    let amounts = contributions
+        .iter()
+        .map(|packet| packet.infantry)
+        .collect::<Vec<_>>();
+    let cursor = wave
+        .split_cursors
+        .get(cell_id as usize)
+        .copied()
+        .ok_or_else(|| format!("expand split cursor is missing cell {cell_id}"))?;
+    let (allocations, next_cursor) =
+        aggregate_lane_allocations_rotated(&amounts, children.len(), usize::from(cursor))?;
+    let next_cursor =
+        u8::try_from(next_cursor).map_err(|_| "expand child cursor exceeds u8".to_string())?;
+    let topology_changed = next_cursor != cursor;
+    if topology_changed {
+        wave.split_cursors[cell_id as usize] = next_cursor;
+    }
+    let mut stationed_by_contribution = vec![0_u64; contributions.len()];
+    let mut outgoing = Vec::new();
+    for (contribution_index, child_index, amount) in allocations {
+        let child = children[child_index];
+        if expansion_edge_is_available(ctx, order.player_id, cell_id, child)? {
+            outgoing.push((contribution_index, child, amount));
+        } else {
+            stationed_by_contribution[contribution_index] = stationed_by_contribution
+                [contribution_index]
+                .checked_add(amount)
+                .ok_or_else(|| "expand stationed strength overflow".to_string())?;
+        }
+    }
+
+    for (index, contribution) in contributions.iter().enumerate() {
+        let stationed = stationed_by_contribution[index];
+        if stationed > 0 {
+            station_packet_allocation(ctx, contribution, stationed, logical_step)?;
+        }
+        if let Some(remaining) = ctx
+            .db
+            .transit_packet()
+            .packet_key()
+            .find(&contribution.packet_key)
+        {
+            ctx.db
+                .transit_packet()
+                .packet_key()
+                .delete(&remaining.packet_key);
+        }
+    }
+    for (contribution_index, child, amount) in outgoing {
+        insert_expand_edge_packet(
+            ctx,
+            order,
+            &contributions[contribution_index],
+            cell_id,
+            child,
+            amount,
+            logical_step,
+        )?;
+    }
+    Ok(topology_changed)
+}
+
+/// Pays only capture-scoped debt and only from this expansion's resting
+/// allocations. Infantry stays in the cell; stationing merely retires the
+/// allocation and accounts it as delivered before any surplus can branch.
+fn pay_expansion_garrison_debt(
+    ctx: &ReducerContext,
+    order: &TransferOrder,
+    cell_id: u32,
+    contributions: &[TransitPacket],
+    logical_step: u64,
+) -> Result<Vec<TransitPacket>, String> {
+    let Some(mut debt) = ctx.db.expansion_garrison_debt().cell_id().find(cell_id) else {
+        return Ok(contributions.to_vec());
+    };
+    let cell = cell_state(ctx, cell_id)?;
+    if !expansion_debt_applies(debt.owner_player_id, cell.owner_player_id, order.player_id) {
+        ctx.db.expansion_garrison_debt().cell_id().delete(cell_id);
+        return Ok(contributions.to_vec());
+    }
+
+    let required = occupation_garrison(cell.military_capacity, terrain(ctx, cell_id)?.terrain);
+    let allocated = allocated_infantry_at_cell(ctx, order.player_id, cell_id);
+    let currently_missing = additional_garrison_required(required, cell.infantry, allocated);
+    let mut remaining_debt = debt.remaining_infantry.min(currently_missing);
+
+    for contribution in contributions {
+        if remaining_debt == 0 {
+            break;
+        }
+        let Some(current) = ctx
+            .db
+            .transit_packet()
+            .packet_key()
+            .find(&contribution.packet_key)
+        else {
+            continue;
+        };
+        if current.order_id != order.order_id
+            || current.owner_player_id != order.player_id
+            || current.current_cell != cell_id
+            || !expansion_packet_is_resting(&current)
+        {
+            return Err("expand garrison debt received an invalid resting contribution".into());
+        }
+        let (stationed, next_debt, _) = garrison_debt_partition(remaining_debt, current.infantry);
+        station_packet_allocation(ctx, &current, stationed, logical_step)?;
+        remaining_debt = next_debt;
+    }
+
+    if remaining_debt == 0 {
+        ctx.db.expansion_garrison_debt().cell_id().delete(cell_id);
+    } else if remaining_debt != debt.remaining_infantry {
+        debt.remaining_infantry = remaining_debt;
+        ctx.db.expansion_garrison_debt().cell_id().update(debt);
+    }
+
+    Ok(contributions
+        .iter()
+        .filter_map(|contribution| {
+            ctx.db
+                .transit_packet()
+                .packet_key()
+                .find(&contribution.packet_key)
+        })
+        .collect())
+}
+
+fn expansion_debt_applies(debt_owner: u8, cell_owner: u8, order_owner: u8) -> bool {
+    debt_owner == cell_owner && cell_owner == order_owner
+}
+
+/// Returns `(stationed, remaining debt, continuing surplus)`.
+fn garrison_debt_partition(debt: u64, arrival: u64) -> (u64, u64, u64) {
+    let stationed = debt.min(arrival);
+    (stationed, debt - stationed, arrival - stationed)
+}
+
+fn expansion_children(
+    ctx: &ReducerContext,
+    wave: &ExpansionWave,
+    cell_id: u32,
+) -> Result<Vec<u32>, String> {
+    if wave.selected_cells.len() != wave.seed_depths.len() {
+        return Err("expand topology has mismatched seed vectors".into());
+    }
+    let parent_depth = wave_node_depth(wave, cell_id)
+        .ok_or_else(|| format!("expand resting cell {cell_id} is outside its topology"))?;
+
+    let match_config = config(ctx)?;
+    let coordinate = coordinate_for_cell(ctx, cell_id)?;
+    let mut children = Vec::new();
+    for neighbor in coordinate.neighbors() {
+        let Some(neighbor_id) = cell_id_for_coordinate(&match_config, neighbor) else {
+            continue;
+        };
+        let matches_depth = wave_node_depth(wave, neighbor_id)
+            .is_some_and(|child_depth| wave_depth_allows_child(parent_depth, child_depth));
+        if matches_depth && edge_runtime_limits(ctx, cell_id, neighbor_id)?.is_some() {
+            children.push(neighbor_id);
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    Ok(children)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaveNodeDepth {
+    Seed(u16),
+    Outside(u16),
+}
+
+fn wave_node_depth(wave: &ExpansionWave, cell_id: u32) -> Option<WaveNodeDepth> {
+    if let Ok(index) = wave.selected_cells.binary_search(&cell_id) {
+        return wave
+            .seed_depths
+            .get(index)
+            .copied()
+            .map(WaveNodeDepth::Seed);
+    }
+    wave.outside_depths
+        .get(cell_id as usize)
+        .copied()
+        .filter(|depth| *depth != u16::MAX)
+        .map(WaveNodeDepth::Outside)
+}
+
+fn wave_depth_allows_child(parent: WaveNodeDepth, child: WaveNodeDepth) -> bool {
+    match (parent, child) {
+        (WaveNodeDepth::Seed(parent), WaveNodeDepth::Seed(child)) => {
+            parent > 0 && child.checked_add(1) == Some(parent)
+        }
+        (WaveNodeDepth::Seed(0), WaveNodeDepth::Outside(1)) => true,
+        (WaveNodeDepth::Outside(parent), WaveNodeDepth::Outside(child)) => {
+            parent.checked_add(1) == Some(child)
+        }
+        _ => false,
+    }
+}
+
+fn expansion_edge_is_available(
+    ctx: &ReducerContext,
+    player_id: u8,
+    from_cell: u32,
+    to_cell: u32,
+) -> Result<bool, String> {
+    let target_terrain = terrain(ctx, to_cell)?;
+    let target_owner = cell_state(ctx, to_cell)?.owner_player_id;
+    Ok(
+        (target_owner == NEUTRAL_PLAYER || target_owner == player_id)
+            && target_terrain.passable
+            && target_terrain.capturable
+            && edge_runtime_limits(ctx, from_cell, to_cell)?.is_some(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_expand_edge_packet(
+    ctx: &ReducerContext,
+    order: &TransferOrder,
+    contribution: &TransitPacket,
+    from_cell: u32,
+    to_cell: u32,
+    amount: u64,
+    logical_step: u64,
+) -> Result<(), String> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let key = packet_key(
+        order.order_id,
+        contribution.origin_cell,
+        to_cell,
+        from_cell,
+        0,
+    );
+    if let Some(mut existing) = ctx.db.transit_packet().packet_key().find(&key) {
+        existing.infantry = merged_expand_strength(existing.infantry, amount)?;
+        existing.updated_step = logical_step;
+        ctx.db.transit_packet().packet_key().update(existing);
+    } else {
+        ctx.db.transit_packet().insert(TransitPacket {
+            packet_key: key,
+            order_id: order.order_id,
+            owner_player_id: order.player_id,
+            origin_cell: contribution.origin_cell,
+            current_cell: from_cell,
+            destination_cell: to_cell,
+            infantry: amount,
+            route_index: 0,
+            route: vec![from_cell, to_cell],
+            updated_step: logical_step,
+        });
+    }
+    Ok(())
+}
+
+fn merged_expand_strength(existing: u64, incoming: u64) -> Result<u64, String> {
+    existing
+        .checked_add(incoming)
+        .ok_or_else(|| "expand packet strength overflow".to_string())
 }
 
 fn clear_combat_fronts(ctx: &ReducerContext) {
@@ -556,11 +899,25 @@ fn occupy_after_combat(
     ctx.db.cell_state().cell_id().update(target.clone());
 
     let mut remaining = occupancy;
+    let mut capturing_expand_order = None::<u64>;
     for packet in packets {
         if remaining == 0 {
             break;
         }
         let moved = remaining.min(packet.infantry);
+        if moved > 0
+            && ctx
+                .db
+                .transfer_order()
+                .order_id()
+                .find(packet.order_id)
+                .is_some_and(|order| order.kind == OrderKind::ExpandAll)
+        {
+            capturing_expand_order = Some(
+                capturing_expand_order
+                    .map_or(packet.order_id, |current| current.min(packet.order_id)),
+            );
+        }
         let mut source = cell_state(ctx, packet.current_cell)?;
         source.infantry = source.infantry.saturating_sub(moved);
         source.last_changed_step = logical_step;
@@ -570,6 +927,51 @@ fn occupy_after_combat(
     }
     station_capture_garrison(ctx, target.cell_id, front.attacker, logical_step)?;
     record_capture(ctx, target.cell_id, old_owner, front.attacker)?;
+    if let Some(order_id) = capturing_expand_order {
+        record_expand_garrison_debt(ctx, order_id, target.cell_id, front.attacker)?;
+    }
+    Ok(())
+}
+
+fn record_expand_garrison_debt(
+    ctx: &ReducerContext,
+    order_id: u64,
+    cell_id: u32,
+    owner_player_id: u8,
+) -> Result<(), String> {
+    let wave = ctx
+        .db
+        .expansion_wave()
+        .order_id()
+        .find(order_id)
+        .ok_or_else(|| format!("capturing expand order {order_id} has no topology"))?;
+    if wave.selected_cells.binary_search(&cell_id).is_ok() {
+        return Err("expand capture debt cannot be recorded inside its seed".into());
+    }
+    if wave
+        .outside_depths
+        .get(cell_id as usize)
+        .is_none_or(|depth| *depth == u16::MAX)
+    {
+        return Err("expand captured a cell outside its wave topology".into());
+    }
+    let cell = cell_state(ctx, cell_id)?;
+    if cell.owner_player_id != owner_player_id {
+        return Err("expand capture owner changed before garrison debt was recorded".into());
+    }
+    let required = occupation_garrison(cell.military_capacity, terrain(ctx, cell_id)?.terrain);
+    let allocated = allocated_infantry_at_cell(ctx, owner_player_id, cell_id);
+    let unallocated = cell.infantry.saturating_sub(allocated);
+    let debt = required.saturating_sub(unallocated);
+    if debt > 0 {
+        ctx.db
+            .expansion_garrison_debt()
+            .insert(ExpansionGarrisonDebt {
+                cell_id,
+                owner_player_id,
+                remaining_infantry: debt,
+            });
+    }
     Ok(())
 }
 
@@ -582,6 +984,9 @@ fn record_capture(
     if old_owner == new_owner || !terrain(ctx, cell_id)?.capturable {
         return Ok(());
     }
+    // Ownership changes eagerly invalidate the prior owner's capture-scoped
+    // debt, even when this capture was performed by a different order kind.
+    ctx.db.expansion_garrison_debt().cell_id().delete(cell_id);
     let mut match_state = state(ctx)?;
     match old_owner {
         PLAYER_ONE => {
@@ -628,6 +1033,15 @@ fn advance_packet(
     if moved == 0 || moved > packet.infantry {
         return Err("invalid packet movement amount".into());
     }
+    let order = ctx
+        .db
+        .transfer_order()
+        .order_id()
+        .find(packet.order_id)
+        .ok_or_else(|| "packet order is missing".to_string())?;
+    if order.kind == OrderKind::ExpandAll {
+        return advance_expand_packet(ctx, &packet, moved, logical_step);
+    }
     let next_index = packet.route_index + 1;
     let next_cell = *packet
         .route
@@ -655,7 +1069,7 @@ fn advance_packet(
         remainder.updated_step = logical_step;
         ctx.db.transit_packet().packet_key().update(remainder);
     }
-    if packet.route_index == 0 {
+    if packet_has_pending_source(&packet) {
         decrement_source_queue(ctx, packet.order_id, packet.origin_cell, moved)?;
     }
 
@@ -696,6 +1110,64 @@ fn advance_packet(
     Ok(())
 }
 
+fn advance_expand_packet(
+    ctx: &ReducerContext,
+    packet: &TransitPacket,
+    moved: u64,
+    logical_step: u64,
+) -> Result<(), String> {
+    if packet.route_index != 0 || packet.route.len() != 2 || packet.route[0] != packet.current_cell
+    {
+        return Err("expand edge packet has an invalid one-edge route".into());
+    }
+    let next_cell = packet.route[1];
+    if moved == packet.infantry {
+        ctx.db
+            .transit_packet()
+            .packet_key()
+            .delete(&packet.packet_key);
+    } else {
+        let mut remainder = packet.clone();
+        remainder.infantry -= moved;
+        remainder.updated_step = logical_step;
+        ctx.db.transit_packet().packet_key().update(remainder);
+    }
+    if packet_has_pending_source(packet) {
+        decrement_source_queue(ctx, packet.order_id, packet.origin_cell, moved)?;
+    }
+
+    let rest_key = packet_key(
+        packet.order_id,
+        EXPANSION_AGGREGATE_ORIGIN,
+        next_cell,
+        next_cell,
+        0,
+    );
+    if let Some(mut resting) = ctx.db.transit_packet().packet_key().find(&rest_key) {
+        resting.infantry = merged_expand_strength(resting.infantry, moved)?;
+        resting.updated_step = logical_step;
+        ctx.db.transit_packet().packet_key().update(resting);
+    } else {
+        ctx.db.transit_packet().insert(TransitPacket {
+            packet_key: rest_key,
+            order_id: packet.order_id,
+            owner_player_id: packet.owner_player_id,
+            origin_cell: EXPANSION_AGGREGATE_ORIGIN,
+            current_cell: next_cell,
+            destination_cell: next_cell,
+            infantry: moved,
+            route_index: 0,
+            route: vec![next_cell],
+            updated_step: logical_step,
+        });
+    }
+    Ok(())
+}
+
+fn packet_has_pending_source(packet: &TransitPacket) -> bool {
+    packet.route_index == 0 && packet.origin_cell != EXPANSION_AGGREGATE_ORIGIN
+}
+
 /// Extends every packet in one push lane by exactly one outward cell.
 ///
 /// `destination_cell` is deliberately kept as the stable lane anchor. This
@@ -710,9 +1182,7 @@ fn extend_sustained_lane(
     let Some(order) = ctx.db.transfer_order().order_id().find(packet.order_id) else {
         return Err("push order is missing while extending a lane".into());
     };
-    if order.status != OrderStatus::Active
-        || !matches!(order.kind, OrderKind::PushFront | OrderKind::ExpandAll)
-    {
+    if order.status != OrderStatus::Active || order.kind != OrderKind::PushFront {
         return Ok(false);
     }
 
@@ -726,22 +1196,7 @@ fn extend_sustained_lane(
         return Ok(true);
     }
 
-    let direction = match order.kind {
-        OrderKind::PushFront => hex_core::Axial::new(order.orientation_q, order.orientation_r),
-        OrderKind::ExpandAll => {
-            let route_len = current.route.len();
-            let from_cell = *current
-                .route
-                .get(route_len.saturating_sub(2))
-                .ok_or_else(|| "expand lane route has no outward edge".to_string())?;
-            edge_direction(
-                coordinate_for_cell(ctx, from_cell)?,
-                coordinate_for_cell(ctx, reached_cell)?,
-            )
-            .ok_or_else(|| "expand lane ended with a non-adjacent edge".to_string())?
-        }
-        _ => return Ok(false),
-    };
+    let direction = hex_core::Axial::new(order.orientation_q, order.orientation_r);
     if !hex_core::Axial::DIRECTIONS.contains(&direction) {
         return Err("active push order has an invalid direction".into());
     }
@@ -753,23 +1208,13 @@ fn extend_sustained_lane(
     let next_terrain = terrain(ctx, next_cell)?;
     let next_state = cell_state(ctx, next_cell)?;
     let traversable = edge_runtime_limits(ctx, reached_cell, next_cell)?.is_some();
-    let eligible = match order.kind {
-        OrderKind::PushFront => push_target_is_eligible(
-            order.player_id,
-            next_state.owner_player_id,
-            next_terrain.passable,
-            next_terrain.capturable,
-            traversable,
-        ),
-        OrderKind::ExpandAll => expand_continuation_target_is_eligible(
-            order.player_id,
-            next_state.owner_player_id,
-            next_terrain.passable,
-            next_terrain.capturable,
-            traversable,
-        ),
-        _ => false,
-    };
+    let eligible = push_target_is_eligible(
+        order.player_id,
+        next_state.owner_player_id,
+        next_terrain.passable,
+        next_terrain.capturable,
+        traversable,
+    );
     if !eligible {
         return Ok(false);
     }
@@ -800,26 +1245,6 @@ fn push_target_is_eligible(
     traversable: bool,
 ) -> bool {
     passable && capturable && traversable && target_owner != player_id
-}
-
-fn expand_continuation_target_is_eligible(
-    player_id: u8,
-    target_owner: u8,
-    passable: bool,
-    capturable: bool,
-    traversable: bool,
-) -> bool {
-    (target_owner == NEUTRAL_PLAYER || target_owner == player_id)
-        && passable
-        && capturable
-        && traversable
-}
-
-fn edge_direction(from: hex_core::Axial, to: hex_core::Axial) -> Option<hex_core::Axial> {
-    let direction = to - from;
-    hex_core::Axial::DIRECTIONS
-        .contains(&direction)
-        .then_some(direction)
 }
 
 fn append_lane_layer(route: &mut Vec<u32>, reached_cell: u32, next_cell: u32) -> bool {
@@ -952,7 +1377,7 @@ fn settle_stopped_sustained_lane(
     let Some(order) = ctx.db.transfer_order().order_id().find(order_id) else {
         return Err("order is missing while settling a stopped push lane".into());
     };
-    if !matches!(order.kind, OrderKind::PushFront | OrderKind::ExpandAll) {
+    if order.kind != OrderKind::PushFront {
         return Ok(());
     }
     let mut packets = ctx
@@ -1000,7 +1425,7 @@ fn station_packet_allocation(
         current.updated_step = logical_step;
         ctx.db.transit_packet().packet_key().update(current.clone());
     }
-    if current.route_index == 0 {
+    if packet_has_pending_source(&current) {
         decrement_source_queue(ctx, current.order_id, current.origin_cell, stationed)?;
     }
     let mut order = ctx
@@ -1036,7 +1461,7 @@ fn reduce_packet_metadata(
         packet.updated_step = logical_step;
         ctx.db.transit_packet().packet_key().update(packet.clone());
     }
-    if packet.route_index == 0 {
+    if packet_has_pending_source(&packet) {
         decrement_source_queue(ctx, packet.order_id, packet.origin_cell, lost)?;
     }
     if count_casualty {
@@ -1131,6 +1556,7 @@ fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         order.in_transit_infantry = active_strength.get(&order.order_id).copied().unwrap_or(0);
         if order.in_transit_infantry == 0 {
             order.status = OrderStatus::Completed;
+            ctx.db.expansion_wave().order_id().delete(order.order_id);
         }
         order.updated_step = logical_step;
         let accounted = order
@@ -1151,6 +1577,80 @@ fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_packet(origin: u32, current: u32, destination: u32, route: Vec<u32>) -> TransitPacket {
+        TransitPacket {
+            packet_key: "test".into(),
+            order_id: 1,
+            owner_player_id: 1,
+            origin_cell: origin,
+            current_cell: current,
+            destination_cell: destination,
+            infantry: 10,
+            route_index: 0,
+            route,
+            updated_step: 0,
+        }
+    }
+
+    #[test]
+    fn expand_resting_nodes_and_one_edge_packets_are_unambiguous() {
+        let resting = test_packet(5, 5, 5, vec![5]);
+        let edge = test_packet(5, 5, 6, vec![5, 6]);
+        assert!(expansion_packet_is_resting(&resting));
+        assert!(!expansion_packet_is_resting(&edge));
+        assert!(packet_has_pending_source(&resting));
+
+        let aggregate = test_packet(EXPANSION_AGGREGATE_ORIGIN, 8, 8, vec![8]);
+        assert!(expansion_packet_is_resting(&aggregate));
+        assert!(!packet_has_pending_source(&aggregate));
+    }
+
+    #[test]
+    fn wave_depth_transitions_are_monotonic_and_cannot_form_cycles_or_rays() {
+        assert!(wave_depth_allows_child(
+            WaveNodeDepth::Seed(2),
+            WaveNodeDepth::Seed(1)
+        ));
+        assert!(wave_depth_allows_child(
+            WaveNodeDepth::Seed(0),
+            WaveNodeDepth::Outside(1)
+        ));
+        assert!(wave_depth_allows_child(
+            WaveNodeDepth::Outside(3),
+            WaveNodeDepth::Outside(4)
+        ));
+        assert!(!wave_depth_allows_child(
+            WaveNodeDepth::Seed(1),
+            WaveNodeDepth::Seed(1)
+        ));
+        assert!(!wave_depth_allows_child(
+            WaveNodeDepth::Outside(3),
+            WaveNodeDepth::Outside(5)
+        ));
+        assert!(!wave_depth_allows_child(
+            WaveNodeDepth::Outside(3),
+            WaveNodeDepth::Outside(2)
+        ));
+
+        let wave = ExpansionWave {
+            order_id: 1,
+            selected_cells: vec![2, 4],
+            seed_depths: vec![1, 0],
+            outside_depths: vec![u16::MAX, 1, u16::MAX, 2, u16::MAX],
+            split_cursors: vec![0; 5],
+        };
+        assert_eq!(wave_node_depth(&wave, 2), Some(WaveNodeDepth::Seed(1)));
+        assert_eq!(wave_node_depth(&wave, 4), Some(WaveNodeDepth::Seed(0)));
+        assert_eq!(wave_node_depth(&wave, 1), Some(WaveNodeDepth::Outside(1)));
+        assert_eq!(wave_node_depth(&wave, 0), None);
+    }
+
+    #[test]
+    fn shared_child_arrivals_merge_with_exact_checked_conservation() {
+        assert_eq!(merged_expand_strength(17, 25), Ok(42));
+        assert!(merged_expand_strength(u64::MAX, 1).is_err());
+    }
 
     #[test]
     fn one_lane_extends_through_successive_layers_without_touching_its_neighbor() {
@@ -1217,52 +1717,10 @@ mod tests {
     }
 
     #[test]
-    fn all_front_continuation_accepts_neutral_or_friendly_but_never_enemy_ground() {
-        assert!(expand_continuation_target_is_eligible(
-            1,
-            NEUTRAL_PLAYER,
-            true,
-            true,
-            true
-        ));
-        assert!(expand_continuation_target_is_eligible(
-            1, 1, true, true, true
-        ));
-        assert!(!expand_continuation_target_is_eligible(
-            1, 2, true, true, true
-        ));
-        assert!(!expand_continuation_target_is_eligible(
-            1, 0, false, true, true
-        ));
-        assert!(!expand_continuation_target_is_eligible(
-            1, 1, true, false, true
-        ));
-        assert!(!expand_continuation_target_is_eligible(
-            1, 0, true, true, false
-        ));
-    }
-
-    #[test]
     fn ownership_change_to_enemy_stops_expand_but_friendly_transit_remains_valid() {
         assert!(!expand_next_owner_is_blocked(1, NEUTRAL_PLAYER));
         assert!(!expand_next_owner_is_blocked(1, 1));
         assert!(expand_next_owner_is_blocked(1, 2));
-    }
-
-    #[test]
-    fn all_front_lanes_keep_their_independent_initial_directions() {
-        assert_eq!(
-            edge_direction(hex_core::Axial::ZERO, hex_core::Axial::new(1, 0)),
-            Some(hex_core::Axial::new(1, 0))
-        );
-        assert_eq!(
-            edge_direction(hex_core::Axial::ZERO, hex_core::Axial::new(0, -1)),
-            Some(hex_core::Axial::new(0, -1))
-        );
-        assert_eq!(
-            edge_direction(hex_core::Axial::ZERO, hex_core::Axial::new(2, 0)),
-            None
-        );
     }
 
     #[test]
@@ -1291,5 +1749,41 @@ mod tests {
         assert_eq!(additional_garrison_required(10, 30, 25), 5);
         assert_eq!(additional_garrison_required(10, 30, 20), 0);
         assert_eq!(additional_garrison_required(10, 30, 0), 0);
+    }
+
+    #[test]
+    fn a_partial_expand_capture_is_topped_up_before_surplus_continues() {
+        let required = occupation_garrison(100, TerrainClass::Plains);
+        let first_capture = 1;
+        let debt = required - first_capture;
+        let (stationed, remaining_debt, continuing) = garrison_debt_partition(debt, 99);
+
+        assert_eq!(required, 5);
+        assert_eq!((stationed, remaining_debt, continuing), (4, 0, 95));
+        assert_eq!(first_capture + stationed, required);
+    }
+
+    #[test]
+    fn a_later_overlapping_order_can_pay_debt_after_the_capturing_order_ends() {
+        let debt_after_capture = 4;
+        // The capturing order has no later arrival and may complete. Because
+        // debt is cell-keyed, that lifecycle does not consume or erase it.
+        let (_, debt_after_first_order, _) = garrison_debt_partition(debt_after_capture, 0);
+        let (stationed_by_overlap, remaining_debt, continuing) =
+            garrison_debt_partition(debt_after_first_order, 99);
+
+        assert_eq!(debt_after_first_order, 4);
+        assert_eq!(
+            (stationed_by_overlap, remaining_debt, continuing),
+            (4, 0, 95)
+        );
+    }
+
+    #[test]
+    fn stale_debt_never_charges_a_different_owner() {
+        assert!(expansion_debt_applies(1, 1, 1));
+        assert!(!expansion_debt_applies(1, 2, 2));
+        assert!(!expansion_debt_applies(1, 1, 2));
+        assert!(!expansion_debt_applies(2, 1, 1));
     }
 }

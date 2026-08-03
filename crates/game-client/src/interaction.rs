@@ -11,7 +11,8 @@ use crate::{
     geometry::axial_to_plane,
     model::{MatchView, ToastKind},
     network::{
-        ClientIntent, NetworkSet, RedistributionPreset, ServerUpdate, expand_all_front_edges,
+        ClientIntent, ExpandWaveError, MAX_WAVE_PREVIEW_RINGS, NetworkSet, RedistributionPreset,
+        ServerUpdate, forecast_expand_wave,
     },
     terrain::TerrainChunk,
 };
@@ -22,6 +23,8 @@ pub struct OrderPreview {
     pub front_edges: Vec<DirectedFrontEdge>,
     pub excluded: BTreeSet<Axial>,
     pub heatmap: BTreeMap<Axial, f32>,
+    pub wave_depth: BTreeMap<Axial, u16>,
+    pub wave_truncated: bool,
     pub eta_seconds: u32,
     /// Upper-bound estimate from visible infantry. Active authoritative packet
     /// allocations are not represented in `MatchView`, so the accepted order
@@ -682,7 +685,7 @@ fn handle_action(
             } else if matches!(interaction.mode, OrderMode::Idle) {
                 interaction.mode = OrderMode::ExpandAllPreview;
                 view.show_toast(
-                    "Expand All previews every neutral frontier · [/] adjusts dispatch request",
+                    "Expand All previews a branching neutral perimeter wave · [/] adjusts dispatch request",
                     ToastKind::Info,
                 );
             }
@@ -1188,107 +1191,51 @@ fn build_expand_all_preview(
         return;
     }
 
-    let edges = match expand_all_front_edges(view, &sources) {
-        Ok(edges) => edges,
-        Err(FrontSelectionError::EmptySelection) => {
-            preview.invalid_reason = Some("Select owned cells before expanding");
-            return;
-        }
-        Err(FrontSelectionError::DisconnectedSelection) => {
-            preview.invalid_reason = Some("Expand All selection must be one connected region");
-            return;
-        }
-        Err(FrontSelectionError::NoEligibleFront) => {
-            preview.invalid_reason = Some("The selection has no passable neutral frontier");
-            return;
-        }
-        Err(FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront) => {
-            preview.invalid_reason = Some("Expand All frontier is invalid");
-            return;
-        }
-    };
-    let front_sources = edges
-        .iter()
-        .map(|edge| edge.source)
-        .collect::<BTreeSet<_>>();
-    let (next, distance) = selected_reachability_to_front(view, &sources, &front_sources);
-    if next.len() != sources.len() {
-        preview.excluded.extend(
-            sources
-                .iter()
-                .filter(|source| !next.contains_key(source))
-                .copied(),
-        );
-        preview.invalid_reason =
-            Some("Every selected source must reach a neutral frontier inside the selection");
-        return;
-    }
+    let forecast =
+        match forecast_expand_wave(view, &sources, commitment_percent, MAX_WAVE_PREVIEW_RINGS) {
+            Ok(forecast) => forecast,
+            Err(ExpandWaveError::Front(FrontSelectionError::EmptySelection)) => {
+                preview.invalid_reason = Some("Select owned cells before expanding");
+                return;
+            }
+            Err(ExpandWaveError::Front(FrontSelectionError::DisconnectedSelection)) => {
+                preview.invalid_reason = Some("Expand All selection must be one connected region");
+                return;
+            }
+            Err(ExpandWaveError::Front(FrontSelectionError::NoEligibleFront)) => {
+                preview.invalid_reason = Some("The selection has no passable neutral frontier");
+                return;
+            }
+            Err(ExpandWaveError::Front(
+                FrontSelectionError::InvalidDirection | FrontSelectionError::DisconnectedFront,
+            )) => {
+                preview.invalid_reason = Some("Expand All frontier is invalid");
+                return;
+            }
+            Err(ExpandWaveError::InternalRoute) => {
+                preview.invalid_reason =
+                    Some("Every selected source must reach the perimeter inside the selection");
+                return;
+            }
+        };
 
-    preview.front_edges = edges;
-    let percentage = u64::from(commitment_percent.clamp(10, 100));
-    preview.strength_upper_bound = sources
-        .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| cell.infantry.saturating_mul(percentage) / 100)
-        .fold(0_u64, u64::saturating_add);
+    preview.front_edges = forecast.initial_edges;
+    preview.wave_depth = forecast.reached_depth;
+    preview.wave_truncated = forecast.truncated;
+    preview.strength_upper_bound = forecast.strength_upper_bound;
     if preview.strength_upper_bound == 0 {
         preview.invalid_reason = Some("Selected sources have no visible infantry to request");
         return;
     }
-    let targets = preview
-        .front_edges
-        .iter()
-        .map(|edge| edge.target)
-        .collect::<BTreeSet<_>>();
-    preview.destination_capacity = targets
-        .iter()
-        .filter_map(|coordinate| view.cell(*coordinate))
-        .map(|cell| cell.military_capacity)
-        .fold(0_u64, u64::saturating_add);
+    preview.destination_capacity = forecast.first_ring_capacity;
     if preview.destination_capacity == 0 {
         preview.invalid_reason = Some("The neutral frontier has no military capacity");
         return;
     }
-
-    // Show one representative rear-to-front route. Every edge is still drawn,
-    // while this route communicates that the rear selection feeds its nearest
-    // boundary rather than cloning troops into each outward direction.
-    let route_start = sources
-        .iter()
-        .filter(|source| view.cell(**source).is_some_and(|cell| cell.infantry > 0))
-        .max_by_key(|source| (distance.get(source).copied().unwrap_or(0), **source))
-        .copied();
-    if let Some(mut current) = route_start {
-        preview.route.push(current);
-        while let Some(next_cell) = next.get(&current).copied() {
-            if next_cell == current {
-                break;
-            }
-            current = next_cell;
-            preview.route.push(current);
-        }
-        if let Some(edge) = preview
-            .front_edges
-            .iter()
-            .find(|edge| edge.source == current)
-        {
-            preview.route.push(edge.target);
-        }
-    }
-    if preview.route.len() >= 2 {
-        preview.bottleneck = preview
-            .route
-            .windows(2)
-            .min_by_key(|edge| view.cell(edge[1]).map_or(0, |cell| cell.military_capacity))
-            .map(|edge| (edge[0], edge[1]));
-    }
-    let max_distance = distance.values().copied().max().unwrap_or(0);
-    let congestion = preview
-        .strength_upper_bound
-        .saturating_sub(preview.destination_capacity)
-        / 20;
-    preview.eta_seconds = (u64::from(max_distance.saturating_add(1)) * 2 + congestion)
-        .min(u64::from(u32::MAX)) as u32;
+    let outside_depth = preview.wave_depth.values().copied().max().unwrap_or(0);
+    let traversed_edges =
+        u64::from(forecast.max_internal_depth).saturating_add(u64::from(outside_depth));
+    preview.eta_seconds = u32::try_from(traversed_edges.saturating_mul(2)).unwrap_or(u32::MAX);
 }
 
 fn selected_reachability_to_front(
@@ -1590,6 +1537,13 @@ mod tests {
             input.press(key);
         }
         input
+    }
+
+    fn hex_disk(radius: i32) -> Vec<Axial> {
+        (-radius..=radius)
+            .flat_map(|q| (-radius..=radius).map(move |r| Axial::new(q, r)))
+            .filter(|coordinate| coordinate.distance(Axial::ZERO) <= radius as u64)
+            .collect()
     }
 
     #[test]
@@ -1937,10 +1891,13 @@ mod tests {
         );
         assert_eq!(preview.strength_upper_bound, 15);
         assert_eq!(preview.destination_capacity, 500);
+        assert_eq!(preview.wave_depth.len(), 5);
+        assert!(preview.wave_depth.values().all(|depth| *depth == 1));
+        assert!(preview.route.is_empty());
     }
 
     #[test]
-    fn expand_all_preview_deduplicates_a_shared_concave_target() {
+    fn expand_all_preview_merges_shared_targets_into_one_wave_cell() {
         let left = Axial::ZERO;
         let right = Axial::new(1, 0);
         let shared_target = Axial::new(0, 1);
@@ -1957,14 +1914,95 @@ mod tests {
         build_expand_all_preview(&view, &BTreeSet::from([left, right]), 50, &mut preview);
 
         assert_eq!(preview.invalid_reason, None);
-        assert_eq!(
-            preview.front_edges,
-            vec![DirectedFrontEdge {
-                source: left,
-                target: shared_target,
-            }]
+        assert_eq!(preview.front_edges.len(), 2);
+        assert!(
+            preview
+                .front_edges
+                .iter()
+                .all(|edge| edge.target == shared_target)
         );
+        assert_eq!(preview.wave_depth, BTreeMap::from([(shared_target, 1)]));
         assert_eq!(preview.strength_upper_bound, 20);
+    }
+
+    #[test]
+    fn expand_all_preview_draws_offset_rings_instead_of_a_route_spoke() {
+        let source = Axial::ZERO;
+        let mut view = MatchView::connecting(1);
+        view.cells
+            .insert(source, preview_cell(source, Some(1), 100, 0));
+        for coordinate in hex_disk(2).into_iter().filter(|cell| *cell != source) {
+            view.cells
+                .insert(coordinate, preview_cell(coordinate, None, 0, 0));
+        }
+        view.rebuild_chunk_index();
+
+        let mut preview = OrderPreview::default();
+        build_expand_all_preview(&view, &BTreeSet::from([source]), 100, &mut preview);
+
+        assert_eq!(preview.invalid_reason, None);
+        assert_eq!(
+            preview
+                .wave_depth
+                .values()
+                .filter(|depth| **depth == 1)
+                .count(),
+            6
+        );
+        assert_eq!(
+            preview
+                .wave_depth
+                .values()
+                .filter(|depth| **depth == 2)
+                .count(),
+            12
+        );
+        assert!(preview.route.is_empty());
+        assert!(preview.bottleneck.is_none());
+    }
+
+    #[test]
+    fn expand_all_preview_keeps_the_first_perimeter_continuous_at_low_strength() {
+        let source = Axial::ZERO;
+        let mut view = MatchView::connecting(1);
+        view.cells
+            .insert(source, preview_cell(source, Some(1), 10, 0));
+        for direction in Axial::DIRECTIONS {
+            let coordinate = source + direction;
+            view.cells
+                .insert(coordinate, preview_cell(coordinate, None, 0, 0));
+        }
+        view.rebuild_chunk_index();
+
+        let mut preview = OrderPreview::default();
+        build_expand_all_preview(&view, &BTreeSet::from([source]), 10, &mut preview);
+
+        assert_eq!(preview.strength_upper_bound, 1);
+        assert_eq!(preview.wave_depth.len(), 6);
+        assert!(preview.wave_depth.values().all(|depth| *depth == 1));
+    }
+
+    #[test]
+    fn expand_all_preview_eta_includes_travel_through_a_deep_seed() {
+        let selected = hex_disk(2).into_iter().collect::<BTreeSet<_>>();
+        let mut view = MatchView::connecting(1);
+        for coordinate in hex_disk(3) {
+            let owner = selected.contains(&coordinate).then_some(1);
+            let infantry = u64::from(coordinate == Axial::ZERO) * 180;
+            view.cells
+                .insert(coordinate, preview_cell(coordinate, owner, infantry, 0));
+        }
+        view.rebuild_chunk_index();
+
+        let mut preview = OrderPreview::default();
+        build_expand_all_preview(&view, &selected, 100, &mut preview);
+
+        assert_eq!(preview.invalid_reason, None);
+        assert_eq!(preview.wave_depth.values().copied().max(), Some(1));
+        assert_eq!(
+            preview.eta_seconds, 6,
+            "two selected-region edges plus one outside ring at two seconds each"
+        );
     }
 
     #[test]

@@ -6,6 +6,9 @@ pub const SINGLETON_ID: u8 = 0;
 pub const PLAYER_ONE: u8 = 1;
 pub const PLAYER_TWO: u8 = 2;
 pub const NEUTRAL_PLAYER: u8 = 0;
+/// Sentinel used after an Expand All contribution has left its real source.
+/// Map cell identifiers are always below this value.
+pub const EXPANSION_AGGREGATE_ORIGIN: u32 = u32::MAX;
 
 #[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MapPreset {
@@ -210,9 +213,9 @@ pub struct TransferOrder {
     pub requested_infantry: u64,
     pub committed_infantry: u64,
     pub in_transit_infantry: u64,
-    /// Surviving strength released from this order. For Push Front this
-    /// includes occupation garrisons, endpoint arrivals, and release-in-place
-    /// when a lane stops or the player cancels it.
+    /// Surviving strength released from this order. For sustained operations
+    /// this includes occupation garrisons, endpoints, and release-in-place
+    /// when a branch stops or the player cancels it.
     pub delivered_infantry: u64,
     pub casualty_infantry: u64,
     pub orientation_q: i32,
@@ -247,7 +250,7 @@ pub struct TransferDestination {
     pub destination_key: String,
     pub order_id: u64,
     /// Destination for redistribution orders; stable first-front lane anchor
-    /// for a sustained Push Front or Expand All operation.
+    /// for a sustained Push Front operation.
     pub cell_id: u32,
     pub target_infantry: u64,
     pub received_infantry: u64,
@@ -276,6 +279,37 @@ pub struct TransitPacket {
     pub route_index: u32,
     pub route: Vec<u32>,
     pub updated_step: u64,
+}
+
+/// Compact private topology for one branching Expand All operation.
+///
+/// `selected_cells` and `seed_depths` are parallel sorted vectors. A seed
+/// depth of zero marks the selected perimeter; larger values flow toward zero.
+/// `outside_depths[cell_id]` is the static multi-source BFS distance from the
+/// first neutral ring, starting at one, or `u16::MAX` when unreachable.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = expansion_wave)]
+pub struct ExpansionWave {
+    #[primary_key]
+    pub order_id: u64,
+    pub selected_cells: Vec<u32>,
+    pub seed_depths: Vec<u16>,
+    pub outside_depths: Vec<u16>,
+    /// Per-cell rotating remainder cursor for unbiased asynchronous splits.
+    pub split_cursors: Vec<u8>,
+}
+
+/// Sparse unpaid occupation garrison created by an Expand All capture.
+///
+/// The debt belongs to the captured cell rather than to one order so a later
+/// overlapping expansion can finish paying it after the capturing order ends.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = expansion_garrison_debt)]
+pub struct ExpansionGarrisonDebt {
+    #[primary_key]
+    pub cell_id: u32,
+    pub owner_player_id: u8,
+    pub remaining_infantry: u64,
 }
 
 #[derive(Clone)]

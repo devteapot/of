@@ -83,22 +83,31 @@ for possible future discrete units such as tanks or boats.
 
 ### Expand All
 
-- Shift+`P` or the HUD `EXPAND ALL` button previews every unique passable
+- Shift+`P` or the HUD `EXPAND ALL` button previews every passable
   selected-to-neutral edge around the connected owned selection. No orientation
-  gesture is required; disconnected boundary arcs may coexist.
-- Rear selected cells feed their nearest eligible boundary through traversable
-  selected terrain. Every movement-isolated part of the selection must expose
-  at least one eligible neutral boundary of its own.
+  gesture is required; disconnected boundary arcs may coexist and a shared
+  outside target may receive strength through more than one edge.
+- Selected strength moves only toward decreasing internal depth until it reaches
+  an eligible boundary. At every cell, the combined local and incoming pool is
+  divided evenly among all traversable children one depth closer to that
+  boundary; contributions merge before the next split. Every
+  movement-isolated part of the selection must expose at least one eligible
+  neutral boundary of its own.
 - `[` / `]` changes dispatch by ten percentage points. The preview shows an
   **up to** amount from visible local strength; the authority applies that share
   once to each selected cell's currently unallocated soldiers at submission.
   It is separate from mobilization.
 - Each boundary's combined pool is divided evenly among its local outward exits.
-  Amber edges communicate neutral expansion, while red remains reserved for a
-  directional Push Front that can attack.
-- `Enter` starts independent straight lanes. A lane stops before enemy
-  territory, when exhausted or blocked, at the map edge, or when cancelled. It
-  may cross friendly ground without paying another occupation garrison.
+  Beyond them, surplus repeats the split-and-merge rule from perimeter depth
+  `d` to `d + 1`; it does not preserve the first edge's axial direction. Amber
+  edges and the forecast wave communicate neutral expansion, while red remains
+  reserved for a directional Push Front that can attack.
+- `Enter` starts independently progressing wave branches. Terrain, throughput,
+  capacity, and garrison costs can make one side bulge while another stalls. A
+  branch cannot cycle, skip a perimeter layer, or tunnel through an uncleared
+  cell; it stops before enemy territory, when exhausted or blocked, at the map
+  edge, or when cancelled. It may cross friendly ground without paying another
+  occupation garrison.
 - From the same selected-region preview, `X` cancels matching active Expand All
   operations and releases survivors where they currently are.
 
@@ -151,8 +160,10 @@ These overlays remain separate:
 - source: solid exposed perimeter around each selected component;
 - active Push Front: bold exact directional boundary edges, with hostile ticks
   when they lead into enemy ownership;
-- Expand All preview: amber perimeter edges only where the selected region can
-  enter neutral land; disconnected arcs and independent directions are allowed;
+- Expand All preview: amber entry edges plus a bounded translucent forecast of
+  successive split-and-merge perimeter depths; disconnected arcs and
+  independently progressing branches are allowed, and forecast truncation is
+  explicit;
 - populated land: one batched external cluster perimeter in Civilians view;
 - selected-only push route: desaturated dashed arrows terminating at the exact
   frontier edge;
@@ -194,9 +205,9 @@ LMB paint · P push · Shift+P expand all · B/F/G/R redistribute · [ ] order %
 
 Contextual first-use hints explain that Push Front uses only selected cells and
 continues in one exact direction with a fixed force pool; Expand All uses the
-same region but only neutral boundaries; every redistribution preset still
-moves troops physically; and the order percentage does not change mobilization
-or send soldiers home.
+same region but forms a branching neutral-only perimeter wave with no retained
+heading; every redistribution preset still moves troops physically; and the
+order percentage does not change mobilization or send soldiers home.
 
 ## First playtest risks
 
@@ -204,8 +215,8 @@ Test these before adding visual polish:
 
 1. ownership remains readable under density shading at far zoom;
 2. the selected reinforcement corridor and active front remain distinct;
-3. each sustained lane's remaining momentum, resistance, and stop reason are
-   understandable without implying lateral retargeting;
+3. each sustained Push lane's remaining momentum, resistance, and stop reason
+   are understandable without implying lateral retargeting;
 4. route aggregation avoids unreadable arrow clutter;
 5. live density and proposed redistribution heatmaps look different;
 6. height-aware picking selects the visible column at cliffs and camera pitch extremes;
@@ -213,3 +224,5 @@ Test these before adding visual polish:
 8. ETA is labeled as an estimate and visibly corrects to authoritative state;
 9. contested color blending communicates pressure without implying that both
    players authoritatively occupy the cell.
+10. the Expand All forecast explains local splits, merges, and independently
+    bulging branches without promising a globally even ring.
