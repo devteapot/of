@@ -265,7 +265,7 @@ struct OrderPreviewKey {
     mode: PreviewModeKey,
     shape_revision: u64,
     attack_revision: u64,
-    cell_state_revision: u64,
+    planning_revision: u64,
     topology_revision: u64,
     retask_revision: u64,
 }
@@ -1148,7 +1148,7 @@ fn select_all_clusters(view: &mut MatchView, interaction: &mut InteractionState)
 #[derive(Default)]
 struct SelectionReconcileCache {
     initialized: bool,
-    cell_state_revision: u64,
+    planning_revision: u64,
     retask_revision: u64,
     source_revision: u64,
 }
@@ -1159,7 +1159,7 @@ fn reconcile_selection(
     mut cache: Local<SelectionReconcileCache>,
 ) {
     if cache.initialized
-        && cache.cell_state_revision == view.cell_state_revision
+        && cache.planning_revision == view.planning_revision
         && cache.retask_revision == view.retask_revision
         && cache.source_revision == interaction.source_revision
     {
@@ -1177,7 +1177,7 @@ fn reconcile_selection(
         interaction.source_revision = interaction.source_revision.wrapping_add(1);
     }
     cache.initialized = true;
-    cache.cell_state_revision = view.cell_state_revision;
+    cache.planning_revision = view.planning_revision;
     cache.retask_revision = view.retask_revision;
     cache.source_revision = interaction.source_revision;
 }
@@ -1863,7 +1863,7 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
         mode,
         shape_revision: interaction.shape_revision,
         attack_revision: interaction.attack_revision,
-        cell_state_revision: view.cell_state_revision,
+        planning_revision: view.planning_revision,
         topology_revision: view.chunk_index_revision,
         retask_revision: view.retask_revision,
     })
@@ -4322,7 +4322,14 @@ mod tests {
         );
 
         view.cell_state_revision = view.cell_state_revision.wrapping_add(1);
-        let current = order_preview_key(&view, &interaction).expect("cell-state key");
+        let current = order_preview_key(&view, &interaction).expect("presentation-only key");
+        assert_eq!(
+            current, prior,
+            "Presentation-only cell changes must not invalidate a command preview"
+        );
+
+        view.planning_revision = view.planning_revision.wrapping_add(1);
+        let current = order_preview_key(&view, &interaction).expect("planning key");
         assert_ne!(current, prior);
         prior = current;
 

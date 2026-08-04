@@ -123,7 +123,9 @@ struct SelectionTotalsCache {
     logical_step: u64,
     chunk_index_revision: u64,
     cell_state_revision: u64,
+    retask_revision: u64,
     totals: (u64, u64, u64),
+    active_strength: u64,
 }
 
 pub struct HudPlugin;
@@ -821,28 +823,31 @@ fn update_hud(
         || selection_totals.logical_step != view.logical_step
         || selection_totals.chunk_index_revision != view.chunk_index_revision
         || selection_totals.cell_state_revision != view.cell_state_revision
+        || selection_totals.retask_revision != view.retask_revision
     {
         selection_totals.totals = view.selected_totals(&interaction.sources);
+        selection_totals.active_strength = interaction
+            .sources
+            .iter()
+            .map(|coordinate| {
+                let infantry = view.cell(*coordinate).map_or(0, |cell| cell.infantry);
+                view.retask_projection
+                    .active_strength_by_cell
+                    .get(coordinate)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(infantry)
+            })
+            .sum();
         selection_totals.source_revision = interaction.source_revision;
         selection_totals.logical_step = view.logical_step;
         selection_totals.chunk_index_revision = view.chunk_index_revision;
         selection_totals.cell_state_revision = view.cell_state_revision;
+        selection_totals.retask_revision = view.retask_revision;
         selection_totals.initialized = true;
     }
     let (raw_strength, raw_capacity, civilians) = selection_totals.totals;
-    let active_strength = interaction
-        .sources
-        .iter()
-        .map(|coordinate| {
-            let infantry = view.cell(*coordinate).map_or(0, |cell| cell.infantry);
-            view.retask_projection
-                .active_strength_by_cell
-                .get(coordinate)
-                .copied()
-                .unwrap_or(0)
-                .min(infantry)
-        })
-        .sum::<u64>();
+    let active_strength = selection_totals.active_strength;
     let free_strength = raw_strength.saturating_sub(active_strength);
     let occupancy = if raw_capacity == 0 {
         0.0

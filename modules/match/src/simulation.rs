@@ -40,13 +40,13 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let logical_step = match_state.logical_step;
     ctx.db.match_state().singleton_id().update(match_state);
 
-    clear_combat_fronts(ctx);
     trim_all_overallocated_packets(ctx, logical_step)?;
     branch_expand_waves(ctx, logical_step)?;
     stop_blocked_expand_edges(ctx, logical_step)?;
     move_friendly_packets(ctx, logical_step)?;
     stop_blocked_internal_edges(ctx, logical_step)?;
     resolve_combats(ctx, logical_step)?;
+    clear_stale_combat_fronts(ctx, logical_step);
     finalize_orders(ctx, logical_step)?;
 
     let config = config(ctx)?;
@@ -568,11 +568,12 @@ fn merged_expand_strength(existing: u64, incoming: u64) -> Result<u64, String> {
         .ok_or_else(|| "expand packet strength overflow".to_string())
 }
 
-fn clear_combat_fronts(ctx: &ReducerContext) {
+fn clear_stale_combat_fronts(ctx: &ReducerContext, logical_step: u64) {
     let keys: Vec<_> = ctx
         .db
         .combat_front()
         .iter()
+        .filter(|front| front.logical_step != logical_step)
         .map(|front| front.front_key)
         .collect();
     for key in keys {
@@ -1116,8 +1117,9 @@ fn resolve_target_combat(
             .ok_or_else(|| "combat route became impassable".to_string())?;
         let front_defender_casualties = outcome.defender_casualties
             + u64::from(extra_defender_casualty > 0 && front.from_cell == fronts[0].from_cell);
-        ctx.db.combat_front().insert(CombatFront {
-            front_key: format!("{}:{}:{}", front.attacker, front.from_cell, front.to_cell),
+        let front_key = format!("{}:{}:{}", front.attacker, front.from_cell, front.to_cell);
+        let next_front = CombatFront {
+            front_key: front_key.clone(),
             attacker_player_id: front.attacker,
             defender_player_id: defender.owner_player_id,
             from_cell: front.from_cell,
@@ -1130,7 +1132,12 @@ fn resolve_target_combat(
             frontage: limits.frontage,
             uphill: limits.uphill,
             logical_step,
-        });
+        };
+        if ctx.db.combat_front().front_key().find(&front_key).is_some() {
+            ctx.db.combat_front().front_key().update(next_front);
+        } else {
+            ctx.db.combat_front().insert(next_front);
+        }
     }
 
     defender.infantry = defender.infantry.saturating_sub(defender_casualties);
@@ -1947,14 +1954,26 @@ fn packet_trim_required(
 }
 
 fn trim_all_overallocated_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
-    let locations: BTreeSet<_> = ctx
-        .db
-        .transit_packet()
-        .iter()
-        .map(|packet| (packet.current_cell, packet.owner_player_id))
-        .collect();
-    for (cell_id, owner) in locations {
-        trim_packets_at_cell(ctx, cell_id, owner, logical_step)?;
+    let mut packets_by_location = BTreeMap::<(u32, u8), Vec<TransitPacket>>::new();
+    for packet in ctx.db.transit_packet().iter() {
+        packets_by_location
+            .entry((packet.current_cell, packet.owner_player_id))
+            .or_default()
+            .push(packet);
+    }
+    for ((cell_id, owner), mut packets) in packets_by_location {
+        let cell = cell_state(ctx, cell_id)?;
+        packets.sort_unstable_by(|left, right| right.packet_key.cmp(&left.packet_key));
+        let allocated = packets.iter().map(|packet| packet.infantry).sum();
+        let mut trim = packet_trim_required(cell.owner_player_id, owner, cell.infantry, allocated);
+        for packet in packets {
+            if trim == 0 {
+                break;
+            }
+            let lost = trim.min(packet.infantry);
+            reduce_packet_metadata(ctx, packet, lost, logical_step, true)?;
+            trim -= lost;
+        }
     }
     Ok(())
 }

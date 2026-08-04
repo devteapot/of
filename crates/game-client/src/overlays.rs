@@ -4,11 +4,11 @@ use bevy::{
     camera::visibility::{VisibilitySystems, VisibleEntities},
     prelude::*,
 };
-use hex_core::Axial;
+use hex_core::{Axial, ChunkCoord};
 
 use crate::{
     camera::GameCamera,
-    geometry::{corner, edge_index_for_direction, world_center},
+    geometry::{chunk_of, corner, edge_index_for_direction, world_center},
     interaction::{InteractionState, OrderMode},
     model::{CellView, MatchView},
     terrain::TerrainChunk,
@@ -78,24 +78,37 @@ fn draw_world_overlays(
     } else {
         Vec::new()
     };
+    let visible_chunks = if view.active_flows.is_empty() && view.active_fronts.is_empty() {
+        BTreeSet::new()
+    } else {
+        visible_chunk_coordinates(&visible, &chunks)
+    };
     draw_blocked_cells(&view, &visible, &chunks, &mut gizmos);
     draw_selection(&view, &interaction, &visible_cells, &mut gizmos);
     draw_preview(&view, &interaction, &visible_cells, &mut gizmos);
-    draw_committed_orders(&view, time.elapsed_secs(), &mut gizmos);
+    draw_committed_orders(&view, time.elapsed_secs(), &visible_chunks, &mut gizmos);
 }
 
 fn visible_cell_coordinates(
     visible: &VisibleEntities,
     chunks: &Query<&TerrainChunk>,
 ) -> Vec<Axial> {
-    let mut coordinates = visible
+    visible
         .iter(TypeId::of::<Mesh3d>())
         .filter_map(|entity| chunks.get(*entity).ok())
         .flat_map(|chunk| chunk.cells.iter().copied())
-        .collect::<Vec<_>>();
-    coordinates.sort_unstable();
-    coordinates.dedup();
-    coordinates
+        .collect()
+}
+
+fn visible_chunk_coordinates(
+    visible: &VisibleEntities,
+    chunks: &Query<&TerrainChunk>,
+) -> BTreeSet<ChunkCoord> {
+    visible
+        .iter(TypeId::of::<Mesh3d>())
+        .filter_map(|entity| chunks.get(*entity).ok())
+        .map(|chunk| chunk.coordinate)
+        .collect()
 }
 
 fn draw_blocked_cells(
@@ -559,31 +572,56 @@ fn axial_to_world_direction(direction: Axial) -> Vec3 {
     Vec3::new(plane.x, 0.0, plane.y)
 }
 
-fn draw_committed_orders(view: &MatchView, elapsed: f32, gizmos: &mut Gizmos) {
+fn draw_committed_orders(
+    view: &MatchView,
+    elapsed: f32,
+    visible_chunks: &BTreeSet<ChunkCoord>,
+    gizmos: &mut Gizmos,
+) {
     for flow in &view.active_flows {
-        let points = flow
-            .route
-            .iter()
-            .filter_map(|coordinate| view.cell(*coordinate))
-            .map(|cell| point(cell, 0.16))
-            .collect::<Vec<_>>();
-        if points.len() < 2 {
+        if flow.route.len() < 2
+            || !flow
+                .route
+                .iter()
+                .any(|coordinate| visible_chunks.contains(&chunk_of(*coordinate)))
+        {
             continue;
         }
         let color = if flow.attacking { HOSTILE } else { FRIENDLY };
-        for pair in points.windows(2) {
-            gizmos.line(pair[0], pair[1], color);
+        for pair in flow.route.windows(2).filter(|pair| {
+            visible_chunks.contains(&chunk_of(pair[0]))
+                || visible_chunks.contains(&chunk_of(pair[1]))
+        }) {
+            let (Some(from), Some(to)) = (view.cell(pair[0]), view.cell(pair[1])) else {
+                continue;
+            };
+            gizmos.line(point(from, 0.16), point(to, 0.16), color);
         }
-        let travel = ((flow.age * 0.68).fract() * (points.len() - 1) as f32)
-            .clamp(0.0, (points.len() - 1) as f32);
+
+        let travel = ((flow.age * 0.68).fract() * (flow.route.len() - 1) as f32)
+            .clamp(0.0, (flow.route.len() - 1) as f32);
         let index = travel.floor() as usize;
-        let next = (index + 1).min(points.len() - 1);
-        let moving = points[index].lerp(points[next], travel.fract()) + Vec3::Y * 0.04;
+        let next = (index + 1).min(flow.route.len() - 1);
+        if !visible_chunks.contains(&chunk_of(flow.route[index]))
+            && !visible_chunks.contains(&chunk_of(flow.route[next]))
+        {
+            continue;
+        }
+        let (Some(from), Some(to)) = (view.cell(flow.route[index]), view.cell(flow.route[next]))
+        else {
+            continue;
+        };
+        let moving = point(from, 0.16).lerp(point(to, 0.16), travel.fract()) + Vec3::Y * 0.04;
         let marker_radius = 0.075 + (flow.strength as f32 / 700.0).clamp(0.0, 0.075);
-        gizmos.sphere(moving, marker_radius, color).resolution(10);
+        gizmos.sphere(moving, marker_radius, color).resolution(4);
     }
 
     for front in &view.active_fronts {
+        if !visible_chunks.contains(&chunk_of(front.friendly))
+            && !visible_chunks.contains(&chunk_of(front.hostile))
+        {
+            continue;
+        }
         let (Some(friendly), Some(hostile)) = (view.cell(front.friendly), view.cell(front.hostile))
         else {
             continue;

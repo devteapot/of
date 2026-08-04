@@ -282,6 +282,13 @@ pub struct MatchView {
     /// Presentation caches use this instead of rescanning large selections or
     /// visible regions every frame.
     pub cell_state_revision: u64,
+    /// Advances only when ownership, infantry, capacity, terrain, or topology
+    /// changes can affect command planning. Civilian-only and combat-overlay
+    /// presentation changes intentionally leave this stable.
+    pub planning_revision: u64,
+    /// Advances when the transient combat overlay changes. This is separate
+    /// from cell values so HUD totals and command previews stay cached.
+    pub contest_revision: u64,
     pub local_player: u32,
     pub authority: AuthorityState,
     pub connection: [ConnectionState; 2],
@@ -337,6 +344,8 @@ impl MatchView {
             cells_by_chunk: BTreeMap::new(),
             chunk_index_revision: 0,
             cell_state_revision: 0,
+            planning_revision: 0,
+            contest_revision: 0,
             local_player: u32::from(preferred_player),
             authority: AuthorityState::Connecting,
             connection: [ConnectionState::Syncing, ConnectionState::Syncing],
@@ -465,6 +474,8 @@ impl MatchView {
             cells_by_chunk,
             chunk_index_revision: 1,
             cell_state_revision: 1,
+            planning_revision: 1,
+            contest_revision: 0,
             local_player: PLAYER_ONE,
             authority: AuthorityState::Offline,
             connection: [ConnectionState::Offline, ConnectionState::Offline],
@@ -508,11 +519,16 @@ impl MatchView {
     pub fn cell_mut(&mut self, coordinate: Axial) -> Option<&mut CellView> {
         self.dirty_chunks.insert(chunk_of(coordinate));
         self.mark_cell_state_changed();
+        self.mark_planning_changed();
         self.cells.get_mut(&coordinate)
     }
 
     pub fn mark_cell_state_changed(&mut self) {
         self.cell_state_revision = self.cell_state_revision.wrapping_add(1);
+    }
+
+    pub fn mark_planning_changed(&mut self) {
+        self.planning_revision = self.planning_revision.wrapping_add(1);
     }
 
     /// Replaces the transient combat projection and schedules both newly
@@ -529,7 +545,7 @@ impl MatchView {
                 .map(chunk_of),
         );
         self.contested_cells = contested_cells;
-        self.mark_cell_state_changed();
+        self.contest_revision = self.contest_revision.wrapping_add(1);
     }
 
     /// Rebuilds the spatial index after a wholesale authoritative map update.
@@ -539,6 +555,7 @@ impl MatchView {
         self.cells_by_chunk = index_cells_by_chunk(&self.cells);
         self.chunk_index_revision = self.chunk_index_revision.wrapping_add(1);
         self.mark_cell_state_changed();
+        self.mark_planning_changed();
     }
 
     pub fn cells_in_chunk(&self, chunk: ChunkCoord) -> &[Axial] {
@@ -1167,6 +1184,8 @@ mod tests {
     #[test]
     fn replacing_contests_dirties_both_cleared_and_added_chunks() {
         let mut view = MatchView::connecting(1);
+        let planning_revision = view.planning_revision;
+        let cell_state_revision = view.cell_state_revision;
         let cleared = Axial::new(-40, 0);
         let added = Axial::new(40, 0);
         view.contested_cells.insert(
@@ -1193,6 +1212,8 @@ mod tests {
         assert!(view.dirty_chunks.contains(&chunk_of(added)));
         assert!(!view.contested_cells.contains_key(&cleared));
         assert!(view.contested_cells.contains_key(&added));
+        assert_eq!(view.planning_revision, planning_revision);
+        assert_eq!(view.cell_state_revision, cell_state_revision);
     }
 
     #[test]

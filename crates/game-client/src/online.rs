@@ -100,6 +100,11 @@ enum LifecycleEvent {
 struct SharedSignals {
     dirty: AtomicU32,
     cell_changes: Mutex<BTreeMap<u32, CellState>>,
+    packet_changes: Mutex<BTreeMap<String, Option<TransitPacket>>>,
+    front_changes: Mutex<BTreeMap<String, Option<CombatFront>>>,
+    order_changes: Mutex<BTreeMap<u64, Option<TransferOrder>>>,
+    source_changes: Mutex<BTreeMap<String, Option<TransferSource>>>,
+    destination_changes: Mutex<BTreeMap<String, Option<TransferDestination>>>,
     events: Mutex<VecDeque<LifecycleEvent>>,
 }
 
@@ -126,6 +131,16 @@ impl SharedSignals {
         )
     }
 
+    fn take_tactical_changes(&self) -> TacticalChanges {
+        TacticalChanges {
+            packets: take_changes(&self.packet_changes),
+            fronts: take_changes(&self.front_changes),
+            orders: take_changes(&self.order_changes),
+            sources: take_changes(&self.source_changes),
+            destinations: take_changes(&self.destination_changes),
+        }
+    }
+
     fn push(&self, event: LifecycleEvent) {
         if let Ok(mut events) = self.events.lock() {
             events.push_back(event);
@@ -136,6 +151,91 @@ impl SharedSignals {
         self.events
             .lock()
             .map_or_else(|_| Vec::new(), |mut events| events.drain(..).collect())
+    }
+}
+
+fn take_changes<K: Ord, V>(changes: &Mutex<BTreeMap<K, Option<V>>>) -> BTreeMap<K, Option<V>> {
+    changes.lock().map_or_else(
+        |_| BTreeMap::new(),
+        |mut changes| std::mem::take(&mut *changes),
+    )
+}
+
+fn record_change<K: Ord, V>(changes: &Mutex<BTreeMap<K, Option<V>>>, key: K, value: Option<V>) {
+    if let Ok(mut changes) = changes.lock() {
+        changes.insert(key, value);
+    }
+}
+
+#[derive(Default)]
+struct TacticalChanges {
+    packets: BTreeMap<String, Option<TransitPacket>>,
+    fronts: BTreeMap<String, Option<CombatFront>>,
+    orders: BTreeMap<u64, Option<TransferOrder>>,
+    sources: BTreeMap<String, Option<TransferSource>>,
+    destinations: BTreeMap<String, Option<TransferDestination>>,
+}
+
+#[derive(Default)]
+struct TacticalCache {
+    packets: BTreeMap<String, TransitPacket>,
+    fronts: BTreeMap<String, CombatFront>,
+    orders: BTreeMap<u64, TransferOrder>,
+    sources: BTreeMap<String, TransferSource>,
+    destinations: BTreeMap<String, TransferDestination>,
+}
+
+impl TacticalCache {
+    fn capture(connection: &DbConnection) -> Self {
+        Self {
+            packets: subscribed_packets(connection)
+                .into_iter()
+                .map(|packet| (packet.packet_key.clone(), packet))
+                .collect(),
+            fronts: connection
+                .db
+                .combat_front()
+                .iter()
+                .map(|front| (front.front_key.clone(), front))
+                .collect(),
+            orders: connection
+                .db
+                .transfer_order()
+                .iter()
+                .filter(|order| order.status == OrderStatus::Active)
+                .map(|order| (order.order_id, order))
+                .collect(),
+            sources: connection
+                .db
+                .transfer_source()
+                .iter()
+                .map(|source| (source.source_key.clone(), source))
+                .collect(),
+            destinations: connection
+                .db
+                .transfer_destination()
+                .iter()
+                .map(|destination| (destination.destination_key.clone(), destination))
+                .collect(),
+        }
+    }
+
+    fn apply(&mut self, changes: TacticalChanges) {
+        apply_changes(&mut self.packets, changes.packets);
+        apply_changes(&mut self.fronts, changes.fronts);
+        apply_changes(&mut self.orders, changes.orders);
+        apply_changes(&mut self.sources, changes.sources);
+        apply_changes(&mut self.destinations, changes.destinations);
+    }
+}
+
+fn apply_changes<K: Ord, V>(rows: &mut BTreeMap<K, V>, changes: BTreeMap<K, Option<V>>) {
+    for (key, value) in changes {
+        if let Some(value) = value {
+            rows.insert(key, value);
+        } else {
+            rows.remove(&key);
+        }
     }
 }
 
@@ -202,6 +302,7 @@ struct OnlineTransport {
     config: ClientConfig,
     coordinate_to_id: BTreeMap<Axial, u32>,
     id_to_coordinate: BTreeMap<u32, Axial>,
+    tactical: TacticalCache,
     pending: BTreeMap<u64, PendingCommand>,
     processed_receipts: BTreeSet<String>,
     terminal_command_ids: BTreeSet<u64>,
@@ -224,6 +325,7 @@ impl OnlineTransport {
             config,
             coordinate_to_id: BTreeMap::new(),
             id_to_coordinate: BTreeMap::new(),
+            tactical: TacticalCache::default(),
             pending: BTreeMap::new(),
             processed_receipts: BTreeSet::new(),
             terminal_command_ids: BTreeSet::new(),
@@ -532,24 +634,208 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
     watch_table!(connection.db.mobilization_policy(), MOBILIZATION_DIRTY);
     watch_table!(connection.db.command_receipt(), RECEIPTS_DIRTY);
     #[cfg(debug_assertions)]
-    watch_table!(connection.db.transit_packet(), FLOWS_DIRTY);
+    {
+        let packet_insert_signals = Arc::clone(signals);
+        connection
+            .db
+            .transit_packet()
+            .on_insert(move |_context, row| {
+                record_change(
+                    &packet_insert_signals.packet_changes,
+                    row.packet_key.clone(),
+                    Some(row.clone()),
+                );
+                packet_insert_signals.mark(FLOWS_DIRTY);
+            });
+        let packet_delete_signals = Arc::clone(signals);
+        connection
+            .db
+            .transit_packet()
+            .on_delete(move |_context, row| {
+                record_change(
+                    &packet_delete_signals.packet_changes,
+                    row.packet_key.clone(),
+                    None,
+                );
+                packet_delete_signals.mark(FLOWS_DIRTY);
+            });
+        let packet_update_signals = Arc::clone(signals);
+        connection
+            .db
+            .transit_packet()
+            .on_update(move |_context, _old, new| {
+                record_change(
+                    &packet_update_signals.packet_changes,
+                    new.packet_key.clone(),
+                    Some(new.clone()),
+                );
+                packet_update_signals.mark(FLOWS_DIRTY);
+            });
+    }
     #[cfg(not(debug_assertions))]
     {
         let packet_insert_signals = Arc::clone(signals);
         connection
             .db
             .visible_packets()
-            .on_insert(move |_context, _row| packet_insert_signals.mark(FLOWS_DIRTY));
+            .on_insert(move |_context, row| {
+                record_change(
+                    &packet_insert_signals.packet_changes,
+                    row.packet_key.clone(),
+                    Some(row.clone()),
+                );
+                packet_insert_signals.mark(FLOWS_DIRTY);
+            });
         let packet_delete_signals = Arc::clone(signals);
         connection
             .db
             .visible_packets()
-            .on_delete(move |_context, _row| packet_delete_signals.mark(FLOWS_DIRTY));
+            .on_delete(move |_context, row| {
+                record_change(
+                    &packet_delete_signals.packet_changes,
+                    row.packet_key.clone(),
+                    None,
+                );
+                packet_delete_signals.mark(FLOWS_DIRTY);
+            });
     }
-    watch_table!(connection.db.combat_front(), FRONTS_DIRTY);
-    watch_table!(connection.db.transfer_order(), ORDERS_DIRTY);
-    watch_table!(connection.db.transfer_source(), ORDERS_DIRTY);
-    watch_table!(connection.db.transfer_destination(), ORDERS_DIRTY);
+    let front_insert_signals = Arc::clone(signals);
+    connection
+        .db
+        .combat_front()
+        .on_insert(move |_context, row| {
+            record_change(
+                &front_insert_signals.front_changes,
+                row.front_key.clone(),
+                Some(row.clone()),
+            );
+            front_insert_signals.mark(FRONTS_DIRTY);
+        });
+    let front_delete_signals = Arc::clone(signals);
+    connection
+        .db
+        .combat_front()
+        .on_delete(move |_context, row| {
+            record_change(
+                &front_delete_signals.front_changes,
+                row.front_key.clone(),
+                None,
+            );
+            front_delete_signals.mark(FRONTS_DIRTY);
+        });
+    let front_update_signals = Arc::clone(signals);
+    connection
+        .db
+        .combat_front()
+        .on_update(move |_context, _old, new| {
+            record_change(
+                &front_update_signals.front_changes,
+                new.front_key.clone(),
+                Some(new.clone()),
+            );
+            front_update_signals.mark(FRONTS_DIRTY);
+        });
+
+    let order_insert_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_order()
+        .on_insert(move |_context, row| {
+            let value = (row.status == OrderStatus::Active).then(|| row.clone());
+            record_change(&order_insert_signals.order_changes, row.order_id, value);
+            order_insert_signals.mark(ORDERS_DIRTY);
+        });
+    let order_delete_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_order()
+        .on_delete(move |_context, row| {
+            record_change(&order_delete_signals.order_changes, row.order_id, None);
+            order_delete_signals.mark(ORDERS_DIRTY);
+        });
+    let order_update_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_order()
+        .on_update(move |_context, _old, new| {
+            let value = (new.status == OrderStatus::Active).then(|| new.clone());
+            record_change(&order_update_signals.order_changes, new.order_id, value);
+            order_update_signals.mark(ORDERS_DIRTY);
+        });
+
+    let source_insert_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_source()
+        .on_insert(move |_context, row| {
+            record_change(
+                &source_insert_signals.source_changes,
+                row.source_key.clone(),
+                Some(row.clone()),
+            );
+            source_insert_signals.mark(ORDERS_DIRTY);
+        });
+    let source_delete_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_source()
+        .on_delete(move |_context, row| {
+            record_change(
+                &source_delete_signals.source_changes,
+                row.source_key.clone(),
+                None,
+            );
+            source_delete_signals.mark(ORDERS_DIRTY);
+        });
+    let source_update_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_source()
+        .on_update(move |_context, _old, new| {
+            record_change(
+                &source_update_signals.source_changes,
+                new.source_key.clone(),
+                Some(new.clone()),
+            );
+            source_update_signals.mark(ORDERS_DIRTY);
+        });
+
+    let destination_insert_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_destination()
+        .on_insert(move |_context, row| {
+            record_change(
+                &destination_insert_signals.destination_changes,
+                row.destination_key.clone(),
+                Some(row.clone()),
+            );
+            destination_insert_signals.mark(ORDERS_DIRTY);
+        });
+    let destination_delete_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_destination()
+        .on_delete(move |_context, row| {
+            record_change(
+                &destination_delete_signals.destination_changes,
+                row.destination_key.clone(),
+                None,
+            );
+            destination_delete_signals.mark(ORDERS_DIRTY);
+        });
+    let destination_update_signals = Arc::clone(signals);
+    connection
+        .db
+        .transfer_destination()
+        .on_update(move |_context, _old, new| {
+            record_change(
+                &destination_update_signals.destination_changes,
+                new.destination_key.clone(),
+                Some(new.clone()),
+            );
+            destination_update_signals.mark(ORDERS_DIRTY);
+        });
 }
 
 fn frame_tick(transport: Res<OnlineTransport>) {
@@ -895,18 +1181,12 @@ struct AuthoritySnapshot {
     players: Option<Vec<PlayerSlot>>,
     mobilization: Option<Vec<MobilizationPolicy>>,
     receipts: Option<Vec<CommandReceipt>>,
-    packets: Option<Vec<TransitPacket>>,
-    fronts: Option<Vec<CombatFront>>,
-    orders: Option<Vec<TransferOrder>>,
-    sources: Option<Vec<TransferSource>>,
-    destinations: Option<Vec<TransferDestination>>,
+    tactical: Option<TacticalCache>,
 }
 
 impl AuthoritySnapshot {
     fn capture(connection: &DbConnection, dirty: u32, changed_cells: Vec<CellState>) -> Self {
         let terrain_changed = dirty & TERRAIN_DIRTY != 0;
-        let tactical_changed =
-            dirty & (TERRAIN_DIRTY | FLOWS_DIRTY | FRONTS_DIRTY | ORDERS_DIRTY) != 0;
         Self {
             identity: connection.try_identity(),
             terrain: terrain_changed.then(|| connection.db.cell_terrain().iter().collect()),
@@ -929,23 +1209,9 @@ impl AuthoritySnapshot {
                 .then(|| connection.db.mobilization_policy().iter().collect()),
             receipts: (dirty & (RECEIPTS_DIRTY | PLAYERS_DIRTY) != 0)
                 .then(|| connection.db.command_receipt().iter().collect()),
-            packets: tactical_changed.then(|| subscribed_packets(connection)),
-            fronts: tactical_changed.then(|| connection.db.combat_front().iter().collect()),
-            orders: tactical_changed.then(|| {
-                connection
-                    .db
-                    .transfer_order()
-                    .iter()
-                    .filter(|order| order.status == OrderStatus::Active)
-                    .collect()
-            }),
-            // Retask/Stop projection is rebuilt whenever packets or fronts
-            // move. Include persistent launch rows in that same snapshot so
-            // an action remains addressable from its source cluster after its
-            // packets have crossed the original boundary.
-            sources: tactical_changed.then(|| connection.db.transfer_source().iter().collect()),
-            destinations: tactical_changed
-                .then(|| connection.db.transfer_destination().iter().collect()),
+            // A topology replacement is the only full tactical-table capture.
+            // Ordinary row callbacks feed the persistent cache incrementally.
+            tactical: terrain_changed.then(|| TacticalCache::capture(connection)),
         }
     }
 }
@@ -980,6 +1246,13 @@ fn synchronize_authoritative_view(
         };
         AuthoritySnapshot::capture(connection, dirty, transport.signals.take_cell_changes())
     };
+    let tactical_changes = transport.signals.take_tactical_changes();
+    if let Some(tactical) = snapshot.tactical {
+        transport.tactical = tactical;
+    }
+    // Deltas may arrive between the full capture and this drain. Applying
+    // them unconditionally closes that race without another table scan.
+    transport.tactical.apply(tactical_changes);
 
     if let Some(terrain) = snapshot.terrain {
         rebuild_cells(
@@ -1033,46 +1306,41 @@ fn synchronize_authoritative_view(
     if let Some(receipts) = snapshot.receipts {
         process_receipts(&mut transport, &view, receipts, &mut updates);
     }
-    if let (Some(packets), Some(orders)) = (snapshot.packets.as_deref(), snapshot.orders.as_deref())
-    {
+    if dirty & (TERRAIN_DIRTY | FLOWS_DIRTY | ORDERS_DIRTY) != 0 {
         replace_authoritative_flows(
             &transport,
             &mut view,
-            packets,
-            orders,
+            transport.tactical.packets.values(),
+            transport.tactical.orders.values(),
             transport.config.debug_policy_flows,
         );
     }
-    if let Some(fronts) = snapshot.fronts.as_deref() {
-        let (active_fronts, contested_cells) = fronts_to_overlays(&transport, &view, fronts);
+    if dirty & (TERRAIN_DIRTY | FRONTS_DIRTY) != 0 {
+        let (active_fronts, contested_cells) =
+            fronts_to_overlays(&transport, &view, transport.tactical.fronts.values());
         view.active_fronts = active_fronts;
         view.set_contested_cells(contested_cells);
     }
-    if let (Some(orders), Some(packets), Some(fronts), Some(sources), Some(destinations)) = (
-        snapshot.orders.as_deref(),
-        snapshot.packets.as_deref(),
-        snapshot.fronts.as_deref(),
-        snapshot.sources.as_deref(),
-        snapshot.destinations.as_deref(),
-    ) {
+    if dirty & (TERRAIN_DIRTY | FLOWS_DIRTY | FRONTS_DIRTY | ORDERS_DIRTY) != 0 {
         let projection = retask_projection_from_authority(
             &transport,
             &view,
-            orders,
-            packets,
-            fronts,
-            sources,
-            destinations,
+            transport.tactical.orders.values(),
+            transport.tactical.packets.values(),
+            transport.tactical.fronts.values(),
+            transport.tactical.sources.values(),
+            transport.tactical.destinations.values(),
         );
         view.set_retask_projection(projection);
     }
-    if let (Some(orders), Some(sources)) = (snapshot.orders.as_deref(), snapshot.sources.as_deref())
-    {
-        view.active_orders = orders
-            .iter()
-            .filter(|order| order.status == OrderStatus::Active)
-            .count();
-        view.queued_infantry = sources.iter().map(|source| source.queued_infantry).sum();
+    if dirty & (TERRAIN_DIRTY | ORDERS_DIRTY) != 0 {
+        view.active_orders = transport.tactical.orders.len();
+        view.queued_infantry = transport
+            .tactical
+            .sources
+            .values()
+            .map(|source| source.queued_infantry)
+            .sum();
     }
 }
 
@@ -1250,6 +1518,19 @@ fn update_cells(
     if !states.is_empty() {
         view.mark_cell_state_changed();
     }
+    let planning_changed = states.iter().any(|state| {
+        let Some(coordinate) = transport.id_to_coordinate.get(&state.cell_id).copied() else {
+            return false;
+        };
+        view.cell(coordinate).is_some_and(|cell| {
+            cell.owner != owner(state.owner_player_id)
+                || cell.infantry != state.infantry
+                || cell.military_capacity != state.military_capacity
+        })
+    });
+    if planning_changed {
+        view.mark_planning_changed();
+    }
     for state in states {
         let Some(coordinate) = transport.id_to_coordinate.get(&state.cell_id).copied() else {
             continue;
@@ -1269,7 +1550,8 @@ fn update_cells(
             }
             continue;
         }
-        let Some(cell) = view.cell_mut(coordinate) else {
+        view.dirty_chunks.insert(chunk_of(coordinate));
+        let Some(cell) = view.cells.get_mut(&coordinate) else {
             continue;
         };
         cell.owner = next_owner;
@@ -1488,11 +1770,11 @@ fn process_receipts(
     }
 }
 
-fn packets_to_flows(
+fn packets_to_flows<'a>(
     transport: &OnlineTransport,
     view: &MatchView,
-    packets: &[TransitPacket],
-    orders: &[TransferOrder],
+    packets: impl IntoIterator<Item = &'a TransitPacket>,
+    orders: impl IntoIterator<Item = &'a TransferOrder>,
     show_policy_flows: bool,
 ) -> Vec<ActiveFlow> {
     // Packet and order callbacks are independent. On a busy policy tick the
@@ -1501,11 +1783,11 @@ fn packets_to_flows(
     // spawned background redistribution flashes as a cyan action route before
     // the next order-table callback supplies the information needed to hide it.
     let orders_by_id = orders
-        .iter()
+        .into_iter()
         .map(|order| (order.order_id, order))
         .collect::<BTreeMap<_, _>>();
     packets
-        .iter()
+        .into_iter()
         .filter_map(|packet| {
             let order = orders_by_id.get(&packet.order_id)?;
             if !order_flow_is_visible(order, show_policy_flows) {
@@ -1539,11 +1821,11 @@ fn packets_to_flows(
         .collect()
 }
 
-fn replace_authoritative_flows(
+fn replace_authoritative_flows<'a>(
     transport: &OnlineTransport,
     view: &mut MatchView,
-    packets: &[TransitPacket],
-    orders: &[TransferOrder],
+    packets: impl IntoIterator<Item = &'a TransitPacket>,
+    orders: impl IntoIterator<Item = &'a TransferOrder>,
     show_policy_flows: bool,
 ) {
     view.active_flows = packets_to_flows(transport, view, packets, orders, show_policy_flows);
@@ -1577,10 +1859,10 @@ fn is_policy_maintenance_order(order: &TransferOrder) -> bool {
     order.client_command_id == 0 && is_internal_distribution_order(order)
 }
 
-fn fronts_to_overlays(
+fn fronts_to_overlays<'a>(
     transport: &OnlineTransport,
     view: &MatchView,
-    fronts: &[CombatFront],
+    fronts: impl IntoIterator<Item = &'a CombatFront>,
 ) -> (Vec<ActiveFront>, BTreeMap<Axial, ContestedCellView>) {
     let mut overlays = Vec::new();
     let mut pressure_by_target = BTreeMap::<Axial, BTreeMap<u32, u64>>::new();
@@ -1655,17 +1937,25 @@ fn fronts_to_overlays(
     (overlays, contested)
 }
 
-fn retask_projection_from_authority(
+fn retask_projection_from_authority<'a, O, P, F, S, D>(
     transport: &OnlineTransport,
     view: &MatchView,
-    orders: &[TransferOrder],
-    packets: &[TransitPacket],
-    fronts: &[CombatFront],
-    sources: &[TransferSource],
-    destinations: &[TransferDestination],
-) -> RetaskProjection {
+    orders: O,
+    packets: P,
+    fronts: F,
+    sources: S,
+    destinations: D,
+) -> RetaskProjection
+where
+    O: Clone + IntoIterator<Item = &'a TransferOrder>,
+    P: IntoIterator<Item = &'a TransitPacket>,
+    F: IntoIterator<Item = &'a CombatFront>,
+    S: IntoIterator<Item = &'a TransferSource>,
+    D: IntoIterator<Item = &'a TransferDestination>,
+{
     let active_local_orders = orders
-        .iter()
+        .clone()
+        .into_iter()
         .filter(|order| {
             order.status == OrderStatus::Active && u32::from(order.player_id) == view.local_player
         })
@@ -1673,7 +1963,8 @@ fn retask_projection_from_authority(
         .collect::<BTreeSet<_>>();
     let mut projection = RetaskProjection {
         background_policy_order_ids: orders
-            .iter()
+            .clone()
+            .into_iter()
             .filter(|order| {
                 order.status == OrderStatus::Active
                     && u32::from(order.player_id) == view.local_player
@@ -1686,7 +1977,7 @@ fn retask_projection_from_authority(
     let mut orders_by_edge = BTreeMap::<(u32, u32), BTreeSet<u64>>::new();
 
     for source in sources
-        .iter()
+        .into_iter()
         .filter(|source| active_local_orders.contains(&source.order_id))
     {
         let Some(coordinate) = transport.id_to_coordinate.get(&source.cell_id).copied() else {
@@ -1699,7 +1990,7 @@ fn retask_projection_from_authority(
             .insert(coordinate);
     }
 
-    for packet in packets.iter().filter(|packet| {
+    for packet in packets.into_iter().filter(|packet| {
         u32::from(packet.owner_player_id) == view.local_player
             && active_local_orders.contains(&packet.order_id)
     }) {
@@ -1745,7 +2036,7 @@ fn retask_projection_from_authority(
     }
 
     let active_local_internal_orders = orders
-        .iter()
+        .into_iter()
         .filter(|order| {
             order.status == OrderStatus::Active
                 && u32::from(order.player_id) == view.local_player
@@ -1760,7 +2051,7 @@ fn retask_projection_from_authority(
         })
         .map(|order| order.order_id)
         .collect::<BTreeSet<_>>();
-    for destination in destinations.iter().filter(|destination| {
+    for destination in destinations.into_iter().filter(|destination| {
         active_local_orders.contains(&destination.order_id)
             && destination.target_infantry > destination.received_infantry
     }) {
@@ -1792,7 +2083,7 @@ fn retask_projection_from_authority(
         );
     }
 
-    for front in fronts.iter().filter(|front| {
+    for front in fronts.into_iter().filter(|front| {
         u32::from(front.attacker_player_id) == view.local_player
             && front
                 .queued_infantry
@@ -1922,6 +2213,43 @@ mod tests {
             created_step: 1,
             updated_step: 1,
         }
+    }
+
+    #[test]
+    fn tactical_row_changes_coalesce_by_primary_key() {
+        let signals = SharedSignals::default();
+        let mut cache = TacticalCache::default();
+        let mut packet = TransitPacket {
+            packet_key: "7:10:11".to_owned(),
+            order_id: 7,
+            owner_player_id: 1,
+            origin_cell: 10,
+            current_cell: 10,
+            destination_cell: 11,
+            infantry: 20,
+            route_index: 0,
+            route: vec![10, 11],
+            updated_step: 1,
+        };
+        record_change(
+            &signals.packet_changes,
+            packet.packet_key.clone(),
+            Some(packet.clone()),
+        );
+        packet.infantry = 12;
+        record_change(
+            &signals.packet_changes,
+            packet.packet_key.clone(),
+            Some(packet.clone()),
+        );
+
+        cache.apply(signals.take_tactical_changes());
+        assert_eq!(cache.packets.len(), 1);
+        assert_eq!(cache.packets[&packet.packet_key].infantry, 12);
+
+        record_change(&signals.packet_changes, packet.packet_key.clone(), None);
+        cache.apply(signals.take_tactical_changes());
+        assert!(cache.packets.is_empty());
     }
 
     #[test]
@@ -2753,6 +3081,7 @@ mod tests {
         let original = view.cell(coordinate).expect("indexed fixture cell").clone();
         transport.id_to_coordinate.insert(42, coordinate);
         view.dirty_chunks.clear();
+        let planning_revision = view.planning_revision;
 
         update_cells(
             &transport,
@@ -2774,6 +3103,7 @@ mod tests {
             original.civilians + 1
         );
         assert_eq!(view.dirty_chunks, BTreeSet::from([chunk_of(coordinate)]));
+        assert_eq!(view.planning_revision, planning_revision);
     }
 
     #[test]
@@ -2784,6 +3114,7 @@ mod tests {
         let original = view.cell(coordinate).expect("fixture cell").clone();
         transport.id_to_coordinate.insert(43, coordinate);
         view.dirty_chunks.clear();
+        let planning_revision = view.planning_revision;
 
         update_cells(
             &transport,
@@ -2805,6 +3136,7 @@ mod tests {
             original.civilians + 1
         );
         assert!(view.dirty_chunks.is_empty());
+        assert_eq!(view.planning_revision, planning_revision);
     }
 
     #[cfg(unix)]

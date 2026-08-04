@@ -145,6 +145,7 @@ struct PresentationInput<'a> {
     window_scale_factor: f32,
     logical_viewport: Option<Rect>,
     cell_state_revision: u64,
+    contest_revision: u64,
     chunk_index_revision: u64,
     visible_chunks: &'a [Entity],
 }
@@ -527,6 +528,7 @@ pub(crate) fn presentation_input_signature(
         window_scale_factor: window.scale_factor(),
         logical_viewport: camera.logical_viewport_rect(),
         cell_state_revision: view.cell_state_revision,
+        contest_revision: view.contest_revision,
         chunk_index_revision: view.chunk_index_revision,
         visible_chunks,
     })
@@ -560,6 +562,7 @@ fn presentation_input_signature_from_parts(input: PresentationInput<'_>) -> u64 
         })
         .hash(&mut hasher);
     input.cell_state_revision.hash(&mut hasher);
+    input.contest_revision.hash(&mut hasher);
     input.chunk_index_revision.hash(&mut hasher);
     input.visible_chunks.hash(&mut hasher);
     hasher.finish()
@@ -849,6 +852,7 @@ mod tests {
             window_scale_factor: 2.0,
             logical_viewport: Some(Rect::from_corners(Vec2::ZERO, Vec2::new(1_280.0, 720.0))),
             cell_state_revision: 17,
+            contest_revision: 5,
             chunk_index_revision: 3,
             visible_chunks: &chunks,
         };
@@ -889,6 +893,10 @@ mod tests {
 
         changed = base;
         changed.cell_state_revision += 1;
+        assert_ne!(signature, presentation_input_signature_from_parts(changed));
+
+        changed = base;
+        changed.contest_revision += 1;
         assert_ne!(signature, presentation_input_signature_from_parts(changed));
 
         changed = base;
