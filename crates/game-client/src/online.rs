@@ -51,6 +51,9 @@ const ORDERS_DIRTY: u32 = 1 << 8;
 const POLICIES_DIRTY: u32 = 1 << 9;
 const ALL_DIRTY: u32 = (1 << 10) - 1;
 
+#[cfg(debug_assertions)]
+const POLICY_FLOW_DEBUG_KEY: KeyCode = KeyCode::F4;
+
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OnlineSyncSet;
 
@@ -248,7 +251,44 @@ impl Plugin for OnlineTransportPlugin {
                     .in_set(NetworkSet::Apply)
                     .in_set(OnlineSyncSet),
             );
+
+        #[cfg(debug_assertions)]
+        app.add_systems(
+            Update,
+            toggle_policy_flow_debug.in_set(NetworkSet::Transport),
+        );
     }
+}
+
+/// Development-only presentation switch for background policy logistics.
+///
+/// Packet visibility depends on both packet and order provenance. Force both
+/// caches through the authoritative projection so enabling is immediate and
+/// disabling cannot leave a previously rendered route behind.
+#[cfg(debug_assertions)]
+fn toggle_policy_flow_debug(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut transport: ResMut<OnlineTransport>,
+    mut view: ResMut<MatchView>,
+) {
+    if !keyboard.just_pressed(POLICY_FLOW_DEBUG_KEY) {
+        return;
+    }
+
+    transport.config.debug_policy_flows = !transport.config.debug_policy_flows;
+    transport.signals.mark(FLOWS_DIRTY | ORDERS_DIRTY);
+    if !transport.config.debug_policy_flows {
+        // A connected client restores explicit routes from authority later in
+        // this frame. Clear first so stale policy trails also disappear when
+        // the toggle is used during a reconnect and no snapshot is available.
+        view.active_flows.clear();
+    }
+    let status = if transport.config.debug_policy_flows {
+        "ON · F4 to hide"
+    } else {
+        "OFF · F4 to show"
+    };
+    view.show_toast(format!("DEBUG · policy routes {status}"), ToastKind::Info);
 }
 
 fn maintain_connection(
@@ -1936,6 +1976,98 @@ mod tests {
         assert_eq!(
             debug.iter().map(|flow| flow.strength).collect::<Vec<_>>(),
             vec![20, 21, 22]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn f4_toggles_policy_routes_and_requests_an_immediate_reprojection() {
+        let transport = OnlineTransport::new(test_config());
+        let signals = Arc::clone(&transport.signals);
+        let mut app = App::new();
+        app.insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(transport)
+            .insert_resource(MatchView::connecting(1))
+            .add_systems(Update, toggle_policy_flow_debug);
+
+        assert!(
+            !app.world()
+                .resource::<OnlineTransport>()
+                .config
+                .debug_policy_flows,
+            "policy routes must start hidden"
+        );
+        assert_eq!(signals.take_dirty(), 0);
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(POLICY_FLOW_DEBUG_KEY);
+        app.update();
+
+        assert!(
+            app.world()
+                .resource::<OnlineTransport>()
+                .config
+                .debug_policy_flows
+        );
+        assert_eq!(signals.take_dirty(), FLOWS_DIRTY | ORDERS_DIRTY);
+        assert_eq!(
+            app.world()
+                .resource::<MatchView>()
+                .toast
+                .as_ref()
+                .map(|toast| toast.text.as_str()),
+            Some("DEBUG · policy routes ON · F4 to hide")
+        );
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear_just_pressed(POLICY_FLOW_DEBUG_KEY);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<OnlineTransport>()
+                .config
+                .debug_policy_flows,
+            "holding F4 must not retrigger the toggle"
+        );
+        assert_eq!(signals.take_dirty(), 0);
+
+        app.world_mut()
+            .resource_mut::<MatchView>()
+            .active_flows
+            .push(ActiveFlow {
+                route: vec![Axial::ZERO, Axial::new(1, 0)],
+                strength: 20,
+                attacking: false,
+                age: 0.0,
+                lifetime: 60.0,
+            });
+        {
+            let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keyboard.reset(POLICY_FLOW_DEBUG_KEY);
+            keyboard.press(POLICY_FLOW_DEBUG_KEY);
+        }
+        app.update();
+
+        assert!(
+            !app.world()
+                .resource::<OnlineTransport>()
+                .config
+                .debug_policy_flows
+        );
+        assert!(
+            app.world().resource::<MatchView>().active_flows.is_empty(),
+            "turning the diagnostic off must clear stale trails without authority"
+        );
+        assert_eq!(signals.take_dirty(), FLOWS_DIRTY | ORDERS_DIRTY);
+        assert_eq!(
+            app.world()
+                .resource::<MatchView>()
+                .toast
+                .as_ref()
+                .map(|toast| toast.text.as_str()),
+            Some("DEBUG · policy routes OFF · F4 to show")
         );
     }
 

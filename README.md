@@ -69,11 +69,12 @@ authoritative timing, combat, and persistence must be evaluated online.
 
 Persistent cluster-policy redistribution is background behavior, so its packet
 movement is not animated in the normal client. Running `./scripts/dev.sh` keeps
-those trails hidden too; use `./scripts/dev.sh --debug-policy-flows` to enable
-them explicitly for both development clients. A single debug client also accepts
-`./scripts/run-client.sh --debug-policy-flows`. Release builds do not expose or
-accept the flag. It changes only flow overlays, never policy execution or troop
-accounting.
+those trails hidden too. In an online development client, press `F4` to show or
+hide them immediately for that window. The optional `--debug-policy-flows`
+argument only starts them visible (`./scripts/dev.sh --debug-policy-flows`
+applies that initial state to both clients). Release builds expose neither the
+key nor the argument. This changes only flow overlays, never policy execution or
+troop accounting.
 
 ## Local two-player match
 
@@ -174,6 +175,10 @@ relevant keys; `?` opens the field manual.
 | `V` | Cycle map views |
 | `?` | Toggle the field manual |
 | `F3` | Toggle the performance overlay |
+
+Online development builds add one diagnostic control: `F4` toggles internal
+cluster-policy route trails. It is absent from release builds and from the
+in-game player manual.
 
 A cluster is the full connected set of owned passable cells. Empty owned cells
 can connect troop-bearing areas; blocked terrain and impassable elevation edges

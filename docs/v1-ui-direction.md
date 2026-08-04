@@ -108,9 +108,10 @@ explicit command, then resume from the unchanged policy setting as capacity
 becomes free. Unrelated explicit movement remains fixed.
 
 Internal policy routes are presentation noise in ordinary play and remain
-hidden when the client is launched with `./scripts/dev.sh`. Developers can opt
-both clients into the diagnostic overlay with
-`./scripts/dev.sh --debug-policy-flows`; the switch does not change authority or
+hidden when the client is launched with `./scripts/dev.sh`. In an online
+development client, `F4` toggles the diagnostic routes immediately for the
+focused window; `--debug-policy-flows` only changes their initial state. Neither
+control exists in release builds, and the switch does not change authority or
 troop accounting.
 
 On a merge, the subscribed newest-revision policy is authoritative. Avoid a

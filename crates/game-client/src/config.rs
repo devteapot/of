@@ -37,7 +37,7 @@ struct ClientArgs {
     #[arg(long)]
     profile: Option<String>,
 
-    /// Show persistent cluster-policy packet animations for diagnostics.
+    /// Start with persistent cluster-policy packet animations visible.
     ///
     /// This presentation-only switch is intentionally absent from release
     /// builds so it cannot become part of the normal player control surface.
@@ -54,8 +54,9 @@ pub struct ClientConfig {
     pub preferred_player: u8,
     pub display_name: String,
     pub profile: String,
-    /// Presentation-only diagnostic. Authoritative policy execution and troop
-    /// accounting never consult this value.
+    /// Presentation-only diagnostic state. Debug clients may toggle it at
+    /// runtime with F4; authoritative policy execution and troop accounting
+    /// never consult this value.
     pub debug_policy_flows: bool,
 }
 

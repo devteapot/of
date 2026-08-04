@@ -231,11 +231,13 @@ are an execution substrate, not a public exact-infantry-transfer API.
 
 The normal client animates explicit action packets but filters internal
 cluster-policy maintenance packets from flow overlays. Debug builds may restore
-those presentation-only animations at startup with `--debug-policy-flows`.
-`./scripts/dev.sh` does not enable the overlay implicitly;
-`./scripts/dev.sh --debug-policy-flows` opts both development clients into it.
-The flag is compiled out of release builds. The filter is downstream of the
-full authoritative snapshot, so order accounting, policy execution, action
+those presentation-only animations at runtime with `F4`. The toggle forces an
+immediate packet-and-order reprojection, so hiding it also clears existing
+policy trails without waiting for an authority callback. `./scripts/dev.sh`
+starts with the overlay hidden; `--debug-policy-flows` remains an optional
+initial-visible state for both development clients. The key and argument are
+compiled out of release builds. The filter is downstream of the full
+authoritative snapshot, so order accounting, policy execution, action
 availability, and Stop/retask projections still observe every packet.
 
 ### Complete-component authority

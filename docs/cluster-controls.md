@@ -107,10 +107,10 @@ input and remains exclusive to Expand Clusters and Attack Clusters.
 Normal clients do not render packet-flow trails for this automatic maintenance.
 The authority still executes and accounts for every policy packet; only its
 presentation is filtered. `./scripts/dev.sh` keeps the trails hidden by default;
-start it as `./scripts/dev.sh --debug-policy-flows` to enable them explicitly for
-both development clients. A single debug client also accepts
-`./scripts/run-client.sh --debug-policy-flows`. Release builds do not expose or
-accept that switch.
+press `F4` in an online development client to show or hide them immediately for
+that window. `--debug-policy-flows` remains available only as an optional
+initial-visible state (and applies to both clients when passed to `dev.sh`).
+Release builds expose neither the key nor the argument.
 
 Newly captured cells inherit the policy of their current connected cluster. A
 split keeps the per-cell lineage on both children. When clusters merge, the
