@@ -598,6 +598,8 @@ fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         if cell.civilian_capacity == 0 {
             continue;
         }
+        let previous_civilians = cell.civilians;
+        let previous_infantry = cell.infantry;
         let missing = cell.civilian_capacity.saturating_sub(cell.civilians);
         if missing > 0 {
             let growth =
@@ -626,8 +628,10 @@ fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
             cell.civilians -= recruit;
             cell.infantry += recruit;
         }
-        cell.last_changed_step = logical_step;
-        ctx.db.cell_state().cell_id().update(cell);
+        if cell.civilians != previous_civilians || cell.infantry != previous_infantry {
+            cell.last_changed_step = logical_step;
+            ctx.db.cell_state().cell_id().update(cell);
+        }
     }
     Ok(())
 }
@@ -1967,20 +1971,27 @@ fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         .filter(OrderStatus::Active)
         .collect();
     for mut order in orders {
-        order.in_transit_infantry = active_strength.get(&order.order_id).copied().unwrap_or(0);
-        order.status = finalized_order_status(
+        let in_transit = active_strength.get(&order.order_id).copied().unwrap_or(0);
+        let status = finalized_order_status(
             order.committed_infantry,
-            order.in_transit_infantry,
+            in_transit,
             order.delivered_infantry,
             order.casualty_infantry,
         )
         .map_err(|error| format!("order {} {error}", order.order_id))?;
-        if order.status == OrderStatus::Completed {
+        let changed = order.in_transit_infantry != in_transit || order.status != status;
+        if status == OrderStatus::Completed {
+            order.in_transit_infantry = in_transit;
+            order.status = status;
             complete_retreat_abandonments(ctx, &order, logical_step)?;
             ctx.db.expansion_wave().order_id().delete(order.order_id);
         }
-        order.updated_step = logical_step;
-        ctx.db.transfer_order().order_id().update(order);
+        if changed {
+            order.in_transit_infantry = in_transit;
+            order.status = status;
+            order.updated_step = logical_step;
+            ctx.db.transfer_order().order_id().update(order);
+        }
     }
     Ok(())
 }
@@ -2127,9 +2138,7 @@ mod tests {
             let mut next_packets = Vec::new();
             for (index, packet) in packets.into_iter().enumerate() {
                 let outcome = &step.outcomes[&(index as u64 + 1)];
-                let capacity_blocked = outcome
-                    .limits
-                    .contains(&MovementLimit::DestinationCapacity);
+                let capacity_blocked = outcome.limits.contains(&MovementLimit::DestinationCapacity);
                 saw_capacity_backpressure |= capacity_blocked;
                 let remainder = packet.infantry - outcome.approved;
                 if remainder > 0 && !(station_blocked_remainders && capacity_blocked) {
@@ -2579,10 +2588,7 @@ mod tests {
         ] {
             let order = test_order(kind, OrderStatus::Active);
             assert!(should_station_capacity_blocked_packet(&order, &capacity));
-            assert!(!should_station_capacity_blocked_packet(
-                &order,
-                &throughput
-            ));
+            assert!(!should_station_capacity_blocked_packet(&order, &throughput));
         }
         for kind in [
             OrderKind::ExpandAll,
@@ -2591,16 +2597,10 @@ mod tests {
         ] {
             let order = test_order(kind, OrderStatus::Active);
             assert!(should_station_capacity_blocked_packet(&order, &capacity));
-            assert!(!should_station_capacity_blocked_packet(
-                &order,
-                &throughput
-            ));
+            assert!(!should_station_capacity_blocked_packet(&order, &throughput));
         }
         let push = test_order(OrderKind::PushFront, OrderStatus::Active);
-        assert!(!should_station_capacity_blocked_packet(
-            &push,
-            &capacity
-        ));
+        assert!(!should_station_capacity_blocked_packet(&push, &capacity));
 
         let committed = 50;
         let moved = 15;
@@ -2625,10 +2625,7 @@ mod tests {
         ] {
             let mut policy = test_order(kind, OrderStatus::Active);
             policy.client_command_id = 0;
-            assert!(!should_station_capacity_blocked_packet(
-                &policy,
-                &capacity
-            ));
+            assert!(!should_station_capacity_blocked_packet(&policy, &capacity));
             assert!(!should_station_capacity_blocked_packet(
                 &policy,
                 &throughput
@@ -2639,9 +2636,7 @@ mod tests {
         // persistent-policy order kinds receives receding-horizon behavior.
         let mut reshape = test_order(OrderKind::Reshape, OrderStatus::Active);
         reshape.client_command_id = 0;
-        assert!(should_station_capacity_blocked_packet(
-            &reshape, &capacity
-        ));
+        assert!(should_station_capacity_blocked_packet(&reshape, &capacity));
     }
 
     #[test]

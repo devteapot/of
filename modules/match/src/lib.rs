@@ -195,13 +195,6 @@ pub fn identity_disconnected(ctx: &ReducerContext) {
 }
 
 fn ensure_simulation_schedule(ctx: &ReducerContext) -> Result<(), String> {
-    if ctx.db.simulation_schedule().iter().next().is_some() {
-        return Ok(());
-    }
-    schedule_next_simulation(ctx)
-}
-
-fn schedule_next_simulation(ctx: &ReducerContext) -> Result<(), String> {
     let duration_ms = ctx
         .db
         .match_config()
@@ -209,22 +202,39 @@ fn schedule_next_simulation(ctx: &ReducerContext) -> Result<(), String> {
         .find(SINGLETON_ID)
         .ok_or("match config is missing")?
         .logical_step_ms;
+    let desired = ScheduleAt::from(Duration::from_millis(u64::from(duration_ms)));
+    let existing = ctx.db.simulation_schedule().iter().collect::<Vec<_>>();
+    if existing.len() == 1 && existing[0].scheduled_at == desired {
+        return Ok(());
+    }
+    for schedule in existing {
+        ctx.db
+            .simulation_schedule()
+            .scheduled_id()
+            .delete(schedule.scheduled_id);
+    }
     ctx.db.simulation_schedule().insert(SimulationSchedule {
         scheduled_id: 0,
-        scheduled_at: ScheduleAt::Time(
-            ctx.timestamp + Duration::from_millis(u64::from(duration_ms)),
-        ),
+        scheduled_at: desired,
     });
     Ok(())
 }
 
 #[spacetimedb::reducer]
-pub fn simulation_tick(ctx: &ReducerContext, _schedule: SimulationSchedule) -> Result<(), String> {
+pub fn simulation_tick(ctx: &ReducerContext, schedule: SimulationSchedule) -> Result<(), String> {
     if ctx.sender() != ctx.database_identity() {
         return Err("simulation_tick may only be invoked by the scheduler".into());
     }
-    if crate::simulation::advance_simulation(ctx)? {
-        schedule_next_simulation(ctx)?;
+    let still_running = crate::simulation::advance_simulation(ctx)?;
+    if !still_running {
+        ctx.db
+            .simulation_schedule()
+            .scheduled_id()
+            .delete(schedule.scheduled_id);
+    } else if matches!(schedule.scheduled_at, ScheduleAt::Time(_)) {
+        // Seamlessly replace a legacy one-shot row when an active database is
+        // upgraded to interval scheduling.
+        ensure_simulation_schedule(ctx)?;
     }
     Ok(())
 }

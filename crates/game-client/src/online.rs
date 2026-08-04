@@ -12,6 +12,10 @@ use std::{
 
 use bevy::prelude::*;
 use hex_core::{Axial, TerrainKind};
+#[cfg(debug_assertions)]
+use match_bindings::TransitPacketTableAccess;
+#[cfg(not(debug_assertions))]
+use match_bindings::VisiblePacketsTableAccess;
 use match_bindings::{
     CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, ClusterPolicyAssignment,
     ClusterPolicyAssignmentTableAccess, ClusterPolicyKind as RemoteClusterPolicyKind, CombatFront,
@@ -20,10 +24,9 @@ use match_bindings::{
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
     PlayerSlotTableAccess, ReceiptStatus, TransferDestination, TransferDestinationTableAccess,
     TransferOrder, TransferOrderTableAccess, TransferSource, TransferSourceTableAccess,
-    TransitPacket, TransitPacketTableAccess, cancel_orders, issue_attack_clusters, issue_balance,
-    issue_core_load, issue_expand_all, issue_expand_clusters, issue_front_load,
-    issue_perimeter_load, issue_push_front, issue_reshape, join_match, set_cluster_policy,
-    set_mobilization_target,
+    TransitPacket, cancel_orders, issue_attack_clusters, issue_balance, issue_core_load,
+    issue_expand_all, issue_expand_clusters, issue_front_load, issue_perimeter_load,
+    issue_push_front, issue_reshape, join_match, set_cluster_policy, set_mobilization_target,
 };
 use spacetimedb_sdk::__codegen::InternalError;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
@@ -51,6 +54,31 @@ const ORDERS_DIRTY: u32 = 1 << 8;
 const POLICIES_DIRTY: u32 = 1 << 9;
 const ALL_DIRTY: u32 = (1 << 10) - 1;
 
+/// Debug builds retain the raw packet stream for the F4 policy-route
+/// diagnostic. Release builds use the server-maintained tactical view, so
+/// background rebalancing packets never cross the network.
+#[cfg(debug_assertions)]
+const PACKET_STREAM_QUERY: &str = "SELECT * FROM transit_packet";
+#[cfg(not(debug_assertions))]
+const PACKET_STREAM_QUERY: &str = "SELECT * FROM visible_packets";
+
+/// Subscribe only to the public state used by the game client.
+const CLIENT_SUBSCRIPTIONS: [&str; 13] = [
+    "SELECT * FROM cell_state",
+    "SELECT * FROM cell_terrain",
+    "SELECT * FROM cluster_policy_assignment",
+    "SELECT * FROM combat_front",
+    "SELECT * FROM command_receipt",
+    "SELECT * FROM match_config",
+    "SELECT * FROM match_state",
+    "SELECT * FROM mobilization_policy",
+    "SELECT * FROM player_slot",
+    "SELECT * FROM transfer_destination",
+    "SELECT * FROM transfer_order",
+    "SELECT * FROM transfer_source",
+    PACKET_STREAM_QUERY,
+];
+
 #[cfg(debug_assertions)]
 const POLICY_FLOW_DEBUG_KEY: KeyCode = KeyCode::F4;
 
@@ -71,6 +99,7 @@ enum LifecycleEvent {
 #[derive(Default)]
 struct SharedSignals {
     dirty: AtomicU32,
+    cell_changes: Mutex<BTreeMap<u32, CellState>>,
     events: Mutex<VecDeque<LifecycleEvent>>,
 }
 
@@ -81,6 +110,20 @@ impl SharedSignals {
 
     fn take_dirty(&self) -> u32 {
         self.dirty.swap(0, Ordering::AcqRel)
+    }
+
+    fn record_cell(&self, cell: &CellState) {
+        if let Ok(mut changes) = self.cell_changes.lock() {
+            changes.insert(cell.cell_id, cell.clone());
+        }
+        self.mark(CELLS_DIRTY);
+    }
+
+    fn take_cell_changes(&self) -> Vec<CellState> {
+        self.cell_changes.lock().map_or_else(
+            |_| Vec::new(),
+            |mut changes| std::mem::take(&mut *changes).into_values().collect(),
+        )
     }
 
     fn push(&self, event: LifecycleEvent) {
@@ -403,7 +446,7 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
                         reason: format!("subscription failed: {error}"),
                     });
                 })
-                .subscribe_to_all_tables();
+                .subscribe(CLIENT_SUBSCRIPTIONS);
         })
         .on_connect_error(move |_context, error| {
             connect_error_signals.push(LifecycleEvent::ConnectionFailed {
@@ -466,14 +509,43 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
     }
 
     watch_table!(connection.db.cell_terrain(), TERRAIN_DIRTY | CELLS_DIRTY);
-    watch_table!(connection.db.cell_state(), CELLS_DIRTY);
+    let cell_insert_signals = Arc::clone(signals);
+    connection
+        .db
+        .cell_state()
+        .on_insert(move |_context, row| cell_insert_signals.record_cell(row));
+    let cell_update_signals = Arc::clone(signals);
+    connection
+        .db
+        .cell_state()
+        .on_update(move |_context, _old, new| cell_update_signals.record_cell(new));
+    let cell_delete_signals = Arc::clone(signals);
+    connection.db.cell_state().on_delete(move |_context, _row| {
+        // Cell deletion only occurs during lobby map replacement. Force a
+        // terrain-backed rebuild so removed cells cannot remain in the view.
+        cell_delete_signals.mark(TERRAIN_DIRTY | CELLS_DIRTY);
+    });
     watch_table!(connection.db.cluster_policy_assignment(), POLICIES_DIRTY);
     watch_table!(connection.db.match_config(), MATCH_DIRTY);
     watch_table!(connection.db.match_state(), MATCH_DIRTY);
     watch_table!(connection.db.player_slot(), PLAYERS_DIRTY);
     watch_table!(connection.db.mobilization_policy(), MOBILIZATION_DIRTY);
     watch_table!(connection.db.command_receipt(), RECEIPTS_DIRTY);
+    #[cfg(debug_assertions)]
     watch_table!(connection.db.transit_packet(), FLOWS_DIRTY);
+    #[cfg(not(debug_assertions))]
+    {
+        let packet_insert_signals = Arc::clone(signals);
+        connection
+            .db
+            .visible_packets()
+            .on_insert(move |_context, _row| packet_insert_signals.mark(FLOWS_DIRTY));
+        let packet_delete_signals = Arc::clone(signals);
+        connection
+            .db
+            .visible_packets()
+            .on_delete(move |_context, _row| packet_delete_signals.mark(FLOWS_DIRTY));
+    }
     watch_table!(connection.db.combat_front(), FRONTS_DIRTY);
     watch_table!(connection.db.transfer_order(), ORDERS_DIRTY);
     watch_table!(connection.db.transfer_source(), ORDERS_DIRTY);
@@ -831,15 +903,18 @@ struct AuthoritySnapshot {
 }
 
 impl AuthoritySnapshot {
-    fn capture(connection: &DbConnection, dirty: u32) -> Self {
+    fn capture(connection: &DbConnection, dirty: u32, changed_cells: Vec<CellState>) -> Self {
         let terrain_changed = dirty & TERRAIN_DIRTY != 0;
         let tactical_changed =
             dirty & (TERRAIN_DIRTY | FLOWS_DIRTY | FRONTS_DIRTY | ORDERS_DIRTY) != 0;
         Self {
             identity: connection.try_identity(),
             terrain: terrain_changed.then(|| connection.db.cell_terrain().iter().collect()),
-            cells: (terrain_changed || dirty & CELLS_DIRTY != 0)
-                .then(|| connection.db.cell_state().iter().collect()),
+            cells: if terrain_changed {
+                Some(connection.db.cell_state().iter().collect())
+            } else {
+                (dirty & CELLS_DIRTY != 0).then_some(changed_cells)
+            },
             cluster_policies: (dirty & POLICIES_DIRTY != 0)
                 .then(|| connection.db.cluster_policy_assignment().iter().collect()),
             config: (dirty & MATCH_DIRTY != 0)
@@ -854,7 +929,7 @@ impl AuthoritySnapshot {
                 .then(|| connection.db.mobilization_policy().iter().collect()),
             receipts: (dirty & (RECEIPTS_DIRTY | PLAYERS_DIRTY) != 0)
                 .then(|| connection.db.command_receipt().iter().collect()),
-            packets: tactical_changed.then(|| connection.db.transit_packet().iter().collect()),
+            packets: tactical_changed.then(|| subscribed_packets(connection)),
             fronts: tactical_changed.then(|| connection.db.combat_front().iter().collect()),
             orders: tactical_changed.then(|| {
                 connection
@@ -875,6 +950,16 @@ impl AuthoritySnapshot {
     }
 }
 
+#[cfg(debug_assertions)]
+fn subscribed_packets(connection: &DbConnection) -> Vec<TransitPacket> {
+    connection.db.transit_packet().iter().collect()
+}
+
+#[cfg(not(debug_assertions))]
+fn subscribed_packets(connection: &DbConnection) -> Vec<TransitPacket> {
+    connection.db.visible_packets().iter().collect()
+}
+
 fn synchronize_authoritative_view(
     mut transport: ResMut<OnlineTransport>,
     mut view: ResMut<MatchView>,
@@ -893,7 +978,7 @@ fn synchronize_authoritative_view(
         let Some(connection) = &transport.connection else {
             return;
         };
-        AuthoritySnapshot::capture(connection, dirty)
+        AuthoritySnapshot::capture(connection, dirty, transport.signals.take_cell_changes())
     };
 
     if let Some(terrain) = snapshot.terrain {

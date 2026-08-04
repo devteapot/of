@@ -132,6 +132,18 @@ schema. Generated files carry a prominent generated marker, are committed, and
 are never manually edited. CI regenerates the bindings and fails on an
 unexpected diff so schema drift is visible.
 
+Reducer work regressions are gated with the standalone host's deterministic
+Wasmtime fuel counter rather than wall-clock timing. Run a scenario against a
+fresh isolated database, resolve its identity with `spacetime list --server
+local`, then check the cumulative mean with:
+
+```bash
+./scripts/check-reducer-fuel.sh <database-identity> simulation_tick <fuel-limit>
+./scripts/check-reducer-fuel.sh <database-identity> set_cluster_policy <fuel-limit>
+```
+
+Pin both the Rust and SpacetimeDB versions when comparing fuel baselines.
+
 The cluster-wave, persistent-policy, Reshape, and generic cancellation cutover
 changes both persisted schema and the public reducer API. SpacetimeDB
 2.7.1 cannot migrate this development schema in place; recreate the local

@@ -1,0 +1,15 @@
+[package]
+name = "match-perf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Live-match load driver and step-rate profiler"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+match-bindings = { path = "../../crates/match-bindings" }
+spacetimedb-sdk = { workspace = true }
+
+[lints]
+workspace = true

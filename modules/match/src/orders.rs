@@ -4,14 +4,14 @@ use hex_core::{
     Axial, BALANCE_WEIGHT, DistributionPreset, FrontSelectionError, HexMap, MovementConfig,
     ground_traversal, redistribution_targets, redistribution_targets_with_fallback_constraints,
     selected_all_front_edges, selected_directional_routes, selected_front_edges,
-    selected_local_front_routes,
+    selected_local_front_routes, shortest_path,
 };
-use spacetimedb::{ReducerContext, Table};
+use spacetimedb::{ReducerContext, Table, log_stopwatch::LogStopwatch};
 
 use crate::rules::{
     MAX_SELECTION_CELLS, allocated_infantry_at_cell, cell_state, command_was_seen, config,
-    coordinate_for_cell, core_cell, edge_runtime_limits, packet_key, require_running_player,
-    route_to, state, terrain, write_receipt,
+    coordinate_for_cell, core_cell, edge_runtime_limits, packet_key, require_running_player, state,
+    terrain, write_receipt,
 };
 use crate::schema::{
     ClusterPolicyAssignment, ClusterPolicyKind, EXPANSION_AGGREGATE_ORIGIN, ExpansionWave,
@@ -32,6 +32,12 @@ struct PlannedLeg {
 }
 
 struct PlannedDistribution {
+    /// The component snapshot used to calculate the targets is also the
+    /// authoritative routing graph for this plan. Keeping it here avoids
+    /// rebuilding the same cells through database probes for every leg.
+    map: HexMap,
+    cell_ids_by_coordinate: BTreeMap<Axial, u32>,
+    coordinates_by_cell_id: BTreeMap<u32, Axial>,
     /// Maximum affected strength each source may contribute while preserving
     /// allocations that do not belong to this command.
     source_limits: BTreeMap<u32, u64>,
@@ -73,6 +79,9 @@ struct RetaskSelection {
 /// a receipt-bearing, non-zero client command ID, even when their legacy order
 /// kind is also Balance/FrontLoad/CoreLoad/PerimeterLoad.
 const POLICY_MAINTENANCE_COMMAND_ID: u64 = 0;
+/// Receding-horizon maintenance may finish a large redistribution over
+/// several passes. This caps routing and persistence work in any one tick.
+const MAX_POLICY_REPLAN_LEGS: usize = 128;
 
 impl RetaskSelection {
     fn released_at(&self, cell_id: u32) -> u64 {
@@ -585,14 +594,7 @@ pub fn issue_reshape(
             return Err("reshape destination does not move any selected troops".into());
         }
         let requested = plan.amount;
-        let legs = plan_distribution_legs(
-            ctx,
-            player_id,
-            &selection,
-            plan.source_limits,
-            plan.demands,
-            requested,
-        )?;
+        let legs = plan_distribution_legs(ctx, player_id, &selection, plan, None)?;
         if legs.is_empty() {
             return Err("reshape destination does not move any selected troops".into());
         }
@@ -670,14 +672,8 @@ fn issue_distribution(
                 continue;
             }
             let amount = plan.amount;
-            let component_legs = plan_distribution_legs(
-                ctx,
-                player_id,
-                &component_selection,
-                plan.source_limits,
-                plan.demands,
-                amount,
-            )?;
+            let component_legs =
+                plan_distribution_legs(ctx, player_id, &component_selection, plan, None)?;
             requested = requested
                 .checked_add(amount)
                 .ok_or_else(|| "redistribution requested infantry overflow".to_string())?;
@@ -1448,7 +1444,9 @@ fn set_cluster_policy_inner(
 /// pool. No explicit action order is superseded: its live packets stay frozen in
 /// `redistribution_cell_projection` and continue to consume cell capacity.
 pub(crate) fn maintain_cluster_policies(ctx: &ReducerContext) -> Result<(), String> {
+    let reconciliation_stopwatch = LogStopwatch::new("cluster_policy_reconciliation");
     let components_by_player = reconcile_cluster_policy_assignments(ctx)?;
+    reconciliation_stopwatch.end();
     for (player_id, components) in components_by_player {
         for component in components {
             // Policy movement is opportunistic. An explicit action, temporary
@@ -1468,6 +1466,7 @@ fn maintain_cluster_policy_component(
     player_id: u8,
     component: &BTreeSet<u32>,
 ) -> Result<(), String> {
+    let _component_stopwatch = LogStopwatch::new("cluster_policy_component");
     if component.len() > MAX_SELECTION_CELLS {
         return Err(format!(
             "cluster policy component exceeds the {MAX_SELECTION_CELLS}-cell command limit"
@@ -1510,22 +1509,24 @@ fn maintain_cluster_policy_component(
     // temporary routing/capacity failure never discards live work.
     let selection = include_background_policy_yield(ctx, player_id, selection)?;
     let (kind, preset, orientation) = spec.distribution();
+    let distribution_stopwatch = LogStopwatch::new("cluster_policy_distribution");
     let plan = distribution_plan(ctx, player_id, &selection, preset)?;
+    distribution_stopwatch.end();
     if plan.amount == 0 {
         // The current physical distribution already satisfies the latest
         // policy. Retire any now-redundant in-flight metadata in place.
         cancel_superseded_orders(ctx, player_id, &selection.superseded_order_ids)?;
         return Ok(());
     }
-    let amount = plan.amount;
+    let routing_stopwatch = LogStopwatch::new("cluster_policy_routing");
     let legs = plan_distribution_legs(
         ctx,
         player_id,
         &selection,
-        plan.source_limits,
-        plan.demands,
-        amount,
+        plan,
+        Some(MAX_POLICY_REPLAN_LEGS),
     )?;
+    routing_stopwatch.end();
     let mut relay_availability = BTreeMap::new();
     for &cell_id in component {
         let cell = cell_state(ctx, cell_id)?;
@@ -1596,13 +1597,15 @@ fn policy_horizon_legs(
         if *source != leg.source {
             return Err("policy route starts outside its source".into());
         }
-        let relay_amount = intermediate.iter().try_fold(leg.amount, |amount, cell_id| {
-            relay_spare
-                .get(cell_id)
-                .copied()
-                .map(|cell_available| amount.min(cell_available))
-                .ok_or_else(|| format!("policy route escaped component at cell {cell_id}"))
-        })?;
+        let relay_amount = intermediate
+            .iter()
+            .try_fold(leg.amount, |amount, cell_id| {
+                relay_spare
+                    .get(cell_id)
+                    .copied()
+                    .map(|cell_available| amount.min(cell_available))
+                    .ok_or_else(|| format!("policy route escaped component at cell {cell_id}"))
+            })?;
         let source_commitment = source_remaining
             .get_mut(&leg.source)
             .expect("policy source commitments cover every leg");
@@ -2704,6 +2707,12 @@ fn distribution_plan(
         }
     }
     Ok(PlannedDistribution {
+        map,
+        cell_ids_by_coordinate: by_coordinate.clone(),
+        coordinates_by_cell_id: by_coordinate
+            .into_iter()
+            .map(|(coordinate, cell_id)| (cell_id, coordinate))
+            .collect(),
         source_limits,
         demands,
         amount: total_demand,
@@ -2801,6 +2810,12 @@ fn shape_distribution_plan(
         }
     }
     Ok(PlannedDistribution {
+        map,
+        cell_ids_by_coordinate: by_coordinate.clone(),
+        coordinates_by_cell_id: by_coordinate
+            .into_iter()
+            .map(|(coordinate, cell_id)| (cell_id, coordinate))
+            .collect(),
         source_limits,
         demands,
         amount: total_demand,
@@ -2972,10 +2987,17 @@ fn plan_distribution_legs(
     ctx: &ReducerContext,
     player_id: u8,
     selection: &RetaskSelection,
-    source_limits: BTreeMap<u32, u64>,
-    mut destination_demands: BTreeMap<u32, u64>,
-    requested: u64,
+    plan: PlannedDistribution,
+    max_legs: Option<usize>,
 ) -> Result<Vec<PlannedLeg>, String> {
+    let PlannedDistribution {
+        map,
+        cell_ids_by_coordinate,
+        coordinates_by_cell_id,
+        source_limits,
+        demands: mut destination_demands,
+        amount: requested,
+    } = plan;
     if source_limits.is_empty() {
         return Err("source selection is empty".into());
     }
@@ -3014,16 +3036,33 @@ fn plan_distribution_legs(
     let destination_coordinates = destination_demands
         .keys()
         .copied()
-        .map(|cell_id| Ok((cell_id, coordinate_for_cell(ctx, cell_id)?)))
+        .map(|cell_id| {
+            coordinates_by_cell_id
+                .get(&cell_id)
+                .copied()
+                .map(|coordinate| (cell_id, coordinate))
+                .ok_or_else(|| format!("distribution cell {cell_id} is missing from its map"))
+        })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let match_config = config(ctx)?;
+    let movement = MovementConfig {
+        max_elevation_step: u16::from(match_config.max_elevation_step),
+        level_cost: 10,
+        uphill_cost: 15,
+        downhill_cost: 10,
+    };
     let mut legs = Vec::new();
     let mut remaining = requested;
 
-    for (&source, source_available) in &mut available_by_source {
+    let mut capped = false;
+    'sources: for (&source, source_available) in &mut available_by_source {
         if remaining == 0 {
             break;
         }
-        let source_coordinate = coordinate_for_cell(ctx, source)?;
+        let source_coordinate = coordinates_by_cell_id
+            .get(&source)
+            .copied()
+            .ok_or_else(|| format!("distribution cell {source} is missing from its map"))?;
         let mut candidates: Vec<_> = destination_coordinates
             .iter()
             .filter(|(destination, _)| {
@@ -3036,6 +3075,10 @@ fn plan_distribution_legs(
         candidates.sort_unstable();
 
         for (_, destination) in candidates {
+            if max_legs.is_some_and(|limit| legs.len() >= limit) {
+                capped = true;
+                break 'sources;
+            }
             if *source_available == 0 || remaining == 0 {
                 break;
             }
@@ -3043,9 +3086,27 @@ fn plan_distribution_legs(
             if demand == 0 {
                 continue;
             }
-            let Some((route, _cost)) = route_to(ctx, player_id, source, destination)? else {
+            let Some(path) = shortest_path(
+                &map,
+                source_coordinate,
+                destination_coordinates[&destination],
+                &movement,
+                |cell| cell.owner == Some(u32::from(player_id)),
+            ) else {
                 continue;
             };
+            let route = path
+                .cells
+                .into_iter()
+                .map(|coordinate| {
+                    cell_ids_by_coordinate
+                        .get(&coordinate)
+                        .copied()
+                        .ok_or_else(|| {
+                            format!("route coordinate {coordinate:?} is missing from its map")
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             if route.len() < 2 {
                 continue;
             }
@@ -3063,7 +3124,7 @@ fn plan_distribution_legs(
             });
         }
     }
-    if remaining != 0 {
+    if remaining != 0 && !capped {
         return Err("not all redistribution demand can be routed".into());
     }
     Ok(legs)

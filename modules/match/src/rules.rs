@@ -1,6 +1,3 @@
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
-
 use hex_core::{Axial, Cell, ForceComposition, MovementConfig, TerrainKind, ground_traversal};
 use spacetimedb::{ReducerContext, Table};
 
@@ -10,7 +7,7 @@ use crate::schema::{
 };
 use crate::schema::{
     cell_state, cell_terrain, command_receipt, match_config, match_state, player_slot,
-    transit_packet,
+    static_edge_limit, transit_packet,
 };
 
 pub const BASIS_POINTS: u64 = 10_000;
@@ -23,6 +20,20 @@ pub struct EdgeRuntimeLimits {
     pub throughput_per_step: u64,
     pub frontage: u64,
     pub uphill: bool,
+}
+
+pub const fn edge_key(first_cell: u32, second_cell: u32) -> u64 {
+    let first = if first_cell < second_cell {
+        first_cell
+    } else {
+        second_cell
+    };
+    let second = if first_cell < second_cell {
+        second_cell
+    } else {
+        first_cell
+    };
+    (first as u64) << 32 | second as u64
 }
 
 pub fn config(ctx: &ReducerContext) -> Result<MatchConfig, String> {
@@ -154,118 +165,54 @@ pub fn core_cell(ctx: &ReducerContext, cell_id: u32) -> Result<Cell, String> {
     Ok(cell)
 }
 
-pub fn route_to(
-    ctx: &ReducerContext,
-    owner_player_id: u8,
-    start_cell: u32,
-    goal_cell: u32,
-) -> Result<Option<(Vec<u32>, u64)>, String> {
-    let config = config(ctx)?;
-    let start = core_cell(ctx, start_cell)?;
-    let goal = core_cell(ctx, goal_cell)?;
-    let goal_terrain = terrain(ctx, goal_cell)?;
-    if start.owner != Some(u32::from(owner_player_id)) || !goal_terrain.passable {
-        return Ok(None);
-    }
-    if start_cell == goal_cell {
-        return Ok(Some((vec![start_cell], 0)));
-    }
-
-    let movement = MovementConfig {
-        max_elevation_step: u16::from(config.max_elevation_step),
-        level_cost: 10,
-        uphill_cost: 15,
-        downhill_cost: 10,
-    };
-    let start_coordinate = start.coordinate;
-    let goal_coordinate = goal.coordinate;
-    let goal_is_owned = goal.owner == Some(u32::from(owner_player_id));
-    let mut frontier = BinaryHeap::from([Reverse((0_u64, start_coordinate))]);
-    let mut distances = BTreeMap::from([(start_coordinate, 0_u64)]);
-    let mut previous = BTreeMap::<Axial, Axial>::new();
-    let mut visited = BTreeSet::new();
-
-    while let Some(Reverse((cost, current))) = frontier.pop() {
-        if !visited.insert(current) {
-            continue;
-        }
-        if current == goal_coordinate {
-            let mut coordinates = vec![current];
-            let mut cursor = current;
-            while cursor != start_coordinate {
-                cursor = previous[&cursor];
-                coordinates.push(cursor);
-            }
-            coordinates.reverse();
-            let route = coordinates
-                .into_iter()
-                .map(|coordinate| {
-                    cell_id_for_coordinate(&config, coordinate)
-                        .ok_or_else(|| "route escaped map bounds".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(Some((route, cost)));
-        }
-
-        let Some(current_id) = cell_id_for_coordinate(&config, current) else {
-            continue;
-        };
-        let from = core_cell(ctx, current_id)?;
-        let mut neighbors = current.neighbors();
-        neighbors.sort_unstable();
-        for neighbor in neighbors {
-            if visited.contains(&neighbor) {
-                continue;
-            }
-            let Some(neighbor_id) = cell_id_for_coordinate(&config, neighbor) else {
-                continue;
-            };
-            let terrain_row = terrain(ctx, neighbor_id)?;
-            if !terrain_row.passable {
-                continue;
-            }
-            let to = core_cell(ctx, neighbor_id)?;
-            if goal_is_owned
-                && neighbor != goal_coordinate
-                && to.owner != Some(u32::from(owner_player_id))
-            {
-                continue;
-            }
-            let Some(traversal) = ground_traversal(&from, &to, &movement) else {
-                continue;
-            };
-            let candidate = cost.saturating_add(u64::from(traversal.cost));
-            let best = distances.get(&neighbor).copied().unwrap_or(u64::MAX);
-            if candidate < best {
-                distances.insert(neighbor, candidate);
-                previous.insert(neighbor, current);
-                frontier.push(Reverse((candidate, neighbor)));
-            }
-        }
-    }
-    Ok(None)
-}
-
 pub fn edge_runtime_limits(
     ctx: &ReducerContext,
     from_cell: u32,
     to_cell: u32,
 ) -> Result<Option<EdgeRuntimeLimits>, String> {
-    let config = config(ctx)?;
-    let from_terrain = terrain(ctx, from_cell)?;
-    let to_terrain = terrain(ctx, to_cell)?;
-    if !from_terrain.passable || !to_terrain.passable {
-        return Ok(None);
+    if let Some(limits) = ctx
+        .db
+        .static_edge_limit()
+        .edge_key()
+        .find(edge_key(from_cell, to_cell))
+    {
+        if !limits.traversable {
+            return Ok(None);
+        }
+        let forward = from_cell == limits.first_cell;
+        return Ok(Some(if forward {
+            EdgeRuntimeLimits {
+                throughput_per_step: limits.first_to_second_throughput,
+                frontage: limits.first_to_second_frontage,
+                uphill: limits.first_to_second_uphill,
+            }
+        } else {
+            EdgeRuntimeLimits {
+                throughput_per_step: limits.second_to_first_throughput,
+                frontage: limits.second_to_first_frontage,
+                uphill: limits.second_to_first_uphill,
+            }
+        }));
     }
+
+    // Databases created before the static-edge table was introduced remain
+    // playable until their next lobby map regeneration backfills the cache.
+    let config = config(ctx)?;
     let from = core_cell(ctx, from_cell)?;
     let to = core_cell(ctx, to_cell)?;
+    Ok(calculate_edge_runtime_limits(&config, &from, &to))
+}
+
+pub fn calculate_edge_runtime_limits(
+    config: &MatchConfig,
+    from: &Cell,
+    to: &Cell,
+) -> Option<EdgeRuntimeLimits> {
     let movement = MovementConfig {
         max_elevation_step: u16::from(config.max_elevation_step),
         ..MovementConfig::default()
     };
-    if ground_traversal(&from, &to, &movement).is_none() {
-        return Ok(None);
-    }
+    ground_traversal(from, to, &movement)?;
     let minimum_capacity = from.military_capacity.min(to.military_capacity);
     let capacity_scale = minimum_capacity.min(config.base_military_capacity);
     let mut throughput = u128::from(config.base_edge_throughput_per_second)
@@ -275,24 +222,20 @@ pub fn edge_runtime_limits(
         / u128::from(config.base_military_capacity.max(1));
     let mut frontage = u128::from(config.base_combat_frontage) * u128::from(capacity_scale)
         / u128::from(config.base_military_capacity.max(1));
-    if matches!(
-        from_terrain.terrain,
-        TerrainClass::Hills | TerrainClass::Mountain
-    ) || matches!(
-        to_terrain.terrain,
-        TerrainClass::Hills | TerrainClass::Mountain
-    ) {
+    if matches!(from.terrain, TerrainKind::Hills | TerrainKind::Mountain)
+        || matches!(to.terrain, TerrainKind::Hills | TerrainKind::Mountain)
+    {
         throughput = throughput * 8_000 / u128::from(BASIS_POINTS);
         frontage = frontage * 8_000 / u128::from(BASIS_POINTS);
     }
-    if to_terrain.elevation > from_terrain.elevation {
+    if to.elevation > from.elevation {
         throughput = throughput * 7_500 / u128::from(BASIS_POINTS);
     }
-    Ok(Some(EdgeRuntimeLimits {
+    Some(EdgeRuntimeLimits {
         throughput_per_step: (throughput as u64).max(1),
         frontage: (frontage as u64).max(1),
-        uphill: to_terrain.elevation > from_terrain.elevation,
-    }))
+        uphill: to.elevation > from.elevation,
+    })
 }
 
 pub fn allocated_infantry_at_cell(ctx: &ReducerContext, owner_player_id: u8, cell_id: u32) -> u64 {

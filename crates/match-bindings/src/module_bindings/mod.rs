@@ -48,6 +48,7 @@ pub mod retreat_abandonment_type;
 pub mod set_cluster_policy_reducer;
 pub mod set_mobilization_target_reducer;
 pub mod simulation_schedule_type;
+pub mod static_edge_limit_type;
 pub mod terrain_class_type;
 pub mod transfer_destination_table;
 pub mod transfer_destination_type;
@@ -57,6 +58,7 @@ pub mod transfer_source_table;
 pub mod transfer_source_type;
 pub mod transit_packet_table;
 pub mod transit_packet_type;
+pub mod visible_packets_table;
 
 pub use cancel_orders_reducer::cancel_orders;
 pub use cell_state_table::*;
@@ -100,6 +102,7 @@ pub use retreat_abandonment_type::RetreatAbandonment;
 pub use set_cluster_policy_reducer::set_cluster_policy;
 pub use set_mobilization_target_reducer::set_mobilization_target;
 pub use simulation_schedule_type::SimulationSchedule;
+pub use static_edge_limit_type::StaticEdgeLimit;
 pub use terrain_class_type::TerrainClass;
 pub use transfer_destination_table::*;
 pub use transfer_destination_type::TransferDestination;
@@ -109,6 +112,7 @@ pub use transfer_source_table::*;
 pub use transfer_source_type::TransferSource;
 pub use transit_packet_table::*;
 pub use transit_packet_type::TransitPacket;
+pub use visible_packets_table::*;
 
 #[derive(Clone, PartialEq, Debug)]
 
@@ -385,6 +389,7 @@ pub struct DbUpdate {
     transfer_order: __sdk::TableUpdate<TransferOrder>,
     transfer_source: __sdk::TableUpdate<TransferSource>,
     transit_packet: __sdk::TableUpdate<TransitPacket>,
+    visible_packets: __sdk::TableUpdate<TransitPacket>,
 }
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
@@ -432,6 +437,9 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "transit_packet" => db_update
                     .transit_packet
                     .append(transit_packet_table::parse_table_update(table_update)?),
+                "visible_packets" => db_update
+                    .visible_packets
+                    .append(visible_packets_table::parse_table_update(table_update)?),
 
                 unknown => {
                     return Err(__sdk::InternalError::unknown_name(
@@ -506,6 +514,9 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.transit_packet = cache
             .apply_diff_to_table::<TransitPacket>("transit_packet", &self.transit_packet)
             .with_updates_by_pk(|row| &row.packet_key);
+        diff.visible_packets = cache
+            .apply_diff_to_table::<TransitPacket>("visible_packets", &self.visible_packets)
+            .with_updates_by_pk(|row| &row.packet_key);
 
         diff
     }
@@ -551,6 +562,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "transit_packet" => db_update
                     .transit_packet
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "visible_packets" => db_update
+                    .visible_packets
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -604,6 +618,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "transit_packet" => db_update
                     .transit_packet
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "visible_packets" => db_update
+                    .visible_packets
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 unknown => {
                     return Err(
                         __sdk::InternalError::unknown_name("table", unknown, "QueryRows").into(),
@@ -632,6 +649,7 @@ pub struct AppliedDiff<'r> {
     transfer_order: __sdk::TableAppliedDiff<'r, TransferOrder>,
     transfer_source: __sdk::TableAppliedDiff<'r, TransferSource>,
     transit_packet: __sdk::TableAppliedDiff<'r, TransitPacket>,
+    visible_packets: __sdk::TableAppliedDiff<'r, TransitPacket>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
 
@@ -696,6 +714,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         callbacks.invoke_table_row_callbacks::<TransitPacket>(
             "transit_packet",
             &self.transit_packet,
+            event,
+        );
+        callbacks.invoke_table_row_callbacks::<TransitPacket>(
+            "visible_packets",
+            &self.visible_packets,
             event,
         );
     }
@@ -1371,6 +1394,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
         transfer_order_table::register_table(client_cache);
         transfer_source_table::register_table(client_cache);
         transit_packet_table::register_table(client_cache);
+        visible_packets_table::register_table(client_cache);
     }
     const ALL_TABLE_NAMES: &'static [&'static str] = &[
         "cell_state",
@@ -1386,5 +1410,6 @@ impl __sdk::SpacetimeModule for RemoteModule {
         "transfer_order",
         "transfer_source",
         "transit_packet",
+        "visible_packets",
     ];
 }

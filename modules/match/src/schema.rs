@@ -1,4 +1,4 @@
-use spacetimedb::{Identity, ScheduleAt, SpacetimeType};
+use spacetimedb::{AnonymousViewContext, Identity, Query, ScheduleAt, SpacetimeType};
 
 use crate::simulation_tick;
 
@@ -166,6 +166,7 @@ pub struct MobilizationPolicy {
 )]
 pub struct CellTerrain {
     #[primary_key]
+    #[index(direct)]
     pub cell_id: u32,
     pub q: i32,
     pub r: i32,
@@ -186,6 +187,7 @@ pub struct CellTerrain {
 )]
 pub struct CellState {
     #[primary_key]
+    #[index(direct)]
     pub cell_id: u32,
     pub owner_player_id: u8,
     pub civilians: u64,
@@ -193,6 +195,27 @@ pub struct CellState {
     pub infantry: u64,
     pub military_capacity: u64,
     pub last_changed_step: u64,
+}
+
+/// Static, direction-aware movement limits for one undirected neighboring
+/// cell pair. Terrain, elevation, capacity, and match configuration cannot
+/// change after a match starts, so hot simulation phases should not rebuild
+/// these values through repeated terrain/state probes.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = static_edge_limit)]
+pub struct StaticEdgeLimit {
+    /// `(min(cell_a, cell_b) << 32) | max(cell_a, cell_b)`.
+    #[primary_key]
+    pub edge_key: u64,
+    pub first_cell: u32,
+    pub second_cell: u32,
+    pub traversable: bool,
+    pub first_to_second_throughput: u64,
+    pub second_to_first_throughput: u64,
+    pub first_to_second_frontage: u64,
+    pub second_to_first_frontage: u64,
+    pub first_to_second_uphill: bool,
+    pub second_to_first_uphill: bool,
 }
 
 /// Policy lineage attached to one owned cell.
@@ -334,6 +357,19 @@ pub struct TransitPacket {
     pub route_index: u32,
     pub route: Vec<u32>,
     pub updated_step: u64,
+}
+
+/// Tactical packet stream for regular clients. Background policy packets are
+/// authoritative simulation detail, but are not rendered and previously made
+/// up most replicated packet traffic during large rebalances.
+#[spacetimedb::view(accessor = visible_packets, public, primary_key = packet_key)]
+pub fn visible_packets(ctx: &AnonymousViewContext) -> impl Query<TransitPacket> {
+    ctx.from
+        .transfer_order()
+        .r#where(|order| order.client_command_id.ne(0_u64))
+        .right_semijoin(ctx.from.transit_packet(), |order, packet| {
+            order.order_id.eq(packet.packet_by_order)
+        })
 }
 
 /// Compact private topology for one branching neutral or cluster-attack wave.

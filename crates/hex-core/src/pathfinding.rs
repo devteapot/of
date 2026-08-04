@@ -13,11 +13,13 @@ pub struct Path {
     pub total_cost: u64,
 }
 
-/// Deterministic Dijkstra routing over ground-traversable cells.
+/// Deterministic A* routing over ground-traversable cells.
 ///
 /// `can_enter` expresses order-specific policy such as friendly ownership. The
-/// ordered frontier and coordinate tie-break make the same map and predicate
-/// produce the same path regardless of map insertion order.
+/// hex-distance heuristic is scaled by the cheapest configured edge cost, so
+/// it is admissible and consistent. The ordered frontier and coordinate
+/// tie-break make the same map and predicate produce the same path regardless
+/// of map insertion order.
 pub fn shortest_path<F>(
     map: &HexMap,
     start: Axial,
@@ -40,12 +42,19 @@ where
         });
     }
 
-    let mut frontier = BTreeSet::from([(0_u64, start)]);
+    let minimum_edge_cost = u64::from(
+        movement
+            .level_cost
+            .min(movement.uphill_cost)
+            .min(movement.downhill_cost),
+    );
+    let heuristic = |coordinate: Axial| minimum_edge_cost.saturating_mul(coordinate.distance(goal));
+    let mut frontier = BTreeSet::from([(heuristic(start), 0_u64, start)]);
     let mut distances = BTreeMap::from([(start, 0_u64)]);
     let mut previous = BTreeMap::<Axial, Axial>::new();
     let mut visited = BTreeSet::new();
 
-    while let Some((cost, current)) = frontier.pop_first() {
+    while let Some((_estimated_total, cost, current)) = frontier.pop_first() {
         if !visited.insert(current) {
             continue;
         }
@@ -75,11 +84,15 @@ where
             let best = distances.get(&neighbor).copied().unwrap_or(u64::MAX);
             if candidate < best {
                 if best != u64::MAX {
-                    frontier.remove(&(best, neighbor));
+                    frontier.remove(&(best.saturating_add(heuristic(neighbor)), best, neighbor));
                 }
                 distances.insert(neighbor, candidate);
                 previous.insert(neighbor, current);
-                frontier.insert((candidate, neighbor));
+                frontier.insert((
+                    candidate.saturating_add(heuristic(neighbor)),
+                    candidate,
+                    neighbor,
+                ));
             }
         }
     }

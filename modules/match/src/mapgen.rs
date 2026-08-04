@@ -2,12 +2,15 @@ use hex_core::{Axial, ConquestRule, TerrainKind};
 use spacetimedb::{ReducerContext, Table};
 use worldgen::{generate, validate};
 
+use crate::rules::{calculate_edge_runtime_limits, edge_key};
 use crate::schema::{
     CellState, CellTerrain, ClusterPolicyAssignment, ClusterPolicyKind, MapPreset, MatchConfig,
-    MatchPhase, MatchState, NEUTRAL_PLAYER, PLAYER_ONE, PLAYER_TWO, SINGLETON_ID, TerrainClass,
+    MatchPhase, MatchState, NEUTRAL_PLAYER, PLAYER_ONE, PLAYER_TWO, SINGLETON_ID, StaticEdgeLimit,
+    TerrainClass,
 };
 use crate::schema::{
     cell_state, cell_terrain, cluster_policy_assignment, match_config, match_state,
+    static_edge_limit,
 };
 
 pub fn default_config() -> MatchConfig {
@@ -113,8 +116,6 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
         }
     }
 
-    let rule = ConquestRule::new(capturable, 8_000)
-        .map_err(|error| format!("invalid conquest map: {error:?}"))?;
     let mut config = default_config();
     config.map_preset = preset;
     config.map_seed = seed;
@@ -125,6 +126,47 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
     config.map_hash = manifest.content_hash;
     config.spawn_one_cell = spawn_one_cell;
     config.spawn_two_cell = spawn_two_cell;
+
+    for from in generated.cells.cells() {
+        let from_cell = cell_id_for_manifest(manifest, from.coordinate)?;
+        for neighbor in from.coordinate.neighbors() {
+            let Some(to) = generated.cells.get(neighbor) else {
+                continue;
+            };
+            let to_cell = cell_id_for_manifest(manifest, neighbor)?;
+            if from_cell >= to_cell {
+                continue;
+            }
+            let forward = calculate_edge_runtime_limits(&config, from, to);
+            let reverse = calculate_edge_runtime_limits(&config, to, from);
+            let traversable = forward.is_some() && reverse.is_some();
+            let forward = forward.unwrap_or(crate::rules::EdgeRuntimeLimits {
+                throughput_per_step: 0,
+                frontage: 0,
+                uphill: false,
+            });
+            let reverse = reverse.unwrap_or(crate::rules::EdgeRuntimeLimits {
+                throughput_per_step: 0,
+                frontage: 0,
+                uphill: false,
+            });
+            ctx.db.static_edge_limit().insert(StaticEdgeLimit {
+                edge_key: edge_key(from_cell, to_cell),
+                first_cell: from_cell,
+                second_cell: to_cell,
+                traversable,
+                first_to_second_throughput: forward.throughput_per_step,
+                second_to_first_throughput: reverse.throughput_per_step,
+                first_to_second_frontage: forward.frontage,
+                second_to_first_frontage: reverse.frontage,
+                first_to_second_uphill: forward.uphill,
+                second_to_first_uphill: reverse.uphill,
+            });
+        }
+    }
+
+    let rule = ConquestRule::new(capturable, 8_000)
+        .map_err(|error| format!("invalid conquest map: {error:?}"))?;
     ctx.db.match_config().insert(config);
     ctx.db.match_state().insert(MatchState {
         singleton_id: SINGLETON_ID,
@@ -143,6 +185,15 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
 }
 
 fn clear_map(ctx: &ReducerContext) {
+    let edge_keys = ctx
+        .db
+        .static_edge_limit()
+        .iter()
+        .map(|row| row.edge_key)
+        .collect::<Vec<_>>();
+    for edge_key in edge_keys {
+        ctx.db.static_edge_limit().edge_key().delete(edge_key);
+    }
     let terrain_ids: Vec<_> = ctx
         .db
         .cell_terrain()
