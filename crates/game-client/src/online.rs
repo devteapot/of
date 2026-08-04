@@ -13,28 +13,30 @@ use std::{
 use bevy::prelude::*;
 use hex_core::{Axial, TerrainKind};
 use match_bindings::{
-    CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, CombatFront,
+    CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, ClusterPolicyAssignment,
+    ClusterPolicyAssignmentTableAccess, ClusterPolicyKind as RemoteClusterPolicyKind, CombatFront,
     CombatFrontTableAccess, CommandReceipt, CommandReceiptTableAccess, DbConnection, MatchConfig,
     MatchConfigTableAccess, MatchPhase as RemoteMatchPhase, MatchState, MatchStateTableAccess,
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
-    PlayerSlotTableAccess, ReceiptStatus, TransferDestinationTableAccess, TransferOrder,
-    TransferOrderTableAccess, TransferSource, TransferSourceTableAccess, TransitPacket,
-    TransitPacketTableAccess, cancel_expand_all, cancel_push_fronts, issue_balance,
-    issue_core_load, issue_expand_all, issue_front_load, issue_perimeter_load, issue_push_front,
-    join_match, set_mobilization_target,
+    PlayerSlotTableAccess, ReceiptStatus, TransferDestination, TransferDestinationTableAccess,
+    TransferOrder, TransferOrderTableAccess, TransferSource, TransferSourceTableAccess,
+    TransitPacket, TransitPacketTableAccess, cancel_orders, issue_attack_clusters, issue_balance,
+    issue_core_load, issue_expand_all, issue_expand_clusters, issue_front_load,
+    issue_perimeter_load, issue_push_front, issue_reshape, join_match, set_cluster_policy,
+    set_mobilization_target,
 };
 use spacetimedb_sdk::__codegen::InternalError;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 
 use crate::{
     config::ClientConfig,
-    geometry::{HEX_RADIUS, chunk_of},
+    geometry::chunk_of,
     map_view::MapViewMode,
     model::{
-        ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, ContestedCellView,
-        MatchPhase, MatchView, RetaskProjection, ToastKind,
+        ActiveFlow, ActiveFront, AuthorityState, CellView, ClusterPolicyView, ConnectionState,
+        ContestedCellView, MatchPhase, MatchView, RetaskProjection, ToastKind,
     },
-    network::{ClientIntent, NetworkSet, RedistributionPreset, ServerUpdate},
+    network::{ClientIntent, ClusterPolicy, NetworkSet, RedistributionPreset, ServerUpdate},
 };
 
 const TERRAIN_DIRTY: u32 = 1 << 0;
@@ -46,7 +48,8 @@ const RECEIPTS_DIRTY: u32 = 1 << 5;
 const FLOWS_DIRTY: u32 = 1 << 6;
 const FRONTS_DIRTY: u32 = 1 << 7;
 const ORDERS_DIRTY: u32 = 1 << 8;
-const ALL_DIRTY: u32 = (1 << 9) - 1;
+const POLICIES_DIRTY: u32 = 1 << 9;
+const ALL_DIRTY: u32 = (1 << 10) - 1;
 
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OnlineSyncSet;
@@ -92,10 +95,13 @@ impl SharedSignals {
 
 #[derive(Clone, Debug)]
 enum PendingCommand {
+    ExpandClusters,
+    AttackClusters,
+    ClusterPolicy(ClusterPolicy),
     PushFront,
-    CancelPush,
     ExpandAll,
-    CancelExpandAll,
+    Reshape,
+    CancelOrders,
     Balance,
     FrontLoad,
     CoreLoad,
@@ -106,24 +112,30 @@ enum PendingCommand {
 impl PendingCommand {
     const fn label(&self) -> &'static str {
         match self {
+            Self::ExpandClusters => "Expand Clusters",
+            Self::AttackClusters => "Attack Clusters",
+            Self::ClusterPolicy(policy) => policy.label(),
             Self::PushFront => "Push Front",
-            Self::CancelPush => "Stop Push",
-            Self::ExpandAll => "Expand All",
-            Self::CancelExpandAll => "Stop Expand All",
-            Self::Balance => "Balance",
-            Self::FrontLoad => "Front-load",
-            Self::CoreLoad => "Core-load",
-            Self::PerimeterLoad => "Perimeter-load",
+            Self::ExpandAll => "Expand Perimeter",
+            Self::Reshape => "Reshape",
+            Self::CancelOrders => "Stop Orders",
+            Self::Balance => "Formation · Balanced",
+            Self::FrontLoad => "Directional Bias",
+            Self::CoreLoad => "Formation · Center",
+            Self::PerimeterLoad => "Formation · Perimeter",
             Self::Mobilization { .. } => "Mobilization",
         }
     }
 
     const fn receipt_name(&self) -> &'static str {
         match self {
+            Self::ExpandClusters => "issue_expand_clusters",
+            Self::AttackClusters => "issue_attack_clusters",
+            Self::ClusterPolicy(_) => "set_cluster_policy",
             Self::PushFront => "issue_push_front",
-            Self::CancelPush => "cancel_push_fronts",
             Self::ExpandAll => "issue_expand_all",
-            Self::CancelExpandAll => "cancel_expand_all",
+            Self::Reshape => "issue_reshape",
+            Self::CancelOrders => "cancel_orders",
             Self::Balance => "issue_balance",
             Self::FrontLoad => "issue_front_load",
             Self::CoreLoad => "issue_core_load",
@@ -415,6 +427,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
 
     watch_table!(connection.db.cell_terrain(), TERRAIN_DIRTY | CELLS_DIRTY);
     watch_table!(connection.db.cell_state(), CELLS_DIRTY);
+    watch_table!(connection.db.cluster_policy_assignment(), POLICIES_DIRTY);
     watch_table!(connection.db.match_config(), MATCH_DIRTY);
     watch_table!(connection.db.match_state(), MATCH_DIRTY);
     watch_table!(connection.db.player_slot(), PLAYERS_DIRTY);
@@ -501,6 +514,59 @@ fn invoke_intent(
     };
 
     match intent {
+        ClientIntent::ExpandClusters {
+            sources,
+            focus,
+            commitment_percent,
+        } => {
+            connection
+                .reducers
+                .issue_expand_clusters_then(
+                    command_id,
+                    ids_for_selection(transport, sources)?,
+                    id_for_coordinate(transport, *focus)?,
+                    u32::from((*commitment_percent).clamp(1, 100)) * 100,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::ExpandClusters)
+        }
+        ClientIntent::AttackClusters {
+            sources,
+            targets,
+            commitment_percent,
+        } => {
+            connection
+                .reducers
+                .issue_attack_clusters_then(
+                    command_id,
+                    ids_for_selection(transport, sources)?,
+                    ids_for_selection(transport, targets)?,
+                    u32::from((*commitment_percent).clamp(1, 100)) * 100,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::AttackClusters)
+        }
+        ClientIntent::SetClusterPolicy {
+            sources,
+            policy,
+            direction,
+        } => {
+            let (kind, orientation) = remote_cluster_policy(*policy, *direction)?;
+            connection
+                .reducers
+                .set_cluster_policy_then(
+                    command_id,
+                    ids_for_selection(transport, sources)?,
+                    kind,
+                    orientation.q,
+                    orientation.r,
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::ClusterPolicy(*policy))
+        }
         ClientIntent::PushFront {
             sources,
             supersede_order_ids,
@@ -538,35 +604,34 @@ fn invoke_intent(
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::ExpandAll)
         }
-        ClientIntent::CancelPush { sources, direction } => {
+        ClientIntent::Reshape {
+            sources,
+            targets,
+            supersede_order_ids,
+        } => {
             connection
                 .reducers
-                .cancel_push_fronts_then(
+                .issue_reshape_then(
                     command_id,
                     ids_for_selection(transport, sources)?,
-                    direction.q,
-                    direction.r,
+                    ids_for_selection(transport, targets)?,
+                    supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
                 .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::CancelPush)
+            Ok(PendingCommand::Reshape)
         }
-        ClientIntent::CancelExpandAll { sources } => {
+        ClientIntent::CancelOrders { order_ids } => {
             connection
                 .reducers
-                .cancel_expand_all_then(
-                    command_id,
-                    ids_for_selection(transport, sources)?,
-                    callback,
-                )
+                .cancel_orders_then(command_id, order_ids.iter().copied().collect(), callback)
                 .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::CancelExpandAll)
+            Ok(PendingCommand::CancelOrders)
         }
         ClientIntent::Redistribute {
             cells,
             supersede_order_ids,
             preset: RedistributionPreset::Balance,
-            amount_percent,
             ..
         } => {
             connection
@@ -574,7 +639,6 @@ fn invoke_intent(
                 .issue_balance_then(
                     command_id,
                     ids_for_selection(transport, cells)?,
-                    u32::from((*amount_percent).clamp(1, 100)) * 100,
                     supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
@@ -586,19 +650,16 @@ fn invoke_intent(
             supersede_order_ids,
             preset: RedistributionPreset::FrontLoad,
             direction,
-            amount_percent,
         } => {
-            let (orientation_q, orientation_r) = direction
-                .and_then(world_direction_to_axial)
-                .ok_or_else(|| "Front-load direction is too short".to_owned())?;
+            let orientation = validated_front_load_orientation(*direction)
+                .ok_or_else(|| "Directional Bias direction is too short".to_owned())?;
             connection
                 .reducers
                 .issue_front_load_then(
                     command_id,
                     ids_for_selection(transport, cells)?,
-                    orientation_q,
-                    orientation_r,
-                    u32::from((*amount_percent).clamp(1, 100)) * 100,
+                    orientation.q,
+                    orientation.r,
                     supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
@@ -609,7 +670,6 @@ fn invoke_intent(
             cells,
             supersede_order_ids,
             preset: RedistributionPreset::CoreLoad,
-            amount_percent,
             ..
         } => {
             connection
@@ -617,7 +677,6 @@ fn invoke_intent(
                 .issue_core_load_then(
                     command_id,
                     ids_for_selection(transport, cells)?,
-                    u32::from((*amount_percent).clamp(1, 100)) * 100,
                     supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
@@ -628,7 +687,6 @@ fn invoke_intent(
             cells,
             supersede_order_ids,
             preset: RedistributionPreset::PerimeterLoad,
-            amount_percent,
             ..
         } => {
             connection
@@ -636,7 +694,6 @@ fn invoke_intent(
                 .issue_perimeter_load_then(
                     command_id,
                     ids_for_selection(transport, cells)?,
-                    u32::from((*amount_percent).clamp(1, 100)) * 100,
                     supersede_order_ids.iter().copied().collect(),
                     callback,
                 )
@@ -653,6 +710,33 @@ fn invoke_intent(
             Ok(PendingCommand::Mobilization { target })
         }
     }
+}
+
+fn remote_cluster_policy(
+    policy: ClusterPolicy,
+    direction: Option<Axial>,
+) -> Result<(RemoteClusterPolicyKind, Axial), String> {
+    let (kind, orientation) = match policy {
+        ClusterPolicy::Balanced => (RemoteClusterPolicyKind::Balanced, Axial::ZERO),
+        ClusterPolicy::Center => (RemoteClusterPolicyKind::Center, Axial::ZERO),
+        ClusterPolicy::Perimeter => (RemoteClusterPolicyKind::Perimeter, Axial::ZERO),
+        ClusterPolicy::Directional => (
+            RemoteClusterPolicyKind::Directional,
+            direction
+                .filter(|orientation| *orientation != Axial::ZERO)
+                .ok_or_else(|| {
+                    "Directional cluster policy needs a visible orientation".to_owned()
+                })?,
+        ),
+    };
+    if policy != ClusterPolicy::Directional && direction.is_some() {
+        return Err("Only the directional cluster policy accepts an orientation".to_owned());
+    }
+    Ok((kind, orientation))
+}
+
+fn validated_front_load_orientation(direction: Option<Axial>) -> Option<Axial> {
+    direction.filter(|orientation| *orientation != Axial::ZERO)
 }
 
 fn ids_for_selection(
@@ -676,22 +760,24 @@ fn ids_for_selection(
         .collect()
 }
 
-fn world_direction_to_axial(direction: Vec2) -> Option<(i32, i32)> {
-    if direction.length_squared() < 0.0001 {
-        return None;
-    }
-    let q = direction.x / (1.5 * HEX_RADIUS);
-    let r = direction.y / (3.0_f32.sqrt() * HEX_RADIUS) - q * 0.5;
-    let scale = 1_024.0 / q.abs().max(r.abs()).max(0.0001);
-    let q = (q * scale).round() as i32;
-    let r = (r * scale).round() as i32;
-    (q != 0 || r != 0).then_some((q, r))
+fn id_for_coordinate(transport: &OnlineTransport, coordinate: Axial) -> Result<u32, String> {
+    transport
+        .coordinate_to_id
+        .get(&coordinate)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "hex {},{} is not present in the authoritative map",
+                coordinate.q, coordinate.r
+            )
+        })
 }
 
 struct AuthoritySnapshot {
     identity: Option<spacetimedb_sdk::Identity>,
     terrain: Option<Vec<CellTerrain>>,
     cells: Option<Vec<CellState>>,
+    cluster_policies: Option<Vec<ClusterPolicyAssignment>>,
     config: Option<MatchConfig>,
     match_state: Option<MatchState>,
     players: Option<Vec<PlayerSlot>>,
@@ -701,6 +787,7 @@ struct AuthoritySnapshot {
     fronts: Option<Vec<CombatFront>>,
     orders: Option<Vec<TransferOrder>>,
     sources: Option<Vec<TransferSource>>,
+    destinations: Option<Vec<TransferDestination>>,
 }
 
 impl AuthoritySnapshot {
@@ -713,6 +800,8 @@ impl AuthoritySnapshot {
             terrain: terrain_changed.then(|| connection.db.cell_terrain().iter().collect()),
             cells: (terrain_changed || dirty & CELLS_DIRTY != 0)
                 .then(|| connection.db.cell_state().iter().collect()),
+            cluster_policies: (dirty & POLICIES_DIRTY != 0)
+                .then(|| connection.db.cluster_policy_assignment().iter().collect()),
             config: (dirty & MATCH_DIRTY != 0)
                 .then(|| connection.db.match_config().iter().next())
                 .flatten(),
@@ -735,8 +824,13 @@ impl AuthoritySnapshot {
                     .filter(|order| order.status == OrderStatus::Active)
                     .collect()
             }),
-            sources: (dirty & ORDERS_DIRTY != 0)
-                .then(|| connection.db.transfer_source().iter().collect()),
+            // Retask/Stop projection is rebuilt whenever packets or fronts
+            // move. Include persistent launch rows in that same snapshot so
+            // an action remains addressable from its source cluster after its
+            // packets have crossed the original boundary.
+            sources: tactical_changed.then(|| connection.db.transfer_source().iter().collect()),
+            destinations: tactical_changed
+                .then(|| connection.db.transfer_destination().iter().collect()),
         }
     }
 }
@@ -775,6 +869,7 @@ fn synchronize_authoritative_view(
 
     if let Some(config) = snapshot.config {
         view.conquest_threshold_bps = config.conquest_threshold_bps;
+        view.max_elevation_step = u16::from(config.max_elevation_step);
     }
     if let Some(state) = snapshot.match_state {
         view.phase = match state.phase {
@@ -790,6 +885,9 @@ fn synchronize_authoritative_view(
     }
     if let Some(players) = snapshot.players {
         update_players(&mut transport, &mut view, snapshot.identity, &players);
+    }
+    if let Some(policies) = snapshot.cluster_policies {
+        update_cluster_policies(&transport, &mut view, &policies);
     }
     if let Some(policies) = snapshot.mobilization
         && let Some(policy) = policies
@@ -810,21 +908,37 @@ fn synchronize_authoritative_view(
     if let Some(receipts) = snapshot.receipts {
         process_receipts(&mut transport, &view, receipts, &mut updates);
     }
-    if let Some(packets) = snapshot.packets.as_deref() {
-        view.active_flows = packets_to_flows(&transport, &view, packets);
+    if let (Some(packets), Some(orders)) = (snapshot.packets.as_deref(), snapshot.orders.as_deref())
+    {
+        replace_authoritative_flows(
+            &transport,
+            &mut view,
+            packets,
+            orders,
+            transport.config.debug_policy_flows,
+        );
     }
     if let Some(fronts) = snapshot.fronts.as_deref() {
         let (active_fronts, contested_cells) = fronts_to_overlays(&transport, &view, fronts);
         view.active_fronts = active_fronts;
         view.set_contested_cells(contested_cells);
     }
-    if let (Some(orders), Some(packets), Some(fronts)) = (
+    if let (Some(orders), Some(packets), Some(fronts), Some(sources), Some(destinations)) = (
         snapshot.orders.as_deref(),
         snapshot.packets.as_deref(),
         snapshot.fronts.as_deref(),
+        snapshot.sources.as_deref(),
+        snapshot.destinations.as_deref(),
     ) {
-        let projection =
-            retask_projection_from_authority(&transport, &view, orders, packets, fronts);
+        let projection = retask_projection_from_authority(
+            &transport,
+            &view,
+            orders,
+            packets,
+            fronts,
+            sources,
+            destinations,
+        );
         view.set_retask_projection(projection);
     }
     if let (Some(orders), Some(sources)) = (snapshot.orders.as_deref(), snapshot.sources.as_deref())
@@ -980,10 +1094,14 @@ fn rebuild_cells(
     view.dirty_chunks
         .extend(view.cells_by_chunk.keys().copied());
     view.cells.clear();
+    view.non_capturable_cells.clear();
     transport.coordinate_to_id.clear();
     transport.id_to_coordinate.clear();
     for terrain in terrain_rows {
         let coordinate = Axial::new(terrain.q, terrain.r);
+        if !terrain.capturable {
+            view.non_capturable_cells.insert(coordinate);
+        }
         let state = states.get(&terrain.cell_id).copied();
         transport
             .coordinate_to_id
@@ -1105,6 +1223,36 @@ fn update_players(
     }
 }
 
+fn update_cluster_policies(
+    transport: &OnlineTransport,
+    view: &mut MatchView,
+    assignments: &[ClusterPolicyAssignment],
+) {
+    view.cluster_policies.clear();
+    for assignment in assignments
+        .iter()
+        .filter(|assignment| u32::from(assignment.owner_player_id) == view.local_player)
+    {
+        let Some(&coordinate) = transport.id_to_coordinate.get(&assignment.cell_id) else {
+            continue;
+        };
+        let kind = match assignment.kind {
+            RemoteClusterPolicyKind::Balanced => ClusterPolicy::Balanced,
+            RemoteClusterPolicyKind::Center => ClusterPolicy::Center,
+            RemoteClusterPolicyKind::Perimeter => ClusterPolicy::Perimeter,
+            RemoteClusterPolicyKind::Directional => ClusterPolicy::Directional,
+        };
+        view.cluster_policies.insert(
+            coordinate,
+            ClusterPolicyView {
+                kind,
+                orientation: Axial::new(assignment.orientation_q, assignment.orientation_r),
+                revision: assignment.revision,
+            },
+        );
+    }
+}
+
 fn seed_command_ids(
     transport: &mut OnlineTransport,
     local_player: u32,
@@ -1219,10 +1367,25 @@ fn packets_to_flows(
     transport: &OnlineTransport,
     view: &MatchView,
     packets: &[TransitPacket],
+    orders: &[TransferOrder],
+    show_policy_flows: bool,
 ) -> Vec<ActiveFlow> {
+    // Packet and order callbacks are independent. On a busy policy tick the
+    // packet can therefore be visible in the SDK cache one frame before its
+    // order row. Unknown packets must fail closed: otherwise every newly
+    // spawned background redistribution flashes as a cyan action route before
+    // the next order-table callback supplies the information needed to hide it.
+    let orders_by_id = orders
+        .iter()
+        .map(|order| (order.order_id, order))
+        .collect::<BTreeMap<_, _>>();
     packets
         .iter()
         .filter_map(|packet| {
+            let order = orders_by_id.get(&packet.order_id)?;
+            if !order_flow_is_visible(order, show_policy_flows) {
+                return None;
+            }
             let route_index = packet.route_index as usize;
             let route = packet
                 .route
@@ -1249,6 +1412,44 @@ fn packets_to_flows(
             })
         })
         .collect()
+}
+
+fn replace_authoritative_flows(
+    transport: &OnlineTransport,
+    view: &mut MatchView,
+    packets: &[TransitPacket],
+    orders: &[TransferOrder],
+    show_policy_flows: bool,
+) {
+    view.active_flows = packets_to_flows(transport, view, packets, orders, show_policy_flows);
+}
+
+const fn order_flow_is_visible(order: &TransferOrder, show_policy_flows: bool) -> bool {
+    match order.kind {
+        match_bindings::OrderKind::Balance
+        | match_bindings::OrderKind::FrontLoad
+        | match_bindings::OrderKind::CoreLoad
+        | match_bindings::OrderKind::PerimeterLoad => show_policy_flows,
+        match_bindings::OrderKind::Reshape
+        | match_bindings::OrderKind::PushFront
+        | match_bindings::OrderKind::ExpandAll
+        | match_bindings::OrderKind::ExpandClusters
+        | match_bindings::OrderKind::AttackClusters => true,
+    }
+}
+
+fn is_internal_distribution_order(order: &TransferOrder) -> bool {
+    matches!(
+        order.kind,
+        match_bindings::OrderKind::Balance
+            | match_bindings::OrderKind::FrontLoad
+            | match_bindings::OrderKind::CoreLoad
+            | match_bindings::OrderKind::PerimeterLoad
+    )
+}
+
+fn is_policy_maintenance_order(order: &TransferOrder) -> bool {
+    order.client_command_id == 0 && is_internal_distribution_order(order)
 }
 
 fn fronts_to_overlays(
@@ -1335,6 +1536,8 @@ fn retask_projection_from_authority(
     orders: &[TransferOrder],
     packets: &[TransitPacket],
     fronts: &[CombatFront],
+    sources: &[TransferSource],
+    destinations: &[TransferDestination],
 ) -> RetaskProjection {
     let active_local_orders = orders
         .iter()
@@ -1343,8 +1546,33 @@ fn retask_projection_from_authority(
         })
         .map(|order| order.order_id)
         .collect::<BTreeSet<_>>();
-    let mut projection = RetaskProjection::default();
+    let mut projection = RetaskProjection {
+        background_policy_order_ids: orders
+            .iter()
+            .filter(|order| {
+                order.status == OrderStatus::Active
+                    && u32::from(order.player_id) == view.local_player
+                    && is_policy_maintenance_order(order)
+            })
+            .map(|order| order.order_id)
+            .collect(),
+        ..Default::default()
+    };
     let mut orders_by_edge = BTreeMap::<(u32, u32), BTreeSet<u64>>::new();
+
+    for source in sources
+        .iter()
+        .filter(|source| active_local_orders.contains(&source.order_id))
+    {
+        let Some(coordinate) = transport.id_to_coordinate.get(&source.cell_id).copied() else {
+            continue;
+        };
+        projection
+            .order_source_cells
+            .entry(source.order_id)
+            .or_default()
+            .insert(coordinate);
+    }
 
     for packet in packets.iter().filter(|packet| {
         u32::from(packet.owner_player_id) == view.local_player
@@ -1370,6 +1598,18 @@ fn retask_projection_from_authority(
             .or_default();
         *order_cell = order_cell.saturating_add(packet.infantry);
 
+        if let Some(destination) = transport
+            .id_to_coordinate
+            .get(&packet.destination_cell)
+            .copied()
+        {
+            projection
+                .destination_claims_by_order
+                .entry(packet.order_id)
+                .or_default()
+                .insert(destination);
+        }
+
         let next_index = packet.route_index as usize + 1;
         if let Some(&next) = packet.route.get(next_index) {
             orders_by_edge
@@ -1377,6 +1617,54 @@ fn retask_projection_from_authority(
                 .or_default()
                 .insert(packet.order_id);
         }
+    }
+
+    let active_local_internal_orders = orders
+        .iter()
+        .filter(|order| {
+            order.status == OrderStatus::Active
+                && u32::from(order.player_id) == view.local_player
+                && matches!(
+                    order.kind,
+                    match_bindings::OrderKind::Balance
+                        | match_bindings::OrderKind::FrontLoad
+                        | match_bindings::OrderKind::CoreLoad
+                        | match_bindings::OrderKind::PerimeterLoad
+                        | match_bindings::OrderKind::Reshape
+                )
+        })
+        .map(|order| order.order_id)
+        .collect::<BTreeSet<_>>();
+    for destination in destinations.iter().filter(|destination| {
+        active_local_orders.contains(&destination.order_id)
+            && destination.target_infantry > destination.received_infantry
+    }) {
+        let Some(coordinate) = transport
+            .id_to_coordinate
+            .get(&destination.cell_id)
+            .copied()
+        else {
+            continue;
+        };
+        projection
+            .destination_claims_by_order
+            .entry(destination.order_id)
+            .or_default()
+            .insert(coordinate);
+        if !active_local_internal_orders.contains(&destination.order_id) {
+            continue;
+        }
+        let reserved = projection
+            .destination_reservations_by_order
+            .entry(destination.order_id)
+            .or_default()
+            .entry(coordinate)
+            .or_default();
+        *reserved = reserved.saturating_add(
+            destination
+                .target_infantry
+                .saturating_sub(destination.received_infantry),
+        );
     }
 
     for front in fronts.iter().filter(|front| {
@@ -1484,20 +1772,46 @@ mod tests {
             preferred_player: 1,
             display_name: "Test".to_owned(),
             profile: "test".to_owned(),
+            debug_policy_flows: false,
+        }
+    }
+
+    fn test_order(
+        order_id: u64,
+        client_command_id: u64,
+        kind: match_bindings::OrderKind,
+    ) -> TransferOrder {
+        TransferOrder {
+            order_id,
+            player_id: 1,
+            client_command_id,
+            kind,
+            status: OrderStatus::Active,
+            requested_infantry: 20,
+            committed_infantry: 20,
+            in_transit_infantry: 20,
+            delivered_infantry: 0,
+            casualty_infantry: 0,
+            orientation_q: 0,
+            orientation_r: 0,
+            created_step: 1,
+            updated_step: 1,
         }
     }
 
     #[test]
-    fn front_load_direction_preserves_axis_orientation() {
-        let east = world_direction_to_axial(Vec2::X).expect("east direction");
-        assert!(east.0 > 0);
-        let north = world_direction_to_axial(Vec2::Y).expect("north direction");
-        assert!(north.1 > 0);
+    fn front_load_transport_preserves_exact_fixed_point_orientation() {
+        let continuous_heading = Axial::new(1_024, 375);
+        assert_eq!(
+            validated_front_load_orientation(Some(continuous_heading)),
+            Some(continuous_heading)
+        );
     }
 
     #[test]
     fn empty_front_load_direction_is_rejected() {
-        assert_eq!(world_direction_to_axial(Vec2::ZERO), None);
+        assert_eq!(validated_front_load_orientation(Some(Axial::ZERO)), None);
+        assert_eq!(validated_front_load_orientation(None), None);
     }
 
     #[test]
@@ -1561,11 +1875,101 @@ mod tests {
             updated_step: 1,
         };
 
-        let flows = packets_to_flows(&transport, &view, &[edge, hostile_edge, resting]);
+        let orders = [
+            test_order(7, 7, match_bindings::OrderKind::ExpandClusters),
+            test_order(8, 8, match_bindings::OrderKind::AttackClusters),
+        ];
+        let flows = packets_to_flows(
+            &transport,
+            &view,
+            &[edge, hostile_edge, resting],
+            &orders,
+            false,
+        );
         assert_eq!(flows.len(), 2);
         assert_eq!(flows[0].route, vec![Axial::ZERO, Axial::new(1, 0)]);
         assert!(!flows[0].attacking, "neutral expansion is not hostile");
         assert!(flows[1].attacking, "enemy-targeted movement stays hostile");
+    }
+
+    #[test]
+    fn internal_distribution_flows_are_debug_only_regardless_of_command_origin() {
+        let mut transport = OnlineTransport::new(test_config());
+        transport.id_to_coordinate.insert(10, Axial::ZERO);
+        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
+        let view = MatchView::connecting(1);
+        let packet = |order_id, infantry| TransitPacket {
+            packet_key: format!("{order_id}:10:11"),
+            order_id,
+            owner_player_id: 1,
+            origin_cell: 10,
+            current_cell: 10,
+            destination_cell: 11,
+            infantry,
+            route_index: 0,
+            route: vec![10, 11],
+            updated_step: 1,
+        };
+        let packets = [
+            packet(20, 20),
+            packet(21, 21),
+            packet(22, 22),
+            // Packet callbacks can precede their order callback on a busy
+            // frame. Unknown packet provenance is never player-visible.
+            packet(23, 23),
+        ];
+        let orders = [
+            test_order(20, 0, match_bindings::OrderKind::PerimeterLoad),
+            // A receipt-bearing legacy redistribution still represents the
+            // same noisy internal logistics and stays behind the diagnostic.
+            test_order(21, 21, match_bindings::OrderKind::PerimeterLoad),
+            test_order(22, 22, match_bindings::OrderKind::ExpandClusters),
+        ];
+
+        let normal = packets_to_flows(&transport, &view, &packets, &orders, false);
+        assert_eq!(
+            normal.iter().map(|flow| flow.strength).collect::<Vec<_>>(),
+            vec![22]
+        );
+
+        let debug = packets_to_flows(&transport, &view, &packets, &orders, true);
+        assert_eq!(
+            debug.iter().map(|flow| flow.strength).collect::<Vec<_>>(),
+            vec![20, 21, 22]
+        );
+    }
+
+    #[test]
+    fn authoritative_flow_sync_clears_stale_and_unknown_policy_routes() {
+        let mut transport = OnlineTransport::new(test_config());
+        transport.id_to_coordinate.insert(10, Axial::ZERO);
+        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
+        let mut view = MatchView::connecting(1);
+        view.active_flows.push(ActiveFlow {
+            route: vec![Axial::ZERO, Axial::new(1, 0)],
+            strength: 99,
+            attacking: false,
+            age: 8.0,
+            lifetime: 60.0,
+        });
+        let packet = TransitPacket {
+            packet_key: "24:10:11".to_owned(),
+            order_id: 24,
+            owner_player_id: 1,
+            origin_cell: 10,
+            current_cell: 10,
+            destination_cell: 11,
+            infantry: 24,
+            route_index: 0,
+            route: vec![10, 11],
+            updated_step: 1,
+        };
+
+        // This models the packet-first callback window: replacement must
+        // clear the old projection rather than retaining or exposing either
+        // route while the matching order row is unavailable.
+        replace_authoritative_flows(&transport, &mut view, &[packet], &[], false);
+        assert!(view.active_flows.is_empty());
     }
 
     #[test]
@@ -1625,6 +2029,63 @@ mod tests {
     }
 
     #[test]
+    fn cluster_policy_transport_preserves_facing_and_rejects_invalid_combinations() {
+        assert_eq!(
+            remote_cluster_policy(ClusterPolicy::Balanced, None),
+            Ok((RemoteClusterPolicyKind::Balanced, Axial::ZERO))
+        );
+        assert_eq!(
+            remote_cluster_policy(ClusterPolicy::Directional, Some(Axial::new(512, -341))),
+            Ok((RemoteClusterPolicyKind::Directional, Axial::new(512, -341)))
+        );
+        assert!(remote_cluster_policy(ClusterPolicy::Directional, None).is_err());
+        assert!(remote_cluster_policy(ClusterPolicy::Center, Some(Axial::new(1, 0))).is_err());
+    }
+
+    #[test]
+    fn policy_snapshot_maps_only_the_bound_players_authoritative_rows() {
+        let mut transport = OnlineTransport::new(test_config());
+        let local = Axial::new(2, -1);
+        let foreign = Axial::new(3, -1);
+        transport.id_to_coordinate.insert(20, local);
+        transport.id_to_coordinate.insert(21, foreign);
+        let mut view = MatchView::connecting(1);
+
+        update_cluster_policies(
+            &transport,
+            &mut view,
+            &[
+                ClusterPolicyAssignment {
+                    cell_id: 20,
+                    owner_player_id: 1,
+                    kind: RemoteClusterPolicyKind::Directional,
+                    orientation_q: 700,
+                    orientation_r: -250,
+                    revision: 8,
+                },
+                ClusterPolicyAssignment {
+                    cell_id: 21,
+                    owner_player_id: 2,
+                    kind: RemoteClusterPolicyKind::Perimeter,
+                    orientation_q: 0,
+                    orientation_r: 0,
+                    revision: 9,
+                },
+            ],
+        );
+
+        assert_eq!(
+            view.cluster_policies.get(&local),
+            Some(&ClusterPolicyView {
+                kind: ClusterPolicy::Directional,
+                orientation: Axial::new(700, -250),
+                revision: 8,
+            })
+        );
+        assert!(!view.cluster_policies.contains_key(&foreign));
+    }
+
+    #[test]
     fn retask_projection_maps_a_contested_handle_to_all_current_order_cells() {
         let mut transport = OnlineTransport::new(test_config());
         let rear = Axial::ZERO;
@@ -1673,11 +2134,11 @@ mod tests {
         let (_, contested) = fronts_to_overlays(&transport, &view, std::slice::from_ref(&combat));
         view.set_contested_cells(contested);
 
-        let order = |order_id, player_id, status| TransferOrder {
+        let order = |order_id, player_id, status, kind| TransferOrder {
             order_id,
             player_id,
             client_command_id: order_id,
-            kind: match_bindings::OrderKind::PushFront,
+            kind,
             status,
             requested_infantry: 20,
             committed_infantry: 20,
@@ -1707,9 +2168,36 @@ mod tests {
             updated_step: 7,
         };
         let orders = [
-            order(7, 1, OrderStatus::Active),
-            order(8, 1, OrderStatus::Active),
-            order(9, 1, OrderStatus::Completed),
+            order(
+                7,
+                1,
+                OrderStatus::Active,
+                match_bindings::OrderKind::PushFront,
+            ),
+            order(
+                8,
+                1,
+                OrderStatus::Active,
+                match_bindings::OrderKind::PushFront,
+            ),
+            order(
+                9,
+                1,
+                OrderStatus::Completed,
+                match_bindings::OrderKind::Balance,
+            ),
+            order(
+                10,
+                1,
+                OrderStatus::Active,
+                match_bindings::OrderKind::Balance,
+            ),
+            order(
+                11,
+                2,
+                OrderStatus::Active,
+                match_bindings::OrderKind::Reshape,
+            ),
         ];
         let packets = [
             packet("7:11:12", 7, 11, 12, 12, vec![11, 12]),
@@ -1717,15 +2205,72 @@ mod tests {
             packet("8:10:10", 8, 10, 10, 5, vec![10]),
             packet("9:10:10", 9, 10, 10, 99, vec![10]),
         ];
+        let destinations = [
+            TransferDestination {
+                destination_key: "7:12".to_owned(),
+                order_id: 7,
+                cell_id: 12,
+                target_infantry: 20,
+                received_infantry: 0,
+            },
+            TransferDestination {
+                destination_key: "9:11".to_owned(),
+                order_id: 9,
+                cell_id: 11,
+                target_infantry: 20,
+                received_infantry: 0,
+            },
+            TransferDestination {
+                destination_key: "10:11".to_owned(),
+                order_id: 10,
+                cell_id: 11,
+                target_infantry: 30,
+                received_infantry: 12,
+            },
+            TransferDestination {
+                destination_key: "11:10".to_owned(),
+                order_id: 11,
+                cell_id: 10,
+                target_infantry: 20,
+                received_infantry: 0,
+            },
+        ];
+        let sources = [
+            TransferSource {
+                source_key: "7:10".to_owned(),
+                order_id: 7,
+                cell_id: 10,
+                committed_infantry: 20,
+                queued_infantry: 0,
+            },
+            TransferSource {
+                source_key: "8:10".to_owned(),
+                order_id: 8,
+                cell_id: 10,
+                committed_infantry: 5,
+                queued_infantry: 0,
+            },
+        ];
 
-        let projection =
-            retask_projection_from_authority(&transport, &view, &orders, &packets, &[combat]);
+        let projection = retask_projection_from_authority(
+            &transport,
+            &view,
+            &orders,
+            &packets,
+            &[combat],
+            &sources,
+            &destinations,
+        );
 
         assert_eq!(
             projection.handle_orders,
             BTreeMap::from([(handle, BTreeSet::from([7]))])
         );
         assert_eq!(projection.active_order_ids, BTreeSet::from([7, 8]));
+        assert_eq!(
+            projection.order_source_cells,
+            BTreeMap::from([(7, BTreeSet::from([rear])), (8, BTreeSet::from([rear])),])
+        );
         assert_eq!(
             projection.order_strength_by_cell[&7],
             BTreeMap::from([(rear, 8), (front, 12)])
@@ -1734,6 +2279,82 @@ mod tests {
             projection.active_strength_by_cell,
             BTreeMap::from([(rear, 13), (front, 12)])
         );
+        assert_eq!(
+            projection.destination_reservations_by_order,
+            BTreeMap::from([(10, BTreeMap::from([(front, 18)]))])
+        );
+        assert_eq!(
+            projection.destination_claims_by_order,
+            BTreeMap::from([
+                (7, BTreeSet::from([rear, handle])),
+                (8, BTreeSet::from([rear])),
+                (10, BTreeSet::from([front])),
+            ])
+        );
+    }
+
+    #[test]
+    fn retask_projection_classifies_only_internal_active_policy_orders() {
+        let transport = OnlineTransport::new(test_config());
+        let view = MatchView::connecting(1);
+        let order = |order_id, player_id, client_command_id, status, kind| TransferOrder {
+            order_id,
+            player_id,
+            client_command_id,
+            kind,
+            status,
+            requested_infantry: 20,
+            committed_infantry: 20,
+            in_transit_infantry: 20,
+            delivered_infantry: 0,
+            casualty_infantry: 0,
+            orientation_q: 0,
+            orientation_r: 0,
+            created_step: 1,
+            updated_step: 1,
+        };
+        let orders = [
+            order(
+                1,
+                1,
+                0,
+                OrderStatus::Active,
+                match_bindings::OrderKind::Balance,
+            ),
+            order(
+                2,
+                1,
+                2,
+                OrderStatus::Active,
+                match_bindings::OrderKind::FrontLoad,
+            ),
+            order(
+                3,
+                1,
+                0,
+                OrderStatus::Completed,
+                match_bindings::OrderKind::CoreLoad,
+            ),
+            order(
+                4,
+                2,
+                0,
+                OrderStatus::Active,
+                match_bindings::OrderKind::PerimeterLoad,
+            ),
+            order(
+                5,
+                1,
+                0,
+                OrderStatus::Active,
+                match_bindings::OrderKind::PushFront,
+            ),
+        ];
+
+        let projection =
+            retask_projection_from_authority(&transport, &view, &orders, &[], &[], &[], &[]);
+
+        assert_eq!(projection.background_policy_order_ids, BTreeSet::from([1]));
     }
 
     #[test]
@@ -1875,6 +2496,32 @@ mod tests {
         };
 
         assert!(!cell_view_from_rows(Axial::ZERO, &terrain, None).blocked);
+    }
+
+    #[test]
+    fn terrain_rebuild_retains_authoritative_capturability() {
+        let mut transport = OnlineTransport::new(test_config());
+        let mut view = MatchView::connecting(1);
+        let mut terrain = CellTerrain {
+            cell_id: 1,
+            q: 0,
+            r: 0,
+            chunk_q: 0,
+            chunk_r: 0,
+            terrain: match_bindings::TerrainClass::Plains,
+            elevation: 0,
+            passable: true,
+            capturable: false,
+            habitable: true,
+        };
+
+        rebuild_cells(&mut transport, &mut view, vec![terrain.clone()], None);
+        assert!(view.cell(Axial::ZERO).is_some_and(|cell| !cell.blocked));
+        assert!(!view.is_capturable(Axial::ZERO));
+
+        terrain.capturable = true;
+        rebuild_cells(&mut transport, &mut view, vec![terrain], None);
+        assert!(view.is_capturable(Axial::ZERO));
     }
 
     #[test]

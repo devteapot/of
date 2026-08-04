@@ -6,67 +6,49 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct CancelPushFrontsArgs {
+pub(super) struct CancelOrdersArgs {
     pub client_command_id: u64,
-    pub selected_cells: Vec<u32>,
-    pub direction_q: i32,
-    pub direction_r: i32,
+    pub order_ids: Vec<u64>,
 }
 
-impl From<CancelPushFrontsArgs> for super::Reducer {
-    fn from(args: CancelPushFrontsArgs) -> Self {
-        Self::CancelPushFronts {
+impl From<CancelOrdersArgs> for super::Reducer {
+    fn from(args: CancelOrdersArgs) -> Self {
+        Self::CancelOrders {
             client_command_id: args.client_command_id,
-            selected_cells: args.selected_cells,
-            direction_q: args.direction_q,
-            direction_r: args.direction_r,
+            order_ids: args.order_ids,
         }
     }
 }
 
-impl __sdk::InModule for CancelPushFrontsArgs {
+impl __sdk::InModule for CancelOrdersArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `cancel_push_fronts`.
+/// Extension trait for access to the reducer `cancel_orders`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait cancel_push_fronts {
-    /// Request that the remote module invoke the reducer `cancel_push_fronts` to run as soon as possible.
+pub trait cancel_orders {
+    /// Request that the remote module invoke the reducer `cancel_orders` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`cancel_push_fronts:cancel_push_fronts_then`] to run a callback after the reducer completes.
-    fn cancel_push_fronts(
-        &self,
-        client_command_id: u64,
-        selected_cells: Vec<u32>,
-        direction_q: i32,
-        direction_r: i32,
-    ) -> __sdk::Result<()> {
-        self.cancel_push_fronts_then(
-            client_command_id,
-            selected_cells,
-            direction_q,
-            direction_r,
-            |_, _| {},
-        )
+    /// /// Use [`cancel_orders:cancel_orders_then`] to run a callback after the reducer completes.
+    fn cancel_orders(&self, client_command_id: u64, order_ids: Vec<u64>) -> __sdk::Result<()> {
+        self.cancel_orders_then(client_command_id, order_ids, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `cancel_push_fronts` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `cancel_orders` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn cancel_push_fronts_then(
+    fn cancel_orders_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
-        direction_q: i32,
-        direction_r: i32,
+        order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -76,13 +58,11 @@ pub trait cancel_push_fronts {
     ) -> __sdk::Result<()>;
 }
 
-impl cancel_push_fronts for super::RemoteReducers {
-    fn cancel_push_fronts_then(
+impl cancel_orders for super::RemoteReducers {
+    fn cancel_orders_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
-        direction_q: i32,
-        direction_r: i32,
+        order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -91,11 +71,9 @@ impl cancel_push_fronts for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            CancelPushFrontsArgs {
+            CancelOrdersArgs {
                 client_command_id,
-                selected_cells,
-                direction_q,
-                direction_r,
+                order_ids,
             },
             callback,
         )

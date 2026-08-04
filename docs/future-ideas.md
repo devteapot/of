@@ -8,19 +8,41 @@ The intended extension point is the same throughout: troops, resources, and infr
 
 ### Precise movement for future discrete units
 
-Aggregate infantry intentionally has no precise cell-to-cell command. Balance,
-directional Front-load, Core-load, Perimeter-load, and sustained Push Front
-should first prove that ordinary infantry logistics can stay expressive without
-destination micromanagement. Exact targeting may return for genuinely discrete
-units such as a tank formation, boat, transport, or specialist whose position
-and route are individually meaningful. Such movement must still preserve
-spatial conservation, expose route and ETA, and respect clearance, congestion,
-and interception. The generic aggregate-transfer tables remain an internal
-execution substrate, not a promise to restore precise infantry transfer.
+Aggregate infantry intentionally has no exact-strength cell-to-cell command.
+Contextual cluster expansion/attack, persistent density policy, and
+single-cluster Reshape should first prove that aggregate infantry logistics can
+remain expressive without destination micromanagement. Reshape draws a target
+footprint, but the deterministic allocator—not the player—chooses capacity-safe
+cell strengths. Exact targeting may return for genuinely discrete units such as
+a tank formation, boat, transport, or specialist whose position and route are
+individually meaningful. Such movement must still preserve spatial
+conservation, expose route and ETA, and respect clearance, congestion, and
+interception.
 
 **Depends on:** a discrete-unit model that earns direct control, validated
 aggregate-infantry interactions, route readability, order priorities, and
 controls that remain usable on large maps.
+
+### Advanced sub-cluster and point-side control
+
+The cluster-first attack wave needs no global direction: it progresses through
+the selected enemy mask from every shared front and can turn as that front
+changes. Playtests may nevertheless reveal a need for optional sub-cluster
+front surgery. If that advanced tool returns, ordinary axial movement exposes
+the six true hex-neighbor directions.
+
+Two explicit screen-space headings toward opposite point pairs would not be
+additional hex edges: they require alternating between adjacent axial steps
+(`a, b, a, b...`). That creates parity-dependent lanes, ambiguous frontage, and
+visually different routes after camera rotation. Keep them out of the global
+control unless cluster-first playtests show a real tactical gap and an advanced
+directional tool is deliberately restored. If added, model them as an explicit
+zig-zag route policy with deterministic parity and a full preview, not as fake
+seventh and eighth hex directions.
+
+**Depends on:** evidence that whole-cluster actions are tactically insufficient,
+stable alternating-lane frontage and collision rules, rotation-proof input
+labeling, and readable route previews.
 
 ### Roads and paths
 
@@ -154,10 +176,11 @@ Larger maps, long-running worlds, or multiple linked theaters could amplify logi
 
 **Depends on:** benchmarks at several map sizes, chunked storage and rendering, interest management, hierarchical routing, regional aggregation, persistence/versioning, and a game loop that remains active while distant forces travel. Scale should grow because it improves decisions, not because the renderer can display more hexes.
 
-Before increasing the V1 4,096-cell command cap, replace per-source duplicated
-packet routes with shared suffixes, a route DAG, or another aggregate corridor
-representation. Track active packet count through the F3 `FLOWS` metric while
-profiling representative wide fronts.
+Before increasing the V1 32,768-cell current-world command cap, measure the
+private cluster-wave topology, policy redistribution routes, packet counts, and
+subscription churn. Coalesce shared topology where those measurements justify
+it. Track active packet count through the F3 `FLOWS` metric while profiling
+representative wide fronts.
 
 ## Browser target
 

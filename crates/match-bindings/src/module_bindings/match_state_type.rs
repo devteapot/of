@@ -17,6 +17,7 @@ pub struct MatchState {
     pub player_one_controlled: u64,
     pub player_two_controlled: u64,
     pub winner_player_id: u8,
+    pub latest_cluster_policy_revision: u64,
     pub started_at_us: u64,
     pub completed_at_us: u64,
 }
@@ -37,6 +38,7 @@ pub struct MatchStateCols {
     pub player_one_controlled: __sdk::__query_builder::Col<MatchState, u64>,
     pub player_two_controlled: __sdk::__query_builder::Col<MatchState, u64>,
     pub winner_player_id: __sdk::__query_builder::Col<MatchState, u8>,
+    pub latest_cluster_policy_revision: __sdk::__query_builder::Col<MatchState, u64>,
     pub started_at_us: __sdk::__query_builder::Col<MatchState, u64>,
     pub completed_at_us: __sdk::__query_builder::Col<MatchState, u64>,
 }
@@ -59,6 +61,10 @@ impl __sdk::__query_builder::HasCols for MatchState {
                 "player_two_controlled",
             ),
             winner_player_id: __sdk::__query_builder::Col::new(table_name, "winner_player_id"),
+            latest_cluster_policy_revision: __sdk::__query_builder::Col::new(
+                table_name,
+                "latest_cluster_policy_revision",
+            ),
             started_at_us: __sdk::__query_builder::Col::new(table_name, "started_at_us"),
             completed_at_us: __sdk::__query_builder::Col::new(table_name, "completed_at_us"),
         }

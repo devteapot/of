@@ -9,7 +9,6 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub(super) struct IssueCoreLoadArgs {
     pub client_command_id: u64,
     pub source_cells: Vec<u32>,
-    pub amount_bps: u32,
     pub supersede_order_ids: Vec<u64>,
 }
 
@@ -18,7 +17,6 @@ impl From<IssueCoreLoadArgs> for super::Reducer {
         Self::IssueCoreLoad {
             client_command_id: args.client_command_id,
             source_cells: args.source_cells,
-            amount_bps: args.amount_bps,
             supersede_order_ids: args.supersede_order_ids,
         }
     }
@@ -43,13 +41,11 @@ pub trait issue_core_load {
         &self,
         client_command_id: u64,
         source_cells: Vec<u32>,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
     ) -> __sdk::Result<()> {
         self.issue_core_load_then(
             client_command_id,
             source_cells,
-            amount_bps,
             supersede_order_ids,
             |_, _| {},
         )
@@ -65,7 +61,6 @@ pub trait issue_core_load {
         &self,
         client_command_id: u64,
         source_cells: Vec<u32>,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
@@ -81,7 +76,6 @@ impl issue_core_load for super::RemoteReducers {
         &self,
         client_command_id: u64,
         source_cells: Vec<u32>,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
@@ -94,7 +88,6 @@ impl issue_core_load for super::RemoteReducers {
             IssueCoreLoadArgs {
                 client_command_id,
                 source_cells,
-                amount_bps,
                 supersede_order_ids,
             },
             callback,

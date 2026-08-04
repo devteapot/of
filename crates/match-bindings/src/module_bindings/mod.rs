@@ -6,12 +6,14 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
-pub mod cancel_expand_all_reducer;
-pub mod cancel_push_fronts_reducer;
+pub mod cancel_orders_reducer;
 pub mod cell_state_table;
 pub mod cell_state_type;
 pub mod cell_terrain_table;
 pub mod cell_terrain_type;
+pub mod cluster_policy_assignment_table;
+pub mod cluster_policy_assignment_type;
+pub mod cluster_policy_kind_type;
 pub mod combat_front_table;
 pub mod combat_front_type;
 pub mod command_receipt_table;
@@ -19,12 +21,15 @@ pub mod command_receipt_type;
 pub mod configure_map_reducer;
 pub mod expansion_garrison_debt_type;
 pub mod expansion_wave_type;
+pub mod issue_attack_clusters_reducer;
 pub mod issue_balance_reducer;
 pub mod issue_core_load_reducer;
 pub mod issue_expand_all_reducer;
+pub mod issue_expand_clusters_reducer;
 pub mod issue_front_load_reducer;
 pub mod issue_perimeter_load_reducer;
 pub mod issue_push_front_reducer;
+pub mod issue_reshape_reducer;
 pub mod join_match_reducer;
 pub mod map_preset_type;
 pub mod match_config_table;
@@ -39,6 +44,8 @@ pub mod order_status_type;
 pub mod player_slot_table;
 pub mod player_slot_type;
 pub mod receipt_status_type;
+pub mod retreat_abandonment_type;
+pub mod set_cluster_policy_reducer;
 pub mod set_mobilization_target_reducer;
 pub mod simulation_schedule_type;
 pub mod terrain_class_type;
@@ -51,12 +58,14 @@ pub mod transfer_source_type;
 pub mod transit_packet_table;
 pub mod transit_packet_type;
 
-pub use cancel_expand_all_reducer::cancel_expand_all;
-pub use cancel_push_fronts_reducer::cancel_push_fronts;
+pub use cancel_orders_reducer::cancel_orders;
 pub use cell_state_table::*;
 pub use cell_state_type::CellState;
 pub use cell_terrain_table::*;
 pub use cell_terrain_type::CellTerrain;
+pub use cluster_policy_assignment_table::*;
+pub use cluster_policy_assignment_type::ClusterPolicyAssignment;
+pub use cluster_policy_kind_type::ClusterPolicyKind;
 pub use combat_front_table::*;
 pub use combat_front_type::CombatFront;
 pub use command_receipt_table::*;
@@ -64,12 +73,15 @@ pub use command_receipt_type::CommandReceipt;
 pub use configure_map_reducer::configure_map;
 pub use expansion_garrison_debt_type::ExpansionGarrisonDebt;
 pub use expansion_wave_type::ExpansionWave;
+pub use issue_attack_clusters_reducer::issue_attack_clusters;
 pub use issue_balance_reducer::issue_balance;
 pub use issue_core_load_reducer::issue_core_load;
 pub use issue_expand_all_reducer::issue_expand_all;
+pub use issue_expand_clusters_reducer::issue_expand_clusters;
 pub use issue_front_load_reducer::issue_front_load;
 pub use issue_perimeter_load_reducer::issue_perimeter_load;
 pub use issue_push_front_reducer::issue_push_front;
+pub use issue_reshape_reducer::issue_reshape;
 pub use join_match_reducer::join_match;
 pub use map_preset_type::MapPreset;
 pub use match_config_table::*;
@@ -84,6 +96,8 @@ pub use order_status_type::OrderStatus;
 pub use player_slot_table::*;
 pub use player_slot_type::PlayerSlot;
 pub use receipt_status_type::ReceiptStatus;
+pub use retreat_abandonment_type::RetreatAbandonment;
+pub use set_cluster_policy_reducer::set_cluster_policy;
 pub use set_mobilization_target_reducer::set_mobilization_target;
 pub use simulation_schedule_type::SimulationSchedule;
 pub use terrain_class_type::TerrainClass;
@@ -104,29 +118,27 @@ pub use transit_packet_type::TransitPacket;
 /// to indicate which reducer caused the event.
 
 pub enum Reducer {
-    CancelExpandAll {
+    CancelOrders {
         client_command_id: u64,
-        selected_cells: Vec<u32>,
-    },
-    CancelPushFronts {
-        client_command_id: u64,
-        selected_cells: Vec<u32>,
-        direction_q: i32,
-        direction_r: i32,
+        order_ids: Vec<u64>,
     },
     ConfigureMap {
         preset: MapPreset,
     },
+    IssueAttackClusters {
+        client_command_id: u64,
+        source_seed_cells: Vec<u32>,
+        target_seed_cells: Vec<u32>,
+        commitment_bps: u32,
+    },
     IssueBalance {
         client_command_id: u64,
         source_cells: Vec<u32>,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
     },
     IssueCoreLoad {
         client_command_id: u64,
         source_cells: Vec<u32>,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
     },
     IssueExpandAll {
@@ -135,18 +147,22 @@ pub enum Reducer {
         commitment_bps: u32,
         supersede_order_ids: Vec<u64>,
     },
+    IssueExpandClusters {
+        client_command_id: u64,
+        source_seed_cells: Vec<u32>,
+        focus_cell_id: u32,
+        commitment_bps: u32,
+    },
     IssueFrontLoad {
         client_command_id: u64,
         source_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
     },
     IssuePerimeterLoad {
         client_command_id: u64,
         source_cells: Vec<u32>,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
     },
     IssuePushFront {
@@ -157,9 +173,22 @@ pub enum Reducer {
         commitment_bps: u32,
         supersede_order_ids: Vec<u64>,
     },
+    IssueReshape {
+        client_command_id: u64,
+        source_cells: Vec<u32>,
+        target_cells: Vec<u32>,
+        supersede_order_ids: Vec<u64>,
+    },
     JoinMatch {
         preferred_player_id: u8,
         display_name: String,
+    },
+    SetClusterPolicy {
+        client_command_id: u64,
+        seed_cells: Vec<u32>,
+        kind: ClusterPolicyKind,
+        orientation_q: i32,
+        orientation_r: i32,
     },
     SetMobilizationTarget {
         client_command_id: u64,
@@ -174,16 +203,19 @@ impl __sdk::InModule for Reducer {
 impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
-            Reducer::CancelExpandAll { .. } => "cancel_expand_all",
-            Reducer::CancelPushFronts { .. } => "cancel_push_fronts",
+            Reducer::CancelOrders { .. } => "cancel_orders",
             Reducer::ConfigureMap { .. } => "configure_map",
+            Reducer::IssueAttackClusters { .. } => "issue_attack_clusters",
             Reducer::IssueBalance { .. } => "issue_balance",
             Reducer::IssueCoreLoad { .. } => "issue_core_load",
             Reducer::IssueExpandAll { .. } => "issue_expand_all",
+            Reducer::IssueExpandClusters { .. } => "issue_expand_clusters",
             Reducer::IssueFrontLoad { .. } => "issue_front_load",
             Reducer::IssuePerimeterLoad { .. } => "issue_perimeter_load",
             Reducer::IssuePushFront { .. } => "issue_push_front",
+            Reducer::IssueReshape { .. } => "issue_reshape",
             Reducer::JoinMatch { .. } => "join_match",
+            Reducer::SetClusterPolicy { .. } => "set_cluster_policy",
             Reducer::SetMobilizationTarget { .. } => "set_mobilization_target",
             _ => unreachable!(),
         }
@@ -191,49 +223,45 @@ impl __sdk::Reducer for Reducer {
     #[allow(clippy::clone_on_copy)]
     fn args_bsatn(&self) -> Result<Vec<u8>, __sats::bsatn::EncodeError> {
         match self {
-            Reducer::CancelExpandAll {
+            Reducer::CancelOrders {
                 client_command_id,
-                selected_cells,
-            } => __sats::bsatn::to_vec(&cancel_expand_all_reducer::CancelExpandAllArgs {
+                order_ids,
+            } => __sats::bsatn::to_vec(&cancel_orders_reducer::CancelOrdersArgs {
                 client_command_id: client_command_id.clone(),
-                selected_cells: selected_cells.clone(),
-            }),
-            Reducer::CancelPushFronts {
-                client_command_id,
-                selected_cells,
-                direction_q,
-                direction_r,
-            } => __sats::bsatn::to_vec(&cancel_push_fronts_reducer::CancelPushFrontsArgs {
-                client_command_id: client_command_id.clone(),
-                selected_cells: selected_cells.clone(),
-                direction_q: direction_q.clone(),
-                direction_r: direction_r.clone(),
+                order_ids: order_ids.clone(),
             }),
             Reducer::ConfigureMap { preset } => {
                 __sats::bsatn::to_vec(&configure_map_reducer::ConfigureMapArgs {
                     preset: preset.clone(),
                 })
             }
+            Reducer::IssueAttackClusters {
+                client_command_id,
+                source_seed_cells,
+                target_seed_cells,
+                commitment_bps,
+            } => __sats::bsatn::to_vec(&issue_attack_clusters_reducer::IssueAttackClustersArgs {
+                client_command_id: client_command_id.clone(),
+                source_seed_cells: source_seed_cells.clone(),
+                target_seed_cells: target_seed_cells.clone(),
+                commitment_bps: commitment_bps.clone(),
+            }),
             Reducer::IssueBalance {
                 client_command_id,
                 source_cells,
-                amount_bps,
                 supersede_order_ids,
             } => __sats::bsatn::to_vec(&issue_balance_reducer::IssueBalanceArgs {
                 client_command_id: client_command_id.clone(),
                 source_cells: source_cells.clone(),
-                amount_bps: amount_bps.clone(),
                 supersede_order_ids: supersede_order_ids.clone(),
             }),
             Reducer::IssueCoreLoad {
                 client_command_id,
                 source_cells,
-                amount_bps,
                 supersede_order_ids,
             } => __sats::bsatn::to_vec(&issue_core_load_reducer::IssueCoreLoadArgs {
                 client_command_id: client_command_id.clone(),
                 source_cells: source_cells.clone(),
-                amount_bps: amount_bps.clone(),
                 supersede_order_ids: supersede_order_ids.clone(),
             }),
             Reducer::IssueExpandAll {
@@ -247,30 +275,37 @@ impl __sdk::Reducer for Reducer {
                 commitment_bps: commitment_bps.clone(),
                 supersede_order_ids: supersede_order_ids.clone(),
             }),
+            Reducer::IssueExpandClusters {
+                client_command_id,
+                source_seed_cells,
+                focus_cell_id,
+                commitment_bps,
+            } => __sats::bsatn::to_vec(&issue_expand_clusters_reducer::IssueExpandClustersArgs {
+                client_command_id: client_command_id.clone(),
+                source_seed_cells: source_seed_cells.clone(),
+                focus_cell_id: focus_cell_id.clone(),
+                commitment_bps: commitment_bps.clone(),
+            }),
             Reducer::IssueFrontLoad {
                 client_command_id,
                 source_cells,
                 orientation_q,
                 orientation_r,
-                amount_bps,
                 supersede_order_ids,
             } => __sats::bsatn::to_vec(&issue_front_load_reducer::IssueFrontLoadArgs {
                 client_command_id: client_command_id.clone(),
                 source_cells: source_cells.clone(),
                 orientation_q: orientation_q.clone(),
                 orientation_r: orientation_r.clone(),
-                amount_bps: amount_bps.clone(),
                 supersede_order_ids: supersede_order_ids.clone(),
             }),
             Reducer::IssuePerimeterLoad {
                 client_command_id,
                 source_cells,
-                amount_bps,
                 supersede_order_ids,
             } => __sats::bsatn::to_vec(&issue_perimeter_load_reducer::IssuePerimeterLoadArgs {
                 client_command_id: client_command_id.clone(),
                 source_cells: source_cells.clone(),
-                amount_bps: amount_bps.clone(),
                 supersede_order_ids: supersede_order_ids.clone(),
             }),
             Reducer::IssuePushFront {
@@ -288,12 +323,36 @@ impl __sdk::Reducer for Reducer {
                 commitment_bps: commitment_bps.clone(),
                 supersede_order_ids: supersede_order_ids.clone(),
             }),
+            Reducer::IssueReshape {
+                client_command_id,
+                source_cells,
+                target_cells,
+                supersede_order_ids,
+            } => __sats::bsatn::to_vec(&issue_reshape_reducer::IssueReshapeArgs {
+                client_command_id: client_command_id.clone(),
+                source_cells: source_cells.clone(),
+                target_cells: target_cells.clone(),
+                supersede_order_ids: supersede_order_ids.clone(),
+            }),
             Reducer::JoinMatch {
                 preferred_player_id,
                 display_name,
             } => __sats::bsatn::to_vec(&join_match_reducer::JoinMatchArgs {
                 preferred_player_id: preferred_player_id.clone(),
                 display_name: display_name.clone(),
+            }),
+            Reducer::SetClusterPolicy {
+                client_command_id,
+                seed_cells,
+                kind,
+                orientation_q,
+                orientation_r,
+            } => __sats::bsatn::to_vec(&set_cluster_policy_reducer::SetClusterPolicyArgs {
+                client_command_id: client_command_id.clone(),
+                seed_cells: seed_cells.clone(),
+                kind: kind.clone(),
+                orientation_q: orientation_q.clone(),
+                orientation_r: orientation_r.clone(),
             }),
             Reducer::SetMobilizationTarget {
                 client_command_id,
@@ -315,6 +374,7 @@ impl __sdk::Reducer for Reducer {
 pub struct DbUpdate {
     cell_state: __sdk::TableUpdate<CellState>,
     cell_terrain: __sdk::TableUpdate<CellTerrain>,
+    cluster_policy_assignment: __sdk::TableUpdate<ClusterPolicyAssignment>,
     combat_front: __sdk::TableUpdate<CombatFront>,
     command_receipt: __sdk::TableUpdate<CommandReceipt>,
     match_config: __sdk::TableUpdate<MatchConfig>,
@@ -339,6 +399,9 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "cell_terrain" => db_update
                     .cell_terrain
                     .append(cell_terrain_table::parse_table_update(table_update)?),
+                "cluster_policy_assignment" => db_update.cluster_policy_assignment.append(
+                    cluster_policy_assignment_table::parse_table_update(table_update)?,
+                ),
                 "combat_front" => db_update
                     .combat_front
                     .append(combat_front_table::parse_table_update(table_update)?),
@@ -401,6 +464,12 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.cell_terrain = cache
             .apply_diff_to_table::<CellTerrain>("cell_terrain", &self.cell_terrain)
             .with_updates_by_pk(|row| &row.cell_id);
+        diff.cluster_policy_assignment = cache
+            .apply_diff_to_table::<ClusterPolicyAssignment>(
+                "cluster_policy_assignment",
+                &self.cluster_policy_assignment,
+            )
+            .with_updates_by_pk(|row| &row.cell_id);
         diff.combat_front = cache
             .apply_diff_to_table::<CombatFront>("combat_front", &self.combat_front)
             .with_updates_by_pk(|row| &row.front_key);
@@ -449,6 +518,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "cell_terrain" => db_update
                     .cell_terrain
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "cluster_policy_assignment" => db_update
+                    .cluster_policy_assignment
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "combat_front" => db_update
                     .combat_front
@@ -499,6 +571,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "cell_terrain" => db_update
                     .cell_terrain
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "cluster_policy_assignment" => db_update
+                    .cluster_policy_assignment
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "combat_front" => db_update
                     .combat_front
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -546,6 +621,7 @@ impl __sdk::DbUpdate for DbUpdate {
 pub struct AppliedDiff<'r> {
     cell_state: __sdk::TableAppliedDiff<'r, CellState>,
     cell_terrain: __sdk::TableAppliedDiff<'r, CellTerrain>,
+    cluster_policy_assignment: __sdk::TableAppliedDiff<'r, ClusterPolicyAssignment>,
     combat_front: __sdk::TableAppliedDiff<'r, CombatFront>,
     command_receipt: __sdk::TableAppliedDiff<'r, CommandReceipt>,
     match_config: __sdk::TableAppliedDiff<'r, MatchConfig>,
@@ -573,6 +649,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         callbacks.invoke_table_row_callbacks::<CellTerrain>(
             "cell_terrain",
             &self.cell_terrain,
+            event,
+        );
+        callbacks.invoke_table_row_callbacks::<ClusterPolicyAssignment>(
+            "cluster_policy_assignment",
+            &self.cluster_policy_assignment,
             event,
         );
         callbacks.invoke_table_row_callbacks::<CombatFront>(
@@ -1279,6 +1360,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
         cell_state_table::register_table(client_cache);
         cell_terrain_table::register_table(client_cache);
+        cluster_policy_assignment_table::register_table(client_cache);
         combat_front_table::register_table(client_cache);
         command_receipt_table::register_table(client_cache);
         match_config_table::register_table(client_cache);
@@ -1293,6 +1375,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
     const ALL_TABLE_NAMES: &'static [&'static str] = &[
         "cell_state",
         "cell_terrain",
+        "cluster_policy_assignment",
         "combat_front",
         "command_receipt",
         "match_config",

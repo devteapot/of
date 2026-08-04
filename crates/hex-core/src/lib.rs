@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod branching;
 pub mod combat;
 pub mod connectivity;
 pub mod conquest;
@@ -16,6 +17,11 @@ pub mod movement;
 pub mod pathfinding;
 pub mod redistribution;
 
+pub use branching::{
+    BranchAllocationError, BranchContributionAllocation, WeightedBranchAllocations,
+    WeightedBranchQuotas, focus_branch_weight, weighted_branch_allocations_rotated,
+    weighted_branch_quotas_rotated,
+};
 pub use combat::{
     AttackFront, AttackOutcome, CombatConfig, CombatError, CombatResolution, resolve_edge_combat,
 };
@@ -23,7 +29,8 @@ pub use connectivity::{connected_components, owned_components};
 pub use conquest::{ConquestError, ConquestProgress, ConquestRule};
 pub use coord::{Axial, ChunkAddress, ChunkCoord, Cube, HexDirection, HexEdge};
 pub use front::{
-    DirectedFrontEdge, FrontSelectionError, selected_all_front_edges, selected_front_edges,
+    DirectedFrontEdge, FrontSelectionError, LocalFrontRoute, selected_all_front_edges,
+    selected_directional_routes, selected_front_edges, selected_local_front_routes,
     unique_target_front_edges,
 };
 pub use map::{
@@ -36,6 +43,7 @@ pub use movement::{
 };
 pub use pathfinding::{Path, shortest_path};
 pub use redistribution::{
-    DistributionError, DistributionPreset, TargetDistribution, distribution_weights,
-    redistribution_targets, redistribution_targets_with_commitment,
+    BALANCE_WEIGHT, DistributionError, DistributionPreset, TargetDistribution,
+    distribution_weights, redistribution_targets, redistribution_targets_with_commitment,
+    redistribution_targets_with_constraints, redistribution_targets_with_fallback_constraints,
 };

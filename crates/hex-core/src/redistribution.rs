@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     conquest::BASIS_POINTS,
@@ -7,8 +7,8 @@ use crate::{
 };
 
 pub const BALANCE_WEIGHT: u32 = 10_000;
-const RADIAL_LOW_WEIGHT: u32 = 5_000;
-const RADIAL_HIGH_WEIGHT: u32 = 15_000;
+const DEPTH_LOW_WEIGHT: u32 = 5_000;
+const DEPTH_HIGH_WEIGHT: u32 = 15_000;
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,9 +21,9 @@ pub enum DistributionPreset {
         rear_weight: u32,
         front_weight: u32,
     },
-    /// Density is greatest near the selection's geometric center.
+    /// Density increases with distance from the selection's exposed boundary.
     CoreLoad,
-    /// Density is greatest farthest from the selection's geometric center.
+    /// Density decreases with distance from the selection's exposed boundary.
     PerimeterLoad,
 }
 
@@ -57,6 +57,15 @@ pub enum DistributionError {
     InfeasibleFrozenStrength {
         frozen: Strength,
         goal: Strength,
+    },
+    ConstraintCellsMismatch,
+    InvalidLowerBound {
+        coordinate: Axial,
+        lower_bound: Strength,
+        current: Strength,
+    },
+    InsufficientTargetCapacity {
+        unassigned: Strength,
     },
     ArithmeticOverflow,
 }
@@ -118,83 +127,71 @@ where
                 .collect()
         }
         DistributionPreset::CoreLoad | DistributionPreset::PerimeterLoad => {
-            radial_weights(&coordinates, preset)
+            boundary_depth_weights(&coordinates, preset)
         }
     }
 }
 
-/// Computes radial weights without rounding the selection centroid to a cell.
-///
-/// For a selection of `n` cube coordinates, `n * coordinate - sum` is the
-/// displacement from the fractional centroid with the common denominator
-/// removed. Squared cube distance therefore remains integer-only, symmetric,
-/// and translation invariant even when the center lies between hexes.
-fn radial_weights(
+/// Measures topological depth from the exact exposed boundary of a selection.
+/// Every cell adjacent to any unselected coordinate seeds depth zero; a stable
+/// multi-source BFS then assigns inward layers. Concavities and holes therefore
+/// influence loading directly instead of being approximated by a centroid.
+fn boundary_depth_weights(
     coordinates: &BTreeSet<Axial>,
     preset: DistributionPreset,
 ) -> Result<BTreeMap<Axial, u32>, DistributionError> {
-    let count =
-        i128::try_from(coordinates.len()).map_err(|_| DistributionError::ArithmeticOverflow)?;
-    let (sum_x, sum_y, sum_z) = coordinates.iter().try_fold(
-        (0_i128, 0_i128, 0_i128),
-        |(sum_x, sum_y, sum_z), coordinate| {
-            let cube = coordinate.cube();
-            Ok::<_, DistributionError>((
-                sum_x
-                    .checked_add(i128::from(cube.x))
-                    .ok_or(DistributionError::ArithmeticOverflow)?,
-                sum_y
-                    .checked_add(i128::from(cube.y))
-                    .ok_or(DistributionError::ArithmeticOverflow)?,
-                sum_z
-                    .checked_add(i128::from(cube.z))
-                    .ok_or(DistributionError::ArithmeticOverflow)?,
-            ))
-        },
-    )?;
-    let scores = coordinates
-        .iter()
-        .map(|&coordinate| {
-            let cube = coordinate.cube();
-            let delta_x = count
-                .checked_mul(i128::from(cube.x))
-                .and_then(|value| value.checked_sub(sum_x))
-                .ok_or(DistributionError::ArithmeticOverflow)?;
-            let delta_y = count
-                .checked_mul(i128::from(cube.y))
-                .and_then(|value| value.checked_sub(sum_y))
-                .ok_or(DistributionError::ArithmeticOverflow)?;
-            let delta_z = count
-                .checked_mul(i128::from(cube.z))
-                .and_then(|value| value.checked_sub(sum_z))
-                .ok_or(DistributionError::ArithmeticOverflow)?;
-            let score = delta_x
-                .checked_mul(delta_x)
-                .and_then(|value| value.checked_add(delta_y.checked_mul(delta_y)?))
-                .and_then(|value| value.checked_add(delta_z.checked_mul(delta_z)?))
-                .and_then(|value| u128::try_from(value).ok())
-                .ok_or(DistributionError::ArithmeticOverflow)?;
-            Ok((coordinate, score))
-        })
-        .collect::<Result<BTreeMap<_, _>, DistributionError>>()?;
-    let minimum = *scores.values().min().expect("selection is not empty");
-    let maximum = *scores.values().max().expect("selection is not empty");
-    let span = maximum - minimum;
-    let weight_span = u128::from(RADIAL_HIGH_WEIGHT - RADIAL_LOW_WEIGHT);
+    let mut depths = BTreeMap::<Axial, u64>::new();
+    let mut pending = VecDeque::new();
+    for &coordinate in coordinates {
+        if coordinate
+            .neighbors()
+            .into_iter()
+            .any(|neighbor| !coordinates.contains(&neighbor))
+        {
+            depths.insert(coordinate, 0);
+            pending.push_back(coordinate);
+        }
+    }
 
-    scores
+    while let Some(coordinate) = pending.pop_front() {
+        let next_depth = depths[&coordinate]
+            .checked_add(1)
+            .ok_or(DistributionError::ArithmeticOverflow)?;
+        for neighbor in coordinate.neighbors() {
+            if coordinates.contains(&neighbor) && !depths.contains_key(&neighbor) {
+                depths.insert(neighbor, next_depth);
+                pending.push_back(neighbor);
+            }
+        }
+    }
+    debug_assert_eq!(depths.len(), coordinates.len());
+    let max_depth = depths
+        .values()
+        .copied()
+        .max()
+        .expect("a finite non-empty selection has an exposed boundary");
+    if max_depth == 0 {
+        return Ok(coordinates
+            .iter()
+            .map(|&coordinate| (coordinate, BALANCE_WEIGHT))
+            .collect());
+    }
+
+    let weight_span = u128::from(DEPTH_HIGH_WEIGHT - DEPTH_LOW_WEIGHT);
+    depths
         .into_iter()
-        .map(|(coordinate, score)| {
+        .map(|(coordinate, depth)| {
             let offset = weight_span
-                .checked_mul(score - minimum)
+                .checked_mul(u128::from(depth))
                 .ok_or(DistributionError::ArithmeticOverflow)?
-                .checked_div(span)
-                .unwrap_or(weight_span / 2) as u32;
+                / u128::from(max_depth);
+            let offset =
+                u32::try_from(offset).map_err(|_| DistributionError::ArithmeticOverflow)?;
             let weight = match preset {
-                DistributionPreset::CoreLoad => RADIAL_HIGH_WEIGHT - offset,
-                DistributionPreset::PerimeterLoad => RADIAL_LOW_WEIGHT + offset,
+                DistributionPreset::CoreLoad => DEPTH_LOW_WEIGHT + offset,
+                DistributionPreset::PerimeterLoad => DEPTH_HIGH_WEIGHT - offset,
                 DistributionPreset::Balance | DistributionPreset::FrontLoad { .. } => {
-                    unreachable!("radial_weights only accepts radial presets")
+                    unreachable!("boundary_depth_weights only accepts depth presets")
                 }
             };
             Ok((coordinate, weight))
@@ -270,8 +267,6 @@ where
     let weights = distribution_weights(selection, preset)?;
     let mut capacities = BTreeMap::new();
     let mut lower_bounds = BTreeMap::new();
-    let mut capacity_total = 0_u64;
-    let mut frozen_total = 0_u64;
     for coordinate in weights.keys().copied() {
         let cell = map
             .get(coordinate)
@@ -290,16 +285,211 @@ where
         let participating =
             (u128::from(current) * u128::from(amount_bps) / u128::from(BASIS_POINTS)) as Strength;
         let frozen = current - participating;
-        frozen_total = frozen_total
-            .checked_add(frozen)
-            .ok_or(DistributionError::ArithmeticOverflow)?;
-        capacity_total = capacity_total
-            .checked_add(cell.military_capacity)
-            .ok_or(DistributionError::ArithmeticOverflow)?;
         capacities.insert(coordinate, cell.military_capacity);
         lower_bounds.insert(coordinate, frozen);
     }
 
+    constrained_targets(weights, capacities, lower_bounds, total_strength)
+}
+
+/// Apportions strength with caller-supplied density weights and per-cell frozen
+/// lower bounds.
+///
+/// This is the shape-drawing primitive: target cells receive positive weight,
+/// source-only cells receive zero weight, and the lower bound limits how much
+/// of each source may leave. Unlike broad preset redistribution, a drawn shape
+/// is exact: every unit of `total_strength` must fit or the operation is
+/// rejected. All constrained cells must be owned map cells and the weight and
+/// lower-bound maps must have identical keys.
+pub fn redistribution_targets_with_constraints(
+    map: &HexMap,
+    owner: PlayerId,
+    weights: BTreeMap<Axial, u32>,
+    lower_bounds: BTreeMap<Axial, Strength>,
+    total_strength: Strength,
+) -> Result<TargetDistribution, DistributionError> {
+    let capacities = validated_constraint_capacities(map, owner, &weights, &lower_bounds)?;
+    let distribution = constrained_targets(weights, capacities, lower_bounds, total_strength)?;
+    if distribution.unassigned > 0 {
+        return Err(DistributionError::InsufficientTargetCapacity {
+            unassigned: distribution.unassigned,
+        });
+    }
+    Ok(distribution)
+}
+
+/// Apportions strength into preferred cells first, then uses zero-weight cells
+/// as deterministic overflow storage.
+///
+/// This is the best-effort shape-drawing primitive. Positive weights identify
+/// the drawn footprint, while zero-weight cells are source cells that may keep
+/// strength when the footprint is too small. Frozen lower bounds are always
+/// honored. If the preferred cells can hold all non-frozen strength, fallback
+/// cells receive only their lower bounds; otherwise every preferred cell is
+/// saturated before overflow is balanced across the fallback cells' current
+/// affected strength. Consequently a fallback source can only retain or lose
+/// strength, never gain it from another excluded source.
+///
+/// Unlike [`redistribution_targets_with_constraints`], insufficient capacity
+/// in the preferred cells is not an error. The operation fails only when the
+/// complete preferred-plus-fallback set cannot conserve `total_strength`.
+pub fn redistribution_targets_with_fallback_constraints(
+    map: &HexMap,
+    owner: PlayerId,
+    weights: BTreeMap<Axial, u32>,
+    lower_bounds: BTreeMap<Axial, Strength>,
+    total_strength: Strength,
+) -> Result<TargetDistribution, DistributionError> {
+    let capacities = validated_constraint_capacities(map, owner, &weights, &lower_bounds)?;
+    let preferred = weights
+        .iter()
+        .filter_map(|(&coordinate, &weight)| (weight > 0).then_some(coordinate))
+        .collect::<BTreeSet<_>>();
+    let fallback = weights
+        .iter()
+        .filter_map(|(&coordinate, &weight)| (weight == 0).then_some(coordinate))
+        .collect::<BTreeSet<_>>();
+
+    let fallback_floor = fallback.iter().try_fold(0_u64, |total, coordinate| {
+        total
+            .checked_add(lower_bounds[coordinate])
+            .ok_or(DistributionError::ArithmeticOverflow)
+    })?;
+    let frozen_total = lower_bounds.values().try_fold(0_u64, |total, frozen| {
+        total
+            .checked_add(*frozen)
+            .ok_or(DistributionError::ArithmeticOverflow)
+    })?;
+    let preferred_capacity = preferred.iter().try_fold(0_u64, |total, coordinate| {
+        total
+            .checked_add(capacities[coordinate])
+            .ok_or(DistributionError::ArithmeticOverflow)
+    })?;
+    let preferred_goal = total_strength
+        .checked_sub(fallback_floor)
+        .ok_or(DistributionError::InfeasibleFrozenStrength {
+            frozen: frozen_total,
+            goal: total_strength,
+        })?
+        .min(preferred_capacity);
+
+    let preferred_distribution = constrained_targets(
+        preferred
+            .iter()
+            .map(|coordinate| (*coordinate, weights[coordinate]))
+            .collect(),
+        preferred
+            .iter()
+            .map(|coordinate| (*coordinate, capacities[coordinate]))
+            .collect(),
+        preferred
+            .iter()
+            .map(|coordinate| (*coordinate, lower_bounds[coordinate]))
+            .collect(),
+        preferred_goal,
+    )?;
+    let fallback_goal = total_strength
+        .checked_sub(preferred_distribution.assigned)
+        .ok_or(DistributionError::ArithmeticOverflow)?;
+    let fallback_distribution = constrained_targets(
+        fallback
+            .iter()
+            .map(|coordinate| (*coordinate, BALANCE_WEIGHT))
+            .collect(),
+        fallback
+            .iter()
+            .map(|coordinate| {
+                let current = map
+                    .get(*coordinate)
+                    .expect("constraint validation resolved every coordinate")
+                    .force();
+                (*coordinate, capacities[coordinate].min(current))
+            })
+            .collect(),
+        fallback
+            .iter()
+            .map(|coordinate| (*coordinate, lower_bounds[coordinate]))
+            .collect(),
+        fallback_goal,
+    )?;
+
+    let assigned = preferred_distribution
+        .assigned
+        .checked_add(fallback_distribution.assigned)
+        .ok_or(DistributionError::ArithmeticOverflow)?;
+    let unassigned = total_strength
+        .checked_sub(assigned)
+        .ok_or(DistributionError::ArithmeticOverflow)?;
+    if unassigned > 0 {
+        return Err(DistributionError::InsufficientTargetCapacity { unassigned });
+    }
+    let mut targets = preferred_distribution.targets;
+    targets.extend(fallback_distribution.targets);
+    Ok(TargetDistribution {
+        weights,
+        targets,
+        assigned,
+        unassigned,
+    })
+}
+
+fn validated_constraint_capacities(
+    map: &HexMap,
+    owner: PlayerId,
+    weights: &BTreeMap<Axial, u32>,
+    lower_bounds: &BTreeMap<Axial, Strength>,
+) -> Result<BTreeMap<Axial, Strength>, DistributionError> {
+    if weights.is_empty() {
+        return Err(DistributionError::EmptySelection);
+    }
+    if weights.keys().ne(lower_bounds.keys()) {
+        return Err(DistributionError::ConstraintCellsMismatch);
+    }
+    let mut capacities = BTreeMap::new();
+    for coordinate in weights.keys().copied() {
+        let cell = map
+            .get(coordinate)
+            .ok_or(DistributionError::UnknownCell(coordinate))?;
+        if cell.owner != Some(owner) {
+            return Err(DistributionError::NotOwned { coordinate, owner });
+        }
+        let current = cell.force();
+        if current > cell.military_capacity {
+            return Err(DistributionError::CurrentStrengthExceedsCapacity {
+                coordinate,
+                current,
+                capacity: cell.military_capacity,
+            });
+        }
+        let lower_bound = lower_bounds[&coordinate];
+        if lower_bound > current {
+            return Err(DistributionError::InvalidLowerBound {
+                coordinate,
+                lower_bound,
+                current,
+            });
+        }
+        capacities.insert(coordinate, cell.military_capacity);
+    }
+    Ok(capacities)
+}
+
+fn constrained_targets(
+    weights: BTreeMap<Axial, u32>,
+    capacities: BTreeMap<Axial, Strength>,
+    lower_bounds: BTreeMap<Axial, Strength>,
+    total_strength: Strength,
+) -> Result<TargetDistribution, DistributionError> {
+    let capacity_total = capacities.values().try_fold(0_u64, |total, capacity| {
+        total
+            .checked_add(*capacity)
+            .ok_or(DistributionError::ArithmeticOverflow)
+    })?;
+    let frozen_total = lower_bounds.values().try_fold(0_u64, |total, frozen| {
+        total
+            .checked_add(*frozen)
+            .ok_or(DistributionError::ArithmeticOverflow)
+    })?;
     let goal = total_strength.min(capacity_total);
     if frozen_total > goal {
         return Err(DistributionError::InfeasibleFrozenStrength {
@@ -329,10 +519,6 @@ where
             }
             break;
         }
-        // Adding lower bounds can only reduce the proportional scale for the
-        // remaining cells, so a violated lower bound can be fixed permanently.
-        // Re-running the ordinary capacity apportionment also lets previously
-        // saturated cells fall below capacity when the scale decreases.
         for coordinate in violations {
             let lower_bound = lower_bounds[&coordinate];
             targets.insert(coordinate, lower_bound);
@@ -468,6 +654,19 @@ mod tests {
         map
     }
 
+    fn hex_disk(radius: i32) -> BTreeSet<Axial> {
+        let mut selection = BTreeSet::new();
+        for q in -radius..=radius {
+            for r in -radius..=radius {
+                let coordinate = Axial::new(q, r);
+                if Axial::ZERO.distance(coordinate) <= radius as u64 {
+                    selection.insert(coordinate);
+                }
+            }
+        }
+        selection
+    }
+
     #[test]
     fn balance_equalizes_occupancy_ratio_not_raw_strength() {
         let map = line(&[100, 200]);
@@ -586,48 +785,91 @@ mod tests {
     }
 
     #[test]
-    fn core_and_perimeter_are_symmetric_about_fractional_centroid() {
-        let selection = [
-            Axial::new(0, 0),
-            Axial::new(1, 0),
-            Axial::new(2, 0),
-            Axial::new(3, 0),
-            Axial::new(4, 0),
-        ];
-        let core = distribution_weights(selection, DistributionPreset::CoreLoad).unwrap();
-        let perimeter = distribution_weights(selection, DistributionPreset::PerimeterLoad).unwrap();
+    fn solid_disk_loads_by_exact_boundary_depth() {
+        let selection = hex_disk(2);
+        let core =
+            distribution_weights(selection.iter().copied(), DistributionPreset::CoreLoad).unwrap();
+        let perimeter =
+            distribution_weights(selection.iter().copied(), DistributionPreset::PerimeterLoad)
+                .unwrap();
 
-        assert_eq!(core[&Axial::new(0, 0)], RADIAL_LOW_WEIGHT);
-        assert_eq!(core[&Axial::new(2, 0)], RADIAL_HIGH_WEIGHT);
-        assert_eq!(core[&Axial::new(0, 0)], core[&Axial::new(4, 0)]);
-        assert_eq!(core[&Axial::new(1, 0)], core[&Axial::new(3, 0)]);
         for coordinate in selection {
-            assert_eq!(
-                core[&coordinate] + perimeter[&coordinate],
-                RADIAL_LOW_WEIGHT + RADIAL_HIGH_WEIGHT
-            );
+            let distance = Axial::ZERO.distance(coordinate);
+            let (expected_core, expected_perimeter) = match distance {
+                0 => (DEPTH_HIGH_WEIGHT, DEPTH_LOW_WEIGHT),
+                1 => (BALANCE_WEIGHT, BALANCE_WEIGHT),
+                2 => (DEPTH_LOW_WEIGHT, DEPTH_HIGH_WEIGHT),
+                _ => unreachable!("radius-two disk has only three inward layers"),
+            };
+            assert_eq!(core[&coordinate], expected_core);
+            assert_eq!(perimeter[&coordinate], expected_perimeter);
         }
     }
 
     #[test]
-    fn radial_weights_are_translation_invariant_with_center_between_cells() {
-        let original = [
-            Axial::new(0, 0),
-            Axial::new(1, 0),
-            Axial::new(2, -1),
-            Axial::new(3, -1),
-        ];
-        let translated = original.map(|coordinate| coordinate + Axial::new(37, -91));
+    fn a_notch_is_boundary_and_depth_weights_are_translation_invariant() {
+        let mut original = hex_disk(3);
+        for q in 1..=3 {
+            original.remove(&Axial::new(q, 0));
+        }
+        let translation = Axial::new(37, -91);
+        let translated = original
+            .iter()
+            .map(|&coordinate| coordinate + translation)
+            .collect::<BTreeSet<_>>();
 
         for preset in [
             DistributionPreset::CoreLoad,
             DistributionPreset::PerimeterLoad,
         ] {
-            let original_weights = distribution_weights(original, preset).unwrap();
-            let translated_weights = distribution_weights(translated, preset).unwrap();
+            let original_weights = distribution_weights(original.iter().copied(), preset).unwrap();
+            let translated_weights =
+                distribution_weights(translated.iter().copied(), preset).unwrap();
+            for &coordinate in &original {
+                assert_eq!(
+                    original_weights[&coordinate],
+                    translated_weights[&(coordinate + translation)]
+                );
+            }
+        }
+
+        let core =
+            distribution_weights(original.iter().copied(), DistributionPreset::CoreLoad).unwrap();
+        assert_eq!(core[&Axial::ZERO], DEPTH_LOW_WEIGHT);
+        assert!(core.values().any(|&weight| weight > DEPTH_LOW_WEIGHT));
+    }
+
+    #[test]
+    fn thin_and_single_cell_selections_use_the_midpoint_weight() {
+        let thin = (0..=6).map(|q| Axial::new(q, 0)).collect::<BTreeSet<_>>();
+        let single = BTreeSet::from([Axial::new(-4, 9)]);
+
+        for selection in [&thin, &single] {
+            for preset in [
+                DistributionPreset::CoreLoad,
+                DistributionPreset::PerimeterLoad,
+            ] {
+                let weights = distribution_weights(selection.iter().copied(), preset).unwrap();
+                assert!(weights.values().all(|&weight| weight == BALANCE_WEIGHT));
+            }
+        }
+    }
+
+    #[test]
+    fn core_and_perimeter_weights_are_complementary_at_every_depth() {
+        let mut selection = hex_disk(4);
+        selection.remove(&Axial::new(4, 0));
+        selection.remove(&Axial::new(3, 0));
+        let core =
+            distribution_weights(selection.iter().copied(), DistributionPreset::CoreLoad).unwrap();
+        let perimeter =
+            distribution_weights(selection.iter().copied(), DistributionPreset::PerimeterLoad)
+                .unwrap();
+
+        for coordinate in selection {
             assert_eq!(
-                original_weights.values().copied().collect::<Vec<_>>(),
-                translated_weights.values().copied().collect::<Vec<_>>()
+                core[&coordinate] + perimeter[&coordinate],
+                DEPTH_LOW_WEIGHT + DEPTH_HIGH_WEIGHT
             );
         }
     }
@@ -685,6 +927,187 @@ mod tests {
                     let frozen = strengths[index] - movable as u64;
                     assert!(result.targets[&coordinate] >= frozen);
                     assert!(result.targets[&coordinate] <= capacities[index]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_targets_move_only_the_unfrozen_share_into_a_drawn_shape() {
+        let map = occupied_line(&[100, 100, 100], &[80, 0, 0]);
+        let source = Axial::new(0, 0);
+        let middle = Axial::new(1, 0);
+        let target = Axial::new(2, 0);
+        let result = redistribution_targets_with_constraints(
+            &map,
+            1,
+            BTreeMap::from([(source, 0), (middle, 0), (target, BALANCE_WEIGHT)]),
+            BTreeMap::from([(source, 40), (middle, 0), (target, 0)]),
+            80,
+        )
+        .unwrap();
+
+        assert_eq!(result.targets[&source], 40);
+        assert_eq!(result.targets[&middle], 0);
+        assert_eq!(result.targets[&target], 40);
+        assert_eq!(result.assigned, 80);
+        assert_eq!(result.unassigned, 0);
+        assert_eq!(result.targets.values().sum::<u64>(), 80);
+    }
+
+    #[test]
+    fn constrained_targets_reject_a_shape_that_cannot_hold_the_movable_share() {
+        let map = occupied_line(&[100, 20], &[80, 0]);
+        let source = Axial::new(0, 0);
+        let target = Axial::new(1, 0);
+
+        assert_eq!(
+            redistribution_targets_with_constraints(
+                &map,
+                1,
+                BTreeMap::from([(source, 0), (target, BALANCE_WEIGHT)]),
+                BTreeMap::from([(source, 40), (target, 0)]),
+                80,
+            ),
+            Err(DistributionError::InsufficientTargetCapacity { unassigned: 20 })
+        );
+    }
+
+    #[test]
+    fn constrained_targets_reject_a_nonempty_movable_share_without_a_target() {
+        let map = occupied_line(&[100], &[80]);
+        let source = Axial::new(0, 0);
+
+        assert_eq!(
+            redistribution_targets_with_constraints(
+                &map,
+                1,
+                BTreeMap::from([(source, 0)]),
+                BTreeMap::from([(source, 79)]),
+                80,
+            ),
+            Err(DistributionError::InsufficientTargetCapacity { unassigned: 1 })
+        );
+    }
+
+    #[test]
+    fn fallback_constraints_drain_sources_when_the_drawn_shape_fits() {
+        let map = occupied_line(&[100, 100, 100], &[45, 45, 0]);
+        let source_a = Axial::new(0, 0);
+        let source_b = Axial::new(1, 0);
+        let target = Axial::new(2, 0);
+
+        let result = redistribution_targets_with_fallback_constraints(
+            &map,
+            1,
+            BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+            BTreeMap::from([(source_a, 0), (source_b, 0), (target, 0)]),
+            90,
+        )
+        .unwrap();
+
+        assert_eq!(result.targets[&source_a], 0);
+        assert_eq!(result.targets[&source_b], 0);
+        assert_eq!(result.targets[&target], 90);
+        assert_eq!(result.assigned, 90);
+        assert_eq!(result.unassigned, 0);
+    }
+
+    #[test]
+    fn fallback_constraints_saturate_the_shape_then_conserve_overflow_on_sources() {
+        let map = occupied_line(&[100, 60, 50], &[80, 40, 0]);
+        let source_a = Axial::new(0, 0);
+        let source_b = Axial::new(1, 0);
+        let target = Axial::new(2, 0);
+
+        let result = redistribution_targets_with_fallback_constraints(
+            &map,
+            1,
+            BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+            BTreeMap::from([(source_a, 0), (source_b, 0), (target, 0)]),
+            120,
+        )
+        .unwrap();
+
+        assert_eq!(result.targets[&target], 50);
+        assert_eq!(result.targets[&source_a], 47);
+        assert_eq!(result.targets[&source_b], 23);
+        assert!(result.targets[&source_a] <= 80);
+        assert!(result.targets[&source_b] <= 40);
+        assert_eq!(result.targets.values().sum::<u64>(), 120);
+        assert!(
+            result.targets.iter().all(|(coordinate, strength)| *strength
+                <= map.get(*coordinate).unwrap().military_capacity)
+        );
+    }
+
+    #[test]
+    fn fallback_constraints_preserve_frozen_strength_during_overflow() {
+        let map = occupied_line(&[100, 100, 20], &[60, 20, 0]);
+        let source_a = Axial::new(0, 0);
+        let source_b = Axial::new(1, 0);
+        let target = Axial::new(2, 0);
+
+        let result = redistribution_targets_with_fallback_constraints(
+            &map,
+            1,
+            BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+            BTreeMap::from([(source_a, 45), (source_b, 0), (target, 0)]),
+            80,
+        )
+        .unwrap();
+
+        assert_eq!(result.targets[&target], 20);
+        assert!(result.targets[&source_a] >= 45);
+        assert_eq!(result.targets.values().sum::<u64>(), 80);
+    }
+
+    #[test]
+    fn fallback_constraints_reject_only_when_all_capacity_is_insufficient() {
+        let map = occupied_line(&[20, 20], &[20, 0]);
+        let source = Axial::new(0, 0);
+        let target = Axial::new(1, 0);
+
+        assert_eq!(
+            redistribution_targets_with_fallback_constraints(
+                &map,
+                1,
+                BTreeMap::from([(source, 0), (target, BALANCE_WEIGHT)]),
+                BTreeMap::from([(source, 0), (target, 0)]),
+                50,
+            ),
+            Err(DistributionError::InsufficientTargetCapacity { unassigned: 10 })
+        );
+    }
+
+    #[test]
+    fn fallback_constraints_exhaustively_preserve_strength_and_prefer_the_shape() {
+        let source_a = Axial::new(0, 0);
+        let source_b = Axial::new(1, 0);
+        let target = Axial::new(2, 0);
+        for strength_a in 0..=12 {
+            for strength_b in 0..=12 {
+                for target_capacity in 0..=30 {
+                    let total = strength_a + strength_b;
+                    let map = occupied_line(
+                        &[strength_a + 7, strength_b + 11, target_capacity],
+                        &[strength_a, strength_b, 0],
+                    );
+                    let result = redistribution_targets_with_fallback_constraints(
+                        &map,
+                        1,
+                        BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+                        BTreeMap::from([(source_a, 0), (source_b, 0), (target, 0)]),
+                        total,
+                    )
+                    .unwrap();
+
+                    assert_eq!(result.targets.values().sum::<u64>(), total);
+                    assert_eq!(result.targets[&target], total.min(target_capacity));
+                    assert!(result.targets[&source_a] <= strength_a);
+                    assert!(result.targets[&source_b] <= strength_b);
+                    assert_eq!(result.assigned, total);
+                    assert_eq!(result.unassigned, 0);
                 }
             }
         }

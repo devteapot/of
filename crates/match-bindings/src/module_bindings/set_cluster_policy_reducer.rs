@@ -4,64 +4,76 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+use super::cluster_policy_kind_type::ClusterPolicyKind;
+
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct IssuePerimeterLoadArgs {
+pub(super) struct SetClusterPolicyArgs {
     pub client_command_id: u64,
-    pub source_cells: Vec<u32>,
-    pub supersede_order_ids: Vec<u64>,
+    pub seed_cells: Vec<u32>,
+    pub kind: ClusterPolicyKind,
+    pub orientation_q: i32,
+    pub orientation_r: i32,
 }
 
-impl From<IssuePerimeterLoadArgs> for super::Reducer {
-    fn from(args: IssuePerimeterLoadArgs) -> Self {
-        Self::IssuePerimeterLoad {
+impl From<SetClusterPolicyArgs> for super::Reducer {
+    fn from(args: SetClusterPolicyArgs) -> Self {
+        Self::SetClusterPolicy {
             client_command_id: args.client_command_id,
-            source_cells: args.source_cells,
-            supersede_order_ids: args.supersede_order_ids,
+            seed_cells: args.seed_cells,
+            kind: args.kind,
+            orientation_q: args.orientation_q,
+            orientation_r: args.orientation_r,
         }
     }
 }
 
-impl __sdk::InModule for IssuePerimeterLoadArgs {
+impl __sdk::InModule for SetClusterPolicyArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `issue_perimeter_load`.
+/// Extension trait for access to the reducer `set_cluster_policy`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait issue_perimeter_load {
-    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible.
+pub trait set_cluster_policy {
+    /// Request that the remote module invoke the reducer `set_cluster_policy` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`issue_perimeter_load:issue_perimeter_load_then`] to run a callback after the reducer completes.
-    fn issue_perimeter_load(
+    /// /// Use [`set_cluster_policy:set_cluster_policy_then`] to run a callback after the reducer completes.
+    fn set_cluster_policy(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        supersede_order_ids: Vec<u64>,
+        seed_cells: Vec<u32>,
+        kind: ClusterPolicyKind,
+        orientation_q: i32,
+        orientation_r: i32,
     ) -> __sdk::Result<()> {
-        self.issue_perimeter_load_then(
+        self.set_cluster_policy_then(
             client_command_id,
-            source_cells,
-            supersede_order_ids,
+            seed_cells,
+            kind,
+            orientation_q,
+            orientation_r,
             |_, _| {},
         )
     }
 
-    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `set_cluster_policy` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn issue_perimeter_load_then(
+    fn set_cluster_policy_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        supersede_order_ids: Vec<u64>,
+        seed_cells: Vec<u32>,
+        kind: ClusterPolicyKind,
+        orientation_q: i32,
+        orientation_r: i32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -71,12 +83,14 @@ pub trait issue_perimeter_load {
     ) -> __sdk::Result<()>;
 }
 
-impl issue_perimeter_load for super::RemoteReducers {
-    fn issue_perimeter_load_then(
+impl set_cluster_policy for super::RemoteReducers {
+    fn set_cluster_policy_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        supersede_order_ids: Vec<u64>,
+        seed_cells: Vec<u32>,
+        kind: ClusterPolicyKind,
+        orientation_q: i32,
+        orientation_r: i32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -85,10 +99,12 @@ impl issue_perimeter_load for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            IssuePerimeterLoadArgs {
+            SetClusterPolicyArgs {
                 client_command_id,
-                source_cells,
-                supersede_order_ids,
+                seed_cells,
+                kind,
+                orientation_q,
+                orientation_r,
             },
             callback,
         )

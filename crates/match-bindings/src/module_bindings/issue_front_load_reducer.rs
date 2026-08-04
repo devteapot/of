@@ -11,7 +11,6 @@ pub(super) struct IssueFrontLoadArgs {
     pub source_cells: Vec<u32>,
     pub orientation_q: i32,
     pub orientation_r: i32,
-    pub amount_bps: u32,
     pub supersede_order_ids: Vec<u64>,
 }
 
@@ -22,7 +21,6 @@ impl From<IssueFrontLoadArgs> for super::Reducer {
             source_cells: args.source_cells,
             orientation_q: args.orientation_q,
             orientation_r: args.orientation_r,
-            amount_bps: args.amount_bps,
             supersede_order_ids: args.supersede_order_ids,
         }
     }
@@ -49,7 +47,6 @@ pub trait issue_front_load {
         source_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
     ) -> __sdk::Result<()> {
         self.issue_front_load_then(
@@ -57,7 +54,6 @@ pub trait issue_front_load {
             source_cells,
             orientation_q,
             orientation_r,
-            amount_bps,
             supersede_order_ids,
             |_, _| {},
         )
@@ -75,7 +71,6 @@ pub trait issue_front_load {
         source_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
@@ -93,7 +88,6 @@ impl issue_front_load for super::RemoteReducers {
         source_cells: Vec<u32>,
         orientation_q: i32,
         orientation_r: i32,
-        amount_bps: u32,
         supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
@@ -108,7 +102,6 @@ impl issue_front_load for super::RemoteReducers {
                 source_cells,
                 orientation_q,
                 orientation_r,
-                amount_bps,
                 supersede_order_ids,
             },
             callback,

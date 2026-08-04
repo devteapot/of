@@ -56,8 +56,11 @@ pub enum OrderKind {
     FrontLoad,
     CoreLoad,
     PerimeterLoad,
+    Reshape,
     PushFront,
     ExpandAll,
+    ExpandClusters,
+    AttackClusters,
 }
 
 #[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +74,19 @@ pub enum OrderStatus {
 pub enum ReceiptStatus {
     Accepted,
     Rejected,
+}
+
+/// Persistent distribution behavior for one owned traversable cluster.
+///
+/// Assignments are stored per cell so splits inherit their previous behavior
+/// without manufacturing a new cluster identity. When components merge, the
+/// assignment with the newest explicit revision wins for the whole component.
+#[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterPolicyKind {
+    Balanced,
+    Center,
+    Perimeter,
+    Directional,
 }
 
 #[derive(Clone)]
@@ -128,6 +144,8 @@ pub struct MatchState {
     pub player_one_controlled: u64,
     pub player_two_controlled: u64,
     pub winner_player_id: u8,
+    /// Monotonic authority-owned revision for explicit cluster-policy changes.
+    pub latest_cluster_policy_revision: u64,
     pub started_at_us: u64,
     pub completed_at_us: u64,
 }
@@ -177,6 +195,28 @@ pub struct CellState {
     pub last_changed_step: u64,
 }
 
+/// Policy lineage attached to one owned cell.
+///
+/// This table deliberately does not identify a cluster directly: connected
+/// components are derived from current ownership and terrain. Per-cell lineage
+/// makes a split free, while `revision` gives merges a deterministic winner.
+#[derive(Clone)]
+#[spacetimedb::table(
+    accessor = cluster_policy_assignment,
+    public,
+    index(accessor = policy_by_owner, btree(columns = [owner_player_id]))
+)]
+pub struct ClusterPolicyAssignment {
+    #[primary_key]
+    pub cell_id: u32,
+    pub owner_player_id: u8,
+    pub kind: ClusterPolicyKind,
+    /// Exact fixed-point axial facing used only by `Directional`.
+    pub orientation_q: i32,
+    pub orientation_r: i32,
+    pub revision: u64,
+}
+
 #[derive(Clone)]
 #[spacetimedb::table(
     accessor = command_receipt,
@@ -213,9 +253,8 @@ pub struct TransferOrder {
     pub requested_infantry: u64,
     pub committed_infantry: u64,
     pub in_transit_infantry: u64,
-    /// Surviving strength released from this order. For sustained operations
-    /// this includes occupation garrisons, endpoints, and release-in-place
-    /// when a branch stops or the player cancels it.
+    /// Surviving strength released from this order, including occupation
+    /// garrisons, endpoints, and release-in-place when cancelled.
     pub delivered_infantry: u64,
     pub casualty_infantry: u64,
     pub orientation_q: i32,
@@ -237,6 +276,22 @@ pub struct TransferSource {
     pub cell_id: u32,
     pub committed_infantry: u64,
     pub queued_infantry: u64,
+}
+
+/// A selected trailing-edge cell which may be relinquished after a friendly
+/// Push has completed its one-hex retreat. This is private command topology:
+/// clients derive the same forecast from selection geometry, while authority
+/// rechecks the physical cell before changing ownership.
+#[derive(Clone)]
+#[spacetimedb::table(
+    accessor = retreat_abandonment,
+    index(accessor = abandonment_by_order, btree(columns = [order_id]))
+)]
+pub struct RetreatAbandonment {
+    #[primary_key]
+    pub abandonment_key: String,
+    pub order_id: u64,
+    pub cell_id: u32,
 }
 
 #[derive(Clone)]
@@ -281,12 +336,12 @@ pub struct TransitPacket {
     pub updated_step: u64,
 }
 
-/// Compact private topology for one branching Expand All operation.
+/// Compact private topology for one branching neutral or cluster-attack wave.
 ///
 /// `selected_cells` and `seed_depths` are parallel sorted vectors. A seed
 /// depth of zero marks the selected perimeter; larger values flow toward zero.
 /// `outside_depths[cell_id]` is the static multi-source BFS distance from the
-/// first neutral ring, starting at one, or `u16::MAX` when unreachable.
+/// first destination ring, starting at one, or `u16::MAX` when unreachable.
 #[derive(Clone)]
 #[spacetimedb::table(accessor = expansion_wave)]
 pub struct ExpansionWave {
@@ -297,6 +352,12 @@ pub struct ExpansionWave {
     pub outside_depths: Vec<u16>,
     /// Per-cell rotating remainder cursor for unbiased asynchronous splits.
     pub split_cursors: Vec<u8>,
+    /// Optional neutral click objective. Branch weights are 3/2/1 according
+    /// to whether a child moves closer/equally/farther from this cell.
+    pub focus_cell_id: Option<u32>,
+    /// Immutable sorted enemy footprint for `AttackClusters`. Empty for both
+    /// neutral expansion variants. Attack branches may never leave this mask.
+    pub target_cells: Vec<u32>,
 }
 
 /// Sparse unpaid occupation garrison created by an Expand All capture.

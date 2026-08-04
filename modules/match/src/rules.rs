@@ -14,7 +14,9 @@ use crate::schema::{
 };
 
 pub const BASIS_POINTS: u64 = 10_000;
-pub const MAX_SELECTION_CELLS: usize = 4_096;
+/// V1 exact-payload ceiling. This covers Select All on the largest current map
+/// preset (21,484 capturable cells) while retaining a bounded reducer input.
+pub const MAX_SELECTION_CELLS: usize = 32_768;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EdgeRuntimeLimits {

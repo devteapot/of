@@ -12,6 +12,8 @@ pub struct ExpansionWave {
     pub seed_depths: Vec<u16>,
     pub outside_depths: Vec<u16>,
     pub split_cursors: Vec<u8>,
+    pub focus_cell_id: Option<u32>,
+    pub target_cells: Vec<u32>,
 }
 
 impl __sdk::InModule for ExpansionWave {
@@ -27,6 +29,8 @@ pub struct ExpansionWaveCols {
     pub seed_depths: __sdk::__query_builder::Col<ExpansionWave, Vec<u16>>,
     pub outside_depths: __sdk::__query_builder::Col<ExpansionWave, Vec<u16>>,
     pub split_cursors: __sdk::__query_builder::Col<ExpansionWave, Vec<u8>>,
+    pub focus_cell_id: __sdk::__query_builder::Col<ExpansionWave, Option<u32>>,
+    pub target_cells: __sdk::__query_builder::Col<ExpansionWave, Vec<u32>>,
 }
 
 impl __sdk::__query_builder::HasCols for ExpansionWave {
@@ -38,6 +42,8 @@ impl __sdk::__query_builder::HasCols for ExpansionWave {
             seed_depths: __sdk::__query_builder::Col::new(table_name, "seed_depths"),
             outside_depths: __sdk::__query_builder::Col::new(table_name, "outside_depths"),
             split_cursors: __sdk::__query_builder::Col::new(table_name, "split_cursors"),
+            focus_cell_id: __sdk::__query_builder::Col::new(table_name, "focus_cell_id"),
+            target_cells: __sdk::__query_builder::Col::new(table_name, "target_cells"),
         }
     }
 }

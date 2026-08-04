@@ -1,17 +1,16 @@
 use bevy::{
     picking::hover::Hovered,
     prelude::*,
-    ui::{Pressed, UiRect},
+    ui::UiRect,
     ui_widgets::{
-        Activate, Button, Slider, SliderDragState, SliderRange, SliderThumb, SliderValue,
-        TrackClick, ValueChange,
+        Slider, SliderDragState, SliderRange, SliderThumb, SliderValue, TrackClick, ValueChange,
     },
 };
 
 use crate::{
-    interaction::{InteractionState, OrderMode, UiAction},
+    interaction::{InteractionState, OrderMode},
     map_view::map_view_status_bundle,
-    model::{MatchView, ToastKind},
+    model::{ClusterPolicy, MatchView, ToastKind},
     network::{ClientIntent, NetworkSet},
 };
 
@@ -22,6 +21,23 @@ const TEXT: Color = Color::srgb(0.88, 0.93, 0.95);
 const MUTED: Color = Color::srgb(0.57, 0.68, 0.72);
 const CYAN: Color = Color::srgb(0.40, 0.87, 0.91);
 const CORAL: Color = Color::srgb(1.0, 0.40, 0.32);
+
+const FIELD_MANUAL: &str = concat!(
+    "CLUSTER SELECTION\n",
+    "C selects the complete owned traversable cluster under the cursor. Shift+C adds; Control+C removes; Control/Command+A selects all owned clusters. Empty owned cells connect a cluster, while blocked terrain and cliffs split it. Escape clears an idle selection.\n\n",
+    "LMB NEUTRAL  EXPAND CLUSTERS\n",
+    "Click unclaimed passable ground to dispatch the selected Share from every eligible selected perimeter. Expansion still pressures all sides; branches closer/equal/farther from the click receive 3/2/1 weight. Repeat the exact click while it is in flight to layer another independent command: each Share is computed from the action-available troops remaining after earlier commands. [ / ] changes Share.\n\n",
+    "LMB ENEMY  ATTACK CLUSTERS\n",
+    "Click an enemy cluster to attack every shared front. Shift+LMB stages/toggles several complete enemy clusters, Control+LMB removes one, and plain LMB or Enter dispatches the union once. Repeat the exact plain click while it is in flight to layer another independent Share from the remaining action-available troops. The wave turns and branches as fronts change but never leaves the selected enemy mask.\n\n",
+    "R / F  PERSISTENT POLICY\n",
+    "R cycles Balanced, Perimeter, and Center on every selected cluster. Hold F, drag toward a facing, and release for Directional. Policy uses only free troops: live action packets are excluded from its targets but still consume capacity. Policy follows captures/splits; the newest explicit policy wins a merge. Share is ignored.\n\n",
+    "T  RESHAPE ONE CLUSTER\n",
+    "Select exactly one cluster, press T, and draw its desired owned troop footprint. [ / ] grows a symmetric ring; Shift+[ / ] changes width and Control+[ / ] changes height. The full unavailable/off-world brush remains visible. Reshape uses all free troops, fills the drawing best-effort, and leaves conserved overflow outside when it cannot fit. Release previews; LMB/Enter applies; T redraws.\n\n",
+    "X  STOP\n",
+    "X snapshots live orders intersecting the selected clusters. LMB/Enter stops only that exact snapshot. Selecting a cluster never retasks or cancels its active troops.\n\n",
+    "MAP / CAMERA\n",
+    "1 overview · 2 soldiers · 3 civilians · V cycle. MMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame. Bottom slider or M+Arrows changes future recruitment. ? closes this guide.",
+);
 
 #[derive(Component)]
 struct TopStatus;
@@ -45,7 +61,60 @@ struct MobilizationSlider;
 struct MobilizationThumb;
 
 #[derive(Component)]
-struct HudActionButton(UiAction);
+struct CommandContextTitle;
+#[derive(Component)]
+struct CommandContextSummary;
+#[derive(Component)]
+struct CommandKeyHints;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormationChoice {
+    Center,
+    Balanced,
+    Perimeter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadyCommand {
+    Push,
+    ContactPush,
+    Expand,
+    DirectionBias,
+}
+
+/// Small UI-facing projection of the reducer state. Keeping this mapper pure
+/// makes the command strip straightforward to adapt as order modes converge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HudContext {
+    Idle,
+    AttackTargets,
+    Formation(FormationChoice),
+    Orient,
+    Ready(ReadyCommand),
+    ReshapeDrawing,
+    ReshapeReady,
+    Stop,
+    Submitting,
+}
+
+fn hud_context(mode: &OrderMode) -> HudContext {
+    match mode {
+        OrderMode::Idle => HudContext::Idle,
+        OrderMode::AttackClustersPreview => HudContext::AttackTargets,
+        OrderMode::PushFrontOrient { .. } | OrderMode::FrontLoadOrient { .. } => HudContext::Orient,
+        OrderMode::PushFrontPreview { .. } => HudContext::Ready(ReadyCommand::Push),
+        OrderMode::PushFrontArcPreview => HudContext::Ready(ReadyCommand::ContactPush),
+        OrderMode::ExpandAllPreview => HudContext::Ready(ReadyCommand::Expand),
+        OrderMode::BalancePreview => HudContext::Formation(FormationChoice::Balanced),
+        OrderMode::FrontLoadPreview { .. } => HudContext::Ready(ReadyCommand::DirectionBias),
+        OrderMode::CoreLoadPreview => HudContext::Formation(FormationChoice::Center),
+        OrderMode::PerimeterLoadPreview => HudContext::Formation(FormationChoice::Perimeter),
+        OrderMode::ReshapeDrawing => HudContext::ReshapeDrawing,
+        OrderMode::ReshapePreview => HudContext::ReshapeReady,
+        OrderMode::StopPreview { .. } => HudContext::Stop,
+        OrderMode::Submitting { .. } => HudContext::Submitting,
+    }
+}
 
 #[derive(Default)]
 struct SelectionTotalsCache {
@@ -61,14 +130,13 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(on_hud_action)
-            .add_observer(on_mobilization_change)
+        app.add_observer(on_mobilization_change)
             .add_systems(Startup, spawn_hud)
             .add_systems(
                 Update,
                 (
                     update_hud.after(NetworkSet::Apply),
-                    update_button_style,
+                    update_command_bar.after(update_hud),
                     update_slider_visuals.after(update_hud),
                 ),
             );
@@ -91,8 +159,8 @@ fn spawn_hud(mut commands: Commands, view: Res<MatchView>) {
         .with_children(|root| {
             spawn_top_bar(root);
             spawn_right_panel(root);
+            spawn_command_bar(root);
             spawn_bottom_bar(root, view.mobilization_target);
-            spawn_onboarding(root);
             spawn_toast(root);
             spawn_help(root);
         });
@@ -118,7 +186,7 @@ fn spawn_top_bar(root: &mut ChildSpawnerCommands) {
     .with_children(|bar| {
         bar.spawn((
             TopStatus,
-            Text::new("Loading match state…"),
+            Text::new("Loading match state..."),
             TextFont::from_font_size(13.0),
             TextColor(TEXT),
             Pickable::IGNORE,
@@ -128,25 +196,23 @@ fn spawn_top_bar(root: &mut ChildSpawnerCommands) {
 
 fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
     root.spawn((
-        Name::new("Tactical control panel"),
+        Name::new("Compact tactical summary"),
         Node {
             position_type: PositionType::Absolute,
             right: px(14),
             top: px(70),
-            bottom: px(94),
-            width: px(326),
-            padding: UiRect::all(px(15)),
+            width: px(286),
+            padding: UiRect::all(px(12)),
             border: UiRect::all(px(1)),
             flex_direction: FlexDirection::Column,
-            row_gap: px(10),
-            overflow: Overflow::clip_y(),
+            row_gap: px(8),
             ..default()
         },
         BackgroundColor(PANEL),
         BorderColor::all(LINE),
     ))
     .with_children(|panel| {
-        panel.spawn(section_title("TACTICAL CONTROL  //  AUTHORITY"));
+        panel.spawn(section_title("TACTICAL SUMMARY"));
         panel.spawn(map_view_status_bundle());
         panel.spawn(divider());
         panel.spawn((
@@ -159,54 +225,73 @@ fn spawn_right_panel(root: &mut ChildSpawnerCommands) {
         panel.spawn(divider());
         panel.spawn((
             OrderText,
-            Text::new("ORDER\nPaint an owned region to begin"),
+            Text::new("ORDER\nC selects a cluster · LMB issues contextual orders"),
             TextFont::from_font_size(12.5),
             TextColor(TEXT),
             Pickable::IGNORE,
         ));
-        panel
-            .spawn(Node {
-                width: percent(100),
-                flex_direction: FlexDirection::Row,
-                column_gap: px(6),
-                flex_wrap: FlexWrap::Wrap,
-                row_gap: px(6),
+    });
+}
+
+fn spawn_command_bar(root: &mut ChildSpawnerCommands) {
+    root.spawn((
+        Name::new("Compact contextual key hints"),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(14),
+            right: px(14),
+            bottom: px(91),
+            height: px(52),
+            padding: UiRect::axes(px(12), px(7)),
+            border: UiRect::all(px(1)),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(12),
+            ..default()
+        },
+        BackgroundColor(PANEL),
+        BorderColor::all(LINE),
+    ))
+    .with_children(|bar| {
+        bar.spawn((
+            Node {
+                width: px(220),
+                flex_shrink: 0.0,
+                flex_direction: FlexDirection::Column,
+                row_gap: px(2),
                 ..default()
-            })
-            .with_children(|buttons| {
-                spawn_button(buttons, "P  PUSH FRONT", UiAction::PushFront, false);
-                spawn_button(buttons, "SHIFT+P  EXPAND ALL", UiAction::ExpandAll, false);
-                spawn_button(buttons, "B  BALANCE", UiAction::Balance, false);
-                spawn_button(buttons, "F  FRONT-LOAD", UiAction::FrontLoad, false);
-                spawn_button(buttons, "G  CORE-LOAD", UiAction::CoreLoad, false);
-                spawn_button(
-                    buttons,
-                    "R  PERIMETER-LOAD",
-                    UiAction::PerimeterLoad,
-                    false,
-                );
-                spawn_button(buttons, "X  STOP MATCHING", UiAction::CancelPush, false);
-                spawn_button(buttons, "[  SHARE −10%", UiAction::AmountDown, true);
-                spawn_button(buttons, "]  SHARE +10%", UiAction::AmountUp, true);
-            });
-        panel.spawn(divider());
-        panel
-            .spawn(Node {
-                width: percent(100),
-                flex_direction: FlexDirection::Row,
-                column_gap: px(7),
-                ..default()
-            })
-            .with_children(|buttons| {
-                spawn_button(buttons, "ENTER  CONFIRM", UiAction::Confirm, false);
-                spawn_button(buttons, "ESC  CANCEL", UiAction::Cancel, false);
-            });
-        panel.spawn((
+            },
+            Pickable::IGNORE,
+        ))
+        .with_children(|context| {
+            context.spawn((
+                CommandContextTitle,
+                Text::new("SELECTION  //  EMPTY"),
+                TextFont::from_font_size(10.5),
+                TextColor(CYAN),
+                Pickable::IGNORE,
+            ));
+            context.spawn((
+                CommandContextSummary,
+                Text::new("LMB neutral expand  ·  LMB enemy attack  ·  ? manual"),
+                TextFont::from_font_size(9.5),
+                TextColor(MUTED),
+                Pickable::IGNORE,
+            ));
+        });
+
+        bar.spawn((
+            CommandKeyHints,
             Text::new(
-                "MAP KEY\nouter perimeter     selected source region\nmagenta dashes      retask handle\ncyan dashes         derived packet sources\namber rings         expansion wave\nred edge            attack front\nmixed player fill   contested pressure\n× marker            blocked\nopposing chevrons   combat",
+                "C cluster  ·  Shift/Ctrl+C multi  ·  Ctrl+A all  ·  [ / ] Share  ·  R policy  ·  F facing  ·  T reshape  ·  X stop",
             ),
-            TextFont::from_font_size(10.5),
-            TextColor(MUTED),
+            TextFont::from_font_size(10.0),
+            TextColor(TEXT),
+            Node {
+                flex_grow: 1.0,
+                min_width: px(0),
+                ..default()
+            },
             Pickable::IGNORE,
         ));
     });
@@ -250,7 +335,7 @@ fn spawn_bottom_bar(root: &mut ChildSpawnerCommands, mobilization: f32) {
                 Pickable::IGNORE,
             ));
             group.spawn((
-                Text::new("future recruitment · existing soldiers remain mobilized"),
+                Text::new("future recruitment / existing soldiers remain mobilized"),
                 TextFont::from_font_size(10.0),
                 TextColor(MUTED),
                 Pickable::IGNORE,
@@ -333,31 +418,6 @@ fn spawn_bottom_bar(root: &mut ChildSpawnerCommands, mobilization: f32) {
     });
 }
 
-fn spawn_onboarding(root: &mut ChildSpawnerCommands) {
-    root.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            left: percent(50),
-            bottom: px(91),
-            padding: UiRect::axes(px(12), px(6)),
-            ..default()
-        },
-        UiTransform::from_translation(Val2::percent(-50.0, 0.0)),
-        BackgroundColor(PANEL_SOFT),
-        Pickable::IGNORE,
-    ))
-    .with_children(|hint| {
-        hint.spawn((
-            Text::new(
-                "LMB paint  ·  [ / ] brush  ·  C cluster  ·  Ctrl/Cmd+A all  ·  P push  ·  Shift+P expand all  ·  B/F/G/R redistribute  ·  ? help",
-            ),
-            TextFont::from_font_size(11.0),
-            TextColor(MUTED),
-            Pickable::IGNORE,
-        ));
-    });
-}
-
 fn spawn_toast(root: &mut ChildSpawnerCommands) {
     root.spawn((
         ToastRoot,
@@ -365,7 +425,7 @@ fn spawn_toast(root: &mut ChildSpawnerCommands) {
             display: Display::None,
             position_type: PositionType::Absolute,
             left: percent(50),
-            bottom: px(145),
+            bottom: px(155),
             padding: UiRect::axes(px(17), px(9)),
             border: UiRect::all(px(1)),
             ..default()
@@ -392,13 +452,13 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
         Node {
             display: Display::None,
             position_type: PositionType::Absolute,
-            left: px(72),
-            top: px(82),
-            width: px(450),
-            padding: UiRect::all(px(19)),
+            left: px(56),
+            top: px(74),
+            width: px(760),
+            padding: UiRect::all(px(14)),
             border: UiRect::all(px(1)),
             flex_direction: FlexDirection::Column,
-            row_gap: px(8),
+            row_gap: px(6),
             ..default()
         },
         GlobalZIndex(40),
@@ -408,10 +468,8 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
     .with_children(|help| {
         help.spawn(section_title("FIELD MANUAL  //  ? TO CLOSE"));
         help.spawn((
-            Text::new(
-                "SELECT\nLMB drag paints owned source hexes and magenta enemy contested retask handles. A handle snapshots the exact local orders currently pressing that cell; cyan dashes show those orders' derived current packet sources. Shift adds; Control subtracts. In source mode, [ / ] removes or adds one complete hex ring around the brush, Shift+[ / ] changes width, and Control+[ / ] changes height. C selects the connected owned cluster under the cursor; Shift adds it and Control removes it. Ctrl/Cmd+A selects all owned hexes and clears retask handles.\n\nPUSH FRONTS\nThe outward-facing selected cells form the front; connected selected cells behind them are its reinforcement corridor. A blocked gap may split the boundary into multiple active arcs; each arc is fed independently from the connected selection. Hold P, drag outward, and release to choose one of six directions; Enter starts a sustained directional push. Shift+P instead treats the connected selection as one seed and previews a perimeter wave. Central strength branches through selected neighbors, merges at shared boundary cells, and then advances through successive one-cell offset rings. It stops rather than attacking enemy territory. Plain [ / ] changes the share requested from each effective source. The estimate includes selected retasked troops but protects unrelated active allocations. Enter atomically replaces the snapshotted orders if they are still active. X is a legacy stop command matched from ordinary owned sources; retask handles are intentionally ignored.\n\nMAP VIEWS\n1 shows ownership overview, 2 shows absolute soldier strength, and 3 shows civilians. V cycles views. Exact values appear when the camera is close enough to read them; Civilians also outlines populated clusters. Contested cells mix both player colors by relative force.\n\nREDISTRIBUTE\nB balances density, F orients front-load, G loads toward the selection core, and R loads toward its perimeter. Plain [ / ] changes how much of every effective source stack participates; Enter confirms or atomically retasks selected orders. Pale nested outlines show the ideal estimated target density. Unrelated incoming redistribution reservations remain protected, so authority may reduce a destination below the heatmap to prevent overbooking.\n\nCAMERA\nMMB or Space+LMB pan · WASD pan · Q/E rotate · wheel zoom · Home frame.\n\nDIAGNOSTICS\nF3 toggles the performance overlay. It reports FPS, frame time, entity and gameplay counts.\n\nMOBILIZATION\nUse the bottom slider or M + arrows. Mobilization is the future recruitment/conversion target; it is separate from the order dispatch share. Lowering it does not demobilize existing soldiers.",
-            ),
-            TextFont::from_font_size(12.0),
+            Text::new(FIELD_MANUAL),
+            TextFont::from_font_size(9.5),
             TextColor(TEXT),
             Pickable::IGNORE,
         ));
@@ -439,50 +497,6 @@ fn divider() -> impl Bundle {
     )
 }
 
-fn spawn_button(
-    parent: &mut ChildSpawnerCommands,
-    label: &'static str,
-    action: UiAction,
-    compact: bool,
-) {
-    parent
-        .spawn((
-            HudActionButton(action),
-            Button,
-            Hovered::default(),
-            Node {
-                min_width: if compact { px(70) } else { px(132) },
-                height: px(31),
-                padding: UiRect::axes(px(9), px(0)),
-                border: UiRect::all(px(1)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                flex_grow: f32::from(!compact),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.08, 0.12, 0.14)),
-            BorderColor::all(LINE),
-        ))
-        .with_children(|button| {
-            button.spawn((
-                Text::new(label),
-                TextFont::from_font_size(10.0),
-                TextColor(TEXT),
-                Pickable::IGNORE,
-            ));
-        });
-}
-
-fn on_hud_action(
-    activate: On<Activate>,
-    buttons: Query<&HudActionButton>,
-    mut actions: MessageWriter<UiAction>,
-) {
-    if let Ok(action) = buttons.get(activate.event_target()) {
-        actions.write(action.0);
-    }
-}
-
 fn on_mobilization_change(
     change: On<ValueChange<f32>>,
     sliders: Query<(), With<MobilizationSlider>>,
@@ -492,6 +506,230 @@ fn on_mobilization_change(
         intents.write(ClientIntent::SetMobilization {
             target: change.value.clamp(0.0, 1.0),
         });
+    }
+}
+
+fn update_command_bar(
+    interaction: Res<InteractionState>,
+    mut copy: ParamSet<(
+        Single<&mut Text, With<CommandContextTitle>>,
+        Single<&mut Text, With<CommandContextSummary>>,
+        Single<&mut Text, With<CommandKeyHints>>,
+    )>,
+) {
+    let context = hud_context(&interaction.mode);
+    let (title, summary, hints) = command_bar_copy(&interaction, context);
+    set_text(&mut copy.p0(), title);
+    set_text(&mut copy.p1(), summary);
+    set_text(&mut copy.p2(), hints);
+}
+
+fn command_bar_copy(
+    interaction: &InteractionState,
+    context: HudContext,
+) -> (String, String, String) {
+    let invalid = interaction.preview.invalid_reason;
+    let contextual_status =
+        interaction
+            .contextual_in_flight_label()
+            .map_or_else(String::new, |label| {
+                format!(
+                    "  ·  {} {} IN FLIGHT  ·  REPEAT SAME CLICK TO LAYER",
+                    interaction.contextual_in_flight_count(),
+                    label,
+                )
+            });
+    let projection = |include_share: bool| {
+        if let Some(reason) = invalid {
+            format!("INVALID  //  {reason}")
+        } else if include_share {
+            format!(
+                "SHARE {:>3}%  ·  {:>5} INF  ·  {} OUT  ·  ETA ~{}s",
+                interaction.amount_percent,
+                interaction.preview.strength_upper_bound,
+                interaction.preview.excluded.len(),
+                interaction.preview.eta_seconds,
+            )
+        } else {
+            format!(
+                "WHOLE SELECTION  ·  {:>5} INF  ·  {} OUT  ·  ETA ~{}s",
+                interaction.preview.strength_upper_bound,
+                interaction.preview.excluded.len(),
+                interaction.preview.eta_seconds,
+            )
+        }
+    };
+    match context {
+        HudContext::Idle => (
+            format!(
+                "SELECTED CLUSTERS  //  {} CELL{}",
+                interaction.sources.len(),
+                plural(interaction.sources.len())
+            ),
+            format!(
+                "SHARE {:>3}%  ·  LMB neutral expand  ·  LMB enemy attack{contextual_status}  ·  ? manual",
+                interaction.amount_percent,
+            ),
+            "C cluster  ·  Shift/Ctrl+C multi  ·  Ctrl+A all  ·  [ / ] Share  ·  R policy  ·  F facing  ·  T reshape  ·  X stop".to_owned(),
+        ),
+        HudContext::AttackTargets => (
+            "ATTACK CLUSTERS  //  TARGETS".to_owned(),
+            format!(
+                "{} TARGET HEX{}  ·  SHARE {:>3}%{contextual_status}",
+                interaction.attack_targets.len(),
+                plural(interaction.attack_targets.len()),
+                interaction.amount_percent,
+            ),
+            "Shift+LMB toggle cluster  ·  Ctrl+LMB remove  ·  [ / ] Share  ·  LMB/Enter dispatch union  ·  Esc cancel".to_owned(),
+        ),
+        HudContext::Formation(choice) => (
+            format!(
+                "CLUSTER POLICY  //  {}",
+                match choice {
+                    FormationChoice::Center => "CENTER",
+                    FormationChoice::Balanced => "BALANCED",
+                    FormationChoice::Perimeter => "PERIMETER",
+                }
+            ),
+            "FREE TROOPS ONLY  ·  ACTIVE ACTION TROOPS EXCLUDED".to_owned(),
+            "R cycles Balanced / Perimeter / Center  ·  F sets facing  ·  Share ignored".to_owned(),
+        ),
+        HudContext::Orient => {
+            let direction = match interaction.mode {
+                OrderMode::PushFrontOrient { .. } => interaction.push_direction(),
+                OrderMode::FrontLoadOrient { .. } => interaction.frontload_orientation(),
+                _ => None,
+            };
+            (
+                if matches!(interaction.mode, OrderMode::PushFrontOrient { .. }) {
+                    "PUSH  //  CHOOSE DIRECTION".to_owned()
+                } else {
+                    "DIRECTIONAL POLICY  //  CHOOSE FACING".to_owned()
+                },
+                direction.map_or_else(
+                    || {
+                        if matches!(interaction.mode, OrderMode::PushFrontOrient { .. }) {
+                            format!(
+                                "SHARE {:>3}%  ·  tap for contacts or point for direction",
+                                interaction.amount_percent
+                            )
+                        } else {
+                            "FREE TROOPS ONLY  ·  point on map".to_owned()
+                        }
+                    },
+                    |direction| {
+                        if matches!(interaction.mode, OrderMode::PushFrontOrient { .. }) {
+                            format!(
+                                "HEX {:+},{:+}  ·  SHARE {:>3}%",
+                                direction.q, direction.r, interaction.amount_percent
+                            )
+                        } else {
+                            format!("FACING {:+},{:+}  ·  FREE TROOPS ONLY", direction.q, direction.r)
+                        }
+                    },
+                ),
+                if matches!(interaction.mode, OrderMode::PushFrontOrient { .. }) {
+                    "Tap P contact arcs  ·  hold+point global  ·  [ / ] share  ·  Alt+release cast".to_owned()
+                } else {
+                    "Hold F + drag  ·  release applies policy  ·  Esc cancels".to_owned()
+                },
+            )
+        }
+        HudContext::Ready(command) => (
+            format!(
+                "{}  //  READY",
+                match command {
+                    ReadyCommand::Push => "PUSH",
+                    ReadyCommand::ContactPush => "CONTACT FRONTS",
+                    ReadyCommand::Expand => "EXPAND PERIMETER",
+                    ReadyCommand::DirectionBias => "DIRECTIONAL POLICY",
+                }
+            ),
+            projection(matches!(
+                command,
+                ReadyCommand::Push | ReadyCommand::ContactPush | ReadyCommand::Expand
+            )),
+            if matches!(
+                command,
+                ReadyCommand::Push | ReadyCommand::ContactPush | ReadyCommand::Expand
+            ) {
+                "[ / ] share  ·  LMB/Enter dispatch  ·  Esc back".to_owned()
+            } else {
+                "Apply to free troops only  ·  active action troops stay allocated  ·  Esc back".to_owned()
+            },
+        ),
+        HudContext::ReshapeDrawing => (
+            "RESHAPE  //  DRAW".to_owned(),
+            format!(
+                "{} DESTINATION HEX{}  ·  BRUSH {}x{}+{}  ·  FREE TROOPS  ·  ONE CLUSTER",
+                interaction.shape_targets.len(),
+                plural(interaction.shape_targets.len()),
+                interaction.brush.width(),
+                interaction.brush.height(),
+                interaction.brush.rings(),
+            ),
+            "LMB draw  ·  [ / ] ring  ·  Shift+[ / ] width  ·  Ctrl+[ / ] height  ·  release previews".to_owned(),
+        ),
+        HudContext::ReshapeReady => (
+            "RESHAPE  //  READY".to_owned(),
+            if let Some(reason) = invalid {
+                format!("INVALID  //  {reason}")
+            } else if interaction.preview.reshape_outside_strength > 0 {
+                format!(
+                    "FIT {} / CAP {}  ·  {} STAY OUTSIDE  ·  BEST EFFORT",
+                    interaction.preview.reshape_destination_strength,
+                    interaction.preview.destination_capacity,
+                    interaction.preview.reshape_outside_strength,
+                )
+            } else {
+                format!(
+                    "{} DESTINATION HEX{}  ·  FIT {} / CAP {}  ·  EXACT",
+                    interaction.shape_targets.len(),
+                    plural(interaction.shape_targets.len()),
+                    interaction.preview.reshape_destination_strength,
+                    interaction.preview.destination_capacity,
+                )
+            },
+            "T redraw  ·  LMB/Enter apply  ·  Esc back".to_owned(),
+        ),
+        HudContext::Stop => {
+            let count = match &interaction.mode {
+                OrderMode::StopPreview { order_ids } => order_ids.len(),
+                _ => 0,
+            };
+            (
+                "STOP  //  EXACT SNAPSHOT".to_owned(),
+                format!(
+                    "{count} exact order{} highlighted  ·  STOP affects only this snapshot",
+                    plural(count)
+                ),
+                "LMB/Enter stop highlighted orders  ·  Esc back".to_owned(),
+            )
+        }
+        HudContext::Submitting => (
+            "SUBMITTING COMMAND".to_owned(),
+            "WAITING FOR AUTHORITY  ·  troop controls locked".to_owned(),
+            "The selection and pending command remain stable until the response arrives".to_owned(),
+        ),
+    }
+}
+
+fn selected_policy_label(view: &MatchView, interaction: &InteractionState) -> String {
+    let mut policies = interaction.sources.iter().filter_map(|coordinate| {
+        view.cluster_policy_at(*coordinate)
+            .map(|policy| (policy.kind, policy.orientation))
+    });
+    let Some(first) = policies.next() else {
+        return "NONE".to_owned();
+    };
+    if policies.any(|policy| policy != first) {
+        return "MIXED".to_owned();
+    }
+    match first {
+        (ClusterPolicy::Directional, orientation) => {
+            format!("DIRECTIONAL {:+},{:+}", orientation.q, orientation.r)
+        }
+        (kind, _) => kind.label().to_owned(),
     }
 }
 
@@ -522,7 +760,7 @@ fn update_hud(
         set_text(
             &mut top,
             format!(
-                "LOCAL P{}  ·  AUTH {:<22}     ◆ P1 {:<15}     P1  {:>5.1}%     {}     P2  {:>5.1}%     ◇ P2 {:<15}",
+                "LOCAL P{}  /  AUTH {:<22}     P1 {:<15}     P1  {:>5.1}%     {}     P2  {:>5.1}%     P2 {:<15}",
                 view.local_player,
                 view.authority.label(),
                 view.connection[0].label(),
@@ -543,7 +781,7 @@ fn update_hud(
                 String::new,
                 |contest| {
                     format!(
-                        "\nCONTEST P{} {:>4}  ·  SHARE {:>3.0}%  ·  TOTAL {:>4}",
+                        "\nCONTEST P{} {:>4}  /  SHARE {:>3.0}%  /  TOTAL {:>4}",
                         contest.attacker_player,
                         contest.attacker_strength,
                         contest.attacker_share * 100.0,
@@ -552,7 +790,7 @@ fn update_hud(
                 },
             );
             format!(
-                "INSPECTOR\nHEX {:+03},{:+03}  ·  {:?}\nELEVATION {:02}  ·  OWNER {}\nCIVILIANS {:>4}  ·  CONTROL INF {:>4}\nCAPACITY {:>4}  ·  OCCUPANCY {:>3.0}%{}{}",
+                "INSPECTOR\nHEX {:+03},{:+03}  /  {:?}\nELEVATION {:02}  /  OWNER {}\nCIVILIANS {:>4}  /  CONTROL INF {:>4}\nCAPACITY {:>4}  /  OCCUPANCY {:>3.0}%{}{}",
                 coordinate.q,
                 coordinate.r,
                 cell.terrain,
@@ -562,7 +800,7 @@ fn update_hud(
                 cell.infantry,
                 cell.military_capacity,
                 cell.density() * 100.0,
-                if cell.blocked { "  ·  × BLOCKED" } else { "" },
+                if cell.blocked { "  /  X BLOCKED" } else { "" },
                 contest,
             )
         })
@@ -592,146 +830,83 @@ fn update_hud(
         selection_totals.initialized = true;
     }
     let (raw_strength, raw_capacity, civilians) = selection_totals.totals;
-    let (strength, capacity) =
-        if interaction.has_selection() && interaction.preview.projected_source_count > 0 {
-            (
-                interaction.preview.projected_strength,
-                interaction.preview.projected_capacity,
-            )
-        } else {
-            (raw_strength, raw_capacity)
-        };
-    let occupancy = if capacity == 0 {
+    let active_strength = interaction
+        .sources
+        .iter()
+        .map(|coordinate| {
+            let infantry = view.cell(*coordinate).map_or(0, |cell| cell.infantry);
+            view.retask_projection
+                .active_strength_by_cell
+                .get(coordinate)
+                .copied()
+                .unwrap_or(0)
+                .min(infantry)
+        })
+        .sum::<u64>();
+    let free_strength = raw_strength.saturating_sub(active_strength);
+    let occupancy = if raw_capacity == 0 {
         0.0
     } else {
-        strength as f32 * 100.0 / capacity as f32
+        raw_strength as f32 * 100.0 / raw_capacity as f32
     };
-    let bottleneck = interaction.preview.bottleneck.map_or_else(
-        || "none".to_owned(),
-        |(from, to)| format!("{},{} → {},{}", from.q, from.r, to.q, to.r),
+    let state_line = interaction.preview.invalid_reason.map_or_else(
+        || match interaction.mode {
+            OrderMode::Idle if interaction.contextual_in_flight_count() > 0 => format!(
+                "{} {} IN FLIGHT / REPEAT SAME CLICK TO LAYER",
+                interaction.contextual_in_flight_count(),
+                interaction
+                    .contextual_in_flight_label()
+                    .unwrap_or("COMMAND"),
+            ),
+            OrderMode::Idle => "LMB NEUTRAL EXPAND / ENEMY ATTACK".to_owned(),
+            OrderMode::AttackClustersPreview => "STAGE TARGET CLUSTERS OR DISPATCH".to_owned(),
+            OrderMode::FrontLoadOrient { .. } => {
+                "RELEASE SETS PERSISTENT DIRECTIONAL POLICY".to_owned()
+            }
+            OrderMode::ReshapeDrawing | OrderMode::ReshapePreview => {
+                "BEST-EFFORT SINGLE-CLUSTER TRANSITION".to_owned()
+            }
+            OrderMode::StopPreview { .. } => "STOP AFFECTS ONLY THIS SNAPSHOT".to_owned(),
+            OrderMode::Submitting { .. } => "WAITING FOR AUTHORITY".to_owned(),
+            _ => "READY FOR CONTEXTUAL COMMAND".to_owned(),
+        },
+        |reason| format!("INVALID / {reason}"),
     );
-    let mut context_hint = match interaction.mode {
-        OrderMode::Idle => format!(
-            "BRUSH {}x{} · RING {} · [/] perimeter · Shift width · Ctrl height",
-            interaction.brush.width(),
-            interaction.brush.height(),
-            interaction.brush.rings()
-        ),
-        OrderMode::PushFrontOrient { .. } => {
-            "Choose outward · release P or click map to quantize".to_owned()
-        }
-        OrderMode::PushFrontPreview { .. } => interaction.preview.invalid_reason.map_or_else(
-            || {
-                "UP TO excludes unrelated active allocations · Enter starts or retasks · X stops legacy source matches"
-                    .to_owned()
-            },
-            |reason| format!("INVALID · {reason}"),
-        ),
-        OrderMode::ExpandAllPreview => interaction.preview.invalid_reason.map_or_else(
-            || {
-                "Amber bands are branching/merging rings · unrelated active allocations stay protected · Enter starts or retasks"
-                    .to_owned()
-            },
-            |reason| format!("INVALID · {reason}"),
-        ),
-        OrderMode::BalancePreview => {
-            "Ideal target heatmap · unrelated incoming reservations may reduce authority targets"
-                .to_owned()
-        }
-        OrderMode::FrontLoadOrient { .. } => {
-            "Choose direction · release F or click map to preview".to_owned()
-        }
-        OrderMode::FrontLoadPreview { .. } => {
-            "Arrow shows orientation · ideal heatmap; authority preserves unrelated reservations"
-                .to_owned()
-        }
-        OrderMode::CoreLoadPreview => {
-            "Loads inward · ideal heatmap; authority preserves unrelated reservations".to_owned()
-        }
-        OrderMode::PerimeterLoadPreview => {
-            "Loads outward · ideal heatmap; authority preserves unrelated reservations".to_owned()
-        }
-        OrderMode::Submitting { .. } => "Waiting for authoritative response…".to_owned(),
-    };
-    if interaction.preview.retask_order_count > 0 {
-        context_hint = format!(
-            "RETASK {} HANDLE{} · {} ORDER{} · {} INF\n{}",
-            interaction.preview.retask_handle_count,
-            plural(interaction.preview.retask_handle_count),
-            interaction.preview.retask_order_count,
-            plural(interaction.preview.retask_order_count),
-            interaction.preview.retask_strength,
-            context_hint,
-        );
-    }
-    let percentage_label = match interaction.mode {
+    let policy = selected_policy_label(&view, &interaction);
+    let allocation = match interaction.mode {
         OrderMode::PushFrontOrient { .. }
         | OrderMode::PushFrontPreview { .. }
-        | OrderMode::ExpandAllPreview => "DISPATCH REQUEST",
+        | OrderMode::PushFrontArcPreview
+        | OrderMode::ExpandAllPreview
+        | OrderMode::AttackClustersPreview => {
+            format!("SHARE {:>3}%", interaction.amount_percent)
+        }
         OrderMode::BalancePreview
         | OrderMode::FrontLoadOrient { .. }
         | OrderMode::FrontLoadPreview { .. }
         | OrderMode::CoreLoadPreview
-        | OrderMode::PerimeterLoadPreview => "PARTICIPATE",
-        OrderMode::Idle | OrderMode::Submitting { .. } => "ORDER SHARE",
-    };
-    let (boundary_label, boundary_count) =
-        if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
-            (
-                "PERIMETER",
-                interaction
-                    .preview
-                    .wave_depth
-                    .values()
-                    .filter(|depth| **depth == 1)
-                    .count(),
-            )
-        } else {
-            ("FRONT", interaction.preview.front_edges.len())
-        };
-    let movement_extent = if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
-        let rings = interaction
-            .preview
-            .wave_depth
-            .values()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        format!(
-            "WAVE {:>2} RING{}{}",
-            rings,
-            if rings == 1 { "" } else { "S" },
-            if interaction.preview.wave_truncated {
-                "+"
-            } else {
-                ""
-            }
-        )
-    } else {
-        format!("ROUTE {:>3} HEXES", interaction.preview.route.len())
+        | OrderMode::PerimeterLoadPreview
+        | OrderMode::ReshapeDrawing
+        | OrderMode::ReshapePreview => format!("AVAILABLE FREE INF {free_strength}"),
+        OrderMode::StopPreview { .. } => "SCOPE EXACT".to_owned(),
+        OrderMode::Idle => format!("POLICY {policy}"),
+        OrderMode::Submitting { .. } => "SCOPE LOCKED".to_owned(),
     };
     {
         let mut order = texts.p2();
         set_text(
             &mut order,
             format!(
-                "ORDER  //  {}\nSOURCE {:>3} HEXES  ·  INF {:>5} / {:>5}\nCIVILIANS {:>5}  ·  DENSITY {:>3.0}%\n{} {:>3} CELLS  ·  UP TO EST. {:>5}\n{} {:>3}%  ·  {}  ·  EXCLUDED {:>2}\nETA ≈ {:>3}s  ·  BOTTLENECK {}\n\n{}",
+                "ORDER  //  {}\nSOURCE {:>3} CELLS\nFREE {:>5}  /  ACTIVE {:>5}  /  CAP {:>5}\nCIV {:>5}  /  TOTAL DENSITY {:>3.0}%\n{}\n{}",
                 interaction.mode.label(),
-                interaction.preview.projected_source_count,
-                strength,
-                capacity,
+                interaction.sources.len(),
+                free_strength,
+                active_strength,
+                raw_capacity,
                 civilians,
                 occupancy,
-                boundary_label,
-                boundary_count,
-                interaction.preview.strength_upper_bound,
-                percentage_label,
-                interaction.amount_percent,
-                movement_extent,
-                interaction.preview.excluded.len(),
-                interaction.preview.eta_seconds,
-                bottleneck,
-                context_hint,
+                allocation,
+                state_line,
             ),
         );
     }
@@ -741,7 +916,7 @@ fn update_hud(
         set_text(
             &mut bottom,
             format!(
-                "STEP {:>7}  ·  {} ORDER{}  ·  {} FLOW{}  ·  {} FRONT{}  ·  {:>4} QUEUED\nLATEST  {}",
+                "STEP {:>7}  /  {} ORDER{}  /  {} FLOW{}  /  {} FRONT{}  /  {:>4} QUEUED\nLATEST  {}",
                 view.logical_step,
                 view.active_orders,
                 plural(view.active_orders),
@@ -799,30 +974,6 @@ fn update_hud(
     }
 }
 
-fn update_button_style(
-    mut buttons: Query<
-        (
-            &Hovered,
-            Has<Pressed>,
-            &mut BackgroundColor,
-            &mut BorderColor,
-        ),
-        With<HudActionButton>,
-    >,
-) {
-    for (hovered, pressed, mut background, mut border) in &mut buttons {
-        let (fill, line) = if pressed {
-            (Color::srgb(0.16, 0.35, 0.39), CYAN)
-        } else if hovered.get() {
-            (Color::srgb(0.11, 0.20, 0.23), CYAN)
-        } else {
-            (Color::srgb(0.08, 0.12, 0.14), LINE)
-        };
-        background.0 = fill;
-        border.set_all(line);
-    }
-}
-
 fn update_slider_visuals(
     slider: Single<
         (&SliderValue, &SliderRange, &Hovered, &SliderDragState),
@@ -846,4 +997,201 @@ fn set_text(text: &mut Text, value: String) {
 
 const fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "S" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hex_core::Axial;
+
+    #[test]
+    fn modes_map_to_the_expected_compact_context() {
+        assert_eq!(hud_context(&OrderMode::Idle), HudContext::Idle);
+        assert_eq!(
+            hud_context(&OrderMode::AttackClustersPreview),
+            HudContext::AttackTargets
+        );
+        assert_eq!(
+            hud_context(&OrderMode::BalancePreview),
+            HudContext::Formation(FormationChoice::Balanced)
+        );
+        assert_eq!(
+            hud_context(&OrderMode::CoreLoadPreview),
+            HudContext::Formation(FormationChoice::Center)
+        );
+        assert_eq!(
+            hud_context(&OrderMode::PerimeterLoadPreview),
+            HudContext::Formation(FormationChoice::Perimeter)
+        );
+        assert_eq!(
+            hud_context(&OrderMode::PushFrontPreview {
+                direction: Axial::new(1, 0)
+            }),
+            HudContext::Ready(ReadyCommand::Push)
+        );
+        assert_eq!(
+            hud_context(&OrderMode::PushFrontArcPreview),
+            HudContext::Ready(ReadyCommand::ContactPush)
+        );
+        assert_eq!(
+            hud_context(&OrderMode::FrontLoadPreview {
+                orientation: Axial::new(12, -7)
+            }),
+            HudContext::Ready(ReadyCommand::DirectionBias)
+        );
+        assert_eq!(
+            hud_context(&OrderMode::ReshapeDrawing),
+            HudContext::ReshapeDrawing
+        );
+        assert_eq!(
+            hud_context(&OrderMode::Submitting { _label: "test" }),
+            HudContext::Submitting
+        );
+    }
+
+    #[test]
+    fn idle_strip_exposes_contextual_cluster_controls_without_command_buttons() {
+        let mut interaction = InteractionState::default();
+        interaction.sources.insert(Axial::new(2, -1));
+        let (title, summary, hints) = command_bar_copy(&interaction, HudContext::Idle);
+
+        assert!(title.contains("1 CELL"));
+        assert!(summary.contains("LMB neutral expand"));
+        assert!(summary.contains("LMB enemy attack"));
+        assert!(summary.contains("SHARE"));
+        for key in [
+            "C cluster",
+            "Shift/Ctrl+C multi",
+            "Ctrl+A all",
+            "[ / ] Share",
+            "R policy",
+            "F facing",
+            "T reshape",
+            "X stop",
+        ] {
+            assert!(hints.contains(key), "missing key hint: {key}");
+        }
+        assert!(!hints.contains("P push"));
+    }
+
+    #[test]
+    fn persistent_policy_is_key_driven_and_excludes_action_troops() {
+        let interaction = InteractionState::default();
+        let (title, summary, hints) = command_bar_copy(
+            &interaction,
+            HudContext::Formation(FormationChoice::Perimeter),
+        );
+
+        assert!(title.contains("PERIMETER"));
+        assert!(title.contains("CLUSTER POLICY"));
+        assert!(summary.contains("FREE TROOPS ONLY"));
+        assert!(summary.contains("ACTIVE ACTION TROOPS EXCLUDED"));
+        assert!(!summary.contains("SHARE"));
+        assert!(hints.contains("R cycles Balanced / Perimeter / Center"));
+        assert!(hints.contains("F sets facing"));
+        assert!(hints.contains("Share ignored"));
+    }
+
+    #[test]
+    fn share_is_visible_for_contextual_expansion_and_attack_only() {
+        let mut interaction = InteractionState::default();
+        interaction.amount_percent = 70;
+        let (_, idle_summary, idle_hints) = command_bar_copy(&interaction, HudContext::Idle);
+        assert!(idle_summary.contains("SHARE  70%"));
+        assert!(idle_hints.contains("[ / ] Share"));
+
+        interaction.attack_targets.insert(Axial::new(3, -1));
+        let (_, attack_summary, attack_hints) =
+            command_bar_copy(&interaction, HudContext::AttackTargets);
+        assert!(attack_summary.contains("SHARE  70%"));
+        assert!(attack_hints.contains("[ / ] Share"));
+
+        // Compatibility previews retain the same participation semantic even
+        // though they are no longer exposed as primary launchers.
+        for context in [
+            HudContext::Ready(ReadyCommand::Push),
+            HudContext::Ready(ReadyCommand::ContactPush),
+            HudContext::Ready(ReadyCommand::Expand),
+        ] {
+            let (_, summary, hints) = command_bar_copy(&interaction, context);
+            assert!(summary.contains("SHARE  70%"));
+            assert!(hints.contains("[ / ] share"));
+        }
+
+        for context in [
+            HudContext::Formation(FormationChoice::Balanced),
+            HudContext::Ready(ReadyCommand::DirectionBias),
+            HudContext::ReshapeDrawing,
+            HudContext::ReshapeReady,
+        ] {
+            let (_, summary, hints) = command_bar_copy(&interaction, context);
+            assert!(!summary.contains("SHARE"), "share leaked into {context:?}");
+            assert!(
+                !hints.contains("[ / ] share"),
+                "share key leaked into {context:?}"
+            );
+        }
+
+        interaction.mode = OrderMode::FrontLoadOrient {
+            start: Vec3::ZERO,
+            current: Vec3::new(1.0, 0.0, 1.0),
+        };
+        let (_, summary, hints) = command_bar_copy(&interaction, HudContext::Orient);
+        assert!(summary.contains("FREE TROOPS ONLY"));
+        assert!(!hints.contains("share"));
+    }
+
+    #[test]
+    fn reshape_hints_explain_free_footprint_and_redraw() {
+        let mut interaction = InteractionState::default();
+        let (_, drawing, draw_hints) = command_bar_copy(&interaction, HudContext::ReshapeDrawing);
+        assert!(drawing.contains("FREE TROOPS"));
+        assert!(drawing.contains("ONE CLUSTER"));
+        assert!(draw_hints.contains("[ / ] ring"));
+        assert!(draw_hints.contains("Shift+[ / ] width"));
+        assert!(draw_hints.contains("Ctrl+[ / ] height"));
+
+        interaction.preview.reshape_destination_strength = 200;
+        interaction.preview.destination_capacity = 200;
+        interaction.preview.reshape_outside_strength = 280;
+        let (_, ready, ready_hints) = command_bar_copy(&interaction, HudContext::ReshapeReady);
+        assert!(ready.contains("FIT 200 / CAP 200"));
+        assert!(ready.contains("280 STAY OUTSIDE"));
+        assert!(ready.contains("BEST EFFORT"));
+        assert!(ready_hints.contains("T redraw"));
+        assert!(ready_hints.contains("LMB/Enter apply"));
+    }
+
+    #[test]
+    fn field_manual_describes_cluster_first_flow_and_not_legacy_launchers() {
+        for phrase in [
+            "C selects the complete",
+            "LMB NEUTRAL",
+            "LMB ENEMY",
+            "PERSISTENT POLICY",
+            "free troops",
+            "RESHAPE ONE CLUSTER",
+            "X  STOP",
+        ] {
+            assert!(
+                FIELD_MANUAL.contains(phrase),
+                "missing manual phrase: {phrase}"
+            );
+        }
+        assert!(!FIELD_MANUAL.contains("P  PUSH FRONT"));
+        assert!(!FIELD_MANUAL.contains("STOP / RETASK"));
+    }
+
+    #[test]
+    fn invalid_and_submitting_states_remain_legible_without_buttons() {
+        let mut interaction = InteractionState::default();
+        interaction.preview.invalid_reason = Some("destination blocked");
+        let (_, invalid, _) = command_bar_copy(&interaction, HudContext::Ready(ReadyCommand::Push));
+        assert_eq!(invalid, "INVALID  //  destination blocked");
+
+        let (title, summary, hints) = command_bar_copy(&interaction, HudContext::Submitting);
+        assert!(title.contains("SUBMITTING"));
+        assert!(summary.contains("WAITING FOR AUTHORITY"));
+        assert!(hints.contains("remain stable"));
+    }
 }

@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hex_core::{
-    AttackFront, CombatConfig, EdgeLimits, HexMap, LogisticsConfig, MovementConfig, MovementIntent,
-    movement_step, resolve_edge_combat,
+    AttackFront, Axial, CombatConfig, EdgeLimits, HexMap, LogisticsConfig, MovementConfig,
+    MovementIntent, MovementLimit, focus_branch_weight, movement_step, resolve_edge_combat,
+    weighted_branch_allocations_rotated,
 };
 use spacetimedb::{ReducerContext, Table};
 
-use crate::orders::aggregate_lane_allocations_rotated;
+use crate::orders::{is_background_policy_order, maintain_cluster_policies};
 use crate::rules::{
     allocated_infantry_at_cell, cell_id_for_coordinate, cell_state, config, coordinate_for_cell,
     core_cell, edge_runtime_limits, packet_key, state, terrain,
@@ -18,9 +19,14 @@ use crate::schema::{
 };
 use crate::schema::{
     cell_state as cell_state_table, combat_front, expansion_garrison_debt, expansion_wave,
-    match_state, mobilization_policy, transfer_destination, transfer_order, transfer_source,
-    transit_packet,
+    match_state, mobilization_policy, retreat_abandonment, transfer_destination, transfer_order,
+    transfer_source, transit_packet,
 };
+
+/// Full policy reconciliation rebuilds component topology, target weights,
+/// routes, and a receding-horizon order. Let existing packets advance between
+/// rebuilds instead of paying that global cost on every recruitment pass.
+const POLICY_REPLAN_POPULATION_PASSES: u64 = 4;
 
 pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let mut match_state = state(ctx)?;
@@ -39,41 +45,68 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     branch_expand_waves(ctx, logical_step)?;
     stop_blocked_expand_edges(ctx, logical_step)?;
     move_friendly_packets(ctx, logical_step)?;
+    stop_blocked_internal_edges(ctx, logical_step)?;
     resolve_combats(ctx, logical_step)?;
     finalize_orders(ctx, logical_step)?;
 
     let config = config(ctx)?;
-    if logical_step % u64::from(config.population_step_interval.max(1)) == 0 {
+    let population_interval = u64::from(config.population_step_interval.max(1));
+    if logical_step.is_multiple_of(population_interval) {
         population_step(ctx, logical_step)?;
+        if policy_replan_is_due(logical_step, population_interval) {
+            maintain_cluster_policies(ctx)?;
+        }
     }
     Ok(state(ctx)?.phase == MatchPhase::Running)
 }
 
-/// Expansion is neutral-only even if ownership changes after the command was
-/// accepted. Friendly cells remain valid transit, but an edge is released in
-/// place before crossing any cell currently owned by an enemy.
+fn policy_replan_is_due(logical_step: u64, population_interval: u64) -> bool {
+    let normalized_interval = population_interval.max(1);
+    let cadence = normalized_interval.saturating_mul(POLICY_REPLAN_POPULATION_PASSES);
+    logical_step.is_multiple_of(cadence)
+}
+
+fn is_expansion_wave_order(kind: OrderKind) -> bool {
+    matches!(
+        kind,
+        OrderKind::ExpandAll | OrderKind::ExpandClusters | OrderKind::AttackClusters
+    )
+}
+
+/// Neutral waves stop at later enemy ownership. Attack waves are constrained
+/// instead by their immutable source and target masks, so captures can open
+/// deeper fronts without ever leaking into an unselected cluster.
 fn stop_blocked_expand_edges(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
     let expand_orders = ctx
         .db
         .transfer_order()
         .order_by_status()
         .filter(OrderStatus::Active)
-        .filter(|order| order.kind == OrderKind::ExpandAll)
-        .map(|order| (order.order_id, order.player_id))
+        .filter(|order| is_expansion_wave_order(order.kind))
         .collect::<Vec<_>>();
     if expand_orders.is_empty() {
         return Ok(());
     }
 
     let mut blocked_packets = Vec::new();
-    for (order_id, player_id) in expand_orders {
-        for packet in ctx.db.transit_packet().packet_by_order().filter(order_id) {
+    for order in expand_orders {
+        let wave = ctx
+            .db
+            .expansion_wave()
+            .order_id()
+            .find(order.order_id)
+            .ok_or_else(|| format!("wave order {} has no topology", order.order_id))?;
+        for packet in ctx
+            .db
+            .transit_packet()
+            .packet_by_order()
+            .filter(order.order_id)
+        {
             let next_index = packet.route_index as usize + 1;
             let Some(&next_cell) = packet.route.get(next_index) else {
                 continue;
             };
-            let next_owner = cell_state(ctx, next_cell)?.owner_player_id;
-            if expand_next_owner_is_blocked(player_id, next_owner) {
+            if !expansion_edge_is_available(ctx, &order, &wave, packet.current_cell, next_cell)? {
                 blocked_packets.push(packet);
             }
         }
@@ -85,8 +118,56 @@ fn stop_blocked_expand_edges(ctx: &ReducerContext, logical_step: u64) -> Result<
     Ok(())
 }
 
-fn expand_next_owner_is_blocked(player_id: u8, next_owner: u8) -> bool {
-    next_owner != NEUTRAL_PLAYER && next_owner != player_id
+/// Formation and reshape routes are logistics-only. If ownership changes
+/// after an order is accepted, its allocation is retired in its current cell
+/// before the generic combat pass can treat the stale route as an attack.
+/// Running this after friendly movement also catches a packet that advanced
+/// next to the newly non-friendly cell during the same simulation step.
+fn stop_blocked_internal_edges(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+    let internal_orders = ctx
+        .db
+        .transfer_order()
+        .order_by_status()
+        .filter(OrderStatus::Active)
+        .filter(|order| internal_order_requires_friendly_route(order.kind))
+        .map(|order| (order.order_id, order.player_id, order.kind))
+        .collect::<Vec<_>>();
+    if internal_orders.is_empty() {
+        return Ok(());
+    }
+
+    let mut blocked_packets = Vec::new();
+    for (order_id, player_id, kind) in internal_orders {
+        for packet in ctx.db.transit_packet().packet_by_order().filter(order_id) {
+            let Some(&next_cell) = packet.route.get(packet.route_index as usize + 1) else {
+                continue;
+            };
+            let next_owner = cell_state(ctx, next_cell)?.owner_player_id;
+            if internal_next_owner_is_blocked(kind, player_id, next_owner) {
+                blocked_packets.push(packet);
+            }
+        }
+    }
+    blocked_packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    for packet in blocked_packets {
+        station_packet_allocation(ctx, &packet, packet.infantry, logical_step)?;
+    }
+    Ok(())
+}
+
+fn internal_order_requires_friendly_route(kind: OrderKind) -> bool {
+    matches!(
+        kind,
+        OrderKind::Balance
+            | OrderKind::FrontLoad
+            | OrderKind::CoreLoad
+            | OrderKind::PerimeterLoad
+            | OrderKind::Reshape
+    )
+}
+
+fn internal_next_owner_is_blocked(kind: OrderKind, player_id: u8, next_owner: u8) -> bool {
+    internal_order_requires_friendly_route(kind) && next_owner != player_id
 }
 
 fn branch_expand_waves(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
@@ -95,7 +176,7 @@ fn branch_expand_waves(ctx: &ReducerContext, logical_step: u64) -> Result<(), St
         .transfer_order()
         .order_by_status()
         .filter(OrderStatus::Active)
-        .filter(|order| order.kind == OrderKind::ExpandAll)
+        .filter(|order| is_expansion_wave_order(order.kind))
         .collect::<Vec<_>>();
     for order in orders {
         let mut wave = ctx
@@ -174,8 +255,12 @@ fn branch_expand_node(
         .get(cell_id as usize)
         .copied()
         .ok_or_else(|| format!("expand split cursor is missing cell {cell_id}"))?;
-    let (allocations, next_cursor) =
-        aggregate_lane_allocations_rotated(&amounts, children.len(), usize::from(cursor))?;
+    let child_weights = expansion_child_weights(ctx, wave, cell_id, &children)?;
+    let weighted =
+        weighted_branch_allocations_rotated(&amounts, &child_weights, usize::from(cursor))
+            .map_err(|error| format!("invalid expansion branch allocation: {error:?}"))?;
+    let allocations = weighted.allocations;
+    let next_cursor = weighted.next_cursor;
     let next_cursor =
         u8::try_from(next_cursor).map_err(|_| "expand child cursor exceeds u8".to_string())?;
     let topology_changed = next_cursor != cursor;
@@ -184,14 +269,14 @@ fn branch_expand_node(
     }
     let mut stationed_by_contribution = vec![0_u64; contributions.len()];
     let mut outgoing = Vec::new();
-    for (contribution_index, child_index, amount) in allocations {
-        let child = children[child_index];
-        if expansion_edge_is_available(ctx, order.player_id, cell_id, child)? {
-            outgoing.push((contribution_index, child, amount));
+    for allocation in allocations {
+        let child = children[allocation.child_index];
+        if expansion_edge_is_available(ctx, order, wave, cell_id, child)? {
+            outgoing.push((allocation.contribution_index, child, allocation.amount));
         } else {
-            stationed_by_contribution[contribution_index] = stationed_by_contribution
-                [contribution_index]
-                .checked_add(amount)
+            stationed_by_contribution[allocation.contribution_index] = stationed_by_contribution
+                [allocation.contribution_index]
+                .checked_add(allocation.amount)
                 .ok_or_else(|| "expand stationed strength overflow".to_string())?;
         }
     }
@@ -332,6 +417,35 @@ fn expansion_children(
     Ok(children)
 }
 
+fn expansion_child_weights(
+    ctx: &ReducerContext,
+    wave: &ExpansionWave,
+    parent_cell: u32,
+    children: &[u32],
+) -> Result<Vec<u8>, String> {
+    let Some(focus_cell) = wave.focus_cell_id else {
+        return Ok(vec![1; children.len()]);
+    };
+    let parent = coordinate_for_cell(ctx, parent_cell)?;
+    let focus = coordinate_for_cell(ctx, focus_cell)?;
+    let child_coordinates = children
+        .iter()
+        .map(|child| coordinate_for_cell(ctx, *child))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(focus_weights_for_coordinates(
+        parent,
+        &child_coordinates,
+        focus,
+    ))
+}
+
+fn focus_weights_for_coordinates(parent: Axial, children: &[Axial], focus: Axial) -> Vec<u8> {
+    children
+        .iter()
+        .map(|child| focus_branch_weight(parent, *child, focus))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaveNodeDepth {
     Seed(u16),
@@ -368,18 +482,43 @@ fn wave_depth_allows_child(parent: WaveNodeDepth, child: WaveNodeDepth) -> bool 
 
 fn expansion_edge_is_available(
     ctx: &ReducerContext,
-    player_id: u8,
+    order: &TransferOrder,
+    wave: &ExpansionWave,
     from_cell: u32,
     to_cell: u32,
 ) -> Result<bool, String> {
     let target_terrain = terrain(ctx, to_cell)?;
     let target_owner = cell_state(ctx, to_cell)?.owner_player_id;
-    Ok(
-        (target_owner == NEUTRAL_PLAYER || target_owner == player_id)
-            && target_terrain.passable
-            && target_terrain.capturable
-            && edge_runtime_limits(ctx, from_cell, to_cell)?.is_some(),
-    )
+    Ok(wave_scope_allows_cell(
+        order.kind,
+        order.player_id,
+        to_cell,
+        target_owner,
+        &wave.selected_cells,
+        &wave.target_cells,
+    ) && target_terrain.passable
+        && target_terrain.capturable
+        && edge_runtime_limits(ctx, from_cell, to_cell)?.is_some())
+}
+
+fn wave_scope_allows_cell(
+    kind: OrderKind,
+    player_id: u8,
+    cell_id: u32,
+    owner_player_id: u8,
+    selected_cells: &[u32],
+    target_cells: &[u32],
+) -> bool {
+    match kind {
+        OrderKind::ExpandAll | OrderKind::ExpandClusters => {
+            owner_player_id == NEUTRAL_PLAYER || owner_player_id == player_id
+        }
+        OrderKind::AttackClusters => {
+            target_cells.binary_search(&cell_id).is_ok()
+                || (owner_player_id == player_id && selected_cells.binary_search(&cell_id).is_ok())
+        }
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -443,6 +582,8 @@ fn clear_combat_fronts(ctx: &ReducerContext) {
 
 fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
     let config = config(ctx)?;
+    let destination_reservations = active_internal_destination_reservations(ctx)?;
+    let retreating_edge_cells = active_retreat_abandonment_cells(ctx);
     let policies: BTreeMap<_, _> = ctx
         .db
         .mobilization_policy()
@@ -467,12 +608,21 @@ fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         let local_population = cell.civilians.saturating_add(cell.infantry);
         let desired_infantry =
             ((u128::from(local_population) * u128::from(target_bps)) / 10_000) as u64;
-        if cell.infantry < desired_infantry {
+        if cell.infantry < desired_infantry && !retreating_edge_cells.contains(&cell.cell_id) {
+            let reserved_capacity = reserved_recruitment_capacity(
+                &destination_reservations,
+                cell.owner_player_id,
+                cell.cell_id,
+            );
             let recruit = desired_infantry
                 .saturating_sub(cell.infantry)
                 .min(config.mobilization_per_population_step)
                 .min(cell.civilians)
-                .min(cell.military_capacity.saturating_sub(cell.infantry));
+                .min(recruitment_headroom(
+                    cell.military_capacity,
+                    cell.infantry,
+                    reserved_capacity,
+                ));
             cell.civilians -= recruit;
             cell.infantry += recruit;
         }
@@ -482,11 +632,137 @@ fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
     Ok(())
 }
 
+fn active_retreat_abandonment_cells(ctx: &ReducerContext) -> BTreeSet<u32> {
+    let active_orders = ctx
+        .db
+        .transfer_order()
+        .order_by_status()
+        .filter(OrderStatus::Active)
+        .map(|order| order.order_id)
+        .collect::<BTreeSet<_>>();
+    ctx.db
+        .retreat_abandonment()
+        .iter()
+        .filter(|candidate| active_orders.contains(&candidate.order_id))
+        .map(|candidate| candidate.cell_id)
+        .collect()
+}
+
+/// Capacity promised to active internal movement remains unavailable to local
+/// recruitment until the destination receives it. Without this reservation, a
+/// long Formation or Reshape route can be accepted capacity-safely and then be
+/// blocked forever because later mobilization fills its destination first.
+fn active_internal_destination_reservations(
+    ctx: &ReducerContext,
+) -> Result<BTreeMap<(u8, u32), u64>, String> {
+    let mut reservations = BTreeMap::<(u8, u32), u64>::new();
+    for destination in ctx.db.transfer_destination().iter() {
+        let Some(order) = ctx
+            .db
+            .transfer_order()
+            .order_id()
+            .find(destination.order_id)
+        else {
+            continue;
+        };
+        add_internal_destination_reservation(
+            &mut reservations,
+            &order,
+            destination.cell_id,
+            destination.target_infantry,
+            destination.received_infantry,
+        )?;
+    }
+    Ok(reservations)
+}
+
+fn order_reserves_recruitment_capacity(order: &TransferOrder) -> bool {
+    order.status == OrderStatus::Active && internal_order_requires_friendly_route(order.kind)
+}
+
+fn add_internal_destination_reservation(
+    reservations: &mut BTreeMap<(u8, u32), u64>,
+    order: &TransferOrder,
+    cell_id: u32,
+    target_infantry: u64,
+    received_infantry: u64,
+) -> Result<(), String> {
+    if !order_reserves_recruitment_capacity(order) {
+        return Ok(());
+    }
+    let remaining = target_infantry.saturating_sub(received_infantry);
+    if remaining == 0 {
+        return Ok(());
+    }
+    let reserved = reservations.entry((order.player_id, cell_id)).or_default();
+    *reserved = reserved
+        .checked_add(remaining)
+        .ok_or_else(|| "internal destination reservation overflow".to_string())?;
+    Ok(())
+}
+
+fn reserved_recruitment_capacity(
+    reservations: &BTreeMap<(u8, u32), u64>,
+    owner_player_id: u8,
+    cell_id: u32,
+) -> u64 {
+    reservations
+        .get(&(owner_player_id, cell_id))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn recruitment_headroom(capacity: u64, current: u64, reserved: u64) -> u64 {
+    capacity.saturating_sub(current).saturating_sub(reserved)
+}
+
 #[derive(Clone)]
 struct FriendlyIntent {
     id: u64,
     packet: TransitPacket,
     next_cell: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacketArrival {
+    Friendly,
+    Capture,
+}
+
+impl PacketArrival {
+    const fn may_extend_sustained_push(self) -> bool {
+        matches!(self, Self::Capture)
+    }
+}
+
+fn should_settle_capacity_blocked_friendly_lane(
+    kind: OrderKind,
+    route_index: u32,
+    route_len: usize,
+    limits: &BTreeSet<MovementLimit>,
+) -> bool {
+    kind == OrderKind::PushFront
+        && usize::try_from(route_index)
+            .ok()
+            .and_then(|index| index.checked_add(2))
+            == Some(route_len)
+        && limits.contains(&MovementLimit::DestinationCapacity)
+}
+
+fn should_station_capacity_blocked_packet(
+    order: &TransferOrder,
+    limits: &BTreeSet<MovementLimit>,
+) -> bool {
+    // Policy maintenance is replanned from the packets' current physical
+    // positions at each policy checkpoint. Keep capacity-blocked packets
+    // queued until then: prematurely stationing them marks undelivered demand
+    // as completed and is the source of large-cluster redistribution churn.
+    // Explicit one-shot logistics and bounded expansion waves retain their
+    // best-effort stop-in-place semantics.
+    !is_background_policy_order(order)
+        && (internal_order_requires_friendly_route(order.kind)
+            || is_expansion_wave_order(order.kind))
+        && limits.contains(&MovementLimit::DestinationCapacity)
 }
 
 fn move_friendly_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
@@ -557,6 +833,41 @@ fn move_friendly_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), 
     let result = movement_step(&mut map, &movement_intents, &movement, &logistics)
         .map_err(|error| format!("friendly movement failed: {error:?}"))?;
 
+    // Throughput is a per-step throttle, so constrained packets remain queued.
+    // Capacity is a hard stop: Push releases the whole directional lane, while
+    // an internal logistics or Expand packet retires its blocked remainder in
+    // place. This guarantees neither a Formation/Reshape nor a bounded wave can
+    // remain active forever behind a full friendly cell.
+    let mut capacity_stopped_lanes = BTreeSet::new();
+    let mut capacity_stopped_packets = BTreeMap::new();
+    for intent in &intents {
+        let Some(outcome) = result.outcomes.get(&intent.id) else {
+            continue;
+        };
+        let order = ctx
+            .db
+            .transfer_order()
+            .order_id()
+            .find(intent.packet.order_id)
+            .ok_or_else(|| "friendly packet order is missing".to_string())?;
+        if should_settle_capacity_blocked_friendly_lane(
+            order.kind,
+            intent.packet.route_index,
+            intent.packet.route.len(),
+            &outcome.limits,
+        ) {
+            let direction = push_lane_direction(ctx, &order, &intent.packet)?;
+            capacity_stopped_lanes.insert((
+                intent.packet.order_id,
+                intent.packet.destination_cell,
+                direction,
+            ));
+        } else if should_station_capacity_blocked_packet(&order, &outcome.limits) {
+            capacity_stopped_packets
+                .insert(intent.packet.packet_key.clone(), intent.packet.clone());
+        }
+    }
+
     for cell_id in participating {
         let coordinate = coordinate_for_cell(ctx, cell_id)?;
         let infantry = map
@@ -586,8 +897,23 @@ fn move_friendly_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), 
             .map(|outcome| outcome.approved)
             .unwrap_or(0);
         if approved > 0 {
-            advance_packet(ctx, &intent.packet, approved, logical_step)?;
+            advance_packet(
+                ctx,
+                &intent.packet,
+                approved,
+                logical_step,
+                PacketArrival::Friendly,
+            )?;
         }
+    }
+    for (order_id, lane_anchor, direction) in capacity_stopped_lanes {
+        settle_stopped_sustained_lane(ctx, order_id, lane_anchor, direction, logical_step)?;
+    }
+    for packet in capacity_stopped_packets.into_values() {
+        // An upstream packet can merge into this key during the same pipeline
+        // step. Retire the complete post-movement allocation at the blocked
+        // choke, not only the amount present in the pre-step snapshot.
+        station_packet_allocation(ctx, &packet, u64::MAX, logical_step)?;
     }
     Ok(())
 }
@@ -911,7 +1237,7 @@ fn occupy_after_combat(
                 .transfer_order()
                 .order_id()
                 .find(packet.order_id)
-                .is_some_and(|order| order.kind == OrderKind::ExpandAll)
+                .is_some_and(|order| is_expansion_wave_order(order.kind))
         {
             capturing_expand_order = Some(
                 capturing_expand_order
@@ -922,7 +1248,7 @@ fn occupy_after_combat(
         source.infantry = source.infantry.saturating_sub(moved);
         source.last_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(source);
-        advance_packet(ctx, &packet, moved, logical_step)?;
+        advance_packet(ctx, &packet, moved, logical_step, PacketArrival::Capture)?;
         remaining -= moved;
     }
     station_capture_garrison(ctx, target.cell_id, front.attacker, logical_step)?;
@@ -1002,12 +1328,12 @@ fn record_capture(
         PLAYER_TWO => match_state.player_two_controlled += 1,
         _ => {}
     }
-    let controlled = if new_owner == PLAYER_ONE {
-        match_state.player_one_controlled
-    } else {
-        match_state.player_two_controlled
-    };
-    if controlled >= match_state.required_control {
+    let controlled = controlled_cells_for_owner(
+        new_owner,
+        match_state.player_one_controlled,
+        match_state.player_two_controlled,
+    );
+    if controlled.is_some_and(|controlled| controlled >= match_state.required_control) {
         match_state.phase = MatchPhase::Completed;
         match_state.winner_player_id = new_owner;
         match_state.completed_at_us = crate::timestamp_us(ctx);
@@ -1016,11 +1342,20 @@ fn record_capture(
     Ok(())
 }
 
+fn controlled_cells_for_owner(owner: u8, player_one: u64, player_two: u64) -> Option<u64> {
+    match owner {
+        PLAYER_ONE => Some(player_one),
+        PLAYER_TWO => Some(player_two),
+        _ => None,
+    }
+}
+
 fn advance_packet(
     ctx: &ReducerContext,
     packet: &TransitPacket,
     moved: u64,
     logical_step: u64,
+    arrival: PacketArrival,
 ) -> Result<(), String> {
     let Some(mut packet) = ctx
         .db
@@ -1039,7 +1374,7 @@ fn advance_packet(
         .order_id()
         .find(packet.order_id)
         .ok_or_else(|| "packet order is missing".to_string())?;
-    if order.kind == OrderKind::ExpandAll {
+    if is_expansion_wave_order(order.kind) {
         return advance_expand_packet(ctx, &packet, moved, logical_step);
     }
     let next_index = packet.route_index + 1;
@@ -1048,7 +1383,7 @@ fn advance_packet(
         .get(next_index as usize)
         .ok_or_else(|| "packet route ended before movement".to_string())?;
 
-    if next_index as usize + 1 == packet.route.len() {
+    if next_index as usize + 1 == packet.route.len() && arrival.may_extend_sustained_push() {
         extend_sustained_lane(ctx, &packet, next_cell, logical_step)?;
         packet = ctx
             .db
@@ -1075,7 +1410,16 @@ fn advance_packet(
 
     if next_index as usize + 1 == packet.route.len() {
         increment_destination_received(ctx, packet.order_id, packet.destination_cell, moved)?;
-        settle_stopped_sustained_lane(ctx, packet.order_id, packet.destination_cell, logical_step)?;
+        if arrival.may_extend_sustained_push() && order.kind == OrderKind::PushFront {
+            let direction = push_lane_direction(ctx, &order, &packet)?;
+            settle_stopped_sustained_lane(
+                ctx,
+                packet.order_id,
+                packet.destination_cell,
+                direction,
+                logical_step,
+            )?;
+        }
         return Ok(());
     }
 
@@ -1168,11 +1512,54 @@ fn packet_has_pending_source(packet: &TransitPacket) -> bool {
     packet.route_index == 0 && packet.origin_cell != EXPANSION_AGGREGATE_ORIGIN
 }
 
-/// Extends every packet in one push lane by exactly one outward cell.
+/// Resolves the immutable local normal of one Push lane from its persisted
+/// route. `destination_cell` is the first cell beyond the original selection,
+/// and the preceding route cell is therefore the selected boundary source.
+/// Later sustained layers append after this pair without changing it.
+fn push_lane_direction(
+    ctx: &ReducerContext,
+    order: &TransferOrder,
+    packet: &TransitPacket,
+) -> Result<Axial, String> {
+    if order.kind != OrderKind::PushFront || packet.order_id != order.order_id {
+        return Err("lane direction requires a packet from its Push order".into());
+    }
+    let direction = lane_direction_from_route(&packet.route, packet.destination_cell, |cell_id| {
+        coordinate_for_cell(ctx, cell_id)
+    })?;
+    let stored = Axial::new(order.orientation_q, order.orientation_r);
+    if stored != Axial::ZERO && stored != direction {
+        return Err("directional push lane disagrees with its stored orientation".into());
+    }
+    Ok(direction)
+}
+
+fn lane_direction_from_route(
+    route: &[u32],
+    destination_cell: u32,
+    mut coordinate: impl FnMut(u32) -> Result<Axial, String>,
+) -> Result<Axial, String> {
+    let destination_index = route
+        .iter()
+        .position(|cell_id| *cell_id == destination_cell)
+        .ok_or_else(|| "push route does not contain its stable lane destination".to_string())?;
+    let boundary_index = destination_index
+        .checked_sub(1)
+        .ok_or_else(|| "push lane destination has no preceding boundary cell".to_string())?;
+    let boundary = coordinate(route[boundary_index])?;
+    let destination = coordinate(destination_cell)?;
+    let direction = destination - boundary;
+    if !Axial::DIRECTIONS.contains(&direction) {
+        return Err("push lane route has an invalid local direction".into());
+    }
+    Ok(direction)
+}
+
+/// Extends every packet in one straight push lane by one outward cell.
 ///
-/// `destination_cell` is deliberately kept as the stable lane anchor. This
-/// allows packets from different selected source cells to share one advancing
-/// ray without rewriting packet keys or destination metadata every layer.
+/// `destination_cell` remains the stable first-layer anchor. Local-arc orders
+/// may approach one anchor from several directions, so only packets sharing
+/// both the anchor and the route-derived direction may share later layers.
 fn extend_sustained_lane(
     ctx: &ReducerContext,
     packet: &TransitPacket,
@@ -1196,10 +1583,7 @@ fn extend_sustained_lane(
         return Ok(true);
     }
 
-    let direction = hex_core::Axial::new(order.orientation_q, order.orientation_r);
-    if !hex_core::Axial::DIRECTIONS.contains(&direction) {
-        return Err("active push order has an invalid direction".into());
-    }
+    let direction = push_lane_direction(ctx, &order, &current)?;
     let match_config = config(ctx)?;
     let next_coordinate = coordinate_for_cell(ctx, reached_cell)? + direction;
     let Some(next_cell) = cell_id_for_coordinate(&match_config, next_coordinate) else {
@@ -1208,7 +1592,7 @@ fn extend_sustained_lane(
     let next_terrain = terrain(ctx, next_cell)?;
     let next_state = cell_state(ctx, next_cell)?;
     let traversable = edge_runtime_limits(ctx, reached_cell, next_cell)?.is_some();
-    let eligible = push_target_is_eligible(
+    let eligible = sustained_push_target_is_eligible(
         order.player_id,
         next_state.owner_player_id,
         next_terrain.passable,
@@ -1227,6 +1611,9 @@ fn extend_sustained_lane(
         .collect::<Vec<_>>();
     let mut extended = false;
     for mut candidate in packets {
+        if push_lane_direction(ctx, &order, &candidate)? != direction {
+            continue;
+        }
         if !append_lane_layer(&mut candidate.route, reached_cell, next_cell) {
             continue;
         }
@@ -1237,7 +1624,7 @@ fn extend_sustained_lane(
     Ok(extended)
 }
 
-fn push_target_is_eligible(
+fn sustained_push_target_is_eligible(
     player_id: u8,
     target_owner: u8,
     passable: bool,
@@ -1366,12 +1753,11 @@ fn occupation_garrison(military_capacity: u64, terrain: TerrainClass) -> u64 {
 
 /// Releases every still-allocated survivor in a lane where the directional
 /// ray reached friendly territory, the map boundary, or an impassable edge.
-/// The underlying infantry remains in its current cell; only the operation's
-/// allocation metadata is retired.
 fn settle_stopped_sustained_lane(
     ctx: &ReducerContext,
     order_id: u64,
     lane_anchor: u32,
+    direction: Axial,
     logical_step: u64,
 ) -> Result<(), String> {
     let Some(order) = ctx.db.transfer_order().order_id().find(order_id) else {
@@ -1388,6 +1774,9 @@ fn settle_stopped_sustained_lane(
         .collect::<Vec<_>>();
     packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
     for packet in packets {
+        if push_lane_direction(ctx, &order, &packet)? != direction {
+            continue;
+        }
         station_packet_allocation(ctx, &packet, packet.infantry, logical_step)?;
     }
     Ok(())
@@ -1397,6 +1786,29 @@ fn settle_stopped_sustained_lane(
 /// `delivered_infantry` counter therefore means all surviving strength that
 /// has left this operation: endpoint arrivals, occupation garrisons, and
 /// release-in-place at an automatic stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StationAccounting {
+    stationed: u64,
+    packet_remaining: u64,
+    delivered_after: u64,
+}
+
+fn station_accounting(
+    packet_infantry: u64,
+    amount: u64,
+    delivered_before: u64,
+) -> Result<StationAccounting, String> {
+    let stationed = amount.min(packet_infantry);
+    let delivered_after = delivered_before
+        .checked_add(stationed)
+        .ok_or_else(|| "stationed infantry overflow".to_string())?;
+    Ok(StationAccounting {
+        stationed,
+        packet_remaining: packet_infantry - stationed,
+        delivered_after,
+    })
+}
+
 fn station_packet_allocation(
     ctx: &ReducerContext,
     packet: &TransitPacket,
@@ -1411,22 +1823,8 @@ fn station_packet_allocation(
     else {
         return Ok(());
     };
-    let stationed = amount.min(current.infantry);
-    if stationed == 0 {
+    if amount == 0 || current.infantry == 0 {
         return Ok(());
-    }
-    if stationed == current.infantry {
-        ctx.db
-            .transit_packet()
-            .packet_key()
-            .delete(&current.packet_key);
-    } else {
-        current.infantry -= stationed;
-        current.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(current.clone());
-    }
-    if packet_has_pending_source(&current) {
-        decrement_source_queue(ctx, current.order_id, current.origin_cell, stationed)?;
     }
     let mut order = ctx
         .db
@@ -1434,10 +1832,26 @@ fn station_packet_allocation(
         .order_id()
         .find(current.order_id)
         .ok_or_else(|| "order is missing while stationing infantry".to_string())?;
-    order.delivered_infantry = order
-        .delivered_infantry
-        .checked_add(stationed)
-        .ok_or_else(|| "stationed infantry overflow".to_string())?;
+    let accounting = station_accounting(current.infantry, amount, order.delivered_infantry)?;
+    if accounting.packet_remaining == 0 {
+        ctx.db
+            .transit_packet()
+            .packet_key()
+            .delete(&current.packet_key);
+    } else {
+        current.infantry = accounting.packet_remaining;
+        current.updated_step = logical_step;
+        ctx.db.transit_packet().packet_key().update(current.clone());
+    }
+    if packet_has_pending_source(&current) {
+        decrement_source_queue(
+            ctx,
+            current.order_id,
+            current.origin_cell,
+            accounting.stationed,
+        )?;
+    }
+    order.delivered_infantry = accounting.delivered_after;
     order.updated_step = logical_step;
     ctx.db.transfer_order().order_id().update(order);
     Ok(())
@@ -1554,29 +1968,271 @@ fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         .collect();
     for mut order in orders {
         order.in_transit_infantry = active_strength.get(&order.order_id).copied().unwrap_or(0);
-        if order.in_transit_infantry == 0 {
-            order.status = OrderStatus::Completed;
+        order.status = finalized_order_status(
+            order.committed_infantry,
+            order.in_transit_infantry,
+            order.delivered_infantry,
+            order.casualty_infantry,
+        )
+        .map_err(|error| format!("order {} {error}", order.order_id))?;
+        if order.status == OrderStatus::Completed {
+            complete_retreat_abandonments(ctx, &order, logical_step)?;
             ctx.db.expansion_wave().order_id().delete(order.order_id);
         }
         order.updated_step = logical_step;
-        let accounted = order
-            .in_transit_infantry
-            .saturating_add(order.delivered_infantry)
-            .saturating_add(order.casualty_infantry);
-        if accounted != order.committed_infantry {
-            return Err(format!(
-                "order {} violates infantry conservation: committed {}, accounted {}",
-                order.order_id, order.committed_infantry, accounted
-            ));
-        }
         ctx.db.transfer_order().order_id().update(order);
     }
     Ok(())
 }
 
+fn complete_retreat_abandonments(
+    ctx: &ReducerContext,
+    order: &TransferOrder,
+    logical_step: u64,
+) -> Result<(), String> {
+    let candidates = ctx
+        .db
+        .retreat_abandonment()
+        .abandonment_by_order()
+        .filter(order.order_id)
+        .collect::<Vec<_>>();
+    for candidate in candidates {
+        let mut cell = cell_state(ctx, candidate.cell_id)?;
+        let ground = terrain(ctx, candidate.cell_id)?;
+        let has_live_packet_claim = ctx.db.transit_packet().iter().any(|packet| {
+            packet.owner_player_id == order.player_id
+                && (packet.current_cell == candidate.cell_id
+                    || packet.destination_cell == candidate.cell_id)
+        });
+        let has_active_destination_reservation =
+            ctx.db.transfer_destination().iter().any(|target| {
+                target.cell_id == candidate.cell_id
+                    && target.order_id != order.order_id
+                    && target.target_infantry > target.received_infantry
+                    && ctx
+                        .db
+                        .transfer_order()
+                        .order_id()
+                        .find(target.order_id)
+                        .is_some_and(|other| {
+                            other.player_id == order.player_id
+                                && other.status == OrderStatus::Active
+                        })
+            });
+        let may_abandon = retreat_abandonment_is_safe(
+            cell.owner_player_id == order.player_id,
+            ground.passable,
+            ground.capturable,
+            cell.infantry,
+            allocated_infantry_at_cell(ctx, order.player_id, candidate.cell_id),
+            has_live_packet_claim,
+            has_active_destination_reservation,
+        );
+        if may_abandon {
+            let old_owner = cell.owner_player_id;
+            cell.owner_player_id = NEUTRAL_PLAYER;
+            cell.last_changed_step = logical_step;
+            ctx.db.cell_state().cell_id().update(cell);
+            record_capture(ctx, candidate.cell_id, old_owner, NEUTRAL_PLAYER)?;
+        }
+        ctx.db
+            .retreat_abandonment()
+            .abandonment_key()
+            .delete(&candidate.abandonment_key);
+    }
+    Ok(())
+}
+
+fn retreat_abandonment_is_safe(
+    still_owned: bool,
+    passable: bool,
+    capturable: bool,
+    infantry: u64,
+    allocated: u64,
+    has_live_packet_claim: bool,
+    has_active_destination_reservation: bool,
+) -> bool {
+    still_owned
+        && passable
+        && capturable
+        && infantry == 0
+        && allocated == 0
+        && !has_live_packet_claim
+        && !has_active_destination_reservation
+}
+
+fn finalized_order_status(
+    committed: u64,
+    in_transit: u64,
+    delivered: u64,
+    casualties: u64,
+) -> Result<OrderStatus, String> {
+    let accounted = in_transit
+        .checked_add(delivered)
+        .and_then(|total| total.checked_add(casualties))
+        .ok_or_else(|| "has overflowing infantry accounting".to_string())?;
+    if accounted != committed {
+        return Err(format!(
+            "violates infantry conservation: committed {committed}, accounted {accounted}"
+        ));
+    }
+    Ok(if in_transit == 0 {
+        OrderStatus::Completed
+    } else {
+        OrderStatus::Active
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct FunnelPacket {
+        route: Vec<Axial>,
+        route_index: usize,
+        infantry: u64,
+    }
+
+    fn run_policy_pipeline(
+        mut map: HexMap,
+        mut packets: Vec<FunnelPacket>,
+        station_blocked_remainders: bool,
+        max_passes: usize,
+    ) -> (HexMap, bool, usize) {
+        let movement = MovementConfig::default();
+        let logistics = LogisticsConfig {
+            default_military_capacity: 100,
+            default_edge_throughput: 1_000,
+            default_combat_frontage: 100,
+        };
+        let mut saw_capacity_backpressure = false;
+        let mut passes = 0;
+        while !packets.is_empty() && passes < max_passes {
+            passes += 1;
+            let intents = packets
+                .iter()
+                .enumerate()
+                .map(|(index, packet)| MovementIntent {
+                    id: index as u64 + 1,
+                    priority: 0,
+                    owner: 1,
+                    from: packet.route[packet.route_index],
+                    to: packet.route[packet.route_index + 1],
+                    requested: packet.infantry,
+                })
+                .collect::<Vec<_>>();
+            let step = movement_step(&mut map, &intents, &movement, &logistics)
+                .expect("capacity-safe friendly policy pipeline");
+            let mut next_packets = Vec::new();
+            for (index, packet) in packets.into_iter().enumerate() {
+                let outcome = &step.outcomes[&(index as u64 + 1)];
+                let capacity_blocked = outcome
+                    .limits
+                    .contains(&MovementLimit::DestinationCapacity);
+                saw_capacity_backpressure |= capacity_blocked;
+                let remainder = packet.infantry - outcome.approved;
+                if remainder > 0 && !(station_blocked_remainders && capacity_blocked) {
+                    next_packets.push(FunnelPacket {
+                        infantry: remainder,
+                        ..packet.clone()
+                    });
+                }
+                if outcome.approved > 0 && packet.route_index + 2 < packet.route.len() {
+                    next_packets.push(FunnelPacket {
+                        route_index: packet.route_index + 1,
+                        infantry: outcome.approved,
+                        ..packet
+                    });
+                }
+            }
+            packets = next_packets;
+        }
+        assert!(packets.is_empty(), "the queued policy pipeline must drain");
+        (map, saw_capacity_backpressure, passes)
+    }
+
+    fn run_capacity_funnel(station_blocked_remainders: bool) -> (HexMap, bool, usize) {
+        let center = Axial::ZERO;
+        let source_a = Axial::new(-1, 0);
+        let source_b = Axial::new(0, -1);
+        let source_c = Axial::new(-1, 1);
+        let destination_a = Axial::new(1, 0);
+        let destination_b = Axial::new(0, 1);
+        let destination_c = Axial::new(1, -1);
+        let mut map = HexMap::new();
+        for (coordinate, infantry) in [
+            (source_a, 100),
+            (source_b, 100),
+            (source_c, 100),
+            (center, 100),
+            (destination_a, 0),
+            (destination_b, 0),
+            (destination_c, 0),
+        ] {
+            let mut cell = hex_core::Cell::ground(coordinate, 0, Some(1), 100);
+            cell.forces.infantry = infantry;
+            map.insert(cell);
+        }
+
+        // This is a balanced target for 400 infantry over seven equal cells:
+        // 57 everywhere with the deterministic remainder at source C. Every
+        // source-to-destination route crosses the already-full center, which
+        // reproduces the large-cluster funnel that used to strand most of a
+        // policy order at intermediate capacity stops.
+        let packets = vec![
+            FunnelPacket {
+                route: vec![center, destination_a],
+                route_index: 0,
+                infantry: 43,
+            },
+            FunnelPacket {
+                route: vec![source_a, center, destination_a],
+                route_index: 0,
+                infantry: 14,
+            },
+            FunnelPacket {
+                route: vec![source_a, center, destination_b],
+                route_index: 0,
+                infantry: 29,
+            },
+            FunnelPacket {
+                route: vec![source_b, center, destination_b],
+                route_index: 0,
+                infantry: 28,
+            },
+            FunnelPacket {
+                route: vec![source_b, center, destination_c],
+                route_index: 0,
+                infantry: 15,
+            },
+            FunnelPacket {
+                route: vec![source_c, center, destination_c],
+                route_index: 0,
+                infantry: 42,
+            },
+        ];
+        run_policy_pipeline(map, packets, station_blocked_remainders, 16)
+    }
+
+    fn test_order(kind: OrderKind, status: OrderStatus) -> TransferOrder {
+        TransferOrder {
+            order_id: 1,
+            player_id: 1,
+            client_command_id: 1,
+            kind,
+            status,
+            requested_infantry: 10,
+            committed_infantry: 10,
+            in_transit_infantry: 10,
+            delivered_infantry: 0,
+            casualty_infantry: 0,
+            orientation_q: 0,
+            orientation_r: 0,
+            created_step: 0,
+            updated_step: 0,
+        }
+    }
 
     fn test_packet(origin: u32, current: u32, destination: u32, route: Vec<u32>) -> TransitPacket {
         TransitPacket {
@@ -1591,6 +2247,36 @@ mod tests {
             route,
             updated_step: 0,
         }
+    }
+
+    #[test]
+    fn policy_replan_cadence_is_every_four_population_passes() {
+        let population_interval = 4;
+        for logical_step in [4, 8, 12, 20, 24, 28] {
+            assert!(!policy_replan_is_due(logical_step, population_interval));
+        }
+        for logical_step in [16, 32, 48, 64] {
+            assert!(policy_replan_is_due(logical_step, population_interval));
+        }
+    }
+
+    #[test]
+    fn policy_replan_cadence_normalizes_zero_and_saturates_overflow() {
+        assert!(!policy_replan_is_due(1, 0));
+        assert!(policy_replan_is_due(4, 0));
+
+        let largest_config_interval = u64::from(u32::MAX);
+        let largest_config_cadence = largest_config_interval * POLICY_REPLAN_POPULATION_PASSES;
+        assert!(policy_replan_is_due(
+            largest_config_cadence,
+            largest_config_interval
+        ));
+        assert!(!policy_replan_is_due(
+            largest_config_interval,
+            largest_config_interval
+        ));
+
+        assert!(policy_replan_is_due(u64::MAX, u64::MAX));
     }
 
     #[test]
@@ -1639,6 +2325,8 @@ mod tests {
             seed_depths: vec![1, 0],
             outside_depths: vec![u16::MAX, 1, u16::MAX, 2, u16::MAX],
             split_cursors: vec![0; 5],
+            focus_cell_id: None,
+            target_cells: Vec::new(),
         };
         assert_eq!(wave_node_depth(&wave, 2), Some(WaveNodeDepth::Seed(1)));
         assert_eq!(wave_node_depth(&wave, 4), Some(WaveNodeDepth::Seed(0)));
@@ -1653,7 +2341,84 @@ mod tests {
     }
 
     #[test]
-    fn one_lane_extends_through_successive_layers_without_touching_its_neighbor() {
+    fn focused_cluster_expansion_biases_without_zeroing_the_rear() {
+        let parent = Axial::ZERO;
+        let children = [Axial::new(1, 0), Axial::new(1, -1), Axial::new(-1, 0)];
+        let weights = focus_weights_for_coordinates(parent, &children, Axial::new(3, 0));
+        assert_eq!(weights, vec![3, 2, 1]);
+
+        let split = weighted_branch_allocations_rotated(&[12], &weights, 0).unwrap();
+        let by_child = split.allocations.into_iter().fold(
+            vec![0_u64; children.len()],
+            |mut totals, allocation| {
+                totals[allocation.child_index] += allocation.amount;
+                totals
+            },
+        );
+        assert_eq!(by_child, vec![6, 4, 2]);
+        assert!(by_child[2] > 0, "the rear perimeter must remain active");
+    }
+
+    #[test]
+    fn focused_cluster_expansion_recomputes_opposed_front_vectors_locally() {
+        let focus = Axial::ZERO;
+        let west_parent = Axial::new(-1, 0);
+        let east_parent = Axial::new(1, 0);
+
+        let west_children = [focus, Axial::new(-2, 0)];
+        let east_children = [focus, Axial::new(2, 0)];
+        let west_weights = focus_weights_for_coordinates(west_parent, &west_children, focus);
+        let east_weights = focus_weights_for_coordinates(east_parent, &east_children, focus);
+
+        assert_eq!(west_weights, vec![3, 1]);
+        assert_eq!(east_weights, vec![3, 1]);
+
+        let split_totals = |weights: &[u8]| {
+            weighted_branch_allocations_rotated(&[20], weights, 0)
+                .unwrap()
+                .allocations
+                .into_iter()
+                .fold(vec![0_u64; weights.len()], |mut totals, allocation| {
+                    totals[allocation.child_index] += allocation.amount;
+                    totals
+                })
+        };
+        let west_split = split_totals(&west_weights);
+        let east_split = split_totals(&east_weights);
+
+        assert_eq!(west_split, vec![15, 5]);
+        assert_eq!(east_split, vec![15, 5]);
+        assert_eq!(west_split.iter().chain(&east_split).sum::<u64>(), 40);
+        assert!(west_split[1] > 0 && east_split[1] > 0);
+    }
+
+    #[test]
+    fn attack_wave_can_branch_and_turn_on_successive_mask_depths() {
+        let parent_coordinate = Axial::new(1, 0);
+        let straight_child = Axial::new(2, 0);
+        let turning_child = Axial::new(1, 1);
+        assert_eq!(parent_coordinate.distance(straight_child), 1);
+        assert_eq!(parent_coordinate.distance(turning_child), 1);
+        assert_ne!(
+            straight_child - parent_coordinate,
+            turning_child - parent_coordinate
+        );
+        assert!(wave_depth_allows_child(
+            WaveNodeDepth::Outside(1),
+            WaveNodeDepth::Outside(2)
+        ));
+
+        let split = weighted_branch_allocations_rotated(&[8], &[1, 1], 0).unwrap();
+        let reached = split
+            .allocations
+            .iter()
+            .map(|allocation| allocation.child_index)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(reached, BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn one_lane_extends_without_touching_its_parallel_neighbor() {
         let mut first_lane = vec![1, 2, 3];
         let mut second_lane = vec![10, 11];
 
@@ -1665,11 +2430,67 @@ mod tests {
     }
 
     #[test]
-    fn partial_frontage_keeps_the_extended_route_for_leading_and_queued_packets() {
-        // `extend_sustained_lane` updates every packet sharing the stable lane
-        // anchor before `advance_packet` splits off the throughput-approved
-        // amount. Consequently both the leading child and source remainder
-        // retain the next layer rather than stopping after a partial capture.
+    fn shared_destination_lanes_retain_distinct_route_derived_directions() {
+        let west_origin = 1;
+        let west_boundary = 2;
+        let east_origin = 3;
+        let east_boundary = 4;
+        let shared_target = 5;
+        let later_layer = 6;
+        let coordinates = BTreeMap::from([
+            (west_origin, Axial::new(-2, 0)),
+            (west_boundary, Axial::new(-1, 0)),
+            (east_origin, Axial::new(2, 0)),
+            (east_boundary, Axial::new(1, 0)),
+            (shared_target, Axial::ZERO),
+            (later_layer, Axial::new(1, 0)),
+        ]);
+        let lookup = |cell_id| {
+            coordinates
+                .get(&cell_id)
+                .copied()
+                .ok_or_else(|| "unknown test cell".to_string())
+        };
+
+        let eastward = lane_direction_from_route(
+            &[west_origin, west_boundary, shared_target, later_layer],
+            shared_target,
+            lookup,
+        )
+        .unwrap();
+        let westward = lane_direction_from_route(
+            &[east_origin, east_boundary, shared_target],
+            shared_target,
+            lookup,
+        )
+        .unwrap();
+
+        assert_eq!(eastward, Axial::new(1, 0));
+        assert_eq!(westward, Axial::new(-1, 0));
+        assert_ne!(eastward, westward);
+    }
+
+    #[test]
+    fn lane_direction_requires_a_preceding_adjacent_boundary() {
+        let coordinates = BTreeMap::from([
+            (1, Axial::ZERO),
+            (2, Axial::new(2, 0)),
+            (3, Axial::new(1, 0)),
+        ]);
+        let lookup = |cell_id| {
+            coordinates
+                .get(&cell_id)
+                .copied()
+                .ok_or_else(|| "unknown test cell".to_string())
+        };
+
+        assert!(lane_direction_from_route(&[2], 2, lookup).is_err());
+        assert!(lane_direction_from_route(&[1, 2], 2, lookup).is_err());
+        assert!(lane_direction_from_route(&[1, 3], 2, lookup).is_err());
+    }
+
+    #[test]
+    fn partial_frontage_keeps_the_extended_route_for_all_lane_packets() {
         let mut leading_route = vec![1, 2];
         let mut queued_remainder_route = vec![1, 2];
         assert!(append_lane_layer(&mut leading_route, 2, 3));
@@ -1677,11 +2498,209 @@ mod tests {
 
         let offered = 100_u64;
         let throughput = 17_u64;
-        let advanced = offered.min(throughput);
-        let queued = offered - advanced;
-        assert_eq!((advanced, queued), (17, 83));
+        assert_eq!((offered.min(throughput), offered - throughput), (17, 83));
         assert_eq!(leading_route, vec![1, 2, 3]);
         assert_eq!(queued_remainder_route, leading_route);
+    }
+
+    #[test]
+    fn only_a_capture_may_extend_a_sustained_push_lane() {
+        assert!(!PacketArrival::Friendly.may_extend_sustained_push());
+        assert!(PacketArrival::Capture.may_extend_sustained_push());
+    }
+
+    #[test]
+    fn friendly_push_endpoint_settles_capacity_backpressure_but_not_throughput() {
+        let capacity = BTreeSet::from([MovementLimit::DestinationCapacity]);
+        let throughput = BTreeSet::from([MovementLimit::EdgeThroughput]);
+        let both = BTreeSet::from([
+            MovementLimit::DestinationCapacity,
+            MovementLimit::EdgeThroughput,
+        ]);
+
+        assert!(should_settle_capacity_blocked_friendly_lane(
+            OrderKind::PushFront,
+            1,
+            3,
+            &capacity,
+        ));
+        assert!(should_settle_capacity_blocked_friendly_lane(
+            OrderKind::PushFront,
+            1,
+            3,
+            &both,
+        ));
+        assert!(!should_settle_capacity_blocked_friendly_lane(
+            OrderKind::PushFront,
+            1,
+            3,
+            &throughput,
+        ));
+        assert!(!should_settle_capacity_blocked_friendly_lane(
+            OrderKind::PushFront,
+            0,
+            3,
+            &capacity,
+        ));
+        assert!(!should_settle_capacity_blocked_friendly_lane(
+            OrderKind::Balance,
+            1,
+            3,
+            &capacity,
+        ));
+    }
+
+    #[test]
+    fn partial_inward_capacity_move_releases_the_exact_blocked_remainder() {
+        let committed = 50_u64;
+        let moved = 15_u64;
+        let queued_after_move = committed - moved;
+        let stopped = station_accounting(queued_after_move, queued_after_move, moved).unwrap();
+
+        assert_eq!(stopped.stationed, 35);
+        assert_eq!(stopped.packet_remaining, 0);
+        assert_eq!(stopped.delivered_after, committed);
+        assert_eq!(
+            finalized_order_status(committed, 0, stopped.delivered_after, 0),
+            Ok(OrderStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn explicit_logistics_and_expand_capacity_backpressure_station_but_throughput_queues() {
+        let capacity = BTreeSet::from([MovementLimit::DestinationCapacity]);
+        let throughput = BTreeSet::from([MovementLimit::EdgeThroughput]);
+        for kind in [
+            OrderKind::Balance,
+            OrderKind::FrontLoad,
+            OrderKind::CoreLoad,
+            OrderKind::PerimeterLoad,
+            OrderKind::Reshape,
+        ] {
+            let order = test_order(kind, OrderStatus::Active);
+            assert!(should_station_capacity_blocked_packet(&order, &capacity));
+            assert!(!should_station_capacity_blocked_packet(
+                &order,
+                &throughput
+            ));
+        }
+        for kind in [
+            OrderKind::ExpandAll,
+            OrderKind::ExpandClusters,
+            OrderKind::AttackClusters,
+        ] {
+            let order = test_order(kind, OrderStatus::Active);
+            assert!(should_station_capacity_blocked_packet(&order, &capacity));
+            assert!(!should_station_capacity_blocked_packet(
+                &order,
+                &throughput
+            ));
+        }
+        let push = test_order(OrderKind::PushFront, OrderStatus::Active);
+        assert!(!should_station_capacity_blocked_packet(
+            &push,
+            &capacity
+        ));
+
+        let committed = 50;
+        let moved = 15;
+        let stopped = station_accounting(committed - moved, committed - moved, moved).unwrap();
+        assert_eq!(stopped.packet_remaining, 0);
+        assert_eq!(stopped.delivered_after, committed);
+        assert_eq!(
+            finalized_order_status(committed, 0, stopped.delivered_after, 0),
+            Ok(OrderStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn persistent_policy_capacity_backpressure_waits_for_the_next_replan() {
+        let capacity = BTreeSet::from([MovementLimit::DestinationCapacity]);
+        let throughput = BTreeSet::from([MovementLimit::EdgeThroughput]);
+        for kind in [
+            OrderKind::Balance,
+            OrderKind::FrontLoad,
+            OrderKind::CoreLoad,
+            OrderKind::PerimeterLoad,
+        ] {
+            let mut policy = test_order(kind, OrderStatus::Active);
+            policy.client_command_id = 0;
+            assert!(!should_station_capacity_blocked_packet(
+                &policy,
+                &capacity
+            ));
+            assert!(!should_station_capacity_blocked_packet(
+                &policy,
+                &throughput
+            ));
+        }
+
+        // Command ID zero is not enough on its own: only the strict set of
+        // persistent-policy order kinds receives receding-horizon behavior.
+        let mut reshape = test_order(OrderKind::Reshape, OrderStatus::Active);
+        reshape.client_command_id = 0;
+        assert!(should_station_capacity_blocked_packet(
+            &reshape, &capacity
+        ));
+    }
+
+    #[test]
+    fn queued_policy_funnel_converges_while_stationing_reproduces_the_pockets() {
+        let (queued, saw_backpressure, passes) = run_capacity_funnel(false);
+        assert!(saw_backpressure);
+        assert!(passes > 1, "the regression must exercise a real pipeline");
+        assert_eq!(queued.total_force(), 400);
+        for (coordinate, expected) in [
+            (Axial::new(-1, 0), 57),
+            (Axial::new(0, -1), 57),
+            (Axial::new(-1, 1), 58),
+            (Axial::ZERO, 57),
+            (Axial::new(1, 0), 57),
+            (Axial::new(0, 1), 57),
+            (Axial::new(1, -1), 57),
+        ] {
+            assert_eq!(queued.get(coordinate).unwrap().force(), expected);
+        }
+
+        let (stationed, saw_backpressure, _) = run_capacity_funnel(true);
+        assert!(saw_backpressure);
+        assert_eq!(stationed.total_force(), 400);
+        assert!(
+            [Axial::new(1, 0), Axial::new(0, 1), Axial::new(1, -1)]
+                .into_iter()
+                .any(|coordinate| stationed.get(coordinate).unwrap().force() < 57),
+            "old stop-in-place behavior must leave declared policy demand undelivered"
+        );
+        assert!(
+            [
+                Axial::new(-1, 0),
+                Axial::new(0, -1),
+                Axial::new(-1, 1),
+                Axial::ZERO,
+            ]
+            .into_iter()
+            .any(|coordinate| stationed.get(coordinate).unwrap().force() > 58),
+            "undelivered strength must remain as a high pocket"
+        );
+    }
+
+    #[test]
+    fn capacity_stopped_expand_conserves_strength_without_consuming_garrison_debt() {
+        let committed = 50;
+        let delivered_before = 15;
+        let blocked_packet = committed - delivered_before;
+        let stopped = station_accounting(blocked_packet, u64::MAX, delivered_before).unwrap();
+        let existing_debt = 4;
+        let (_, debt_after_stop, continuing) = garrison_debt_partition(existing_debt, 0);
+
+        assert_eq!(stopped.stationed, blocked_packet);
+        assert_eq!(stopped.packet_remaining, 0);
+        assert_eq!(stopped.delivered_after, committed);
+        assert_eq!((debt_after_stop, continuing), (existing_debt, 0));
+        assert_eq!(
+            finalized_order_status(committed, 0, stopped.delivered_after, 0),
+            Ok(OrderStatus::Completed)
+        );
     }
 
     #[test]
@@ -1707,20 +2726,210 @@ mod tests {
     }
 
     #[test]
-    fn a_push_stops_before_friendly_impassable_or_uncapturable_ground() {
-        assert!(push_target_is_eligible(1, 0, true, true, true));
-        assert!(push_target_is_eligible(1, 2, true, true, true));
-        assert!(!push_target_is_eligible(1, 1, true, true, true));
-        assert!(!push_target_is_eligible(1, 0, false, true, true));
-        assert!(!push_target_is_eligible(1, 0, true, false, true));
-        assert!(!push_target_is_eligible(1, 0, true, true, false));
+    fn sustained_push_stops_before_friendly_impassable_or_uncapturable_ground() {
+        assert!(sustained_push_target_is_eligible(1, 0, true, true, true));
+        assert!(sustained_push_target_is_eligible(1, 2, true, true, true));
+        assert!(!sustained_push_target_is_eligible(1, 1, true, true, true));
+        assert!(!sustained_push_target_is_eligible(1, 0, false, true, true));
+        assert!(!sustained_push_target_is_eligible(1, 0, true, false, true));
+        assert!(!sustained_push_target_is_eligible(1, 0, true, true, false));
     }
 
     #[test]
-    fn ownership_change_to_enemy_stops_expand_but_friendly_transit_remains_valid() {
-        assert!(!expand_next_owner_is_blocked(1, NEUTRAL_PLAYER));
-        assert!(!expand_next_owner_is_blocked(1, 1));
-        assert!(expand_next_owner_is_blocked(1, 2));
+    fn wave_scope_keeps_attack_inside_its_snapshot_and_neutral_expand_out_of_enemy_ground() {
+        let selected = [2, 3];
+        let target = [7, 8];
+        assert!(wave_scope_allows_cell(
+            OrderKind::ExpandClusters,
+            1,
+            99,
+            NEUTRAL_PLAYER,
+            &selected,
+            &[],
+        ));
+        assert!(wave_scope_allows_cell(
+            OrderKind::ExpandClusters,
+            1,
+            99,
+            1,
+            &selected,
+            &[],
+        ));
+        assert!(!wave_scope_allows_cell(
+            OrderKind::ExpandClusters,
+            1,
+            99,
+            2,
+            &selected,
+            &[],
+        ));
+
+        for owner in [NEUTRAL_PLAYER, 1, 2] {
+            assert!(wave_scope_allows_cell(
+                OrderKind::AttackClusters,
+                1,
+                7,
+                owner,
+                &selected,
+                &target,
+            ));
+        }
+        assert!(wave_scope_allows_cell(
+            OrderKind::AttackClusters,
+            1,
+            2,
+            1,
+            &selected,
+            &target,
+        ));
+        assert!(!wave_scope_allows_cell(
+            OrderKind::AttackClusters,
+            1,
+            2,
+            2,
+            &selected,
+            &target,
+        ));
+        assert!(!wave_scope_allows_cell(
+            OrderKind::AttackClusters,
+            1,
+            99,
+            1,
+            &selected,
+            &target,
+        ));
+    }
+
+    #[test]
+    fn internal_orders_stop_before_every_non_friendly_route_cell() {
+        for kind in [
+            OrderKind::Balance,
+            OrderKind::FrontLoad,
+            OrderKind::CoreLoad,
+            OrderKind::PerimeterLoad,
+            OrderKind::Reshape,
+        ] {
+            assert!(!internal_next_owner_is_blocked(kind, 1, 1));
+            assert!(internal_next_owner_is_blocked(kind, 1, NEUTRAL_PLAYER));
+            assert!(internal_next_owner_is_blocked(kind, 1, 2));
+        }
+    }
+
+    #[test]
+    fn recruitment_leaves_headroom_for_outstanding_internal_destinations() {
+        assert_eq!(recruitment_headroom(100, 70, 25), 5);
+        assert_eq!(recruitment_headroom(100, 70, 30), 0);
+        assert_eq!(recruitment_headroom(100, 70, 40), 0);
+        assert_eq!(recruitment_headroom(100, 100, 10), 0);
+        assert_eq!(recruitment_headroom(90, 100, 10), 0);
+    }
+
+    #[test]
+    fn only_active_internal_orders_reserve_recruitment_capacity() {
+        for kind in [
+            OrderKind::Balance,
+            OrderKind::FrontLoad,
+            OrderKind::CoreLoad,
+            OrderKind::PerimeterLoad,
+            OrderKind::Reshape,
+        ] {
+            let order = test_order(kind, OrderStatus::Active);
+            assert!(order_reserves_recruitment_capacity(&order));
+        }
+        for kind in [
+            OrderKind::PushFront,
+            OrderKind::ExpandAll,
+            OrderKind::ExpandClusters,
+            OrderKind::AttackClusters,
+        ] {
+            let order = test_order(kind, OrderStatus::Active);
+            assert!(!order_reserves_recruitment_capacity(&order));
+        }
+        for status in [OrderStatus::Completed, OrderStatus::Cancelled] {
+            let order = test_order(OrderKind::Reshape, status);
+            assert!(!order_reserves_recruitment_capacity(&order));
+        }
+
+        let reservations = BTreeMap::from([((2, 7), 30)]);
+        assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 0);
+        assert_eq!(reserved_recruitment_capacity(&reservations, 2, 7), 30);
+    }
+
+    #[test]
+    fn internal_destination_reservation_tracks_only_the_unreceived_remainder() {
+        let mut reservations = BTreeMap::new();
+        let balance = test_order(OrderKind::Balance, OrderStatus::Active);
+        add_internal_destination_reservation(&mut reservations, &balance, 7, 50, 20).unwrap();
+        assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 30);
+
+        let reshape = test_order(OrderKind::Reshape, OrderStatus::Active);
+        add_internal_destination_reservation(&mut reservations, &reshape, 7, 10, 5).unwrap();
+        assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 35);
+
+        let push = test_order(OrderKind::PushFront, OrderStatus::Active);
+        add_internal_destination_reservation(&mut reservations, &push, 7, 100, 0).unwrap();
+        let completed = test_order(OrderKind::CoreLoad, OrderStatus::Completed);
+        add_internal_destination_reservation(&mut reservations, &completed, 7, 100, 0).unwrap();
+        assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 35);
+
+        let mut foreign = test_order(OrderKind::PerimeterLoad, OrderStatus::Active);
+        foreign.player_id = 2;
+        add_internal_destination_reservation(&mut reservations, &foreign, 7, 40, 10).unwrap();
+        assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 35);
+        assert_eq!(reserved_recruitment_capacity(&reservations, 2, 7), 30);
+
+        add_internal_destination_reservation(&mut reservations, &reshape, 8, 10, 15).unwrap();
+        assert_eq!(reserved_recruitment_capacity(&reservations, 1, 8), 0);
+    }
+
+    #[test]
+    fn combat_capable_orders_are_not_stopped_by_the_internal_route_guard() {
+        for kind in [
+            OrderKind::PushFront,
+            OrderKind::ExpandAll,
+            OrderKind::ExpandClusters,
+            OrderKind::AttackClusters,
+        ] {
+            assert!(!internal_next_owner_is_blocked(kind, 1, 1));
+            assert!(!internal_next_owner_is_blocked(kind, 1, NEUTRAL_PLAYER));
+            assert!(!internal_next_owner_is_blocked(kind, 1, 2));
+        }
+    }
+
+    #[test]
+    fn blocked_internal_packets_station_in_place_and_finalize_without_combat() {
+        for kind in [
+            OrderKind::Balance,
+            OrderKind::FrontLoad,
+            OrderKind::CoreLoad,
+            OrderKind::PerimeterLoad,
+            OrderKind::Reshape,
+        ] {
+            let cell_infantry_before = 55_u64;
+            let packet_infantry = 30_u64;
+            let delivered_before = 10_u64;
+            let committed = 40_u64;
+
+            assert!(internal_next_owner_is_blocked(kind, 1, 2));
+            let station =
+                station_accounting(packet_infantry, packet_infantry, delivered_before).unwrap();
+
+            // The production transition only retires allocation metadata; the
+            // backing infantry remains stationed in its current cell.
+            let cell_infantry_after = cell_infantry_before;
+            let in_transit_after = station.packet_remaining;
+            let combat_offered_after = station.packet_remaining;
+            let status =
+                finalized_order_status(committed, in_transit_after, station.delivered_after, 0)
+                    .unwrap();
+
+            assert_eq!(station.stationed, 30);
+            assert_eq!(cell_infantry_after, cell_infantry_before);
+            assert_eq!(station.delivered_after, committed);
+            assert_eq!(in_transit_after, 0);
+            assert_eq!(combat_offered_after, 0);
+            assert_eq!(status, OrderStatus::Completed);
+        }
     }
 
     #[test]
@@ -1785,5 +2994,33 @@ mod tests {
         assert!(!expansion_debt_applies(1, 2, 2));
         assert!(!expansion_debt_applies(1, 1, 2));
         assert!(!expansion_debt_applies(2, 1, 1));
+    }
+
+    #[test]
+    fn retreat_abandonment_requires_an_unclaimed_empty_owned_cell() {
+        let safe = || retreat_abandonment_is_safe(true, true, true, 0, 0, false, false);
+        assert!(safe());
+        assert!(!retreat_abandonment_is_safe(
+            true, true, true, 0, 0, true, false
+        ));
+        assert!(!retreat_abandonment_is_safe(
+            true, true, true, 0, 0, false, true
+        ));
+        assert!(!retreat_abandonment_is_safe(
+            true, true, true, 1, 0, false, false
+        ));
+        assert!(!retreat_abandonment_is_safe(
+            true, true, true, 0, 1, false, false
+        ));
+        assert!(!retreat_abandonment_is_safe(
+            false, true, true, 0, 0, false, false
+        ));
+    }
+
+    #[test]
+    fn neutral_ownership_changes_can_never_name_a_winner() {
+        assert_eq!(controlled_cells_for_owner(PLAYER_ONE, 80, 70), Some(80));
+        assert_eq!(controlled_cells_for_owner(PLAYER_TWO, 80, 70), Some(70));
+        assert_eq!(controlled_cells_for_owner(NEUTRAL_PLAYER, 80, 70), None);
     }
 }

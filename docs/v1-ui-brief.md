@@ -1,88 +1,113 @@
-# V1 Graybox UI Brief
+# V1 graybox UI brief
+
+Status: canonical cluster-first design input
 
 ## Objective
 
-Design a readable native-desktop graybox interface for a two-player 2.5D hex RTS. The interface exists to test aggregate troop logistics, not individual-unit control or visual theme.
+Design a readable native-desktop graybox interface for a two-player 2.5D hex
+RTS. The interface tests aggregate troop logistics through complete territorial
+clusters, not individual units or painted sub-cluster fronts.
+
+The detailed behavior is fixed by
+[Cluster-first troop controls](./cluster-controls.md). Visual exploration may
+improve legibility but must not change its authority or accounting rules.
 
 ## Player mental model
 
-Troops are scalar strength physically located on hexes. A player selects one
-connected owned region, holds `P`, drags toward one of six directions, and
-previews the initial edges of a sustained front before confirming. Selected
-cells facing neutral or enemy territory in that direction form the front; the
-eligible cells may form several disconnected arcs, each of which seeds
-fixed-direction lanes independently. The other selected cells behind them form
-the reinforcement corridor. Rear troops route only through that corridor and
-must be able to reach at least one active arc before feeding its lanes.
-Strength moves subject to hex capacity, edge throughput, elevation, cliffs,
-combat frontage, resistance, and terrain-scaled garrisons. It never teleports.
+1. Hover owned territory and press `C` to select its complete passable cluster.
+2. Add or remove clusters with Shift/Control+`C`, or select all with
+   Control/Command+`A`.
+3. Click neutral territory to expand every reachable selected perimeter,
+   weighted somewhat toward the click.
+4. Click one or more complete enemy clusters to attack every shared front.
+5. Use Share only to choose how much free infantry expansion/attack commits.
+6. Give clusters a persistent Balanced, Perimeter, Center, or Directional
+   density policy.
+7. Use one-cluster Reshape for a best-effort drawn troop footprint and `X` for
+   exact Stop.
+
+Selection never means retask. Explicit actions remain allocated until they
+settle, complete, or are explicitly stopped. Background policy maintenance is
+not a Stop target: it yields to intersecting explicit commands and later resumes
+from the persistent cluster setting.
 
 ## Required V1 interactions
 
-1. Join one of two human player slots and see connection/match status.
-2. Pan, rotate, and zoom an orthographic 3D camera over a stepped hex island.
-3. Hover a hex and inspect coordinate, terrain, elevation, owner, civilians, infantry, capacity, and occupancy percentage.
-4. Paint one connected owned source region, including its intended border arcs
-   and any reinforcement corridor extending backward into owned territory.
-5. Hold `P`, drag outward, and release to choose one exact hex direction.
-6. Preview every eligible active front arc, its exact initial edges,
-   selected-only corridor routes, estimated arrival time, bottlenecks,
-   resistance, garrison cost, and committed troop amount. Disconnected arcs are
-   valid when every selected cell can reach at least one of them internally.
-7. Confirm the sustained Push Front command or stop a matching active push.
-   Each axial lane continues independently until its committed pool is
-   exhausted, blocked, defeated, reaches the map edge, or is manually cancelled.
-8. Select a locally attacked contested cell as a tagged handle, preview every
-   current packet cell and lane belonging to its snapshotted local orders, and
-   atomically replace those orders without treating the enemy cell as occupied.
-9. From the same connected selection, preview and confirm a neutral-only Expand
-   All operation. The chosen dispatch share is taken once from each selected
-   unallocated stack. Combined strength splits evenly at each outward local
-   branch, merges at shared children, and continues through successive perimeter
-   layers. Each branch advances independently until it stops before an enemy,
-   exhausts, blocks, reaches the edge, or is cancelled.
-10. Select an owned region and issue percentage-aware one-shot Balance,
-   Core-load, or Perimeter-load redistribution.
-11. Select an owned region, drag an orientation arrow, preview a directional
-   target-density heatmap, and issue percentage-aware Front-load
-   redistribution. The unparticipating share remains frozen per source cell.
-12. Distinguish a contested cell by a controller/attacker pressure blend without
-    interpreting it as authoritative dual occupancy.
-13. Adjust a global mobilization target. Lowering it stops future conversion but does not demobilize existing troops; this future-recruitment target remains visibly separate from each order's dispatch/participation percentage.
-14. Read active flows, congestion, combat fronts, ownership changes, casualties, conquest percentage, and the 80% victory result.
+1. Show stepped terrain, ownership, absolute infantry density, civilians, and
+   exact cell totals at readable zoom.
+2. Make complete selected clusters legible, including empty owned connectors
+   and multiple disconnected selections.
+3. Keep selection coherent when clusters grow, merge, or split.
+4. Show neutral clicks as a focus on all-perimeter expansion, not a precise
+   destination. Communicate stronger toward/equal/away branch weighting without
+   hiding weak-side expansion.
+5. Highlight the entire enemy cluster under the pointer and every shared source
+   front.
+6. Support Shift staging/toggling and Control removal of several complete enemy
+   target clusters.
+7. Display one persisted Share only for expansion and attack; never show policy
+   or Reshape as percentage-limited.
+8. Expose Balanced, Perimeter, Center, and Directional as persistent cluster
+   settings rather than one-shot commands.
+9. Distinguish free infantry from live action troops. Policy targets exclude
+   live action strength but reserve the capacity it physically occupies.
+10. Enable Reshape only for one selected cluster. Show the complete brush with
+    independent width, independent height, symmetric ring growth, unavailable
+    in-map cells, and out-of-world positions.
+11. Preview best-effort Reshape fit and conserved outside overflow using the
+    whole available pool.
+12. Preview `X` as an exact frozen order set and explain that stopped troops
+    remain at their current physical cells.
+13. Show terrain, capacity, throughput, frontage, garrisons, congestion,
+    blocked paths, and contested pressure without implying dual cell ownership.
+14. Adjust the global mobilization target separately from Share. Lowering it
+    stops future conversion but does not demobilize existing infantry.
+15. Use a compact keybind-first contextual strip and a `?` field manual, not a
+    persistent button for every command.
+
+## Context states
+
+The control strip must have distinct copy for:
+
+- idle selection and contextual click;
+- staged enemy targets;
+- Directional policy gesture;
+- Reshape drawing and ready preview;
+- exact Stop preview;
+- invalid action with a specific reason;
+- locked submission awaiting an authoritative receipt.
+
+Source selection should survive successful commands and ordinary rejections.
+`Escape` backs out of staged modes; idle Escape clears selection.
 
 ## Presentation constraints
 
-- No production assets, fiction, unit portraits, minimap, fog of war, technology tree, or build menu.
-- The map is the primary surface and remains visible behind compact overlays.
-- Ownership and troop-density shading must remain distinguishable at far zoom.
-- Color cannot be the only signal for the selected region, active front,
-  blocked path, or combat.
-- The interface must explain authoritative rejection and congestion rather than silently doing nothing.
-- Prefer direct manipulation and a short, discoverable keyboard vocabulary.
-- Support two separate client windows on one machine during development.
+- Preserve map readability at 1280 x 720.
+- Keep the top status strip, right inspector/order summary, bottom contextual
+  strip, and mobilization control compact.
+- Do not obscure the map with a command grid or long permanent help copy.
+- Use text labels and line/heatmap overlays before adding bespoke iconography.
+- Keep overlay categories composable and color-blind distinguishable through
+  line weight, pattern, or luminance as well as hue.
+- Use one authoritative controller color per cell; blend active attacker pressure
+  only as presentation.
+- Keep unavailable and out-of-world brush cells visually distinct from valid
+  owned targets.
 
 ## Technical constraints
 
-- Bevy 0.19 native UI and GPU rendering.
-- Orthographic 3D camera.
-- Combined chunk meshes with per-vertex colors; avoid one UI/material/collider per hex.
-- Deterministic height-aware ray-to-hex picking.
-- SpacetimeDB is authoritative. Client route/ETA/heatmap previews are replaceable predictions.
-- Initial viewport target is 1440 x 900, but layout must remain usable at 1280 x 720.
+- Combined chunk meshes and batched overlays; no entity/material/UI node per
+  hex.
+- Viewport-bounded outlines and labels.
+- Deterministic axial coordinates and height-aware picking.
+- Generated authoritative reducer bindings; previews never become authority.
+- Complete-component selection and target scope must be revalidated server-side.
+- Materialized selection is capped for V1; later world-scale selection should
+  become symbolic without changing the UX contract.
 
 ## Requested output
 
-Provide an implementation-oriented critique and one recommended layout/input model. Specify:
-
-- information hierarchy;
-- exact Push Front selection/orientation, Expand All, and redistribution gestures;
-- compact HUD regions and their contents;
-- overlay encodings that work together;
-- state transitions for Push Front, Expand All, cancellation, and all four
-  redistribution previews;
-- rejection/error feedback;
-- the smallest viable onboarding hints;
-- major ambiguity or readability risks to test first.
-
-Keep this to V1 graybox mechanics. Do not invent setting, production art, additional resources, units, buildings, or game modes.
+A code-oriented graybox direction that can be implemented with Bevy primitives,
+text, line geometry, vertex-color updates, and target-density heatmaps. Prioritize
+clarity of complete-cluster scope, contextual click result, Share accounting,
+persistent policy, and exact Stop over decorative style.

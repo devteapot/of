@@ -69,6 +69,8 @@ Public state is split by read/update pattern:
   match-wide state;
 - `cell_terrain` is immutable after lobby configuration;
 - `cell_state` holds mutable ownership, population, infantry, and capacities;
+- `cluster_policy_assignment` stores public per-cell policy lineage and explicit
+  policy revisions; clusters themselves remain derived connected components;
 - `command_receipt` records accepted and rejected idempotent commands;
 - `transfer_order`, `transfer_source`, `transfer_destination`, and
   `transit_packet` expose generic internal aggregate-flow progress and
@@ -76,48 +78,87 @@ Public state is split by read/update pattern:
 - `combat_front` exposes the current contested edges and casualties.
 
 `simulation_schedule`, `expansion_wave`, and `expansion_garrison_debt` are
-private. The wave row holds per-order inward/outward depth fields and fair-split
-cursors. Sparse cell-keyed garrison debt ensures partial asynchronous arrivals
-finish the full occupation cost before later wave strength branches, even when
-another overlapping expansion supplies it. Pre-existing friendly transit cells
-create no debt. Clients see only the resulting source accounting and
-resting/one-edge packets. Clients cannot call the scheduled reducer as a player
-identity.
+private. A wave stores its deterministic inward/outward topology, optional
+neutral focus, immutable enemy target mask, and rotating fair-split cursors.
+Sparse cell-keyed garrison debt ensures partial asynchronous arrivals finish the
+full occupation cost before later strength branches, even when another wave
+also reaches the cell. Pre-existing friendly transit cells create no debt.
+Clients see only source accounting and resting/one-edge packets. Clients cannot
+call the scheduled reducer as a player identity.
 
 ## Public reducer surface
 
+The cluster-first client uses these gameplay reducers:
+
 - `configure_map` — select Dev64, Playtest128, or Validation192 before joining.
 - `join_match` — claim or reclaim one of the two player slots.
-- `set_mobilization_target` — change the global target in basis points.
-- `issue_push_front` — commit a percentage of one connected selected region
-  through every eligible front arc in one direction. Disconnected arcs are
-  independent seeds; every selected cell must reach at least one through a
-  traversable selected-only route. After the initial outward edge, each lane
-  sustains movement along the exact stored axial direction using its fixed
-  committed pool.
-- `cancel_push_fronts` — stop matching active directional pushes and release
-  remaining allocations where the troops currently are.
-- `issue_expand_all` — commit a percentage of one connected selected region's
-  currently unallocated infantry to every eligible neutral boundary. Sources
-  split and merge through a depth-directed flow inside the selection, then
-  continue through successive outward perimeter layers without retaining an
-  axial direction.
-- `cancel_expand_all` — stop matching active all-front expansion orders for the
-  submitted source region and release their remaining allocations in place.
-- `issue_balance` — create a percentage-aware physical density equalization
-  order.
-- `issue_front_load` — create a percentage-aware physical directional density
-  order.
-- `issue_core_load` — create a percentage-aware physical inward radial density
-  order.
-- `issue_perimeter_load` — create a percentage-aware physical outward radial
-  density order.
-There is no public precise-infantry-transfer reducer. The generic transfer
-tables are execution machinery shared by Push Front, Expand All, and
-redistribution, not a cell-targeting player command.
+- `set_mobilization_target` — change the global recruitment target in basis
+  points.
+- `issue_expand_clusters` — expand every complete owned cluster touched by the
+  source seeds across its full reachable neutral perimeter. The clicked neutral
+  cell is a focus: deterministic 3/2/1 branch weights favor progress toward it
+  without suppressing the rest of the perimeter.
+- `issue_attack_clusters` — expand source and target seeds to complete owned
+  and enemy clusters, snapshot the enemy target union, and start from every
+  shared passable front. Captures reveal the next masked cells, so local branches
+  can turn, split, and merge but can never leave the accepted targets.
+- `set_cluster_policy` — persist Balanced, Center, Perimeter, or Directional
+  policy on every complete selected source cluster. The policy is metadata, not
+  a Share allocation; the authority immediately schedules any required
+  capacity-safe redistribution of the free pool.
+- `issue_reshape` — prioritize a drawn owned, passable destination shape for
+  one complete source cluster using all available affected strength. Exact fits
+  drain movable non-target strength; undersized targets saturate and conserve
+  deterministic overflow outside.
+- `cancel_orders` — atomically stop the exact explicit active-order IDs
+  snapshotted from current intersections with the selected clusters; the V1
+  Stop snapshot excludes background policy maintenance.
 
-Rejected gameplay commands still create an authoritative receipt with a reason;
-they do not partially mutate match state.
+Both cluster action reducers accept sparse seed IDs and expand them
+authoritatively. The client therefore cannot create a hidden sub-cluster action
+by omitting cells. Share is a basis-point field only on expansion and attack;
+it is applied once to action-available infantry in each participating source.
+That pool includes stationary free strength and local yieldable policy strength
+but excludes other explicit allocations. Sources without an eligible route or
+shared front contribute nothing, and selecting several target clusters never
+multiplies a source commitment.
+
+`cluster_policy_assignment` stores per-cell policy lineage. Connected clusters
+are derived from current ownership and traversal. On a split, both children keep
+their cells' policy. On a merge, the greatest explicit revision wins
+deterministically for the complete merged component; newly captured cells
+inherit their connected cluster's policy.
+
+Policy planning excludes strength in live action packets from both the movable
+pool and the requested density calculation. Those packets still reserve the
+capacity of their physical cells. This prevents policy maintenance from
+counterbalancing against troops that are already expanding, attacking, or
+reshaping, while also preventing overfill. Settled, completed, or cancelled
+strength rejoins the free pool. An accepted explicit command atomically cancels
+only intersecting background maintenance orders and can use their released
+survivors; other explicit allocations remain fixed. The assignment rows persist,
+so maintenance resumes from the same policy on a later pass. Background policy
+packets blocked by capacity stay queued rather than completing at an
+intermediate cell. Reconciliation replaces stale maintenance from current
+physical positions and emits local relay handoffs through saturated connectors
+when necessary. The replacement is prepared before the old maintenance is
+cancelled, so failed planning preserves the live order. None of this reads
+Share; that percentage remains exclusive to expansion and attack.
+
+Reshape has the same accounting rule for unrelated allocations and has no Share
+parameter. A disconnected source part without a reachable drawn target remains
+unchanged. All planning is best effort but conservative: capacity and route
+constraints can leave overflow outside the drawing, never drop strength, and
+never move it through non-friendly cells.
+
+Older reducers such as `issue_push_front`, `issue_expand_all`, and the
+one-shot distribution reducers remain in the module as compatibility and
+implementation-history surfaces. The V1 client does not expose their painted
+sub-cluster or retask-handle grammar as the primary interaction.
+
+Every gameplay intention carries a stable player-scoped command ID. Rejected
+commands still create an authoritative receipt with a UI-suitable reason and do
+not partially mutate match state.
 
 ## Map contract
 
@@ -138,131 +179,135 @@ later.
 ## Client structure
 
 The native client renders combined chunk meshes rather than one entity per hex.
-Each triangle retains its authoritative axial cell so ray picking selects the
+Each triangle retains its authoritative axial cell so ray picking resolves the
 visible stepped surface. Ownership hue and the active map-view intensity are
-encoded in vertex colors; separate overlays communicate selection, target
-density, route, bottlenecks, active flow, and combat fronts.
+encoded in vertex colors; separate batched overlays communicate cluster
+selection, target clusters, intended Reshape footprint, active flows, combat
+fronts, congestion, and blocked paths.
 
-Contested targets still have exactly one authoritative controller and one local
-infantry stack. The client aggregates subscribed `CombatFront` pressure, derives
-an attacker share, and blends the controller and attacker colors in the
-existing chunk vertex-color buffer. This adds no UI node, entity, or unique
-material per contested cell and does not imply dual occupancy.
+The default Soldiers view shades cells by absolute infantry strength rather than
+capacity occupancy. Overview removes force-dependent luminance, and Civilians
+shades absolute population. `1`, `2`, and `3` select those views; `V`
+cycles them. Stable reference values keep an unrelated cell's color from
+changing when the map-wide maximum changes. Readable close-zoom totals and
+civilian perimeters are viewport-bounded batches, not a UI entity or draw call
+per cell.
 
-The default Soldiers view shades cells by absolute infantry strength rather
-than capacity occupancy. Overview removes force-dependent luminance, and the
-Civilians view shades by absolute civilian population. `1`, `2`, and `3`
-select those views directly; `V` cycles them. Stable presentation reference
-values keep an unrelated cell's color from changing when the map-wide maximum
-changes. At readable zoom levels, one texture-atlas-backed world-space mesh
-batches compact authoritative totals directly over their hex tops; there is no
-UI node or draw call per cell. Farther out, the vertex-color heatmap carries the
-information without trying to draw text for every cell. The label LOD is
-viewport-derived and displays the complete readable visible set or hides it,
-rather than silently sampling cells when a fixed budget is exceeded.
-In Civilians mode, a second single-mesh batch draws thin quads across exposed
-edges of six-connected populated land, with most of each strip kept on the
-populated hex top. Its scan is limited to visible render chunks and its edge
-budget is likewise complete-or-hidden; it does not create a UI element,
-material, entity, or gizmo for every populated cell. Camera, projection,
-visible-chunk, and cell-state signatures skip both value and perimeter scans on
-unchanged frames.
+Rendering uses an 8 x 8 client-side spatial index independently of the module's
+16 x 16 storage chunks. Initial chunk creation is amortized; state changes
+replace only affected vertex colors; visible dirty chunks are prioritized; and
+hidden chunks converge under a bounded budget. Selection and target outlines
+inspect visible render chunks and emit exposed edges only.
 
-Rendering work is organized by an 8 x 8 client-side spatial index. This is
-deliberately independent of the module's 16 x 16 storage/subscription chunks so
-the renderer can tune culling granularity without changing authoritative cell
-identity. Initial render-chunk creation is amortized, state changes replace
-only the affected vertex-color attributes, visible dirty chunks are
-prioritized, and hidden chunks converge under a bounded per-frame budget.
-The value batch, population outline, blocked overlay, and selected-region
-perimeters inspect visible render-chunk cells rather than scanning the whole
-map. Selection painting supports a centered odd-sized rectangular core with
-complete hex-ring dilation up to 31 x 31 cells, connected local-owned
-components, and all-local-owned selection. Width and height remain independently
-adjustable while combined resizing adds or removes a true one-cell perimeter.
-Large selections are materialized once in V1, but their per-frame outline work
-is viewport-bounded and emits only exposed edges. Order previews are keyed by
-selection and cell-state revisions. Push Front uses shared deterministic rules
-to derive only the exact chosen-direction boundary, then checks reachability
-backward through the selected region; it does not perform a route search for
-every possible map destination. This keeps presentation work tied primarily to
-the viewport and real state changes. World-scale maps will still
-require symbolic region selections plus chunk-interest subscriptions or
-regional summaries so the client does not retain or transmit every
-authoritative cell.
+### Cluster selection and reconciliation
 
-Input produces `ClientIntent`. The online transport maps coordinates to
-authoritative cell IDs, invokes reducers, pumps SpacetimeDB frames, and rebuilds
-`MatchView` from subscribed tables. The offline transport implements the same
-message boundary for UI development but is not a rules-equivalent substitute
-for the server.
+`C` selects the complete owned, passable component under the cursor.
+Shift+`C` adds a component, Control+`C` removes one, and
+Control/Command+`A` selects all owned traversable components, including empty
+owned cells. Empty owned cells may connect troop-bearing areas; blocked cells
+and impassable cliff edges split them.
 
-`MatchView` joins active local transfer orders, their packets, and hostile
-front edges into a compact retask projection. A selection stores ordinary
-owned cells separately from `handle -> snapshotted order IDs`; packet current
-cells are derived live for preview but newly pressing order IDs are never
-adopted. Reducer intents send physical source IDs and explicit supersede-order
-IDs. The module preflights conservation and the complete new plan against a
-virtual release, then cancels the exact old IDs and persists the prepared order
-in the same transaction. A rejection therefore leaves old packets, counters,
-and reservations intact.
+The interaction resource stores a materialized selected-cell set for V1, but
+selection semantics remain whole-cluster. Reconciliation after subscription
+updates absorbs owned growth and merges. If a selected cluster splits, every
+still-owned resulting child remains selected. Ordinary selection never snapshots
+a retask handle, adopts an active packet, or cancels a live order.
 
-The V1 conquest interaction is Push Front: paint one connected owned region,
-hold `P`, drag outward, and release to preview one exact direction. Plain
-brackets adjust commitment and `Enter` submits. Selected cells facing non-owned
-territory in that direction are the front; selection geometry or target
-eligibility may split them into several disconnected arcs. Every arc seeds
-independent outward lanes. The other selected cells are their reinforcement
-corridor, and each must have a traversable selected-only route to at least one
-arc. The server routes through that corridor, then extends each lane through
-successive layers only along the chosen direction.
-Terrain, elevation, throughput, frontage, enemies, and terrain-scaled garrisons
-consume or delay its fixed committed pool. Lanes stop independently when
-exhausted, blocked, defeated, at the map edge, or cancelled. With the same
-front and direction previewed, `X` stops matching active pushes.
+Large selections retain the 32,768-cell current-world command limit.
+World-scale play will need symbolic component or chunk masks plus authority
+revalidation rather than transmitting millions of IDs.
 
-Shift+`P` (or `EXPAND ALL` in the HUD) skips orientation and previews every
-eligible neutral edge around the connected selection. Plain brackets change
-the order's dispatch percentage; this is independent of the mobilization
-slider, which controls future recruitment. Each selected cell contributes that
-share of its currently unallocated infantry once. Inside the selection, every
-cell combines its local and incoming pools, then divides that strength evenly
-among all traversable neighbors one depth closer to an eligible boundary.
-Shared children merge contributions before splitting again. Boundary cells use
-the same rule across their eligible neutral exits, and captured surplus repeats
-it from perimeter depth `d` to `d + 1`. Branches progress independently, so the
-result can bulge, but depth always moves monotonically and the operation cannot
-cycle, skip layers, or preserve a straight-ray heading. Enemy targets are
-excluded initially and rechecked during execution, so Expand All stops rather
-than becoming an implicit attack. A captured cell consumes its full
-terrain-scaled occupation garrison across partial arrivals before surplus
-continues; already-friendly transit cells do not pay that cost. From the same
-preview, `X` cancels matching Expand All orders.
+### Contextual cluster actions
 
-`B`, `F`, `G`, and `R` preview Balance, directional Front-load, Core-load, and
-Perimeter-load. Brackets adjust percentage participation for all four. The
-unparticipating share of each selected cell's current stack remains frozen in
-that cell; the shared integer allocator redistributes only the participating
-pool and provides the client heatmap as well as the authoritative target plan.
-Precise infantry destination painting is not part of the V1 loop; exact
-cell-to-cell control is reserved for possible future discrete units.
+With source clusters selected, idle left-click is contextual:
+
+- neutral ground emits `ExpandClusters` with the clicked coordinate as a focus;
+- enemy ground emits `AttackClusters` for the complete enemy component;
+- Shift-click toggles additional enemy components in a staged target union;
+- Control-click removes a staged target;
+- a plain enemy click adds its component and submits the union, while `Enter`
+  submits an already staged union.
+
+Source selection remains after a successful command so the player can continue
+operating the same clusters. Staged targets clear after submission. Rejections
+preserve authoritative state and surface the receipt reason.
+
+The online adapter converts coordinates to cell IDs and invokes the cluster
+reducers. The server expands sparse source and target seeds back to complete
+current components, making the reducer contract independent of any stale client
+snapshot. The offline adapter implements the same intent boundary for interface
+work but is not a rules-equivalent substitute for authoritative timing, combat,
+or persistence.
+
+`[` and `]` change one persisted Share. Only contextual expansion and attack
+read it. Preview and HUD accounting use each source's action-available infantry
+once (stationary free strength plus local yieldable policy strength, excluding
+other explicit allocations); multiple shared fronts or staged targets do not
+duplicate the source base.
+
+### Persistent policy, Reshape, and Stop
+
+`R` cycles selected clusters among Balanced, Perimeter, and Center.
+Holding `F`, dragging, and releasing writes Directional policy with the exact
+fixed-point axial vector used by the server. Subscribed
+`cluster_policy_assignment` rows rebuild the policy view; missing owned rows
+display the revision-zero Balanced default.
+
+Policy is not a pending one-shot command and is never multiplied by Share. The
+server redistributes only the free pool while excluding live action packets from
+the policy target calculation and reserving the capacity those packets occupy.
+The HUD reports the selected policy, or mixed policy when selected clusters
+differ.
+
+`T` enters Reshape only when exactly one source cluster is selected. Left-drag
+draws an owned, passable desired troop footprint and release builds a best-effort
+preview. The brush supports independent width and height plus symmetric ring
+growth. Its overlay always distinguishes available cells, unavailable in-map
+cells, and positions outside the world so the intended shape remains legible at
+boundaries. Reshape uses the whole available pool, never Share.
+
+`X` freezes the exact explicit active-order IDs whose current allocations
+intersect the selected clusters. Background policy-maintenance orders are
+excluded. Confirmation cancels only that snapshot and leaves policy metadata
+enabled. `Escape` backs out of staged attack targets, Reshape, or Stop; while
+idle it clears selection. Selection never supersedes an explicit order; an
+accepted contextual action yields intersecting background maintenance only.
+
+### HUD and transport state
+
+The HUD is a compact text-only, keybind-first contextual strip with no command
+grid. Idle state shows cluster selection, Share, policy, and the few current
+keys. Attack staging, Directional policy, Reshape drawing, exact Stop,
+invalid state, and locked submission each replace that copy with their relevant
+instructions. `?` toggles the complete field manual. The right panel remains
+a compact map-view, inspector, and order summary.
+
+Input produces `ClientIntent`. The online transport invokes generated typed
+reducers, pumps SpacetimeDB frames, and rebuilds `MatchView` from subscribed
+tables including cluster policy. Stable command IDs and receipts make retry
+observation idempotent. Reconnect discards speculative UI state and rebuilds the
+selection-adjacent presentation from the new authoritative snapshot.
 
 ## Tests and current evidence
 
-- `hex-core` covers coordinates, chunks, traversal, routing, connectivity,
-  selected directional- and all-front derivation, capacity, throughput,
-  backpressure, conservation, multi-edge combat, redistribution, and exact 80%
-  victory math.
+- `hex-core` covers coordinates, traversal, routing, connectivity, capacity,
+  throughput, conservation, combat, redistribution, focused branch weights,
+  exact integer allocation, rotating fairness, and Conquest math.
+- Module tests cover authority expansion from sparse seeds to complete source
+  and target clusters, Share-once accounting, all-shared-front attack topology,
+  immutable target containment, terrain/capacity/garrison constraints, policy
+  split/merge/capture lineage, live-packet exclusion with physical capacity
+  reservation, atomic background-maintenance yield, queued policy congestion,
+  saturated-connector relay, and shared-relay coalescing.
+- Client interaction tests cover whole-cluster selection, modifiers and Select
+  All, reconciliation after growth/merge/split, contextual neutral and enemy
+  clicks, staged enemy unions, persistent-policy keys, single-cluster Reshape,
+  explicit-only Stop, policy yield previews, and submission/rejection state.
 - `worldgen` pins all curated maps, round-trips serialization, rejects invalid
   metadata/duplicates, and sweeps supported custom seeds.
-- The module's native tests pin preset metadata; module compilation validates
-  the SpacetimeDB schema and WASM target.
-- The headless real-server smoke test uses two identities to cover slot claims,
-  match start, subscriptions, idempotent receipts, sustained multi-layer Push
-  progression, branching and direction-changing neutral Expand All wave
-  progression, cancellation, and token-based reconnect. Deterministic module
-  and client cases pin shared-child merging and asynchronous split fairness.
-- The Bevy client has coordinate/fixture/route tests and a native launch smoke.
+- The real-server two-identity harness covers slot claims, match start,
+  subscriptions, idempotent receipts, public cluster actions and policies,
+  conserved movement, cancellation, and reconnect.
 - CI repeats formatting, workspace tests/lints, module tests/lints/build, and
   generated-binding drift detection.
 
@@ -270,19 +315,23 @@ cell-to-cell control is reserved for possible future discrete units.
 
 - Infantry is the only force composition serialized by the module.
 - The second join auto-starts the match; there is no lobby UI or ready toggle.
-- Corridor routes and axial lane directions are deterministic and fixed when an
-  order is accepted; sustained Push packets extend only along that ray and do
-  not dynamically replan around later ownership changes. Expand All instead
-  uses a deterministic depth-directed wave topology fixed by the accepted seed
-  state; it has no retained axial heading.
-- Push Front and Expand All convert the chosen dispatch percentage to
-  authoritative basis points. There are no order priorities or adaptive lane
-  retargeting. Expand All applies only to the submitted connected selection;
-  the V1 4,096-cell command limit is not a world-scale global policy.
-- Population/mobilization uses a provisional full-state cadence. Movement and
-  combat use active sets, but nominal/stress performance gates still need
-  representative playtest measurement.
-- There is no retreat, morale, explicit supply penalty, HQ defeat, time limit,
+- Expansion topology is deterministic from the accepted state. The focus changes
+  branch allocation but is not a continuously replanned destination.
+- Attack snapshots complete enemy target clusters at acceptance. Fronts evolve
+  within that mask, but later growth of the enemy cluster is not silently added
+  and the wave never retargets another cluster.
+- Cluster policies have no priorities, minimum garrisons, or conditional
+  automation beyond Balanced, Center, Perimeter, and one Directional facing.
+  Their deliberate scope is redistribution of the currently free pool.
+- Reshape is confined to one selected owned cluster and owned passable target
+  cells. It does not use drawing as an alternative conquest command.
+- The 32,768-cell materialized-selection limit is not a world-scale policy or
+  region-selection architecture.
+- Population/mobilization uses a provisional full-state cadence and leaves
+  military headroom for unreceived active internal-order destinations.
+  Movement and combat use active sets, but nominal/stress performance gates
+  still need representative playtest measurement.
+- There is no morale, explicit supply penalty, HQ defeat, time limit,
   economy/upkeep, demobilization, infrastructure, fog, armor, naval/air force,
   diplomacy, AI, matchmaking, or production art.
 - Mobilization already removes people from the civilian population, but V1 has

@@ -3,10 +3,12 @@ use spacetimedb::{ReducerContext, Table};
 use worldgen::{generate, validate};
 
 use crate::schema::{
-    CellState, CellTerrain, MapPreset, MatchConfig, MatchPhase, MatchState, NEUTRAL_PLAYER,
-    PLAYER_ONE, PLAYER_TWO, SINGLETON_ID, TerrainClass,
+    CellState, CellTerrain, ClusterPolicyAssignment, ClusterPolicyKind, MapPreset, MatchConfig,
+    MatchPhase, MatchState, NEUTRAL_PLAYER, PLAYER_ONE, PLAYER_TWO, SINGLETON_ID, TerrainClass,
 };
-use crate::schema::{cell_state, cell_terrain, match_config, match_state};
+use crate::schema::{
+    cell_state, cell_terrain, cluster_policy_assignment, match_config, match_state,
+};
 
 pub fn default_config() -> MatchConfig {
     let preset = MapPreset::Dev64;
@@ -97,6 +99,18 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
             military_capacity: cell.military_capacity,
             last_changed_step: 0,
         });
+        if matches!(owner, PLAYER_ONE | PLAYER_TWO) {
+            ctx.db
+                .cluster_policy_assignment()
+                .insert(ClusterPolicyAssignment {
+                    cell_id,
+                    owner_player_id: owner,
+                    kind: ClusterPolicyKind::Balanced,
+                    orientation_q: 0,
+                    orientation_r: 0,
+                    revision: 0,
+                });
+        }
     }
 
     let rule = ConquestRule::new(capturable, 8_000)
@@ -121,6 +135,7 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
         player_one_controlled: controlled_one,
         player_two_controlled: controlled_two,
         winner_player_id: NEUTRAL_PLAYER,
+        latest_cluster_policy_revision: 0,
         started_at_us: 0,
         completed_at_us: 0,
     });
@@ -140,6 +155,15 @@ fn clear_map(ctx: &ReducerContext) {
     let state_ids: Vec<_> = ctx.db.cell_state().iter().map(|row| row.cell_id).collect();
     for cell_id in state_ids {
         ctx.db.cell_state().cell_id().delete(cell_id);
+    }
+    let policy_cell_ids: Vec<_> = ctx
+        .db
+        .cluster_policy_assignment()
+        .iter()
+        .map(|row| row.cell_id)
+        .collect();
+    for cell_id in policy_cell_ids {
+        ctx.db.cluster_policy_assignment().cell_id().delete(cell_id);
     }
     ctx.db.match_config().singleton_id().delete(SINGLETON_ID);
     ctx.db.match_state().singleton_id().delete(SINGLETON_ID);

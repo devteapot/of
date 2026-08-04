@@ -12,9 +12,9 @@ The defining mechanic is **spatially conserved troop flow**:
 
 Army strength cannot be reassigned instantly from one border to another. Troops have a location, routes take time, destinations have finite capacity, and terrain creates bottlenecks. This should preserve high-level RTS control while making geography and logistics matter.
 
-V1 exists to answer one question: is selecting connected regions, pushing their
-directional front arcs, redistributing aggregate strength, and fighting over a
-height-aware hex map understandable and fun?
+V1 exists to answer one question: is selecting complete territorial clusters,
+contextually expanding or attacking with them, choosing persistent density
+policies, and fighting over a height-aware hex map understandable and fun?
 
 ## Locked V1 Scope
 
@@ -66,7 +66,7 @@ V1 may use only infantry strength, but force state must be composition-shaped so
 
 - New troops originate where civilian population is located; they do not appear in a global reserve or teleport from an HQ.
 - A player controls one global target mobilization percentage.
-- Raising the target gradually converts civilian population into military strength locally, subject to local military capacity and the mobilization rate.
+- Raising the target gradually converts civilian population into military strength locally, subject to the mobilization rate and local military capacity not already reserved for an active internal movement destination.
 - Lowering the target slows or stops further recruitment. It does not instantly convert existing soldiers back into civilians.
 - Civilian population recovers slowly toward local population capacity.
 - A disconnected region retains its local civilians and can continue local recruitment if its population and military capacity permit it.
@@ -124,190 +124,158 @@ If territory is cut into disconnected components:
 
 There is no separate out-of-supply damage, disappearance, morale debuff, or HQ-connectivity penalty in V1. Isolation emerges from the spatial population and troop model.
 
-## Player Orders and UX Experiments
+## Player Orders and Cluster-first UX
 
-### Push Front: the primary conquest interaction
+The main control unit is a complete owned traversable cluster, not a painted
+sub-region. This keeps the primary decision strategic: choose which territorial
+forces participate, which territory to pressure, and how much free infantry to
+commit. Direct sub-cluster front surgery remains outside the V1 interaction.
 
-V1 does not expose destination-cell painting as its conquest loop. The player
-selects the territory and troops that may participate, then chooses exactly one
-of the six hex directions in which its boundary should advance:
+The HUD is keybind-first. A compact strip reports selection, current policy,
+Share when relevant, staged targets, preview validity, and submission state.
+It does not repeat every command as a button grid. `?` opens the complete field
+manual.
 
-1. Paint one connected owned source region. Include the intended border arcs
-   and continue backward into owned territory to include their reinforcement
-   corridor and troop pool.
-2. Hold `P`, drag outward, and release. The client quantizes the gesture to one
-   exact axial direction.
-3. Preview the exact initial active edges, selected routes, participating
-   strength, commitment, capacity, congestion, and any invalid condition.
-4. Use `[` / `]` to change commitment, `Enter` to submit, or `Escape` to
-   cancel while retaining the selected region.
+### Cluster selection
 
-For every selected cell, only its neighbor in the chosen direction is
-considered. A selected cell whose outward neighbor is neutral or enemy
-territory is part of the **front**, and the corresponding initial active edge
-is exactly `(selected source, source + direction)`. Side and rear edges never
-join the command implicitly. The remaining selected cells are the
-**reinforcement corridor**: they must connect behind the front through the
-six-connected selected region, but they do not open outward lanes of their own.
-Selection geometry or target eligibility may divide the front cells into
-several disconnected arcs. That is valid: all eligible edges are included, and
-each arc is an independent outward seed for the same command. Initial targets
-must be capturable and traversable. The same command expands into neutral land
-or attacks an enemy-held cell; ownership determines the resolution, not a
-separate targeting mode.
+A cluster is the complete connected set of owned passable cells. Empty owned
+cells may connect troop-bearing regions; blocked terrain and impassable
+elevation edges split them.
 
-Cells behind the boundary contribute only through routes that stay inside the
-submitted selection until they reach an initial front cell. A cell outside the
-selection cannot become a convenient shortcut into the front, and an
-unselected friendly stack cannot be debited. Every selected cell must be able
-to reach at least one initial front cell through traversable selected-only
-edges. Internal cliffs may split those routes between different front arcs,
-but the command is invalid if they isolate any selected cell from every arc.
+- `C` replaces the selection with the cluster under the cursor.
+- Shift+`C` adds a cluster and Control+`C` removes one.
+- Control/Command+`A` selects every owned traversable cluster, including empty
+  controlled cells.
 
-After crossing an initial front edge, the committed force continues
-automatically through successive hex layers along that lane's exact axial ray.
-It does not spread sideways, bend toward an easier target, or absorb newly
-adjacent friendly stacks. Each lane has a fixed committed strength pool and
-resolves independently. Terrain and elevation affect travel, throughput and
-combat; frontage limits engagement; neutral or enemy forces resist; and every
-captured cell retains a terrain-scaled garrison that consumes momentum. A lane
-stops when its mobile pool is exhausted, it is blocked or defeated, it reaches
-the map edge, or the player manually cancels it. This creates momentum from the
-troops physically committed to the selected corridor rather than click-speed
-bonuses or a separate expansion resource.
+Selection has no implicit order ownership. It never adopts a live packet,
+snapshots a contested retask handle, or cancels an existing action. As
+authoritative ownership changes, selected growth and merges are absorbed.
+When a selected cluster splits, each still-owned child remains selected.
 
-The authoritative `issue_push_front` reducer receives a stable command ID, the
-exact sorted selected cell IDs, one axial direction, and commitment in basis
-points. It revalidates ownership, source connectivity, active-front
-eligibility, selected-only reachability to at least one active arc, traversal,
-available unallocated infantry, and target capacity in one transaction.
-Accepted strength becomes ordinary aggregate transit packets; rejected
-commands create a receipt without partial gameplay mutation.
+### Contextual expansion and attack
 
-Commitment is a one-time share of the currently unallocated strength in each
-selected source when the command is accepted. Existing allocations reduce the
-available base; the percentage is never multiplied by the number of front
-edges. Submitting another command is a new allocation decision and applies to
-what remains unallocated at that later moment. Destination reservations are
-scoped to the issuing player; another player's pending attack cannot pre-claim
-neutral capacity before the forces physically meet.
+With one or more source clusters selected, left-clicking the map chooses the
+action from the clicked cell's owner.
 
-### Contested handles and atomic retasking
+Clicking unclaimed capturable ground issues **Expand Clusters**. Every selected
+source cluster with a reachable neutral perimeter participates across all of
+that perimeter. The click is a focus, not a destination. Branches that reduce
+distance to it receive weight 3, equal-distance branches weight 2, and branches
+moving away weight 1. When the committed integer strength is sufficient, each
+eligible branch receives a positive baseline before the weighted remainder.
+Terrain, capacity, throughput, elevation, and terrain-scaled occupation
+garrisons can make the resulting outline bulge or stall. Expansion never enters
+enemy territory.
 
-An enemy-controlled contested cell under local pressure may be selected as an
-**order handle**, not as a claim that local troops occupy that cell. At the
-selection gesture, the client snapshots the IDs of the local active orders
-feeding that hostile edge. A captured handle may remain visible as a tagged
-selection token while those snapshotted orders are active; it never silently
-turns into an ordinary physical source, and newly arriving orders never join
-the snapshot.
+Clicking an enemy hex issues **Attack Clusters** against that complete enemy
+cluster. Every passable front shared by the selected sources and accepted
+targets starts simultaneously. Shift-click stages or toggles more complete
+enemy clusters, Control-click removes a staged cluster, a plain enemy click adds
+its cluster and submits the union, and `Enter` submits an already staged union.
 
-Confirming Push Front, Expand All, or any redistribution preset supersedes each
-snapshotted order in full, including its other lanes. The authority finds every
-surviving packet and its real current cell, unions those physical cells with
-the explicitly selected owned cells, virtually releases only those
-allocations, and plans the replacement with the selected percentage. Other
-orders sharing a cell remain allocated and cannot be stolen. Delivered
-garrisons and casualties remain accounted to the old order.
+The authority snapshots the complete enemy target union when accepting the
+attack. Captures expose the next masked cells, so each local front can turn,
+split, merge, stall, or be defeated as geometry changes. There is no global push
+vector and no assumption that one direction fits every front arc. A branch never
+leaves the accepted target mask or silently attacks a newly adjacent cluster.
+Enemy infantry, frontage, terrain, elevation, throughput, capacity, and
+garrisons are evaluated authoritatively during progress.
 
-Planning and replacement form one transaction. Stale or foreign IDs, missing
-survivors, oversized or disconnected effective selections, blocked routes,
-and zero usable strength reject without cancelling any prior order. Only a
-fully valid plan cancels the old orders and persists the replacement. This is
-the V1 way to redirect aggregate infantry already committed at a front;
-precise one-hex infantry movement remains out of scope.
+### Force Share and live allocations
 
-With the same front selection and direction previewed, `X` cancels matching
-active Push Front orders. Cancellation releases their remaining allocations at
-the cells where they currently exist; it does not rewind captures, return force
-to its original source, or erase casualties.
+One persisted **Share** percentage applies only to Expand Clusters and Attack
+Clusters. `[` and `]` adjust it. It is independent of the mobilization
+target, which controls future civilian conversion.
 
-### Expand All: neutral opening expansion
+On acceptance, each participating source cell contributes Share of its
+action-available infantry exactly once: stationary free strength plus yieldable
+background-policy strength physically inside the source, excluding troops
+committed to another explicit action. A source with no eligible neutral route
+or shared enemy front contributes nothing. Multiple exits, shared fronts, or
+staged target clusters never multiply the source base. Strength remains
+conserved as contributions split and merge.
 
-Expand All applies the same spatial commitment model to every eligible neutral
-boundary around one connected owned selection. Use Shift+`P` or the HUD button
-to preview it, plain `[` / `]` to set the dispatch percentage, `Enter` to start,
-and `X` from the same preview to stop matching operations. It requires no
-orientation and never includes an enemy-held target; directional Push Front
-remains the command for attacks.
+Infantry committed to any live action packet is unavailable to a later action.
+Selecting the same cluster again does not retask, supersede, or double-allocate
+it. The player must explicitly stop that order if its surviving strength should
+become free.
 
-Each selected cell snapshots the chosen share of its currently unallocated
-infantry exactly once. It is not multiplied by the number of adjacent edges.
-The authority assigns every selected cell an internal depth from the eligible
-neutral perimeter. A cell combines its local commitment with incoming strength,
-then divides that pool as evenly as integer strength permits among all
-traversable selected neighbors one depth closer to the perimeter. Contributions
-from several parents merge before the receiving cell makes its own split. This
-forms one deterministic acyclic flow through the selected region rather than
-routing every source to one nearest boundary.
+### Persistent cluster policy
 
-At depth zero, the same rule divides each boundary pool among all eligible
-neutral exits. A concave outside target can receive and merge contributions
-from several boundary cells. After capture, surplus strength repeats the local
-split-and-merge rule across successive morphological perimeter layers: every
-step moves from outside depth `d` to `d + 1`, but it does not retain an axial
-heading. The result is a topology-preserving outward wave, not a set of straight
-rays or a promise of globally equal ring totals. Branching topology and path
-multiplicity can give different exits different amounts even though every local
-fork is divided evenly.
+Every cluster has one density policy:
 
-Branches advance asynchronously under the same capacity, throughput,
-elevation, and terrain-scaled garrison rules as Push Front. A fast branch may
-bulge ahead while another stalls, but no branch may cycle back into the seed,
-skip an outward layer, or tunnel through an uncleared cell. Friendly traversable
-cells may carry the wave without another capture or occupation garrison. If a
-partial arrival captures a neutral cell with less than its full terrain-scaled
-garrison, later wave arrivals finish that cost before surplus continues. A
-branch stops when its mobile pool is exhausted, blocked, reaches the map edge,
-is cancelled, or would enter enemy territory. Ownership is rechecked during
-execution, so a neutral target that becomes hostile is not attacked by an
-already-issued Expand All operation.
+- **Balanced** evens the free pool across residual military capacity.
+- **Perimeter** weights free infantry toward the current boundary.
+- **Center** weights it toward increasing exact boundary depth.
+- **Directional** weights it toward one exact fixed-point axial facing.
 
-The dispatch percentage belongs to the current order. It is deliberately
-separate from the global mobilization target, which governs future conversion
-of civilians into soldiers. This distinction is shown in the order panel and
-help text.
+`R` cycles Balanced, Perimeter, and Center on all selected clusters.
+Holding `F`, dragging, and releasing sets Directional policy. Policies are
+persistent metadata rather than one-shot formation commands. As the cluster
+grows, contracts, or changes shape, the authority can redistribute its free
+troops toward the current policy.
 
-The generic aggregate transfer machinery remains a useful implementation
-substrate for routes, queues, congestion, and delivery, but V1 has no public
-precise-infantry-transfer command. Exact cell targeting is reserved for possible
-future discrete units such as tanks or boats.
+Policy computation deliberately excludes infantry in live expansion, attack,
+Push, or Reshape packets from the target population. The same packets still
+consume capacity in the cells they physically occupy. Therefore policy neither
+moves active action troops nor counterbalances its free distribution against
+them, but it also cannot overfill around them. Settled, completed, or cancelled
+strength rejoins the free pool.
 
-### One-shot redistribution
+Background policy movement yields atomically when an accepted explicit command
+intersects it. A rejected command leaves maintenance untouched, and unrelated
+explicit actions remain fixed. Yielding does not clear the policy metadata; the
+authority resumes maintenance on a later pass when troops and capacity are free.
+Capacity-blocked policy strength remains queued rather than being finalized at
+an intermediate cell. Reconciliation replans from current physical positions
+and can relay resident strength through a saturated connector while incoming
+strength replaces it. Policy always considers the whole free pool and never the
+player's Share; Share remains exclusive to expansion and attack.
 
-A redistribution order applies a target density pattern to selected owned
-hexes. Each order also has a participation percentage. For every selected cell,
-the unparticipating share of its current stack is frozen as a per-cell lower
-bound; only the participating share joins the redistribution pool. Surplus
-strength moves toward deficits through the ordinary route, throughput, and
-capacity rules, so redistribution is never instantaneous.
+Policy lineage is stored on owned cells. Both children of a split inherit their
+existing lineage. Captured cells inherit the connected cluster policy. When
+clusters merge, the policy with the newest explicit player revision wins across
+the merged component; the player can immediately set another one.
 
-Troops allocated to unrelated active orders are frozen outside the movable
-pool and consume residual cell capacity. The heatmap remains the desired
-distribution; already-reserved incoming redistribution can reduce the new
-order's committed movement to prevent overbooking that destination.
+### Single-cluster Reshape
 
-V1 includes four presets:
+Reshape is a best-effort internal movement tool, not an alternative attack.
+It is available only when exactly one cluster is selected. `T` enables the
+brush and left-drag draws the desired owned, passable troop footprint.
 
-- **Balance**: equalize occupancy ratio (`strength / capacity`) over the selection.
-- **Front-load**: bias target density along a player-specified direction.
-- **Core-load**: bias target density inward toward the selected region's
-  geometric center.
-- **Perimeter-load**: bias target density outward toward the selected region's
-  outer rings.
+The brush exposes independent width and height plus symmetric ring growth.
+Its overlay shows the complete intended footprint even at an edge: usable
+cells, unavailable in-map cells, and out-of-world positions have distinct
+treatments. The drawn footprint may be smaller or larger than the current troop
+footprint, including owned cells outside the previous occupied bounds.
 
-For Front-load, the player selects a region and drags an orientation arrow.
-Each selected hex receives a weight based on its projection along that
-direction; the preview shows the resulting target-density heatmap. The
-direction is captured when the one-shot order is issued and does not rotate
-automatically as the border changes. Core-load and Perimeter-load use distance
-from the selected cells' geometric center, so they need no orientation. Plain
-`[` / `]` adjusts participation for every preset before submission.
+Reshape uses the whole currently available pool and never Share. Reachable
+drawn cells fill first by residual capacity. If the drawing can hold the pool,
+movable source strength outside it drains; if it is undersized, targets saturate
+and exact conserved overflow remains outside. Live unrelated allocations remain
+fixed and reserve capacity. A disconnected source part without a reachable
+target stays unchanged. Internal routes never cross non-friendly ground.
 
-Possible future presets include rear reserve, flank concentration,
-fill-to-percentage, and corridor weighting. Persistent policies such as
-“maintain 300 strength here” are deferred until one-shot orders are understood;
-they must not be necessary for V1.
+### Exact Stop and cancellation
+
+`X` snapshots the exact live explicit-order IDs whose current allocations
+intersect the selected clusters. Background policy maintenance is excluded.
+Confirming Stop cancels only that frozen dispatch set and releases its surviving
+strength at current physical cells. It does not rewind captures, restore
+casualties, clear policy metadata, or cancel a newly arriving unrelated order.
+
+`Escape` cancels a staged enemy union, Reshape, or Stop preview. In idle mode
+it clears source selection. Successful contextual actions retain source
+selection for follow-up commands.
+
+### Deliberate V1 boundary
+
+The previous painted sub-cluster Push Front, one-shot Formation/Bias, and
+contested retask-handle grammar remain useful implementation history, not the
+primary V1 interaction. Cluster attacks already compute distinct local
+progression along changing front arcs. Point-side seventh/eighth global
+directions and direct sub-cluster surgery should return only if playtests reveal
+a tactical need that the cluster loop cannot express.
 
 ## Combat Placeholder
 
@@ -325,7 +293,9 @@ V1 combat is aggregate and edge-based:
   infantry stack. Opposing forces remain on hostile edges until capture; V1
   does not introduce dual occupancy or fractional ownership.
 
-Exact lethality, neutral resistance, retreat behavior, capture timing, multi-edge allocation, and elevation coefficients are provisional. The first model should be deterministic, inspectable, and easy to tune rather than feature-rich.
+Exact lethality, neutral resistance, capture timing, multi-edge allocation, and
+elevation coefficients are provisional. The first model should be deterministic,
+inspectable, and easy to tune rather than feature-rich.
 
 ## Presentation
 
@@ -335,8 +305,12 @@ V1 uses intentionally simple graybox graphics:
 - flat terrain and ownership colors;
 - simple lighting;
 - clear borders and selection highlights;
-- selected-only push routes, exact active front edges, queues, and ETA;
-- redistribution target-density heatmaps;
+- selected-cluster and enemy-target perimeters, exact active front edges,
+  queues, and ETA;
+- policy and Reshape target-density heatmaps;
+- a 52-pixel, text-only contextual key-hint strip showing the current mode,
+  projection, invalid/submitting state, and exact next keys, plus a complete
+  `?` field manual and compact side inspector/order summary;
 - pressure-blended contested-cell colors derived from active combat fronts;
 - absolute force-strength shading, with alternate civilian and ownership
   overview modes.
@@ -364,7 +338,8 @@ Later, the Bevy client may render a small deterministic sample of representative
 - Tanks, discrete multi-hex vehicles, artillery, naval combat, or air combat.
 - Technology trees.
 - Full economic resources, production chains, trade, migration, jobs, happiness, training, evacuation, or demobilization.
-- Persistent target-density policies or automatic front management.
+- Per-cell target-density scripting, policy priorities, conditional automation,
+  or automatic enemy-target selection beyond the four cluster policies.
 - Browser delivery, matchmaking, progression, or production operations.
 - Production art, asset generation, or a settled fiction/theme.
 
@@ -394,62 +369,81 @@ Also provisional:
 - terrain capacity and throughput modifiers;
 - combat lethality, frontage ratio, neutral resistance, and uphill penalty;
 - the timer's resolution rule if a timer is enabled;
-- Push Front commitment and redistribution UX details.
+- contextual expansion/attack weighting and cluster-policy tuning details.
 
 ## V1 Acceptance Criteria
 
-The vertical slice is ready for gameplay evaluation when all of the following are true:
+The vertical slice is ready for gameplay evaluation when all of the following
+are true:
 
-1. Two human players can join and finish a Conquest match on a curated stepped island map.
-2. The match ends when one player reaches 80% of the fixed capturable-land denominator; there is no HQ elimination.
-3. The same rules work on variable map sizes, with a 128 x 128 playtest map and a representative 192 x 192 validation map.
-4. Terrain elevation visibly affects traversal and uphill combat, and cliffs block ordinary ground movement.
-5. Civilian population grows locally and a global mobilization target converts it into local infantry strength over time.
-6. Lowering the mobilization target does not instantly demobilize existing force.
-7. Players can select one connected owned region, hold-drag-release `P` to
-   choose one exact direction, and preview every eligible active front arc
-   before confirmation. Disconnected arcs are valid, but every selected cell
-   must reach at least one through traversable selected-only edges.
-8. Push Front routes remain inside the exact selection until they feed an
-   initial front cell, then advance lane-by-lane along the chosen axial
-   direction using one fixed committed pool. Terrain-scaled garrisons consume
-   momentum, lanes stop independently, and no command can teleport or duplicate
-   strength.
-9. Players can preview Expand All over a connected owned selection, choose an
-   order dispatch percentage independently of mobilization, and advance every
-   eligible neutral boundary with a conserved, locally split-and-merged
-   perimeter wave whose branches stop before enemy territory.
-10. Cutting a corridor creates genuinely independent connected components whose existing population and forces remain usable locally but cannot transfer across the cut.
-11. Players can apply percentage-aware one-shot Balance, oriented Front-load,
-    Core-load, and Perimeter-load orders, preview their target densities, and
-    watch the participating force physically redistribute while each cell's
-    unparticipating share remains in place.
-12. A locally attacked contested cell can snapshot the active orders pressing
-    it and atomically retask all their surviving lanes from their real current
-    cells. Invalid replacement leaves the original orders unchanged and cannot
-    steal allocations from unrelated orders.
-13. Combat is resolved across contested edges using frontage, elevation, capacity, and casualties, including attacks from more than one edge without double-counting defenders.
-14. Ownership changes through combat and expansion, and all authoritative state is fully visible to both players.
-15. Graybox overlays make ownership, force density, occupancy/capacity, Push
-    Front flows, queues, active edges, blocked orders, and contested pressure
-    understandable without implying dual occupancy or requiring production
-    assets.
-16. Core tuning values are configurable so playtests can adjust the model without changing its data or interaction foundations.
+1. Two human players can join and finish Conquest on a curated stepped island;
+   victory occurs at 80% of the fixed capturable-land denominator.
+2. The same rules operate on the 128 x 128 playtest and representative 192 x 192
+   validation maps.
+3. Elevation visibly affects traversal and uphill combat, and cliffs block
+   ordinary ground movement.
+4. Civilian population grows locally; the global mobilization target converts
+   it into local infantry over time; lowering the target does not instantly
+   demobilize existing force.
+5. `C`, its add/remove modifiers, and Select All operate on complete owned
+   passable clusters, including empty owned connectors. Selection remains
+   coherent through authoritative growth, merge, and split changes without
+   adopting or cancelling active orders.
+6. Clicking neutral ground expands every reachable selected perimeter with a
+   mild focus bias and positive all-side participation when strength permits.
+   The conserved wave respects terrain, capacity, throughput, garrisons, and
+   hostile exclusion.
+7. Clicking one or more complete enemy clusters attacks every shared front.
+   Fronts can turn, split, and merge as captures expose the immutable target
+   mask, but cannot escape it or duplicate source commitments.
+8. One persisted Share applies exactly once per participating free source cell
+   and only to expansion and attack. Mobilization, policy, and Reshape remain
+   independent of it.
+9. Balanced, Perimeter, Center, and Directional persist on clusters and adapt to
+   geometry. Policy targets exclude live action troops while reserving their
+   occupied capacity. Maintenance yields atomically to intersecting accepted
+   commands, queues at capacity bottlenecks, and replans relay movement from
+   current positions; explicit allocations and split, capture, and
+   newest-revision merge inheritance remain preserved.
+10. One selected cluster can best-effort Reshape into a smaller or larger owned,
+    passable troop footprint using its whole available pool. Exact fits drain
+    movable strength outside; undersized shapes saturate and conserve overflow;
+    unrelated allocations remain fixed.
+11. `X` cancels only the exact explicit-dispatch snapshot intersecting selected
+    clusters; background policy maintenance is excluded. Normal selection and
+    contextual commands never implicitly retask another explicit order.
+12. Cutting a corridor creates genuinely independent components whose existing
+    population and forces remain usable locally but cannot transfer across it.
+13. Combat resolves across contested edges using frontage, elevation, capacity,
+    and casualties, including attacks from several edges without double-counting
+    defenders.
+14. Graybox overlays make source clusters, staged enemy targets, focused
+    expansion, policy/Reshape targets, active flows, blocked orders, and
+    contested pressure understandable without production assets.
+15. Core tuning values are configurable so playtests can adjust the model
+    without changing its data or interaction foundations.
 
 ## Questions for Playtesting, Not Pre-production Blockers
 
-- Does selecting a front plus its backward reinforcement corridor feel direct,
-  and does fixed-pool sustained advancement create understandable momentum
-  without excessive input or opaque automation?
-- Does Expand All make neutral opening expansion faster without obscuring which
-  local troops feed each independent branch or encouraging repeated click spam?
-- Is node-local splitting and merging understandable when topology gives
-  different perimeter exits different totals, or does the preview need stronger
-  branch-allocation and wave-depth feedback?
-- Which selection gestures make irregular connected source regions easy to express?
-- Is the local civilian-to-military mobilization model understandable before an explicit economy is introduced?
-- Do capacity, throughput, and frontage create clear bottlenecks rather than frustrating queues?
-- Do Balance, Front-load, Core-load, and Perimeter-load plus participation
-  percentage provide enough post-push control without precise infantry micro?
-- What map density and match duration best expose troop travel time without creating long periods of inactivity?
-- Is combat readable and sufficiently predictable while still rewarding elevation and multi-edge attacks?
+- Is complete-cluster selection fast enough for ordinary play, including
+  multi-select and Select All, without making players miss sub-cluster control?
+- Does neutral clicking communicate “all sides, weighted toward this focus”
+  clearly enough, or does it need stronger branch-allocation preview?
+- Does attacking complete enemy clusters from every shared front produce
+  understandable momentum as the masked fronts turn, split, and merge?
+- Is one Share value sufficient for both contextual actions, and is it always
+  clear that policies and Reshape ignore it?
+- Do persistent Balanced, Perimeter, Center, and Directional policies reduce
+  repetitive housekeeping without creating surprising troop motion?
+- Is excluding live action troops from policy targets intuitive once their
+  occupied capacity is still visible and reserved?
+- Does the one-cluster Reshape brush make contraction, enlargement, saturation,
+  and conserved overflow legible?
+- Is exact Stop discoverable and precise enough without normal selection ever
+  functioning as a retask gesture?
+- Is the local civilian-to-military mobilization model understandable before an
+  explicit economy is introduced?
+- Do capacity, throughput, frontage, terrain, and garrisons create readable
+  bottlenecks rather than frustrating queues?
+- What map density and match duration best expose travel time without long
+  periods of inactivity?

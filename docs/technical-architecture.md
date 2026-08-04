@@ -1,7 +1,7 @@
 # Technical Architecture
 
 Status: implemented V1 architecture baseline
-Last updated: 2026-08-03
+Last updated: 2026-08-04
 
 This document records the architecture commitments for the first playable version of the game. It deliberately separates those commitments from scaling questions that must be answered with measurements. Gameplay details live elsewhere; this document focuses on authority, state flow, code boundaries, rendering, persistence, and delivery order.
 
@@ -14,8 +14,8 @@ This document records the architecture commitments for the first playable versio
 - V1 starts with one manually provisioned development match database. A lobby database and external match orchestrator are added when concurrent public matches are needed.
 - One visible terrain hex is one authoritative gameplay cell. Terrain is static during a V1 match and is stored and rendered in chunks.
 - Troops are conserved aggregate strength, not individual infantry entities.
-  Push Front, redistribution, and combat operate on active orders and active
-  front edges rather than scanning every cell.
+  Cluster waves, policy redistribution, Reshape, and combat operate on active
+  orders and active front edges rather than per-soldier entities.
 - Authoritative calculations use integers or explicit fixed-point values with stable iteration order. Floating point is reserved for client presentation.
 - Generated SpacetimeDB bindings define the client/server wire contract. Files
   below `match-bindings/src/module_bindings` are generated and never edited by
@@ -74,7 +74,11 @@ flowchart LR
 
 The client owns input, camera, rendering, local previews, interpolation, and UI. The match database owns player slots, authoritative terrain metadata, ownership, troop strength, orders, routing results, aggregate-flow progress, combat, and victory. The shared core contains deterministic rules used by both sides, but server execution always wins when a client preview differs.
 
-This architecture does not copy OpenFront's client-side lockstep or client-majority hash model. OpenFront remains interaction and game-design research only. SpacetimeDB transactions and reducers provide the authority boundary suited to this stack.
+This architecture does not copy OpenFront's client-side lockstep or
+client-majority hash model. OpenFront remains interaction and game-design
+research only; its cluster-level simplicity informs UX, not authority.
+SpacetimeDB transactions and reducers provide the authority boundary suited to
+this stack.
 
 ## Database topology and match lifecycle
 
@@ -82,7 +86,7 @@ This architecture does not copy OpenFront's client-side lockstep or client-major
 
 Publish the match module manually as one development database, `of-match-dev` by
 default. It hosts exactly one two-player match at a time. This avoids building a
-lobby before the Push Front and conquest loop has been validated.
+lobby before the cluster conquest loop has been validated.
 
 ### Concurrent matches
 
@@ -128,10 +132,10 @@ schema. Generated files carry a prominent generated marker, are committed, and
 are never manually edited. CI regenerates the bindings and fails on an
 unexpected diff so schema drift is visible.
 
-The sustained-Push, Expand All, and four-preset redistribution cutover changes
-both the persisted schema and public reducer API. SpacetimeDB 2.7.1 cannot
-migrate this development schema in place; after pulling the cutover, recreate
-the local database and regenerate bindings with:
+The cluster-wave, persistent-policy, Reshape, and generic cancellation cutover
+changes both persisted schema and the public reducer API. SpacetimeDB
+2.7.1 cannot migrate this development schema in place; recreate the local
+database and regenerate bindings after pulling the cutover:
 
 ```bash
 ./scripts/publish-local.sh --fresh --confirm-delete-of-match-dev
@@ -139,28 +143,49 @@ the local database and regenerate bindings with:
 
 ## Authoritative command and state flow
 
-Clients send intentions such as:
+The V1 client sends intentions for:
 
-- join or reclaim a player slot;
-- set the player's global mobilization target;
-- issue or cancel a selected-region directional Push Front order;
-- issue or cancel a selected-region neutral-only Expand All order;
-- issue a percentage-aware one-shot Balance, oriented Front-load, Core-load, or
-  Perimeter-load redistribution order.
+- joining or reclaiming a player slot;
+- changing the global mobilization target;
+- expanding complete selected source clusters across their reachable neutral
+  perimeters, with one clicked focus;
+- attacking the complete selected enemy-cluster union from every shared front;
+- setting Balanced, Center, Perimeter, or Directional policy on complete source
+  clusters;
+- best-effort Reshape of one complete source cluster into an owned, passable
+  drawn footprint;
+- cancelling an exact frozen set of explicit dispatch order IDs.
 
-Spawn selection, retargeting, reprioritization, readiness controls, and rematches
-are not part of the V1 reducer surface.
+The client persists one Share percentage and sends it only with cluster
+expansion and attack. Policy and Reshape have no percentage field. A cluster
+action's sparse source and target seeds are authority hints only: the module
+derives and validates complete current connected components before committing
+anything, so a stale or malicious client cannot create a hidden sub-cluster
+action.
+
+Cluster selection is client presentation state. It does not cancel, adopt, or
+supersede a live allocation. Expand, Attack, policy changes, and Reshape also do
+not implicitly retask another explicit action. Accepted explicit commands do
+automatically preempt intersecting background policy maintenance. Exact Stop is
+the only primary gesture that deliberately cancels the explicit dispatch IDs
+snapshotted by the client and revalidated by the authority.
 
 An intention contains a stable player-scoped command ID. Its reducer verifies
-connection identity, player slot, match phase, source ownership, available
-strength, active-front or destination validity, and rule-specific constraints
-in one transaction. Accepted intentions create or change authoritative orders.
-Rejected gameplay intentions create only an idempotent receipt with a
-UI-suitable reason; they do not partially mutate gameplay state.
+connection identity, player slot, match phase, source ownership, current
+component topology, available strength, target/front eligibility, and
+rule-specific constraints in one transaction. Accepted intentions create
+orders or policy state. Rejected gameplay intentions create only an idempotent
+receipt with a UI-suitable reason; they do not partially mutate gameplay state.
 
-The client never sends a resulting troop count, ownership result, casualty value, arrival time, or victory result. It may predict a path and ETA, but the reducer computes or validates the authoritative route and cost. Visual interpolation is allowed; speculative gameplay state must be clearly replaceable by the next subscription update.
+The client never sends resulting troop counts, ownership, casualties, arrival
+times, policy redistribution targets, or victory. It may preview them, but the
+module computes authoritative results. Visual interpolation is replaceable by
+the next subscription update.
 
-Use a receipt or stable order row keyed by `(player_id, client_command_id)` to make retries idempotent. This matters when a client loses its connection after submission but before observing the committed transaction.
+A receipt or stable order row keyed by `(player_id, client_command_id)` makes
+retries idempotent when a connection disappears after submission but before the
+client observes the transaction. Spawn selection, readiness controls, and
+rematches are outside the reducer surface.
 
 ## Deterministic simulation rules
 
@@ -178,143 +203,165 @@ When processing sets, sort by stable IDs or use ordered collections. Never let h
 
 Keep a logical simulation step counter in database state. A service interruption resumes from stored logical state rather than applying hours of combat instantly. If an optional wall-clock match limit is later enabled, its pause/recovery behavior must be an explicit game-mode rule.
 
-## Aggregate flows, Push Front, congestion, and combat
+## Aggregate flows, cluster waves, policy, and combat
 
-Every troop strength unit is accounted for as stationary, assigned to an aggregate order at a cell, or removed as a casualty. There is no entity or database row per infantry member.
+Every infantry point is stationary at a cell, allocated to an aggregate order at
+a current cell, or removed as a casualty. There is no row per soldier.
 
-The V1 model distinguishes:
+The simulation keeps three different constraints:
 
-- hex capacity: strength that may be staged in a cell;
-- edge throughput: strength per logical second that may cross an edge;
-- combat frontage: strength that may engage across a hostile edge at one time.
+- **hex capacity**: strength that may occupy a cell;
+- **edge throughput**: strength that may cross an edge per logical second;
+- **combat frontage**: strength that may fight across a hostile edge at once.
 
-These share a common strength scale but remain separate values. A city may later increase staging capacity, a road may increase throughput, and a mountain pass may constrain throughput and frontage without conflating all three effects.
+Approved movement is bounded by queued strength, edge throughput over the
+logical step, and destination residual capacity. A two-phase update approves
+outgoing flow before atomically applying incoming flow, allowing capacity-safe
+pipelines. Capacity-blocked background-policy strength remains queued; a
+best-effort explicit command may settle strength only where that command's rules
+allow it. Strength always remains at its real physical cell and is never dropped
+or teleported.
 
-The generic aggregate-flow schema retains the implementation names
-`transfer_order`, source, destination, and transit packet. An order stores its
-owner, requested and committed amounts, progress totals, kind, orientation, and
-status. Source rows account for initial commitments. Destination rows represent
-fixed targets for redistribution or the stable first-layer anchor of a Push;
-Expand All deliberately creates none. Transit packets store scalar queues and
-their current local route. These tables are an execution substrate, not a public
-precise infantry-transfer API. Selected-corridor routes are fixed when accepted;
-a Push packet may extend only along its stored exact axial ray after capture. V1
-has no order priorities or adaptive mid-route replanning. On each logical step,
-approved movement is bounded by:
+The generic execution schema uses `transfer_order`, `transfer_source`,
+`transfer_destination`, and `transit_packet`. Source rows account for initial
+commitments. Destination rows represent fixed redistribution targets; cluster
+waves use private topology rather than persisting one complete path per source
+and exit. Packets carry scalar queues at current physical cells. These tables
+are an execution substrate, not a public exact-infantry-transfer API.
+
+The normal client animates explicit action packets but filters internal
+cluster-policy maintenance packets from flow overlays. Debug builds may restore
+those presentation-only animations at startup with `--debug-policy-flows`.
+`./scripts/dev.sh` does not enable the overlay implicitly;
+`./scripts/dev.sh --debug-policy-flows` opts both development clients into it.
+The flag is compiled out of release builds. The filter is downstream of the
+full authoritative snapshot, so order accounting, policy execution, action
+availability, and Stop/retask projections still observe every packet.
+
+### Complete-component authority
+
+`issue_expand_clusters`, `issue_attack_clusters`, and
+`set_cluster_policy` accept sparse seed cells so payload size does not define
+gameplay scope. The module rebuilds the complete ground-traversable owned or
+enemy components from authoritative ownership, passability, and elevation.
+Blocked cells and impassable edges split components; empty owned cells connect
+them. Invalid, foreign, or stale seeds reject transactionally.
+
+This complete-component derivation is repeated at reducer acceptance. The
+client's materialized cluster selection is therefore a convenience and preview,
+not the authority boundary.
+
+### Focused neutral expansion
+
+Expand Clusters computes every eligible neutral exit around every accepted
+source component. Sources without a reachable neutral perimeter remain
+stationary and do not invalidate other components. Each participating source
+cell contributes its Share of action-available infantry once: stationary free
+strength plus yieldable background-policy strength physically inside the
+source, excluding every other explicit allocation.
+
+The private expansion wave stores a deterministic acyclic topology and the
+clicked focus cell. At each branch, progress toward the focus has weight 3,
+equal-distance progress weight 2, and movement away weight 1. The shared integer
+allocator gives eligible branches a positive baseline when sufficient strength
+exists, conserves the exact total, merges contributions before later splits, and
+rotates remainder priority to avoid permanent branch bias.
+
+Branches move independently under terrain, elevation, throughput, capacity, and
+terrain-scaled occupation garrisons. A fast branch may bulge while another
+queues. Ownership is rechecked; an exit that has become hostile is not converted
+into an implicit attack.
+
+### Enemy-cluster attack
+
+Attack Clusters expands every target seed to its complete same-owner enemy
+component and snapshots the sorted union as an immutable target mask. The
+authority starts from every passable edge shared by accepted source and target
+clusters, not one global direction or one chosen arc.
+
+The target mask is represented as a deterministic acyclic progression from all
+initial shared fronts. Captures reveal the next masked neighbors; local
+progression can turn with the boundary, split at several successors, and merge
+where fronts meet. Each participating source contributes Share once even when it
+touches several fronts or targets. A branch cannot enter a cell outside the
+accepted mask, so later adjacent territory is never attacked accidentally.
+
+Every step rechecks defender infantry, terrain, elevation, frontage, throughput,
+capacity, and remaining garrison cost. Several fronts entering one target share
+one defender pool; strength and casualties remain conserved. Cancellation
+releases surviving packets where they physically are rather than rewinding
+captures.
+
+### Persistent policy accounting
+
+`cluster_policy_assignment` is public per-cell lineage with a monotonically
+increasing explicit revision. A cluster is always derived from current
+ownership. Split components inherit their cells' rows. Captured cells take the
+connected policy. On a merge, the greatest revision wins deterministically for
+the complete result; revision-zero Balanced is the default.
+
+Balanced, Center, Perimeter, and Directional map to deterministic internal
+redistribution targets. Center and Perimeter use exact boundary depth rather
+than a centroid; Directional uses a fixed-point axial vector. Setting policy
+does not cancel action orders. The policy maintenance pass plans from the free
+pool and may persist ordinary internal transfer packets.
+
+For policy target computation, infantry assigned to live action packets is
+removed from the population being distributed. Its occupancy is still removed
+from residual capacity at the packet's current cell. This separation is
+intentional:
 
 ```text
-min(queued strength, edge throughput * step duration, destination free capacity)
+policy population = stationary/free infantry
+policy residual capacity = cell capacity - physically occupied active strength
 ```
 
-Movement uses a two-phase calculation: approve outgoing flow first, then commit incoming flow atomically. This permits a full column to advance as a pipeline without violating end-of-step capacity. Opposite flows of identical friendly infantry may be netted rather than pointlessly swapping identities. Overflow stays in the preceding cell and remains visible as congestion; it is never dropped.
+Consequently, policy cannot move or counterbalance against an expanding,
+attacking, or reshaping allocation and cannot overbook the cell around it.
+Only background redistribution orders identified by the reserved maintenance
+command ID can yield automatically. An explicit reducer preflights its complete
+replacement plan, then atomically cancels any intersecting background policy
+orders and persists the accepted explicit order. Rejection leaves maintenance
+unchanged, and every other explicit allocation remains fixed.
 
-Push Front is the primary V1 producer of aggregate flows. Its authoritative
-reducer accepts an exact selected cell set, one of six axial directions, and a
-commitment in basis points. It requires one six-connected owned source region
-but allows its active directional boundary to contain multiple disconnected
-arcs. A selected cell is part of that front exactly when `source + direction`
-is neutral or enemy territory. Every eligible arc becomes an independent
-outward seed. The other selected cells form the reinforcement corridor; each
-must route to at least one seed entirely within the submitted selection and
-does not create an outward lane of its own. A command is rejected if a selected
-cell cannot reach any seed across traversable selected-only edges. Adjacent
-directions are never inferred. The authority recomputes all derived edges and
-routes, so a client cannot redirect a push by submitting a visual segment or
-predicted result.
+The assignment rows are independent of those temporary maintenance orders.
+They persist after a yield, so completed, settled, or cancelled infantry and
+new residual capacity become free input when maintenance resumes on a later
+pass.
 
-After the initial edge, each front lane advances through successive cells only
-along the stored axial direction. Its committed percentage becomes a fixed
-mobile strength pool. Terrain, elevation, throughput, frontage, and resistance
-may slow or defeat it, while every capture retains a terrain-scaled garrison
-and sends only the surplus onward. Lanes stop independently when exhausted,
-blocked, defeated, at the map edge, or manually cancelled. Cancellation
-releases remaining allocations where they physically are; it is not a rewind.
-The public precise-infantry-transfer reducer has been removed. Exact cell
-movement is reserved for possible future discrete tanks, boats, or other units.
+Maintenance reconciliation is receding-horizon rather than a promise to finish
+an obsolete route. It snapshots stationary strength, matching live policy
+packets, recruitment, and current reservations, prepares a replacement plan,
+then swaps it for the superseded background order. A planning failure leaves the
+old order intact. Capacity-blocked policy packets are not finalized at an
+intermediate cell: they stay queued until a later replacement starts from their
+actual position. Where a route crosses a saturated cell that is already at its
+target, one-edge relay legs can move resident strength onward while incoming
+strength replaces it; shared relay edges are coalesced before persistence. This
+policy-only reconciliation uses no action Share. Share remains an acceptance-time
+input only for Expand Clusters and Attack Clusters.
 
-Contested cells are also client-facing handles for explicit whole-order
-retasking. The client snapshots local active order IDs rather than treating the
-enemy-controlled target as a troop location. Issue reducers receive ordinary
-owned source IDs plus deduplicated supersede-order IDs. The authority derives
-all survivor `current_cell` values itself, unions them into the effective
-physical selection, and computes availability as cell infantry minus packets
-belonging to non-superseded orders. Superseded destination reservations are
-excluded from redistribution planning; unrelated reservations remain.
+### Best-effort Reshape and exact Stop
 
-Retasking uses a read-only prepare phase followed by an atomic apply phase.
-Every requested order must be local, active, conserved, and retain at least one
-packet. The complete replacement topology, routes, strength, and 4,096-cell
-bound are validated before the first cancellation. Planning rejections create
-the normal rejected receipt without gameplay mutation. Apply-time invariant
-failure aborts the transaction, rolling back both cancellations and the new
-order. This prevents partial multi-order replacement and eliminates
-double-allocation without trusting client-projected packet locations.
+Reshape accepts one complete source cluster and an owned, passable drawn target.
+It uses all currently available affected strength, never Share. Deterministic
+capacity-safe targets prefer reachable drawn cells. If the target can hold the
+pool, movable strength outside drains; if it cannot, the drawing saturates and
+conserved overflow stays on source cells outside. Unrelated allocations remain
+fixed and reserve capacity. A disconnected source portion without a reachable
+target remains unchanged.
 
-Expand All is the neutral-only companion producer. Its reducer accepts one
-six-connected owned selection and a basis-point dispatch share, with no
-orientation. It snapshots that share from every cell's currently unallocated
-infantry once. A private `expansion_wave` row stores the accepted topology as
-parallel sorted selected-cell/inward-depth vectors, a map-indexed outside-depth
-vector, and a map-indexed rotating split cursor. A separate sparse private
-`expansion_garrison_debt` row is keyed by each under-garrisoned captured cell.
-Selected depth decreases toward zero; the first neutral ring is outside depth
-one; every later outward edge must increase that depth by exactly one. Enemy
-territory is excluded when those outside depths are built, so a shorter path
-through an enemy cannot suppress a valid neutral route around it.
+The generic `cancel_orders` reducer receives exact active explicit-order IDs
+captured by the Stop preview. Background policy-maintenance IDs are excluded.
+It revalidates ownership and liveness, then releases only that snapshot at
+current cells. This cancels dispatch, not policy metadata; maintenance may run
+again once capacity is free. Normal selection sends no supersede set, while an
+accepted contextual command automatically yields only intersecting background
+policy work as described above.
 
-Each nonzero source commitment begins as a resting packet at its real selected
-cell; all selected cells, including zero commitments, retain source rows for an
-exact command/cancellation identity. On a simulation step, all resting
-contributions at one node are pooled and divided evenly among its sorted
-monotonic children. A per-node rotating remainder cursor prevents asynchronous
-one-unit arrivals from repeatedly favoring the first child. Each allocation
-becomes a one-edge packet. Arrivals merge into one aggregate sentinel-origin
-resting packet, so provenance is discarded after the first source departure
-instead of materializing every complete source-to-exit path. This same local
-split-and-merge operation applies inside the seed, across its neutral exits, and
-through successive morphological outside layers. There is no stable lane
-anchor or retained axial heading for Expand All.
-
-Branches use the ordinary throughput, capacity, elevation, capture, and
-terrain-scaled garrison machinery and advance asynchronously, so the wave may
-bulge. When a partial first arrival cannot fill a captured cell's complete
-terrain-scaled garrison, its sparse cell debt is paid from later same-owner
-Expand All arrivals before any surplus branches. The debt belongs to the cell,
-so an overlapping wave can finish it after the capturing order completes; an
-ownership flip deletes the prior owner's debt. Merely crossing territory that
-was already friendly creates no debt. Runtime ownership is checked before each
-edge: friendly cells remain valid transit, neutral cells may be captured, and
-an enemy flip stations that branch's assigned quota locally without combat or
-rerouting it into a sibling. Cancellation deletes the per-order topology and
-releases every remaining packet at its physical cell, but preserves valid
-capture-scoped cell debt. The usual committed equals in-transit plus delivered
-plus casualties invariant remains exact.
-
-Expand All means every neutral boundary of the submitted six-connected
-selection, not every disconnected territory component owned by the player.
-`Ctrl/Cmd+A` provides the whole-owned-region gesture when that territory is one
-six-connected region; internally movement-isolated parts can proceed only when
-each has its own reachable neutral boundary. The 4,096-cell V1 command limit
-remains in force; a future world-scale global policy would need symbolic
-region/component commands rather than a massive cell payload.
-
-Balance, Front-load, Core-load, and Perimeter-load share one deterministic
-integer target allocator. Their basis-point participation value freezes the
-unparticipating share of each selected cell's current infantry as a local lower
-bound, then redistributes only the participating pool subject to capacity and
-exact conservation. Balance uses capacity-relative density, Front-load uses an
-axial projection, and the radial presets use distance from the selection's
-geometric center. Client previews call the same pure rule, while the module
-remains authoritative for routes and execution.
-
-Hostile forces do not coexist in a V1 cell. Combat occurs on active hostile
-edges. Frontage limits the committed strength that can participate at once,
-and defenders are allocated once across simultaneous hostile edges rather than
-duplicated against every attacker. After defenders reach zero, attackers enter
-subject to edge throughput and destination capacity, then ownership changes
-according to the combat rule. `CellState` retains one controller and one local
-infantry stack throughout; `CombatFront` rows expose edge pressure rather than
-fractional ownership or dual occupancy.
+Legacy Push Front, unfocused Expand Perimeter, one-shot Formation/Bias, and
+retask planning remain compatibility code paths rather than the cluster-first
+client contract.
 
 ### Scheduled and active-set processing
 
@@ -374,7 +421,10 @@ Store the authoritative map hash in the match database. During V1, terrain chunk
 
 ## SpacetimeDB subscriptions and the Bevy cache bridge
 
-On join, the client subscribes to match metadata, its player slot, map manifest/chunks, dynamic cell state, active orders, active fronts, command receipts, and match result. The SpacetimeDB client cache is the network-facing source of truth for the client.
+On join, the client subscribes to match metadata, its player slot, map
+manifest/chunks, dynamic cell state, cluster-policy assignments, active orders,
+active fronts, command receipts, and match result. The SpacetimeDB client cache
+is the network-facing source of truth for the client.
 
 A narrow adapter advances the SpacetimeDB connection in the Bevy update loop as required by the selected SDK version. It translates inserted, updated, and deleted rows into ordered application events and dirty chunk/cell markers. Bevy systems consume those markers; rendering systems do not synchronously query the network and network callbacks do not directly mutate arbitrary ECS state.
 
@@ -382,73 +432,68 @@ The initial snapshot gates entry into the playable state. Subsequent transaction
 
 ## Bevy rendering and interaction
 
-The client uses Bevy's GPU-accelerated renderer on native platforms. WebAssembly portability is an architectural boundary and compile target, not a V1 delivery promise.
+The native client uses Bevy's GPU renderer. Static terrain is chunked combined
+geometry with stable cell-to-vertex metadata, so ownership and map-view updates
+replace only dirty color attributes. No gameplay hex requires its own material,
+collider, or UI node. Close-zoom totals and civilian outlines are batched with
+viewport-derived complete-or-hidden LOD.
 
-Render static terrain by chunk using generated geometry, shared meshes/instances, or combined chunk meshes selected through profiling. The architecture must support dirty chunk rebuilds even though V1 terrain is immutable, because ownership overlays and later terrain features may change independently. Avoid allocating a unique material asset for every cell.
+Picking resolves pointer rays against visible chunk geometry and returns the
+deterministic top axial cell on stepped terrain. The primary overlays remain
+separable from terrain rendering:
 
-The initial material treatment exposes gameplay state clearly:
+- hovered cell and complete selected-cluster perimeters;
+- staged complete enemy target-cluster perimeters;
+- focused neutral expansion and current active wave/front edges;
+- policy and Reshape density targets;
+- complete Reshape brush footprint, including unavailable and out-of-world
+  cells;
+- active packet queues, combat pressure, congestion, and blocked movement.
 
-- flat terrain color and elevation sides;
-- ownership tint and border emphasis;
-- absolute troop strength as a stable, normalized visual channel;
-- alternate Overview and civilian-population map views;
-- hover, selected reinforcement region, and exact active-front edges;
-- selected-only push routes, direction, commitment, congestion, and ETA;
-- active combat/front edges, contested pressure, and blocked paths.
+Map-view shading is presentation only. Overview, Soldiers, and Civilians use
+stable reference values rather than the live map maximum. Contested color blends
+derive attacker pressure from subscribed fronts without changing the cell's
+single authoritative controller.
 
-Map-view shading is presentation only. Clamp and interpolate it client-side
-from authoritative integer values against stable reference values, not a live
-map maximum. Combined chunk meshes retain cell-to-vertex color metadata so a
-state update can replace only color attributes. Recolor visible dirty chunks
-first and let hidden chunks converge under bounded per-frame budgets. Exact
-cell totals use one texture-atlas-backed world-space mesh with viewport-derived
-complete-set LOD; do not create one text/UI entity or material per gameplay
-cell. The Civilians view similarly batches the exposed edges of connected
-populated land into one viewport-bounded mesh. Camera, projection,
-visible-chunk, topology, and cell-state signatures must short-circuit unchanged
-presentation frames before scanning individual cells. Keep overlays separable
-so a future art direction does not require changing simulation state.
+### Interaction state
 
-For a contested target, the client derives attacker pressure from subscribed
-`CombatFront` rows and compares it with the defending local infantry. The
-combined terrain mesh blends the controller and attacker colors by that ratio.
-This is a scalable presentation channel embedded in existing chunk vertex
-colors, not a per-cell UI entity, and it never changes the cell's single
-authoritative controller.
+The client materializes selected cells for V1, but `C`, its modifiers, and
+Select All always produce complete owned passable clusters. A reconciliation
+pass absorbs cluster growth and merges and retains all owned children after a
+split. Selection never stores a contested retask handle or active-order
+ownership.
 
-Picking should resolve pointer rays to chunks and deterministic hex coordinates
-instead of creating a physics collider for every cell. Height-aware picking
-must choose the visible top surface in stepped terrain. The current client
-materializes selected cells, supports a centered rectangular core with complete
-hex-ring dilation, connected owned-component selection, and all-owned
-selection, while drawing only exposed edges from visible render chunks. Truly
-world-scale selection must move to symbolic chunk masks or region selectors
-that the authority revalidates rather than serializing millions of cell IDs.
-The UX is expected to iterate; the server intent model should not depend on one
-specific gesture.
+With sources selected, idle left-click dispatches from map ownership: neutral
+means focused whole-perimeter expansion and enemy means complete-cluster attack.
+Target staging stores complete enemy components. Policy keys submit metadata
+immediately. The Reshape brush exists only in single-cluster Reshape mode; idle
+left-drag is not a source-paint operation. Stop is the only state that snapshots
+explicit dispatch order IDs; policy-maintenance orders are not Stop targets.
 
-Bulk selections must not multiply pathfinding work. Push Front derives its
-exact directional boundary in shared pure code, validates one source component,
-then performs one multi-source search backward from every eligible front arc
-through selected cells. The route labels must cover the whole selection.
-Expand All derives its perimeter and two multi-source breadth-first depth
-fields once when accepted. Runtime work is proportional to active resting and
-one-edge packets: contributions merge by current node, and no complete
-source-by-exit paths are persisted. The private outside-depth and cursor vectors
-are linear in map cells per active Expand All order, a deliberate V1 bound that
-must be profiled before global policies or much larger maps. Previews cache
-results by selection, authoritative cell-state revisions, and a separate
-active-order and packet retask revision. Building that projection scans only
-subscribed active state, not map cells. Every V1 order
-preview and reducer rejects selections above 4,096 cells before building
-heatmaps, routes, or payloads. This is a safety bound, not the world-scale
-selection design. Every authority adapter must debit only source cells that can
-reach the accepted front or redistribution deficit under that order's
-constraints.
+The contextual HUD is a compact text strip, not a command-button grid. It shows
+Share only for expansion/attack, selected policy or mixed state, and the exact
+keys for target staging, policy facing, Reshape, Stop, cancellation, or
+submission. `?` toggles the full field manual.
 
-Native-only filesystem, windowing, and startup behavior belongs behind narrow
-boundaries where practical. A WASM compile gate is deferred with browser
-delivery; native is the only implemented V1 target.
+All command payloads are revalidated by the authority. The 32,768-cell
+materialized-selection cap prevents unbounded preview heatmaps and payloads.
+A later world-scale client should represent selections as symbolic component or
+chunk masks rather than changing cluster semantics.
+
+### Preview and frame-work bounds
+
+Whole-cluster interaction must not multiply pathfinding by the number of
+possible fronts. Focused expansion derives its reachable perimeter and shared
+branch weights once. Cluster attack enumerates all shared fronts once and uses
+one immutable target-mask topology. Previews cache by selection, cell-state,
+active-order, and policy revisions.
+
+Rendering work remains viewport-bounded: dirty visible chunks update first,
+selection and target outlines inspect visible render chunks, and hidden chunks
+converge under budgets. Authoritative scheduled work remains active-order and
+active-front driven. Native-only credentials, windowing, and startup behavior
+stay behind narrow adapters; browser delivery remains a later qualification
+gate.
 
 ## Reconnect and recovery
 
@@ -469,17 +514,23 @@ command IDs. UI-only preferences may remain local; no gameplay-critical state
 may exist only in Bevy.
 
 Simulation progress needed after a host restart is stored in tables: logical
-step, active orders, transit routes and queues, private Expand All wave depths
-and split cursors, sparse capture-garrison debt, fronts, the scheduled wake,
-match phase, and map seed. The persisted scheduled row resumes the fixed logical
-cadence. Explicit repair of a missing schedule row and duplicate-wake fault
-injection remain reliability-hardening work.
+step, cluster-policy lineage, active orders, transit routes and queues, private
+cluster-wave topology/focus/target masks and split cursors, sparse
+capture-garrison debt, fronts, the scheduled wake, match phase, and map seed.
+The persisted scheduled row resumes the fixed logical cadence. Explicit repair
+of a missing schedule row and duplicate-wake fault injection remain
+reliability-hardening work.
 
 ## Testing and performance gates
 
 ### Pure rule tests
 
-`hex-core` receives unit and property tests for coordinate conversion, neighbors, chunk boundaries including negative coordinates, elevation traversal, connectivity, route cost, fixed-point rounding, capacity, flow conservation, simultaneous movement, multi-edge defense allocation, capture, and 80% conquest calculation.
+`hex-core` receives unit and property tests for coordinate conversion,
+neighbors, chunk boundaries including negative coordinates, elevation
+traversal, connectivity, complete-component derivation, branch classification,
+weighted integer quotas, rotating split fairness, route cost, fixed-point
+rounding, capacity, flow conservation, multi-edge defense allocation, capture,
+and 80% Conquest calculation.
 
 High-value invariants include:
 
@@ -492,12 +543,14 @@ High-value invariants include:
 
 ### Module and client integration
 
-The V1 headless two-identity smoke covers join, match start, subscription,
-idempotent command receipts, sustained multi-layer Push progression,
-multi-branch and direction-changing neutral Expand All perimeter-wave
-progression, both cancellation paths, and token-based reconnect. Deterministic
-module and client cases pin shared-child merging and asynchronous split
-fairness. Command rejection, simultaneous hostile orders, full Conquest
+The headless two-identity smoke covers join, match start, subscription,
+idempotent receipts, cluster expansion/attack and policy reducers, conserved
+movement, exact selected-order cancellation, and token-based reconnect.
+Deterministic module and client cases pin complete-component authority,
+focused all-side allocation, immutable attack masks, multi-front progression,
+Share-once accounting, policy inheritance and live-packet exclusion,
+best-effort Reshape, shared-child merging, and asynchronous split fairness.
+Command rejection, simultaneous hostile orders, full Conquest
 completion, schedule fault injection, and completed-match immutability remain
 integration-test extensions; pure rule tests cover their deterministic building
 blocks where applicable.
@@ -521,7 +574,9 @@ Record reducer duration, rows read/written, active-set size, subscription bytes,
 
 ## Asset and UI production workflow
 
-The gameplay vertical slice uses procedural primitives, code-defined colors, and simple icons. Production assets are not a prerequisite for validating Push Front, congestion, combat, or conquest.
+The gameplay vertical slice uses procedural primitives, code-defined colors,
+and simple icons. Production assets are not a prerequisite for validating the
+cluster-control, congestion, combat, or conquest loop.
 
 When custom assets or UI exploration begins:
 
@@ -540,19 +595,19 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
 2. **Workspace skeleton:** create `hex-core`, match module, generated-bindings crate, Bevy client, map tool, formatting/lint/test CI, and one tiny deterministic fixture map.
 3. **Network walking skeleton:** manually publish one match database; connect two native clients; claim two player slots; mutate one test cell through a validated reducer and subscription.
 4. **Map interaction slice:** load authoritative chunked terrain, render stepped
-   graybox hexes, implement camera and height-aware picking, and select connected
-   owned source regions.
-5. **Troop-flow slice:** add cell capacity, fixed-pool sustained Push Front and
-   neutral-only Expand All orders, authoritative selected-corridor
-   routing/validation, scheduled Push lanes and branching perimeter-wave
-   movement, terrain-scaled garrisons, congestion, density shading, exact
-   initial-edge preview, and ETA feedback.
+   graybox hexes, implement camera and height-aware picking, and select complete
+   owned clusters with multi-select and Select All.
+5. **Troop-flow slice:** add cell capacity, focused neutral expansion,
+   target-masked enemy-cluster attack, complete-component authority,
+   Share-once branching waves, persistent cluster policies, best-effort
+   single-cluster Reshape, terrain-scaled garrisons, congestion, density
+   shading, front/target previews, and ETA feedback.
 6. **Conflict slice:** add hostile edges, combat frontage, capture, elevation modifiers, disconnected components, and the Conquest win condition at 80% of capturable land.
 7. **Reliability slice:** add command idempotency, reconnect/reclaim, snapshot rebuild, scheduler recovery, deterministic replay fixtures, and completed-match handling.
 8. **Scale slice:** validate the 128 and 192 presets; retain 256, high-order-count traces, profiling, and soak gates as post-slice performance work.
-9. **Playable V1 pass:** curate several generated maps, improve Push Front
-   legibility and selection UX, add match setup/result screens, and use the
-   asset workflow only where graybox presentation blocks evaluation.
+9. **Playable V1 pass:** curate several generated maps, improve contextual
+   cluster-action and policy legibility, add match setup/result screens, and use
+   the asset workflow only where graybox presentation blocks evaluation.
 
 Each stage should leave a playable or executable end-to-end path. Do not build the lobby/orchestrator, production art pipeline, or speculative unit systems before the two-client troop-flow slice is measurable and understandable.
 
@@ -565,10 +620,9 @@ The following questions stay open until profiling or playtesting supplies eviden
 - Database-host capacity: simultaneous match instances per host, provisioning latency, archival cost, and placement strategy.
 - One match-level scheduler wake versus sharded active-chunk wakes, and when uncontested flows can become calculated arrival events.
 - Routing strategy under congestion: cached paths, flow fields, hierarchical regions, explicit player routes, and replan thresholds.
-- Push packet compaction: the V1 reducer persists one packet and a duplicated
-  route per contributing source cell. Profile the F3 `FLOWS` count, then
-  coalesce shared route suffixes or represent the selected corridor as a route
-  DAG before raising command limits for world-scale maps.
+- Packet compaction: profile the F3 `FLOWS` count for large cluster waves and
+  policy redistributions, then coalesce shared topology where row counts, cache
+  churn, or subscription volume justify it before raising world-scale limits.
 - Static map delivery through database rows versus content-addressed baked assets with hash verification.
 - Region-level summaries and level of detail for maps intended to represent a whole world.
 - Browser delivery, WebGPU/WebGL compatibility, download size, threading limits, and browser-specific SpacetimeDB behavior. WASM portability is retained, but web release work follows native V1.

@@ -6,62 +6,67 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct IssuePerimeterLoadArgs {
+pub(super) struct IssueAttackClustersArgs {
     pub client_command_id: u64,
-    pub source_cells: Vec<u32>,
-    pub supersede_order_ids: Vec<u64>,
+    pub source_seed_cells: Vec<u32>,
+    pub target_seed_cells: Vec<u32>,
+    pub commitment_bps: u32,
 }
 
-impl From<IssuePerimeterLoadArgs> for super::Reducer {
-    fn from(args: IssuePerimeterLoadArgs) -> Self {
-        Self::IssuePerimeterLoad {
+impl From<IssueAttackClustersArgs> for super::Reducer {
+    fn from(args: IssueAttackClustersArgs) -> Self {
+        Self::IssueAttackClusters {
             client_command_id: args.client_command_id,
-            source_cells: args.source_cells,
-            supersede_order_ids: args.supersede_order_ids,
+            source_seed_cells: args.source_seed_cells,
+            target_seed_cells: args.target_seed_cells,
+            commitment_bps: args.commitment_bps,
         }
     }
 }
 
-impl __sdk::InModule for IssuePerimeterLoadArgs {
+impl __sdk::InModule for IssueAttackClustersArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `issue_perimeter_load`.
+/// Extension trait for access to the reducer `issue_attack_clusters`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait issue_perimeter_load {
-    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible.
+pub trait issue_attack_clusters {
+    /// Request that the remote module invoke the reducer `issue_attack_clusters` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`issue_perimeter_load:issue_perimeter_load_then`] to run a callback after the reducer completes.
-    fn issue_perimeter_load(
+    /// /// Use [`issue_attack_clusters:issue_attack_clusters_then`] to run a callback after the reducer completes.
+    fn issue_attack_clusters(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        supersede_order_ids: Vec<u64>,
+        source_seed_cells: Vec<u32>,
+        target_seed_cells: Vec<u32>,
+        commitment_bps: u32,
     ) -> __sdk::Result<()> {
-        self.issue_perimeter_load_then(
+        self.issue_attack_clusters_then(
             client_command_id,
-            source_cells,
-            supersede_order_ids,
+            source_seed_cells,
+            target_seed_cells,
+            commitment_bps,
             |_, _| {},
         )
     }
 
-    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `issue_attack_clusters` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn issue_perimeter_load_then(
+    fn issue_attack_clusters_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        supersede_order_ids: Vec<u64>,
+        source_seed_cells: Vec<u32>,
+        target_seed_cells: Vec<u32>,
+        commitment_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -71,12 +76,13 @@ pub trait issue_perimeter_load {
     ) -> __sdk::Result<()>;
 }
 
-impl issue_perimeter_load for super::RemoteReducers {
-    fn issue_perimeter_load_then(
+impl issue_attack_clusters for super::RemoteReducers {
+    fn issue_attack_clusters_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
-        supersede_order_ids: Vec<u64>,
+        source_seed_cells: Vec<u32>,
+        target_seed_cells: Vec<u32>,
+        commitment_bps: u32,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -85,10 +91,11 @@ impl issue_perimeter_load for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            IssuePerimeterLoadArgs {
+            IssueAttackClustersArgs {
                 client_command_id,
-                source_cells,
-                supersede_order_ids,
+                source_seed_cells,
+                target_seed_cells,
+                commitment_bps,
             },
             callback,
         )

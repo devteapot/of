@@ -6,53 +6,67 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct CancelExpandAllArgs {
+pub(super) struct IssueReshapeArgs {
     pub client_command_id: u64,
-    pub selected_cells: Vec<u32>,
+    pub source_cells: Vec<u32>,
+    pub target_cells: Vec<u32>,
+    pub supersede_order_ids: Vec<u64>,
 }
 
-impl From<CancelExpandAllArgs> for super::Reducer {
-    fn from(args: CancelExpandAllArgs) -> Self {
-        Self::CancelExpandAll {
+impl From<IssueReshapeArgs> for super::Reducer {
+    fn from(args: IssueReshapeArgs) -> Self {
+        Self::IssueReshape {
             client_command_id: args.client_command_id,
-            selected_cells: args.selected_cells,
+            source_cells: args.source_cells,
+            target_cells: args.target_cells,
+            supersede_order_ids: args.supersede_order_ids,
         }
     }
 }
 
-impl __sdk::InModule for CancelExpandAllArgs {
+impl __sdk::InModule for IssueReshapeArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `cancel_expand_all`.
+/// Extension trait for access to the reducer `issue_reshape`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait cancel_expand_all {
-    /// Request that the remote module invoke the reducer `cancel_expand_all` to run as soon as possible.
+pub trait issue_reshape {
+    /// Request that the remote module invoke the reducer `issue_reshape` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`cancel_expand_all:cancel_expand_all_then`] to run a callback after the reducer completes.
-    fn cancel_expand_all(
+    /// /// Use [`issue_reshape:issue_reshape_then`] to run a callback after the reducer completes.
+    fn issue_reshape(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
+        target_cells: Vec<u32>,
+        supersede_order_ids: Vec<u64>,
     ) -> __sdk::Result<()> {
-        self.cancel_expand_all_then(client_command_id, selected_cells, |_, _| {})
+        self.issue_reshape_then(
+            client_command_id,
+            source_cells,
+            target_cells,
+            supersede_order_ids,
+            |_, _| {},
+        )
     }
 
-    /// Request that the remote module invoke the reducer `cancel_expand_all` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `issue_reshape` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn cancel_expand_all_then(
+    fn issue_reshape_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
+        target_cells: Vec<u32>,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -62,11 +76,13 @@ pub trait cancel_expand_all {
     ) -> __sdk::Result<()>;
 }
 
-impl cancel_expand_all for super::RemoteReducers {
-    fn cancel_expand_all_then(
+impl issue_reshape for super::RemoteReducers {
+    fn issue_reshape_then(
         &self,
         client_command_id: u64,
-        selected_cells: Vec<u32>,
+        source_cells: Vec<u32>,
+        target_cells: Vec<u32>,
+        supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -75,9 +91,11 @@ impl cancel_expand_all for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            CancelExpandAllArgs {
+            IssueReshapeArgs {
                 client_command_id,
-                selected_cells,
+                source_cells,
+                target_cells,
+                supersede_order_ids,
             },
             callback,
         )

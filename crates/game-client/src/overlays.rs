@@ -20,6 +20,24 @@ const HOSTILE: Color = Color::srgb(1.0, 0.39, 0.30);
 const AMBER: Color = Color::srgb(1.0, 0.69, 0.25);
 const RETASK: Color = Color::srgb(0.91, 0.54, 1.0);
 const BLOCKED: Color = Color::srgba(0.83, 0.35, 0.24, 0.72);
+const BRUSH_VALID: Color = Color::srgba(0.96, 0.98, 1.0, 0.92);
+const BRUSH_SELECTED: Color = Color::srgba(0.44, 0.90, 0.94, 0.92);
+const BRUSH_RETASK: Color = Color::srgba(0.91, 0.54, 1.0, 0.92);
+const BRUSH_BLOCKED: Color = Color::srgba(1.0, 0.69, 0.25, 0.88);
+const BRUSH_FOREIGN: Color = Color::srgba(1.0, 0.34, 0.24, 0.88);
+const BRUSH_OFF_MAP: Color = Color::srgba(0.48, 0.57, 0.61, 0.78);
+const SHAPE_TARGET: Color = Color::srgb(0.54, 0.94, 0.56);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrushCategory {
+    Selectable,
+    AlreadySelected,
+    RetaskHandle,
+    ShapeTarget,
+    Blocked,
+    Foreign,
+    OffMap,
+}
 
 #[derive(Clone, Copy)]
 struct PerimeterStyle {
@@ -47,9 +65,12 @@ fn draw_world_overlays(
     mut gizmos: Gizmos,
 ) {
     let needs_visible_cells = interaction.has_selection()
+        || !interaction.attack_targets.is_empty()
         || !interaction.preview.front_edges.is_empty()
         || !interaction.preview.wave_depth.is_empty()
         || !interaction.preview.heatmap.is_empty()
+        || !interaction.preview.delta_by_cell.is_empty()
+        || !interaction.preview.component_routes.is_empty()
         || !interaction.preview.projected_sources.is_empty()
         || !interaction.preview.excluded.is_empty();
     let visible_cells = if needs_visible_cells {
@@ -140,7 +161,19 @@ fn draw_selection(
         }
     }
 
-    if interaction.preview.retask_order_count > 0 {
+    if matches!(interaction.mode, OrderMode::StopPreview { .. }) {
+        draw_region_perimeter(
+            view,
+            &interaction.preview.projected_sources,
+            visible_cells,
+            PerimeterStyle {
+                lift: 0.155,
+                scale: 0.82,
+            },
+            |_| RETASK,
+            gizmos,
+        );
+    } else if interaction.preview.retask_order_count > 0 {
         for coordinate in visible_cells.iter().filter(|coordinate| {
             interaction.preview.projected_sources.contains(coordinate)
                 && !interaction.sources.contains(coordinate)
@@ -155,29 +188,122 @@ fn draw_selection(
         }
     }
 
-    let hovered_footprint = interaction.hovered.map_or_else(BTreeSet::new, |hovered| {
-        interaction
-            .brush
-            .cells(hovered)
-            .into_iter()
-            .filter(|coordinate| {
-                matches!(interaction.mode, OrderMode::Idle)
-                    && view.is_local_selection_cell(*coordinate)
-            })
-            .collect()
-    });
-    let hovered_cells = hovered_footprint.iter().copied().collect::<Vec<_>>();
     draw_region_perimeter(
         view,
-        &hovered_footprint,
-        &hovered_cells,
+        &interaction.shape_targets,
+        visible_cells,
         PerimeterStyle {
-            lift: 0.13,
-            scale: 1.01,
+            lift: 0.145,
+            scale: 0.88,
         },
-        |_| Color::srgba(0.96, 0.98, 1.0, 0.92),
+        |_| SHAPE_TARGET,
         gizmos,
     );
+
+    draw_region_perimeter(
+        view,
+        &interaction.attack_targets,
+        visible_cells,
+        PerimeterStyle {
+            lift: 0.155,
+            scale: 0.86,
+        },
+        |_| HOSTILE,
+        gizmos,
+    );
+
+    if matches!(interaction.mode, OrderMode::ReshapeDrawing)
+        && let Some(hovered) = interaction.hovered
+    {
+        let reference_surface = view
+            .cell(hovered)
+            .map_or((0, false), |cell| (cell.elevation, cell.is_water()));
+        for coordinate in interaction.brush.cells(hovered) {
+            let cell = view.cell(coordinate);
+            let center = cell.map_or_else(
+                || {
+                    world_center(coordinate, reference_surface.0, reference_surface.1)
+                        + Vec3::Y * 0.13
+                },
+                |cell| point(cell, 0.13),
+            );
+            draw_brush_cell(
+                gizmos,
+                center,
+                brush_category(view, interaction, coordinate, true),
+            );
+        }
+    }
+}
+
+fn brush_category(
+    view: &MatchView,
+    interaction: &InteractionState,
+    coordinate: Axial,
+    drawing_shape: bool,
+) -> BrushCategory {
+    let Some(cell) = view.cell(coordinate) else {
+        return BrushCategory::OffMap;
+    };
+    if !cell.is_land() || cell.blocked {
+        return BrushCategory::Blocked;
+    }
+    if drawing_shape {
+        if interaction.shape_targets.contains(&coordinate) {
+            BrushCategory::ShapeTarget
+        } else if view.is_local_owned_passable(coordinate) {
+            BrushCategory::Selectable
+        } else {
+            BrushCategory::Foreign
+        }
+    } else if interaction.sources.contains(&coordinate) {
+        BrushCategory::AlreadySelected
+    } else if interaction.retask_handles.contains_key(&coordinate)
+        || view.is_local_retask_handle(coordinate)
+    {
+        BrushCategory::RetaskHandle
+    } else if view.is_local_owned_passable(coordinate) {
+        BrushCategory::Selectable
+    } else {
+        BrushCategory::Foreign
+    }
+}
+
+fn draw_brush_cell(gizmos: &mut Gizmos, center: Vec3, category: BrushCategory) {
+    match category {
+        BrushCategory::Selectable => draw_hex(gizmos, center, 1.01, BRUSH_VALID),
+        BrushCategory::AlreadySelected => {
+            draw_hex(gizmos, center, 1.01, BRUSH_SELECTED);
+            draw_hex(gizmos, center, 0.76, BRUSH_SELECTED);
+        }
+        BrushCategory::RetaskHandle => {
+            for direction in [0, 2, 4] {
+                draw_hex_edge(gizmos, center, direction, 1.01, BRUSH_RETASK);
+            }
+        }
+        BrushCategory::ShapeTarget => {
+            draw_hex(gizmos, center, 1.01, SHAPE_TARGET);
+            draw_hex(gizmos, center, 0.76, SHAPE_TARGET);
+        }
+        BrushCategory::Blocked => {
+            for direction in [0, 2, 4] {
+                draw_hex_edge(gizmos, center, direction, 1.01, BRUSH_BLOCKED);
+            }
+            let arm = 0.22;
+            gizmos.line(
+                center + Vec3::new(-arm, 0.0, -arm),
+                center + Vec3::new(arm, 0.0, arm),
+                BRUSH_BLOCKED,
+            );
+            gizmos.line(
+                center + Vec3::new(-arm, 0.0, arm),
+                center + Vec3::new(arm, 0.0, -arm),
+                BRUSH_BLOCKED,
+            );
+        }
+        BrushCategory::Foreign => draw_segmented_hex(gizmos, center, 1.01, BRUSH_FOREIGN, 0.48),
+        BrushCategory::OffMap => draw_segmented_hex(gizmos, center, 1.01, BRUSH_OFF_MAP, 0.20),
+    }
 }
 
 fn draw_region_perimeter(
@@ -220,10 +346,9 @@ fn draw_preview(
     visible_cells: &[Axial],
     gizmos: &mut Gizmos,
 ) {
+    draw_push_front_edges(view, interaction, visible_cells, gizmos);
     if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
         draw_expand_wave(view, interaction, visible_cells, gizmos);
-    } else {
-        draw_push_front_edges(view, interaction, visible_cells, gizmos);
     }
 
     if !interaction.preview.heatmap.is_empty() {
@@ -243,6 +368,16 @@ fn draw_preview(
             );
             draw_hex(gizmos, point(cell, 0.115), 0.47 + density * 0.29, color);
         }
+    }
+
+    for coordinate in visible_cells {
+        let Some(&delta) = interaction.preview.delta_by_cell.get(coordinate) else {
+            continue;
+        };
+        let Some(cell) = view.cell(*coordinate) else {
+            continue;
+        };
+        draw_redistribution_delta(gizmos, point(cell, 0.205), delta);
     }
 
     if !interaction.preview.excluded.is_empty() {
@@ -268,25 +403,25 @@ fn draw_preview(
     }
 
     if !matches!(interaction.mode, OrderMode::ExpandAllPreview) {
-        let route_points = interaction
-            .preview
-            .route
-            .iter()
-            .filter_map(|coordinate| view.cell(*coordinate))
-            .map(|cell| point(cell, 0.19))
-            .collect::<Vec<_>>();
-        draw_dashed_route(gizmos, &route_points, AMBER);
+        for route in &interaction.preview.component_routes {
+            let route_points = route
+                .iter()
+                .filter_map(|coordinate| view.cell(*coordinate))
+                .map(|cell| point(cell, 0.19))
+                .collect::<Vec<_>>();
+            draw_dashed_route(gizmos, &route_points, AMBER);
+        }
     }
 
-    if let Some((from, to)) = interaction.preview.bottleneck
-        && let (Some(from), Some(to)) = (view.cell(from), view.cell(to))
-    {
-        let a = point(from, 0.205);
-        let b = point(to, 0.205);
-        let direction = (b - a).normalize_or_zero();
-        let side = Vec3::new(-direction.z, 0.0, direction.x) * 0.055;
-        gizmos.line(a + side, b + side, HOSTILE);
-        gizmos.line(a - side, b - side, HOSTILE);
+    for &(from, to) in &interaction.preview.component_bottlenecks {
+        if let (Some(from), Some(to)) = (view.cell(from), view.cell(to)) {
+            let a = point(from, 0.205);
+            let b = point(to, 0.205);
+            let direction = (b - a).normalize_or_zero();
+            let side = Vec3::new(-direction.z, 0.0, direction.x) * 0.055;
+            gizmos.line(a + side, b + side, HOSTILE);
+            gizmos.line(a - side, b - side, HOSTILE);
+        }
     }
 
     if matches!(
@@ -395,11 +530,7 @@ fn draw_push_front_edges(
         else {
             continue;
         };
-        let color = if target.owner.is_some() {
-            HOSTILE
-        } else {
-            AMBER
-        };
+        let color = push_front_edge_color(view.local_player, target.owner);
         let source_point = point(source, 0.155);
         let target_point = point(target, 0.155);
         draw_hex_edge(gizmos, source_point, direction, 1.025, color);
@@ -410,6 +541,16 @@ fn draw_push_front_edges(
                 color,
             )
             .with_tip_length(0.17);
+    }
+}
+
+fn push_front_edge_color(local_player: u32, target_owner: Option<u32>) -> Color {
+    if target_owner == Some(local_player) {
+        FRIENDLY
+    } else if target_owner.is_some() {
+        HOSTILE
+    } else {
+        AMBER
     }
 }
 
@@ -487,6 +628,25 @@ fn draw_hex_edge(gizmos: &mut Gizmos, center: Vec3, direction: usize, scale: f32
     gizmos.line(start, end, color);
 }
 
+fn draw_segmented_hex(
+    gizmos: &mut Gizmos,
+    center: Vec3,
+    scale: f32,
+    color: Color,
+    segment_fraction: f32,
+) {
+    for direction in 0..6 {
+        let start_corner = edge_index_for_direction(direction);
+        let end_corner = (start_corner + 1) % 6;
+        let start = center + (corner(center, start_corner, center.y) - center) * scale;
+        let end = center + (corner(center, end_corner, center.y) - center) * scale;
+        let middle = start.lerp(end, 0.5);
+        let half = segment_fraction.clamp(0.05, 0.95) * 0.5;
+        gizmos.line(start.lerp(middle, 1.0 - half), middle, color);
+        gizmos.line(middle, end.lerp(middle, 1.0 - half), color);
+    }
+}
+
 #[cfg(test)]
 fn perimeter_edge_count(selection: &BTreeSet<Axial>) -> usize {
     selection
@@ -515,6 +675,25 @@ fn draw_dashed_route(gizmos: &mut Gizmos, points: &[Vec3], color: Color) {
     }
 }
 
+fn redistribution_delta_scale(delta: i128) -> f32 {
+    let normalized = delta.unsigned_abs().min(10_000) as f32 / 10_000.0;
+    0.10 + normalized.sqrt() * 0.16
+}
+
+fn draw_redistribution_delta(gizmos: &mut Gizmos, center: Vec3, delta: i128) {
+    let arm = redistribution_delta_scale(delta);
+    let horizontal = Vec3::new(arm, 0.0, 0.0);
+    gizmos.line(
+        center - horizontal,
+        center + horizontal,
+        if delta > 0 { SHAPE_TARGET } else { HOSTILE },
+    );
+    if delta > 0 {
+        let vertical = Vec3::new(0.0, 0.0, arm);
+        gizmos.line(center - vertical, center + vertical, SHAPE_TARGET);
+    }
+}
+
 fn selection_center(
     view: &MatchView,
     selection: &std::collections::BTreeSet<Axial>,
@@ -532,6 +711,20 @@ fn selection_center(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hex_core::TerrainKind;
+
+    fn cell(coordinate: Axial, owner: Option<u32>, blocked: bool) -> CellView {
+        CellView {
+            coordinate,
+            terrain: TerrainKind::Plains,
+            elevation: 0,
+            owner,
+            civilians: 0,
+            infantry: 0,
+            military_capacity: 100,
+            blocked,
+        }
+    }
 
     #[test]
     fn perimeter_counts_only_exposed_edges() {
@@ -548,5 +741,59 @@ mod tests {
             .chain([Axial::ZERO])
             .collect();
         assert_eq!(perimeter_edge_count(&center_and_neighbors), 18);
+    }
+
+    #[test]
+    fn brush_categories_keep_the_full_footprint_legible() {
+        let selected = Axial::ZERO;
+        let available = Axial::new(1, 0);
+        let blocked = Axial::new(0, 1);
+        let foreign = Axial::new(-1, 0);
+        let off_map = Axial::new(8, 8);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(selected, cell(selected, Some(1), false));
+        view.cells
+            .insert(available, cell(available, Some(1), false));
+        view.cells.insert(blocked, cell(blocked, Some(1), true));
+        view.cells.insert(foreign, cell(foreign, Some(2), false));
+        let mut interaction = InteractionState::default();
+        interaction.sources.insert(selected);
+
+        assert_eq!(
+            brush_category(&view, &interaction, selected, false),
+            BrushCategory::AlreadySelected
+        );
+        assert_eq!(
+            brush_category(&view, &interaction, available, false),
+            BrushCategory::Selectable
+        );
+        assert_eq!(
+            brush_category(&view, &interaction, blocked, false),
+            BrushCategory::Blocked
+        );
+        assert_eq!(
+            brush_category(&view, &interaction, foreign, false),
+            BrushCategory::Foreign
+        );
+        assert_eq!(
+            brush_category(&view, &interaction, off_map, false),
+            BrushCategory::OffMap
+        );
+    }
+
+    #[test]
+    fn push_edges_distinguish_inward_neutral_and_hostile_targets() {
+        assert_eq!(push_front_edge_color(1, Some(1)), FRIENDLY);
+        assert_eq!(push_front_edge_color(1, None), AMBER);
+        assert_eq!(push_front_edge_color(1, Some(2)), HOSTILE);
+    }
+
+    #[test]
+    fn redistribution_delta_glyphs_scale_by_magnitude_not_sign() {
+        assert!(
+            (redistribution_delta_scale(25) - redistribution_delta_scale(-25)).abs() < f32::EPSILON
+        );
+        assert!(redistribution_delta_scale(250) > redistribution_delta_scale(25));
+        assert!(redistribution_delta_scale(25_000) <= 0.26);
     }
 }
