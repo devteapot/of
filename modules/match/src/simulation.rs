@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 use hex_core::{
     AttackFront, Axial, CombatConfig, EdgeLimits, HexMap, LogisticsConfig, MovementConfig,
@@ -28,6 +31,172 @@ use crate::schema::{
 /// rebuilds instead of paying that global cost on every recruitment pass.
 const POLICY_REPLAN_POPULATION_PASSES: u64 = 4;
 
+/// Transaction-local packet index for one simulation step.
+///
+/// SpacetimeDB row iteration decodes the complete row, including `route`, on
+/// every scan. The simulation has several ordered packet phases, so keeping a
+/// synchronized in-memory index avoids decoding the same active set for trim,
+/// branching, movement, combat, and finalization while preserving their exact
+/// mutation order. Writes still reach the database immediately so existing
+/// indexed queries outside this module observe the current transaction state.
+#[derive(Clone)]
+struct TickPacket {
+    packet_key: String,
+    order_id: u64,
+    owner_player_id: u8,
+    origin_cell: u32,
+    current_cell: u32,
+    destination_cell: u32,
+    infantry: u64,
+    route_index: u32,
+    route: Rc<[u32]>,
+    updated_step: u64,
+}
+
+impl From<TransitPacket> for TickPacket {
+    fn from(packet: TransitPacket) -> Self {
+        Self {
+            packet_key: packet.packet_key,
+            order_id: packet.order_id,
+            owner_player_id: packet.owner_player_id,
+            origin_cell: packet.origin_cell,
+            current_cell: packet.current_cell,
+            destination_cell: packet.destination_cell,
+            infantry: packet.infantry,
+            route_index: packet.route_index,
+            route: Rc::from(packet.route),
+            updated_step: packet.updated_step,
+        }
+    }
+}
+
+impl TickPacket {
+    fn to_row(&self) -> TransitPacket {
+        TransitPacket {
+            packet_key: self.packet_key.clone(),
+            order_id: self.order_id,
+            owner_player_id: self.owner_player_id,
+            origin_cell: self.origin_cell,
+            current_cell: self.current_cell,
+            destination_cell: self.destination_cell,
+            infantry: self.infantry,
+            route_index: self.route_index,
+            route: self.route.to_vec(),
+            updated_step: self.updated_step,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PacketTickState {
+    rows: BTreeMap<Rc<str>, TickPacket>,
+    by_order: BTreeMap<u64, BTreeSet<Rc<str>>>,
+    by_cell: BTreeMap<u32, BTreeSet<Rc<str>>>,
+    by_order_destination: BTreeMap<(u64, u32), BTreeSet<Rc<str>>>,
+}
+
+impl PacketTickState {
+    fn load(ctx: &ReducerContext) -> Self {
+        let mut state = Self::default();
+        for packet in ctx.db.transit_packet().iter() {
+            state.track(packet.into());
+        }
+        state
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &TickPacket> {
+        self.rows.values()
+    }
+
+    fn find(&self, packet_key: &str) -> Option<TickPacket> {
+        self.rows.get(packet_key).cloned()
+    }
+
+    fn by_order(&self, order_id: u64) -> impl Iterator<Item = &TickPacket> {
+        self.by_order
+            .get(&order_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.rows.get(key))
+    }
+
+    fn by_cell(&self, cell_id: u32) -> impl Iterator<Item = &TickPacket> {
+        self.by_cell
+            .get(&cell_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.rows.get(key))
+    }
+
+    fn by_order_destination(
+        &self,
+        order_id: u64,
+        destination_cell: u32,
+    ) -> impl Iterator<Item = &TickPacket> {
+        self.by_order_destination
+            .get(&(order_id, destination_cell))
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.rows.get(key))
+    }
+
+    fn insert(&mut self, ctx: &ReducerContext, packet: TickPacket) {
+        ctx.db.transit_packet().insert(packet.to_row());
+        self.track(packet);
+    }
+
+    fn update(&mut self, ctx: &ReducerContext, packet: TickPacket) {
+        ctx.db.transit_packet().packet_key().update(packet.to_row());
+        self.untrack(&packet.packet_key);
+        self.track(packet);
+    }
+
+    fn delete(&mut self, ctx: &ReducerContext, packet_key: &str) {
+        if let Some(packet) = self.rows.get(packet_key) {
+            ctx.db
+                .transit_packet()
+                .packet_key()
+                .delete(&packet.packet_key);
+        }
+        self.untrack(packet_key);
+    }
+
+    fn track(&mut self, packet: TickPacket) {
+        let key = Rc::<str>::from(packet.packet_key.as_str());
+        self.by_order
+            .entry(packet.order_id)
+            .or_default()
+            .insert(key.clone());
+        self.by_cell
+            .entry(packet.current_cell)
+            .or_default()
+            .insert(key.clone());
+        self.by_order_destination
+            .entry((packet.order_id, packet.destination_cell))
+            .or_default()
+            .insert(key.clone());
+        self.rows.insert(key, packet);
+    }
+
+    fn untrack(&mut self, packet_key: &str) {
+        let Some(packet) = self.rows.remove(packet_key) else {
+            return;
+        };
+        if let Some(keys) = self.by_order.get_mut(&packet.order_id) {
+            keys.remove(packet_key);
+        }
+        if let Some(keys) = self.by_cell.get_mut(&packet.current_cell) {
+            keys.remove(packet_key);
+        }
+        if let Some(keys) = self
+            .by_order_destination
+            .get_mut(&(packet.order_id, packet.destination_cell))
+        {
+            keys.remove(packet_key);
+        }
+    }
+}
+
 pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let mut match_state = state(ctx)?;
     if match_state.phase != MatchPhase::Running {
@@ -40,14 +209,15 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let logical_step = match_state.logical_step;
     ctx.db.match_state().singleton_id().update(match_state);
 
-    trim_all_overallocated_packets(ctx, logical_step)?;
-    branch_expand_waves(ctx, logical_step)?;
-    stop_blocked_expand_edges(ctx, logical_step)?;
-    move_friendly_packets(ctx, logical_step)?;
-    stop_blocked_internal_edges(ctx, logical_step)?;
-    resolve_combats(ctx, logical_step)?;
+    let mut packets = PacketTickState::load(ctx);
+    trim_all_overallocated_packets(ctx, &mut packets, logical_step)?;
+    branch_expand_waves(ctx, &mut packets, logical_step)?;
+    stop_blocked_expand_edges(ctx, &mut packets, logical_step)?;
+    move_friendly_packets(ctx, &mut packets, logical_step)?;
+    stop_blocked_internal_edges(ctx, &mut packets, logical_step)?;
+    resolve_combats(ctx, &mut packets, logical_step)?;
     clear_stale_combat_fronts(ctx, logical_step);
-    finalize_orders(ctx, logical_step)?;
+    finalize_orders(ctx, &packets, logical_step)?;
 
     let config = config(ctx)?;
     let population_interval = u64::from(config.population_step_interval.max(1));
@@ -76,7 +246,11 @@ fn is_expansion_wave_order(kind: OrderKind) -> bool {
 /// Neutral waves stop at later enemy ownership. Attack waves are constrained
 /// instead by their immutable source and target masks, so captures can open
 /// deeper fronts without ever leaking into an unselected cluster.
-fn stop_blocked_expand_edges(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+fn stop_blocked_expand_edges(
+    ctx: &ReducerContext,
+    packets: &mut PacketTickState,
+    logical_step: u64,
+) -> Result<(), String> {
     let expand_orders = ctx
         .db
         .transfer_order()
@@ -96,24 +270,19 @@ fn stop_blocked_expand_edges(ctx: &ReducerContext, logical_step: u64) -> Result<
             .order_id()
             .find(order.order_id)
             .ok_or_else(|| format!("wave order {} has no topology", order.order_id))?;
-        for packet in ctx
-            .db
-            .transit_packet()
-            .packet_by_order()
-            .filter(order.order_id)
-        {
+        for packet in packets.by_order(order.order_id) {
             let next_index = packet.route_index as usize + 1;
             let Some(&next_cell) = packet.route.get(next_index) else {
                 continue;
             };
             if !expansion_edge_is_available(ctx, &order, &wave, packet.current_cell, next_cell)? {
-                blocked_packets.push(packet);
+                blocked_packets.push(packet.clone());
             }
         }
     }
     blocked_packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
     for packet in blocked_packets {
-        station_packet_allocation(ctx, &packet, packet.infantry, logical_step)?;
+        station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)?;
     }
     Ok(())
 }
@@ -123,7 +292,11 @@ fn stop_blocked_expand_edges(ctx: &ReducerContext, logical_step: u64) -> Result<
 /// before the generic combat pass can treat the stale route as an attack.
 /// Running this after friendly movement also catches a packet that advanced
 /// next to the newly non-friendly cell during the same simulation step.
-fn stop_blocked_internal_edges(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+fn stop_blocked_internal_edges(
+    ctx: &ReducerContext,
+    packets: &mut PacketTickState,
+    logical_step: u64,
+) -> Result<(), String> {
     let internal_orders = ctx
         .db
         .transfer_order()
@@ -138,19 +311,19 @@ fn stop_blocked_internal_edges(ctx: &ReducerContext, logical_step: u64) -> Resul
 
     let mut blocked_packets = Vec::new();
     for (order_id, player_id, kind) in internal_orders {
-        for packet in ctx.db.transit_packet().packet_by_order().filter(order_id) {
+        for packet in packets.by_order(order_id) {
             let Some(&next_cell) = packet.route.get(packet.route_index as usize + 1) else {
                 continue;
             };
             let next_owner = cell_state(ctx, next_cell)?.owner_player_id;
             if internal_next_owner_is_blocked(kind, player_id, next_owner) {
-                blocked_packets.push(packet);
+                blocked_packets.push(packet.clone());
             }
         }
     }
     blocked_packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
     for packet in blocked_packets {
-        station_packet_allocation(ctx, &packet, packet.infantry, logical_step)?;
+        station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)?;
     }
     Ok(())
 }
@@ -170,7 +343,11 @@ fn internal_next_owner_is_blocked(kind: OrderKind, player_id: u8, next_owner: u8
     internal_order_requires_friendly_route(kind) && next_owner != player_id
 }
 
-fn branch_expand_waves(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+fn branch_expand_waves(
+    ctx: &ReducerContext,
+    packets: &mut PacketTickState,
+    logical_step: u64,
+) -> Result<(), String> {
     let orders = ctx
         .db
         .transfer_order()
@@ -185,18 +362,13 @@ fn branch_expand_waves(ctx: &ReducerContext, logical_step: u64) -> Result<(), St
             .order_id()
             .find(order.order_id)
             .ok_or_else(|| format!("expand order {} has no topology", order.order_id))?;
-        let mut resting_by_cell = BTreeMap::<u32, Vec<TransitPacket>>::new();
-        for packet in ctx
-            .db
-            .transit_packet()
-            .packet_by_order()
-            .filter(order.order_id)
-        {
-            if expansion_packet_is_resting(&packet) {
+        let mut resting_by_cell = BTreeMap::<u32, Vec<TickPacket>>::new();
+        for packet in packets.by_order(order.order_id) {
+            if expansion_packet_is_resting(packet) {
                 resting_by_cell
                     .entry(packet.current_cell)
                     .or_default()
-                    .push(packet);
+                    .push(packet.clone());
             }
         }
         let mut topology_changed = false;
@@ -204,6 +376,7 @@ fn branch_expand_waves(ctx: &ReducerContext, logical_step: u64) -> Result<(), St
             contributions.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
             topology_changed |= branch_expand_node(
                 ctx,
+                packets,
                 &order,
                 &mut wave,
                 cell_id,
@@ -218,22 +391,23 @@ fn branch_expand_waves(ctx: &ReducerContext, logical_step: u64) -> Result<(), St
     Ok(())
 }
 
-fn expansion_packet_is_resting(packet: &TransitPacket) -> bool {
+fn expansion_packet_is_resting(packet: &TickPacket) -> bool {
     packet.route_index == 0
-        && packet.route.as_slice() == [packet.current_cell]
+        && packet.route.as_ref() == [packet.current_cell]
         && packet.destination_cell == packet.current_cell
 }
 
 fn branch_expand_node(
     ctx: &ReducerContext,
+    packets: &mut PacketTickState,
     order: &TransferOrder,
     wave: &mut ExpansionWave,
     cell_id: u32,
-    contributions: &[TransitPacket],
+    contributions: &[TickPacket],
     logical_step: u64,
 ) -> Result<bool, String> {
     let contributions =
-        pay_expansion_garrison_debt(ctx, order, cell_id, contributions, logical_step)?;
+        pay_expansion_garrison_debt(ctx, packets, order, cell_id, contributions, logical_step)?;
     if contributions.is_empty() {
         return Ok(false);
     }
@@ -241,7 +415,13 @@ fn branch_expand_node(
     let children = expansion_children(ctx, wave, cell_id)?;
     if children.is_empty() {
         for contribution in &contributions {
-            station_packet_allocation(ctx, contribution, contribution.infantry, logical_step)?;
+            station_packet_allocation(
+                ctx,
+                packets,
+                contribution,
+                contribution.infantry,
+                logical_step,
+            )?;
         }
         return Ok(false);
     }
@@ -284,23 +464,16 @@ fn branch_expand_node(
     for (index, contribution) in contributions.iter().enumerate() {
         let stationed = stationed_by_contribution[index];
         if stationed > 0 {
-            station_packet_allocation(ctx, contribution, stationed, logical_step)?;
+            station_packet_allocation(ctx, packets, contribution, stationed, logical_step)?;
         }
-        if let Some(remaining) = ctx
-            .db
-            .transit_packet()
-            .packet_key()
-            .find(&contribution.packet_key)
-        {
-            ctx.db
-                .transit_packet()
-                .packet_key()
-                .delete(&remaining.packet_key);
+        if packets.find(&contribution.packet_key).is_some() {
+            packets.delete(ctx, &contribution.packet_key);
         }
     }
     for (contribution_index, child, amount) in outgoing {
         insert_expand_edge_packet(
             ctx,
+            packets,
             order,
             &contributions[contribution_index],
             cell_id,
@@ -317,11 +490,12 @@ fn branch_expand_node(
 /// allocation and accounts it as delivered before any surplus can branch.
 fn pay_expansion_garrison_debt(
     ctx: &ReducerContext,
+    packets: &mut PacketTickState,
     order: &TransferOrder,
     cell_id: u32,
-    contributions: &[TransitPacket],
+    contributions: &[TickPacket],
     logical_step: u64,
-) -> Result<Vec<TransitPacket>, String> {
+) -> Result<Vec<TickPacket>, String> {
     let Some(mut debt) = ctx.db.expansion_garrison_debt().cell_id().find(cell_id) else {
         return Ok(contributions.to_vec());
     };
@@ -340,12 +514,7 @@ fn pay_expansion_garrison_debt(
         if remaining_debt == 0 {
             break;
         }
-        let Some(current) = ctx
-            .db
-            .transit_packet()
-            .packet_key()
-            .find(&contribution.packet_key)
-        else {
+        let Some(current) = packets.find(&contribution.packet_key) else {
             continue;
         };
         if current.order_id != order.order_id
@@ -356,7 +525,7 @@ fn pay_expansion_garrison_debt(
             return Err("expand garrison debt received an invalid resting contribution".into());
         }
         let (stationed, next_debt, _) = garrison_debt_partition(remaining_debt, current.infantry);
-        station_packet_allocation(ctx, &current, stationed, logical_step)?;
+        station_packet_allocation(ctx, packets, &current, stationed, logical_step)?;
         remaining_debt = next_debt;
     }
 
@@ -369,12 +538,7 @@ fn pay_expansion_garrison_debt(
 
     Ok(contributions
         .iter()
-        .filter_map(|contribution| {
-            ctx.db
-                .transit_packet()
-                .packet_key()
-                .find(&contribution.packet_key)
-        })
+        .filter_map(|contribution| packets.find(&contribution.packet_key))
         .collect())
 }
 
@@ -524,8 +688,9 @@ fn wave_scope_allows_cell(
 #[allow(clippy::too_many_arguments)]
 fn insert_expand_edge_packet(
     ctx: &ReducerContext,
+    packets: &mut PacketTickState,
     order: &TransferOrder,
-    contribution: &TransitPacket,
+    contribution: &TickPacket,
     from_cell: u32,
     to_cell: u32,
     amount: u64,
@@ -541,23 +706,26 @@ fn insert_expand_edge_packet(
         from_cell,
         0,
     );
-    if let Some(mut existing) = ctx.db.transit_packet().packet_key().find(&key) {
+    if let Some(mut existing) = packets.find(&key) {
         existing.infantry = merged_expand_strength(existing.infantry, amount)?;
         existing.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(existing);
+        packets.update(ctx, existing);
     } else {
-        ctx.db.transit_packet().insert(TransitPacket {
-            packet_key: key,
-            order_id: order.order_id,
-            owner_player_id: order.player_id,
-            origin_cell: contribution.origin_cell,
-            current_cell: from_cell,
-            destination_cell: to_cell,
-            infantry: amount,
-            route_index: 0,
-            route: vec![from_cell, to_cell],
-            updated_step: logical_step,
-        });
+        packets.insert(
+            ctx,
+            TickPacket {
+                packet_key: key,
+                order_id: order.order_id,
+                owner_player_id: order.player_id,
+                origin_cell: contribution.origin_cell,
+                current_cell: from_cell,
+                destination_cell: to_cell,
+                infantry: amount,
+                route_index: 0,
+                route: Rc::from([from_cell, to_cell]),
+                updated_step: logical_step,
+            },
+        );
     }
     Ok(())
 }
@@ -724,7 +892,7 @@ fn recruitment_headroom(capacity: u64, current: u64, reserved: u64) -> u64 {
 #[derive(Clone)]
 struct FriendlyIntent {
     id: u64,
-    packet: TransitPacket,
+    packet: TickPacket,
     next_cell: u32,
 }
 
@@ -770,11 +938,13 @@ fn should_station_capacity_blocked_packet(
         && limits.contains(&MovementLimit::DestinationCapacity)
 }
 
-fn move_friendly_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
-    let mut packets: Vec<_> = ctx.db.transit_packet().iter().collect();
-    packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+fn move_friendly_packets(
+    ctx: &ReducerContext,
+    packets: &mut PacketTickState,
+    logical_step: u64,
+) -> Result<(), String> {
     let mut intents = Vec::new();
-    for packet in packets {
+    for packet in packets.iter() {
         let Some(&next_cell) = packet.route.get(packet.route_index as usize + 1) else {
             continue;
         };
@@ -782,7 +952,7 @@ fn move_friendly_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), 
         if next.owner_player_id == packet.owner_player_id {
             intents.push(FriendlyIntent {
                 id: intents.len() as u64 + 1,
-                packet,
+                packet: packet.clone(),
                 next_cell,
             });
         }
@@ -904,6 +1074,7 @@ fn move_friendly_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), 
         if approved > 0 {
             advance_packet(
                 ctx,
+                packets,
                 &intent.packet,
                 approved,
                 logical_step,
@@ -912,13 +1083,20 @@ fn move_friendly_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), 
         }
     }
     for (order_id, lane_anchor, direction) in capacity_stopped_lanes {
-        settle_stopped_sustained_lane(ctx, order_id, lane_anchor, direction, logical_step)?;
+        settle_stopped_sustained_lane(
+            ctx,
+            packets,
+            order_id,
+            lane_anchor,
+            direction,
+            logical_step,
+        )?;
     }
     for packet in capacity_stopped_packets.into_values() {
         // An upstream packet can merge into this key during the same pipeline
         // step. Retire the complete post-movement allocation at the blocked
         // choke, not only the amount present in the pre-step snapshot.
-        station_packet_allocation(ctx, &packet, u64::MAX, logical_step)?;
+        station_packet_allocation(ctx, packets, &packet, u64::MAX, logical_step)?;
     }
     Ok(())
 }
@@ -928,14 +1106,16 @@ struct FrontPackets {
     attacker: u8,
     from_cell: u32,
     to_cell: u32,
-    packets: Vec<TransitPacket>,
+    packets: Vec<TickPacket>,
 }
 
-fn resolve_combats(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
-    let mut packets: Vec<_> = ctx.db.transit_packet().iter().collect();
-    packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
-    let mut targets = BTreeMap::<u32, BTreeMap<u8, BTreeMap<u32, Vec<TransitPacket>>>>::new();
-    for packet in packets {
+fn resolve_combats(
+    ctx: &ReducerContext,
+    packets: &mut PacketTickState,
+    logical_step: u64,
+) -> Result<(), String> {
+    let mut targets = BTreeMap::<u32, BTreeMap<u8, BTreeMap<u32, Vec<TickPacket>>>>::new();
+    for packet in packets.iter() {
         let Some(&next_cell) = packet.route.get(packet.route_index as usize + 1) else {
             continue;
         };
@@ -949,14 +1129,14 @@ fn resolve_combats(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
             .or_default()
             .entry(packet.current_cell)
             .or_default()
-            .push(packet);
+            .push(packet.clone());
     }
 
     for (target_cell, attackers) in targets {
         if state(ctx)?.phase != MatchPhase::Running {
             break;
         }
-        let attackers = refresh_target_attackers(ctx, target_cell, attackers)?;
+        let attackers = refresh_target_attackers(ctx, packets, target_cell, attackers)?;
         if attackers.is_empty() {
             continue;
         }
@@ -1001,26 +1181,22 @@ fn resolve_combats(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
                 packets: packets.clone(),
             })
             .collect();
-        resolve_target_combat(ctx, defender, fronts, logical_step)?;
+        resolve_target_combat(ctx, packets, defender, fronts, logical_step)?;
     }
     Ok(())
 }
 
 fn refresh_target_attackers(
     ctx: &ReducerContext,
+    packet_state: &PacketTickState,
     target_cell: u32,
-    candidates: BTreeMap<u8, BTreeMap<u32, Vec<TransitPacket>>>,
-) -> Result<BTreeMap<u8, BTreeMap<u32, Vec<TransitPacket>>>, String> {
-    let mut current = BTreeMap::<u8, BTreeMap<u32, Vec<TransitPacket>>>::new();
+    candidates: BTreeMap<u8, BTreeMap<u32, Vec<TickPacket>>>,
+) -> Result<BTreeMap<u8, BTreeMap<u32, Vec<TickPacket>>>, String> {
+    let mut current = BTreeMap::<u8, BTreeMap<u32, Vec<TickPacket>>>::new();
     for (player, fronts) in candidates {
         for (from_cell, packets) in fronts {
             for snapshot in packets {
-                let Some(packet) = ctx
-                    .db
-                    .transit_packet()
-                    .packet_key()
-                    .find(&snapshot.packet_key)
-                else {
+                let Some(packet) = packet_state.find(&snapshot.packet_key) else {
                     continue;
                 };
                 let next_cell = packet.route.get(packet.route_index as usize + 1).copied();
@@ -1045,6 +1221,7 @@ fn refresh_target_attackers(
 
 fn resolve_target_combat(
     ctx: &ReducerContext,
+    packets: &mut PacketTickState,
     mut defender: CellState,
     fronts: Vec<FrontPackets>,
     logical_step: u64,
@@ -1108,7 +1285,13 @@ fn resolve_target_combat(
             .attacker_casualties
             .saturating_add(extra_attacker)
             .min(outcome.offered);
-        apply_attacker_casualties(ctx, &front.packets, attacker_casualties, logical_step)?;
+        apply_attacker_casualties(
+            ctx,
+            packets,
+            &front.packets,
+            attacker_casualties,
+            logical_step,
+        )?;
         surviving_by_front.insert(
             front.from_cell,
             outcome.offered.saturating_sub(attacker_casualties),
@@ -1145,6 +1328,7 @@ fn resolve_target_combat(
     ctx.db.cell_state().cell_id().update(defender.clone());
     trim_packets_at_cell(
         ctx,
+        packets,
         defender.cell_id,
         defender.owner_player_id,
         logical_step,
@@ -1165,7 +1349,7 @@ fn resolve_target_combat(
                 .iter()
                 .find(|front| front.from_cell == from_cell)
                 .ok_or_else(|| "capturing front is missing".to_string())?;
-            occupy_after_combat(ctx, front, defender, logical_step)?;
+            occupy_after_combat(ctx, packets, front, defender, logical_step)?;
         }
     }
     Ok(())
@@ -1173,7 +1357,8 @@ fn resolve_target_combat(
 
 fn apply_attacker_casualties(
     ctx: &ReducerContext,
-    packets: &[TransitPacket],
+    packet_state: &mut PacketTickState,
+    packets: &[TickPacket],
     mut casualties: u64,
     logical_step: u64,
 ) -> Result<(), String> {
@@ -1183,12 +1368,7 @@ fn apply_attacker_casualties(
         if casualties == 0 {
             break;
         }
-        let Some(current) = ctx
-            .db
-            .transit_packet()
-            .packet_key()
-            .find(&packet.packet_key)
-        else {
+        let Some(current) = packet_state.find(&packet.packet_key) else {
             continue;
         };
         let lost = casualties.min(current.infantry);
@@ -1196,7 +1376,7 @@ fn apply_attacker_casualties(
         source_state.infantry = source_state.infantry.saturating_sub(lost);
         source_state.last_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(source_state);
-        reduce_packet_metadata(ctx, current, lost, logical_step, true)?;
+        reduce_packet_metadata(ctx, packet_state, current, lost, logical_step, true)?;
         casualties -= lost;
     }
     Ok(())
@@ -1204,6 +1384,7 @@ fn apply_attacker_casualties(
 
 fn occupy_after_combat(
     ctx: &ReducerContext,
+    packet_state: &mut PacketTickState,
     front: &FrontPackets,
     mut target: CellState,
     logical_step: u64,
@@ -1213,12 +1394,7 @@ fn occupy_after_combat(
     let mut packets: Vec<_> = front
         .packets
         .iter()
-        .filter_map(|packet| {
-            ctx.db
-                .transit_packet()
-                .packet_key()
-                .find(&packet.packet_key)
-        })
+        .filter_map(|packet| packet_state.find(&packet.packet_key))
         .collect();
     packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
     let offered: u64 = packets.iter().map(|packet| packet.infantry).sum();
@@ -1259,10 +1435,23 @@ fn occupy_after_combat(
         source.infantry = source.infantry.saturating_sub(moved);
         source.last_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(source);
-        advance_packet(ctx, &packet, moved, logical_step, PacketArrival::Capture)?;
+        advance_packet(
+            ctx,
+            packet_state,
+            &packet,
+            moved,
+            logical_step,
+            PacketArrival::Capture,
+        )?;
         remaining -= moved;
     }
-    station_capture_garrison(ctx, target.cell_id, front.attacker, logical_step)?;
+    station_capture_garrison(
+        ctx,
+        packet_state,
+        target.cell_id,
+        front.attacker,
+        logical_step,
+    )?;
     record_capture(ctx, target.cell_id, old_owner, front.attacker)?;
     if let Some(order_id) = capturing_expand_order {
         record_expand_garrison_debt(ctx, order_id, target.cell_id, front.attacker)?;
@@ -1363,17 +1552,13 @@ fn controlled_cells_for_owner(owner: u8, player_one: u64, player_two: u64) -> Op
 
 fn advance_packet(
     ctx: &ReducerContext,
-    packet: &TransitPacket,
+    packets: &mut PacketTickState,
+    packet: &TickPacket,
     moved: u64,
     logical_step: u64,
     arrival: PacketArrival,
 ) -> Result<(), String> {
-    let Some(mut packet) = ctx
-        .db
-        .transit_packet()
-        .packet_key()
-        .find(&packet.packet_key)
-    else {
+    let Some(mut packet) = packets.find(&packet.packet_key) else {
         return Ok(());
     };
     if moved == 0 || moved > packet.infantry {
@@ -1386,7 +1571,7 @@ fn advance_packet(
         .find(packet.order_id)
         .ok_or_else(|| "packet order is missing".to_string())?;
     if is_expansion_wave_order(order.kind) {
-        return advance_expand_packet(ctx, &packet, moved, logical_step);
+        return advance_expand_packet(ctx, packets, &packet, moved, logical_step);
     }
     let next_index = packet.route_index + 1;
     let next_cell = *packet
@@ -1395,25 +1580,19 @@ fn advance_packet(
         .ok_or_else(|| "packet route ended before movement".to_string())?;
 
     if next_index as usize + 1 == packet.route.len() && arrival.may_extend_sustained_push() {
-        extend_sustained_lane(ctx, &packet, next_cell, logical_step)?;
-        packet = ctx
-            .db
-            .transit_packet()
-            .packet_key()
+        extend_sustained_lane(ctx, packets, &packet, next_cell, logical_step)?;
+        packet = packets
             .find(&packet.packet_key)
             .ok_or_else(|| "push packet disappeared while extending its lane".to_string())?;
     }
 
     if moved == packet.infantry {
-        ctx.db
-            .transit_packet()
-            .packet_key()
-            .delete(&packet.packet_key);
+        packets.delete(ctx, &packet.packet_key);
     } else {
         let mut remainder = packet.clone();
         remainder.infantry -= moved;
         remainder.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(remainder);
+        packets.update(ctx, remainder);
     }
     if packet_has_pending_source(&packet) {
         decrement_source_queue(ctx, packet.order_id, packet.origin_cell, moved)?;
@@ -1425,6 +1604,7 @@ fn advance_packet(
             let direction = push_lane_direction(ctx, &order, &packet)?;
             settle_stopped_sustained_lane(
                 ctx,
+                packets,
                 packet.order_id,
                 packet.destination_cell,
                 direction,
@@ -1441,33 +1621,37 @@ fn advance_packet(
         next_cell,
         next_index,
     );
-    if let Some(mut existing) = ctx.db.transit_packet().packet_key().find(&child_key) {
+    if let Some(mut existing) = packets.find(&child_key) {
         existing.infantry = existing
             .infantry
             .checked_add(moved)
             .ok_or_else(|| "packet strength overflow".to_string())?;
         existing.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(existing);
+        packets.update(ctx, existing);
     } else {
-        ctx.db.transit_packet().insert(TransitPacket {
-            packet_key: child_key,
-            order_id: packet.order_id,
-            owner_player_id: packet.owner_player_id,
-            origin_cell: packet.origin_cell,
-            current_cell: next_cell,
-            destination_cell: packet.destination_cell,
-            infantry: moved,
-            route_index: next_index,
-            route: packet.route.clone(),
-            updated_step: logical_step,
-        });
+        packets.insert(
+            ctx,
+            TickPacket {
+                packet_key: child_key,
+                order_id: packet.order_id,
+                owner_player_id: packet.owner_player_id,
+                origin_cell: packet.origin_cell,
+                current_cell: next_cell,
+                destination_cell: packet.destination_cell,
+                infantry: moved,
+                route_index: next_index,
+                route: packet.route.clone(),
+                updated_step: logical_step,
+            },
+        );
     }
     Ok(())
 }
 
 fn advance_expand_packet(
     ctx: &ReducerContext,
-    packet: &TransitPacket,
+    packets: &mut PacketTickState,
+    packet: &TickPacket,
     moved: u64,
     logical_step: u64,
 ) -> Result<(), String> {
@@ -1477,15 +1661,12 @@ fn advance_expand_packet(
     }
     let next_cell = packet.route[1];
     if moved == packet.infantry {
-        ctx.db
-            .transit_packet()
-            .packet_key()
-            .delete(&packet.packet_key);
+        packets.delete(ctx, &packet.packet_key);
     } else {
         let mut remainder = packet.clone();
         remainder.infantry -= moved;
         remainder.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(remainder);
+        packets.update(ctx, remainder);
     }
     if packet_has_pending_source(packet) {
         decrement_source_queue(ctx, packet.order_id, packet.origin_cell, moved)?;
@@ -1498,28 +1679,31 @@ fn advance_expand_packet(
         next_cell,
         0,
     );
-    if let Some(mut resting) = ctx.db.transit_packet().packet_key().find(&rest_key) {
+    if let Some(mut resting) = packets.find(&rest_key) {
         resting.infantry = merged_expand_strength(resting.infantry, moved)?;
         resting.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(resting);
+        packets.update(ctx, resting);
     } else {
-        ctx.db.transit_packet().insert(TransitPacket {
-            packet_key: rest_key,
-            order_id: packet.order_id,
-            owner_player_id: packet.owner_player_id,
-            origin_cell: EXPANSION_AGGREGATE_ORIGIN,
-            current_cell: next_cell,
-            destination_cell: next_cell,
-            infantry: moved,
-            route_index: 0,
-            route: vec![next_cell],
-            updated_step: logical_step,
-        });
+        packets.insert(
+            ctx,
+            TickPacket {
+                packet_key: rest_key,
+                order_id: packet.order_id,
+                owner_player_id: packet.owner_player_id,
+                origin_cell: EXPANSION_AGGREGATE_ORIGIN,
+                current_cell: next_cell,
+                destination_cell: next_cell,
+                infantry: moved,
+                route_index: 0,
+                route: Rc::from([next_cell]),
+                updated_step: logical_step,
+            },
+        );
     }
     Ok(())
 }
 
-fn packet_has_pending_source(packet: &TransitPacket) -> bool {
+fn packet_has_pending_source(packet: &TickPacket) -> bool {
     packet.route_index == 0 && packet.origin_cell != EXPANSION_AGGREGATE_ORIGIN
 }
 
@@ -1530,7 +1714,7 @@ fn packet_has_pending_source(packet: &TransitPacket) -> bool {
 fn push_lane_direction(
     ctx: &ReducerContext,
     order: &TransferOrder,
-    packet: &TransitPacket,
+    packet: &TickPacket,
 ) -> Result<Axial, String> {
     if order.kind != OrderKind::PushFront || packet.order_id != order.order_id {
         return Err("lane direction requires a packet from its Push order".into());
@@ -1573,7 +1757,8 @@ fn lane_direction_from_route(
 /// both the anchor and the route-derived direction may share later layers.
 fn extend_sustained_lane(
     ctx: &ReducerContext,
-    packet: &TransitPacket,
+    packets: &mut PacketTickState,
+    packet: &TickPacket,
     reached_cell: u32,
     logical_step: u64,
 ) -> Result<bool, String> {
@@ -1584,10 +1769,7 @@ fn extend_sustained_lane(
         return Ok(false);
     }
 
-    let current = ctx
-        .db
-        .transit_packet()
-        .packet_key()
+    let current = packets
         .find(&packet.packet_key)
         .ok_or_else(|| "push packet is missing while extending a lane".to_string())?;
     if current.route.last().copied() != Some(reached_cell) {
@@ -1614,22 +1796,22 @@ fn extend_sustained_lane(
         return Ok(false);
     }
 
-    let packets = ctx
-        .db
-        .transit_packet()
-        .packet_by_order_destination()
-        .filter((order.order_id, packet.destination_cell))
+    let candidates = packets
+        .by_order_destination(order.order_id, packet.destination_cell)
+        .cloned()
         .collect::<Vec<_>>();
     let mut extended = false;
-    for mut candidate in packets {
+    for mut candidate in candidates {
         if push_lane_direction(ctx, &order, &candidate)? != direction {
             continue;
         }
-        if !append_lane_layer(&mut candidate.route, reached_cell, next_cell) {
+        let mut route = candidate.route.to_vec();
+        if !append_lane_layer(&mut route, reached_cell, next_cell) {
             continue;
         }
+        candidate.route = Rc::from(route);
         candidate.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(candidate);
+        packets.update(ctx, candidate);
         extended = true;
     }
     Ok(extended)
@@ -1705,6 +1887,7 @@ fn increment_destination_received(
 
 fn station_capture_garrison(
     ctx: &ReducerContext,
+    packets: &mut PacketTickState,
     cell_id: u32,
     owner_player_id: u8,
     logical_step: u64,
@@ -1718,11 +1901,8 @@ fn station_capture_garrison(
         return Ok(());
     }
 
-    let mut packets = ctx
-        .db
-        .transit_packet()
-        .packet_by_cell()
-        .filter(cell_id)
+    let mut candidates = packets
+        .by_cell(cell_id)
         .filter(|packet| packet.owner_player_id == owner_player_id)
         .filter(|packet| {
             ctx.db
@@ -1731,14 +1911,15 @@ fn station_capture_garrison(
                 .find(packet.order_id)
                 .is_some_and(|order| order.status == OrderStatus::Active)
         })
+        .cloned()
         .collect::<Vec<_>>();
-    packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
-    for packet in packets {
+    candidates.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    for packet in candidates {
         if remaining == 0 {
             break;
         }
         let stationed = remaining.min(packet.infantry);
-        station_packet_allocation(ctx, &packet, stationed, logical_step)?;
+        station_packet_allocation(ctx, packets, &packet, stationed, logical_step)?;
         remaining -= stationed;
     }
     Ok(())
@@ -1766,6 +1947,7 @@ fn occupation_garrison(military_capacity: u64, terrain: TerrainClass) -> u64 {
 /// ray reached friendly territory, the map boundary, or an impassable edge.
 fn settle_stopped_sustained_lane(
     ctx: &ReducerContext,
+    packets: &mut PacketTickState,
     order_id: u64,
     lane_anchor: u32,
     direction: Axial,
@@ -1777,18 +1959,16 @@ fn settle_stopped_sustained_lane(
     if order.kind != OrderKind::PushFront {
         return Ok(());
     }
-    let mut packets = ctx
-        .db
-        .transit_packet()
-        .packet_by_order_destination()
-        .filter((order_id, lane_anchor))
+    let mut candidates = packets
+        .by_order_destination(order_id, lane_anchor)
+        .cloned()
         .collect::<Vec<_>>();
-    packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
-    for packet in packets {
+    candidates.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    for packet in candidates {
         if push_lane_direction(ctx, &order, &packet)? != direction {
             continue;
         }
-        station_packet_allocation(ctx, &packet, packet.infantry, logical_step)?;
+        station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)?;
     }
     Ok(())
 }
@@ -1822,16 +2002,12 @@ fn station_accounting(
 
 fn station_packet_allocation(
     ctx: &ReducerContext,
-    packet: &TransitPacket,
+    packets: &mut PacketTickState,
+    packet: &TickPacket,
     amount: u64,
     logical_step: u64,
 ) -> Result<(), String> {
-    let Some(mut current) = ctx
-        .db
-        .transit_packet()
-        .packet_key()
-        .find(&packet.packet_key)
-    else {
+    let Some(mut current) = packets.find(&packet.packet_key) else {
         return Ok(());
     };
     if amount == 0 || current.infantry == 0 {
@@ -1845,14 +2021,11 @@ fn station_packet_allocation(
         .ok_or_else(|| "order is missing while stationing infantry".to_string())?;
     let accounting = station_accounting(current.infantry, amount, order.delivered_infantry)?;
     if accounting.packet_remaining == 0 {
-        ctx.db
-            .transit_packet()
-            .packet_key()
-            .delete(&current.packet_key);
+        packets.delete(ctx, &current.packet_key);
     } else {
         current.infantry = accounting.packet_remaining;
         current.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(current.clone());
+        packets.update(ctx, current.clone());
     }
     if packet_has_pending_source(&current) {
         decrement_source_queue(
@@ -1870,21 +2043,19 @@ fn station_packet_allocation(
 
 fn reduce_packet_metadata(
     ctx: &ReducerContext,
-    mut packet: TransitPacket,
+    packets: &mut PacketTickState,
+    mut packet: TickPacket,
     amount: u64,
     logical_step: u64,
     count_casualty: bool,
 ) -> Result<(), String> {
     let lost = amount.min(packet.infantry);
     if lost == packet.infantry {
-        ctx.db
-            .transit_packet()
-            .packet_key()
-            .delete(&packet.packet_key);
+        packets.delete(ctx, &packet.packet_key);
     } else {
         packet.infantry -= lost;
         packet.updated_step = logical_step;
-        ctx.db.transit_packet().packet_key().update(packet.clone());
+        packets.update(ctx, packet.clone());
     }
     if packet_has_pending_source(&packet) {
         decrement_source_queue(ctx, packet.order_id, packet.origin_cell, lost)?;
@@ -1905,17 +2076,16 @@ fn reduce_packet_metadata(
 
 fn trim_packets_at_cell(
     ctx: &ReducerContext,
+    packet_state: &mut PacketTickState,
     cell_id: u32,
     owner_player_id: u8,
     logical_step: u64,
 ) -> Result<(), String> {
     let cell = cell_state(ctx, cell_id)?;
-    let mut packets: Vec<_> = ctx
-        .db
-        .transit_packet()
-        .packet_by_cell()
-        .filter(cell_id)
+    let mut packets: Vec<_> = packet_state
+        .by_cell(cell_id)
         .filter(|packet| packet.owner_player_id == owner_player_id)
+        .cloned()
         .collect();
     packets.sort_unstable_by(|left, right| right.packet_key.cmp(&left.packet_key));
     let allocated: u64 = packets.iter().map(|packet| packet.infantry).sum();
@@ -1930,7 +2100,7 @@ fn trim_packets_at_cell(
             break;
         }
         let lost = trim.min(packet.infantry);
-        reduce_packet_metadata(ctx, packet, lost, logical_step, true)?;
+        reduce_packet_metadata(ctx, packet_state, packet, lost, logical_step, true)?;
         trim -= lost;
     }
     Ok(())
@@ -1953,13 +2123,17 @@ fn packet_trim_required(
     allocated.saturating_sub(backing)
 }
 
-fn trim_all_overallocated_packets(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
-    let mut packets_by_location = BTreeMap::<(u32, u8), Vec<TransitPacket>>::new();
-    for packet in ctx.db.transit_packet().iter() {
+fn trim_all_overallocated_packets(
+    ctx: &ReducerContext,
+    packet_state: &mut PacketTickState,
+    logical_step: u64,
+) -> Result<(), String> {
+    let mut packets_by_location = BTreeMap::<(u32, u8), Vec<TickPacket>>::new();
+    for packet in packet_state.iter() {
         packets_by_location
             .entry((packet.current_cell, packet.owner_player_id))
             .or_default()
-            .push(packet);
+            .push(packet.clone());
     }
     for ((cell_id, owner), mut packets) in packets_by_location {
         let cell = cell_state(ctx, cell_id)?;
@@ -1971,16 +2145,20 @@ fn trim_all_overallocated_packets(ctx: &ReducerContext, logical_step: u64) -> Re
                 break;
             }
             let lost = trim.min(packet.infantry);
-            reduce_packet_metadata(ctx, packet, lost, logical_step, true)?;
+            reduce_packet_metadata(ctx, packet_state, packet, lost, logical_step, true)?;
             trim -= lost;
         }
     }
     Ok(())
 }
 
-fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+fn finalize_orders(
+    ctx: &ReducerContext,
+    packets: &PacketTickState,
+    logical_step: u64,
+) -> Result<(), String> {
     let mut active_strength = BTreeMap::<u64, u64>::new();
-    for packet in ctx.db.transit_packet().iter() {
+    for packet in packets.iter() {
         *active_strength.entry(packet.order_id).or_default() += packet.infantry;
     }
     let orders: Vec<TransferOrder> = ctx
@@ -2002,7 +2180,7 @@ fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         if status == OrderStatus::Completed {
             order.in_transit_infantry = in_transit;
             order.status = status;
-            complete_retreat_abandonments(ctx, &order, logical_step)?;
+            complete_retreat_abandonments(ctx, packets, &order, logical_step)?;
             ctx.db.expansion_wave().order_id().delete(order.order_id);
         }
         if changed {
@@ -2017,6 +2195,7 @@ fn finalize_orders(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
 
 fn complete_retreat_abandonments(
     ctx: &ReducerContext,
+    packets: &PacketTickState,
     order: &TransferOrder,
     logical_step: u64,
 ) -> Result<(), String> {
@@ -2029,7 +2208,7 @@ fn complete_retreat_abandonments(
     for candidate in candidates {
         let mut cell = cell_state(ctx, candidate.cell_id)?;
         let ground = terrain(ctx, candidate.cell_id)?;
-        let has_live_packet_claim = ctx.db.transit_packet().iter().any(|packet| {
+        let has_live_packet_claim = packets.iter().any(|packet| {
             packet.owner_player_id == order.player_id
                 && (packet.current_cell == candidate.cell_id
                     || packet.destination_cell == candidate.cell_id)
@@ -2262,8 +2441,8 @@ mod tests {
         }
     }
 
-    fn test_packet(origin: u32, current: u32, destination: u32, route: Vec<u32>) -> TransitPacket {
-        TransitPacket {
+    fn test_packet(origin: u32, current: u32, destination: u32, route: Vec<u32>) -> TickPacket {
+        TickPacket {
             packet_key: "test".into(),
             order_id: 1,
             owner_player_id: 1,
@@ -2272,9 +2451,33 @@ mod tests {
             destination_cell: destination,
             infantry: 10,
             route_index: 0,
-            route,
+            route: Rc::from(route),
             updated_step: 0,
         }
+    }
+
+    #[test]
+    fn packet_tick_indexes_track_insertions_and_removals() {
+        let mut state = PacketTickState::default();
+        let mut first = test_packet(10, 10, 11, vec![10, 11]);
+        first.packet_key = "1:10:11".into();
+        let mut second = test_packet(20, 20, 21, vec![20, 21]);
+        second.packet_key = "2:20:21".into();
+        second.order_id = 2;
+        state.track(first.clone());
+        state.track(second.clone());
+
+        assert_eq!(state.iter().count(), 2);
+        assert_eq!(state.by_order(1).count(), 1);
+        assert_eq!(state.by_order(2).count(), 1);
+        assert_eq!(state.by_cell(10).count(), 1);
+        assert_eq!(state.by_order_destination(2, 21).count(), 1);
+
+        state.untrack(&first.packet_key);
+        assert!(state.find(&first.packet_key).is_none());
+        assert_eq!(state.by_order(1).count(), 0);
+        assert_eq!(state.by_cell(10).count(), 0);
+        assert_eq!(state.iter().count(), 1);
     }
 
     #[test]

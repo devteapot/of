@@ -241,6 +241,15 @@ waves use private topology rather than persisting one complete path per source
 and exit. Packets carry scalar queues at current physical cells. These tables
 are an execution substrate, not a public exact-infantry-transfer API.
 
+Each simulation step decodes `transit_packet` once into a transaction-local,
+key-ordered packet index with secondary order, cell, and order/destination
+lookups. Routes use shared immutable slices inside that index so trim,
+branching, movement, combat, and finalization preserve their ordered phase
+semantics without repeatedly decoding or cloning every route vector. Packet
+writes are mirrored to the database immediately; reducers and policy
+maintenance outside the tick pipeline therefore continue to observe the
+current transactional state.
+
 The normal client animates explicit action packets but filters internal
 cluster-policy maintenance packets from flow overlays. Debug builds may restore
 those presentation-only animations at runtime with `F4`. The toggle forces an
@@ -639,9 +648,12 @@ The following questions stay open until profiling or playtesting supplies eviden
 - Database-host capacity: simultaneous match instances per host, provisioning latency, archival cost, and placement strategy.
 - One match-level scheduler wake versus sharded active-chunk wakes, and when uncontested flows can become calculated arrival events.
 - Routing strategy under congestion: cached paths, flow fields, hierarchical regions, explicit player routes, and replan thresholds.
-- Packet compaction: profile the F3 `FLOWS` count for large cluster waves and
-  policy redistributions, then coalesce shared topology where row counts, cache
-  churn, or subscription volume justify it before raising world-scale limits.
+- Packet compaction: first-hop expansion packets retain `origin_cell` until
+  movement so source queues, cancellation, and casualties remain attributable.
+  They cannot be merged across origins by changing only the packet key. Profile
+  large cluster waves and consider a separate source-accounting redesign before
+  coalescing those rows; shared downstream expansion topology is already
+  aggregated with `EXPANSION_AGGREGATE_ORIGIN`.
 - Static map delivery through database rows versus content-addressed baked assets with hash verification.
 - Region-level summaries and level of detail for maps intended to represent a whole world.
 - Browser delivery, WebGPU/WebGL compatibility, download size, threading limits, and browser-specific SpacetimeDB behavior. WASM portability is retained, but web release work follows native V1.
