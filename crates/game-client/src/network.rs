@@ -546,8 +546,12 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
                 offline_cells_changed |= !patches.is_empty();
                 for patch in patches {
                     if let Some(cell) = view.cell_mut(patch.coordinate) {
+                        let owner_changed = cell.owner != patch.owner;
                         cell.owner = patch.owner;
                         cell.infantry = patch.infantry.min(cell.military_capacity);
+                        if owner_changed {
+                            view.mark_ownership_changed();
+                        }
                     }
                 }
                 if let Some(flow) = flow {

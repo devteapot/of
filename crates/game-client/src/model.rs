@@ -282,6 +282,10 @@ pub struct MatchView {
     /// Presentation caches use this instead of rescanning large selections or
     /// visible regions every frame.
     pub cell_state_revision: u64,
+    /// Advances only when a cell's owner may have changed (or the map is
+    /// wholesale rebuilt). Structural caches such as cluster membership key on
+    /// this so per-tick combat strength churn never re-floods territory.
+    pub ownership_revision: u64,
     pub local_player: u32,
     pub authority: AuthorityState,
     pub connection: [ConnectionState; 2],
@@ -337,6 +341,7 @@ impl MatchView {
             cells_by_chunk: BTreeMap::new(),
             chunk_index_revision: 0,
             cell_state_revision: 0,
+            ownership_revision: 0,
             local_player: u32::from(preferred_player),
             authority: AuthorityState::Connecting,
             connection: [ConnectionState::Syncing, ConnectionState::Syncing],
@@ -465,6 +470,7 @@ impl MatchView {
             cells_by_chunk,
             chunk_index_revision: 1,
             cell_state_revision: 1,
+            ownership_revision: 1,
             local_player: PLAYER_ONE,
             authority: AuthorityState::Offline,
             connection: [ConnectionState::Offline, ConnectionState::Offline],
@@ -515,6 +521,10 @@ impl MatchView {
         self.cell_state_revision = self.cell_state_revision.wrapping_add(1);
     }
 
+    pub fn mark_ownership_changed(&mut self) {
+        self.ownership_revision = self.ownership_revision.wrapping_add(1);
+    }
+
     /// Replaces the transient combat projection and schedules both newly
     /// contested and newly cleared cells for chunk recoloring.
     pub fn set_contested_cells(&mut self, contested_cells: BTreeMap<Axial, ContestedCellView>) {
@@ -539,6 +549,7 @@ impl MatchView {
         self.cells_by_chunk = index_cells_by_chunk(&self.cells);
         self.chunk_index_revision = self.chunk_index_revision.wrapping_add(1);
         self.mark_cell_state_changed();
+        self.mark_ownership_changed();
     }
 
     pub fn cells_in_chunk(&self, chunk: ChunkCoord) -> &[Axial] {

@@ -1165,11 +1165,15 @@ fn update_cells(
     if !states.is_empty() {
         view.mark_cell_state_changed();
     }
+    let mut ownership_changed = false;
     for state in states {
         let Some(coordinate) = transport.id_to_coordinate.get(&state.cell_id).copied() else {
             continue;
         };
         let next_owner = owner(state.owner_player_id);
+        ownership_changed |= view
+            .cell(coordinate)
+            .is_some_and(|cell| cell.owner != next_owner);
         let rendering_changed = view.cell(coordinate).is_some_and(|cell| {
             cell.owner != next_owner
                 || (mode == MapViewMode::Civilians && cell.civilians != state.civilians)
@@ -1191,6 +1195,9 @@ fn update_cells(
         cell.civilians = state.civilians;
         cell.infantry = state.infantry;
         cell.military_capacity = state.military_capacity;
+    }
+    if ownership_changed {
+        view.mark_ownership_changed();
     }
 }
 

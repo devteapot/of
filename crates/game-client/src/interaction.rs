@@ -1148,7 +1148,7 @@ fn select_all_clusters(view: &mut MatchView, interaction: &mut InteractionState)
 #[derive(Default)]
 struct SelectionReconcileCache {
     initialized: bool,
-    cell_state_revision: u64,
+    ownership_revision: u64,
     retask_revision: u64,
     source_revision: u64,
 }
@@ -1158,8 +1158,11 @@ fn reconcile_selection(
     mut interaction: ResMut<InteractionState>,
     mut cache: Local<SelectionReconcileCache>,
 ) {
+    // Keyed on ownership, not cell state: cluster membership only moves when a
+    // cell changes owner, while combat mutates strengths every tick. Re-flood
+    // filling the whole selected territory each tick tanks the frame rate.
     if cache.initialized
-        && cache.cell_state_revision == view.cell_state_revision
+        && cache.ownership_revision == view.ownership_revision
         && cache.retask_revision == view.retask_revision
         && cache.source_revision == interaction.source_revision
     {
@@ -1177,7 +1180,7 @@ fn reconcile_selection(
         interaction.source_revision = interaction.source_revision.wrapping_add(1);
     }
     cache.initialized = true;
-    cache.cell_state_revision = view.cell_state_revision;
+    cache.ownership_revision = view.ownership_revision;
     cache.retask_revision = view.retask_revision;
     cache.source_revision = interaction.source_revision;
 }
@@ -1863,7 +1866,14 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
         mode,
         shape_revision: interaction.shape_revision,
         attack_revision: interaction.attack_revision,
-        cell_state_revision: view.cell_state_revision,
+        // Idle shows no strength figures, only the selection highlight, so it
+        // only depends on ownership. Keying it on every combat tick would
+        // re-project the full selection each frame during an invasion.
+        cell_state_revision: if matches!(interaction.mode, OrderMode::Idle) {
+            view.ownership_revision
+        } else {
+            view.cell_state_revision
+        },
         topology_revision: view.chunk_index_revision,
         retask_revision: view.retask_revision,
     })
