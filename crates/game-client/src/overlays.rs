@@ -78,14 +78,23 @@ fn draw_world_overlays(
     } else {
         Vec::new()
     };
-    let visible_chunks = if view.active_flows.is_empty() && view.active_fronts.is_empty() {
+    let visible_chunks = if view.active_flows.is_empty()
+        && view.active_fronts.is_empty()
+        && interaction.preview.front_edges.is_empty()
+    {
         BTreeSet::new()
     } else {
         visible_chunk_coordinates(&visible, &chunks)
     };
     draw_blocked_cells(&view, &visible, &chunks, &mut gizmos);
     draw_selection(&view, &interaction, &visible_cells, &mut gizmos);
-    draw_preview(&view, &interaction, &visible_cells, &mut gizmos);
+    draw_preview(
+        &view,
+        &interaction,
+        &visible_cells,
+        &visible_chunks,
+        &mut gizmos,
+    );
     draw_committed_orders(&view, time.elapsed_secs(), &visible_chunks, &mut gizmos);
 }
 
@@ -357,9 +366,10 @@ fn draw_preview(
     view: &MatchView,
     interaction: &InteractionState,
     visible_cells: &[Axial],
+    visible_chunks: &BTreeSet<ChunkCoord>,
     gizmos: &mut Gizmos,
 ) {
-    draw_push_front_edges(view, interaction, visible_cells, gizmos);
+    draw_push_front_edges(view, interaction, visible_chunks, gizmos);
     if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
         draw_expand_wave(view, interaction, visible_cells, gizmos);
     }
@@ -523,13 +533,11 @@ fn draw_expand_wave(
 fn draw_push_front_edges(
     view: &MatchView,
     interaction: &InteractionState,
-    visible_cells: &[Axial],
+    visible_chunks: &BTreeSet<ChunkCoord>,
     gizmos: &mut Gizmos,
 ) {
     for edge in &interaction.preview.front_edges {
-        if visible_cells.binary_search(&edge.source).is_err()
-            && visible_cells.binary_search(&edge.target).is_err()
-        {
+        if !edge_touches_visible_chunk(visible_chunks, edge.source, edge.target) {
             continue;
         }
         let (Some(source), Some(target)) = (view.cell(edge.source), view.cell(edge.target)) else {
@@ -555,6 +563,14 @@ fn draw_push_front_edges(
             )
             .with_tip_length(0.17);
     }
+}
+
+fn edge_touches_visible_chunk(
+    visible_chunks: &BTreeSet<ChunkCoord>,
+    source: Axial,
+    target: Axial,
+) -> bool {
+    visible_chunks.contains(&chunk_of(source)) || visible_chunks.contains(&chunk_of(target))
 }
 
 fn push_front_edge_color(local_player: u32, target_owner: Option<u32>) -> Color {
@@ -779,6 +795,26 @@ mod tests {
             .chain([Axial::ZERO])
             .collect();
         assert_eq!(perimeter_edge_count(&center_and_neighbors), 18);
+    }
+
+    #[test]
+    fn push_edge_visibility_uses_chunks_instead_of_cell_ordering() {
+        let visible = BTreeSet::from([chunk_of(Axial::ZERO)]);
+        assert!(edge_touches_visible_chunk(
+            &visible,
+            Axial::ZERO,
+            Axial::new(20, 0),
+        ));
+        assert!(edge_touches_visible_chunk(
+            &visible,
+            Axial::new(20, 0),
+            Axial::new(1, 0),
+        ));
+        assert!(!edge_touches_visible_chunk(
+            &visible,
+            Axial::new(20, 0),
+            Axial::new(21, 0),
+        ));
     }
 
     #[test]

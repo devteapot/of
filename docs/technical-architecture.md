@@ -248,9 +248,14 @@ immediate packet-and-order reprojection, so hiding it also clears existing
 policy trails without waiting for an authority callback. `./scripts/dev.sh`
 starts with the overlay hidden; `--debug-policy-flows` remains an optional
 initial-visible state for both development clients. The key and argument are
-compiled out of release builds. The filter is downstream of the full
-authoritative snapshot, so order accounting, policy execution, action
-availability, and Stop/retask projections still observe every packet.
+compiled out of release builds. Debug clients subscribe to the full packet
+table so the diagnostic and its local projections can include background
+policy traffic. Release clients subscribe to the `visible_packets` view and
+therefore omit background-policy packets from flow rendering, HUD active/free
+strength, and local retask projections. This intentionally previews the
+post-yield strength available to explicit commands; server-side order
+accounting and policy execution remain authoritative, while Stop/retask handles
+are unchanged because background-policy orders are never actionable there.
 
 ### Complete-component authority
 
