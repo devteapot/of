@@ -533,6 +533,7 @@ fn offline_policy_maintenance_targets(
 
 pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: ResMut<MatchView>) {
     let mut offline_cells_changed = false;
+    let mut offline_ownership_changed = false;
     for update in updates.read() {
         match update {
             ServerUpdate::SubmissionStarted { .. } => {}
@@ -546,6 +547,7 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
                 offline_cells_changed |= !patches.is_empty();
                 for patch in patches {
                     if let Some(cell) = view.cell_mut(patch.coordinate) {
+                        offline_ownership_changed |= cell.owner != patch.owner;
                         cell.owner = patch.owner;
                         cell.infantry = patch.infantry.min(cell.military_capacity);
                     }
@@ -580,6 +582,10 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
                 view.show_toast(reason, ToastKind::Rejection);
             }
         }
+    }
+
+    if offline_ownership_changed {
+        view.mark_ownership_changed();
     }
 
     if offline_cells_changed && matches!(view.authority, crate::model::AuthorityState::Offline) {
@@ -4170,6 +4176,7 @@ mod tests {
             None,
         );
         let inherited_revision = view.cluster_policy_at(left).unwrap().revision;
+        let ownership_revision = view.ownership_revision;
 
         let mut app = App::new();
         app.add_message::<ServerUpdate>()
@@ -4197,6 +4204,7 @@ mod tests {
 
         let view = app.world().resource::<MatchView>();
         assert_eq!(view.latest_result, "Expansion accepted");
+        assert_eq!(view.ownership_revision, ownership_revision.wrapping_add(1));
         assert_eq!(
             [left, middle, captured].map(|coordinate| view.cell(coordinate).unwrap().infantry),
             [30, 30, 30]

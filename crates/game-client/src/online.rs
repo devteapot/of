@@ -1518,18 +1518,26 @@ fn update_cells(
     if !states.is_empty() {
         view.mark_cell_state_changed();
     }
-    let planning_changed = states.iter().any(|state| {
+    let mut planning_changed = false;
+    let mut ownership_changed = false;
+    for state in states {
         let Some(coordinate) = transport.id_to_coordinate.get(&state.cell_id).copied() else {
-            return false;
+            continue;
         };
-        view.cell(coordinate).is_some_and(|cell| {
-            cell.owner != owner(state.owner_player_id)
-                || cell.infantry != state.infantry
-                || cell.military_capacity != state.military_capacity
-        })
-    });
+        let Some(cell) = view.cell(coordinate) else {
+            continue;
+        };
+        let owner_changed = cell.owner != owner(state.owner_player_id);
+        ownership_changed |= owner_changed;
+        planning_changed |= owner_changed
+            || cell.infantry != state.infantry
+            || cell.military_capacity != state.military_capacity;
+    }
     if planning_changed {
         view.mark_planning_changed();
+    }
+    if ownership_changed {
+        view.mark_ownership_changed();
     }
     for state in states {
         let Some(coordinate) = transport.id_to_coordinate.get(&state.cell_id).copied() else {
@@ -1617,7 +1625,12 @@ fn update_players(
             .iter()
             .find(|slot| slot.identity.as_ref() == Some(&identity))
     {
-        view.local_player = u32::from(slot.player_id);
+        let local_player = u32::from(slot.player_id);
+        if view.local_player != local_player {
+            view.local_player = local_player;
+            view.mark_planning_changed();
+            view.mark_ownership_changed();
+        }
         if transport.bound_player != Some(slot.player_id) {
             transport.bound_player = Some(slot.player_id);
             transport.command_ids_ready = false;
@@ -3137,6 +3150,47 @@ mod tests {
         );
         assert!(view.dirty_chunks.is_empty());
         assert_eq!(view.planning_revision, planning_revision);
+    }
+
+    #[test]
+    fn infantry_updates_preserve_ownership_revision_until_control_changes() {
+        let mut transport = OnlineTransport::new(test_config());
+        let mut view = MatchView::offline_fixture();
+        let coordinate = *view
+            .cells
+            .keys()
+            .find(|coordinate| view.is_local_owned(**coordinate))
+            .expect("fixture owned cell");
+        let original = view.cell(coordinate).expect("fixture cell").clone();
+        transport.id_to_coordinate.insert(44, coordinate);
+        let ownership_revision = view.ownership_revision;
+        let planning_revision = view.planning_revision;
+
+        let state = |owner_player_id, infantry| CellState {
+            cell_id: 44,
+            owner_player_id,
+            civilians: original.civilians,
+            civilian_capacity: original.civilians,
+            infantry,
+            military_capacity: original.military_capacity,
+            last_changed_step: 1,
+        };
+        update_cells(
+            &transport,
+            &mut view,
+            &[state(1, original.infantry.saturating_add(1))],
+            MapViewMode::Soldiers,
+        );
+        assert_eq!(view.ownership_revision, ownership_revision);
+        assert_eq!(view.planning_revision, planning_revision.wrapping_add(1));
+
+        update_cells(
+            &transport,
+            &mut view,
+            &[state(2, original.infantry.saturating_add(1))],
+            MapViewMode::Soldiers,
+        );
+        assert_eq!(view.ownership_revision, ownership_revision.wrapping_add(1));
     }
 
     #[cfg(unix)]

@@ -265,7 +265,7 @@ struct OrderPreviewKey {
     mode: PreviewModeKey,
     shape_revision: u64,
     attack_revision: u64,
-    planning_revision: u64,
+    state_revision: u64,
     topology_revision: u64,
     retask_revision: u64,
 }
@@ -1148,9 +1148,25 @@ fn select_all_clusters(view: &mut MatchView, interaction: &mut InteractionState)
 #[derive(Default)]
 struct SelectionReconcileCache {
     initialized: bool,
-    planning_revision: u64,
+    ownership_revision: u64,
     retask_revision: u64,
     source_revision: u64,
+}
+
+impl SelectionReconcileCache {
+    fn is_current(&self, view: &MatchView, interaction: &InteractionState) -> bool {
+        self.initialized
+            && self.ownership_revision == view.ownership_revision
+            && self.retask_revision == view.retask_revision
+            && self.source_revision == interaction.source_revision
+    }
+
+    fn record(&mut self, view: &MatchView, interaction: &InteractionState) {
+        self.initialized = true;
+        self.ownership_revision = view.ownership_revision;
+        self.retask_revision = view.retask_revision;
+        self.source_revision = interaction.source_revision;
+    }
 }
 
 fn reconcile_selection(
@@ -1158,11 +1174,7 @@ fn reconcile_selection(
     mut interaction: ResMut<InteractionState>,
     mut cache: Local<SelectionReconcileCache>,
 ) {
-    if cache.initialized
-        && cache.planning_revision == view.planning_revision
-        && cache.retask_revision == view.retask_revision
-        && cache.source_revision == interaction.source_revision
-    {
+    if cache.is_current(&view, &interaction) {
         return;
     }
     let changed = {
@@ -1176,10 +1188,7 @@ fn reconcile_selection(
     if changed {
         interaction.source_revision = interaction.source_revision.wrapping_add(1);
     }
-    cache.initialized = true;
-    cache.planning_revision = view.planning_revision;
-    cache.retask_revision = view.retask_revision;
-    cache.source_revision = interaction.source_revision;
+    cache.record(&view, &interaction);
 }
 
 fn reconcile_selection_sets(
@@ -1863,7 +1872,11 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
         mode,
         shape_revision: interaction.shape_revision,
         attack_revision: interaction.attack_revision,
-        planning_revision: view.planning_revision,
+        state_revision: if matches!(interaction.mode, OrderMode::Idle) {
+            view.ownership_revision
+        } else {
+            view.planning_revision
+        },
         topology_revision: view.chunk_index_revision,
         retask_revision: view.retask_revision,
     })
@@ -4343,6 +4356,29 @@ mod tests {
             order_preview_key(&view, &interaction).expect("retask key"),
             prior
         );
+    }
+
+    #[test]
+    fn idle_preview_and_selection_reconcile_ignore_infantry_only_changes() {
+        let mut view = MatchView::connecting(1);
+        let interaction = InteractionState::default();
+        let idle_key = order_preview_key(&view, &interaction).expect("idle key");
+        let mut reconcile_cache = SelectionReconcileCache::default();
+        reconcile_cache.record(&view, &interaction);
+
+        view.planning_revision = view.planning_revision.wrapping_add(1);
+        assert_eq!(
+            order_preview_key(&view, &interaction).expect("infantry-only idle key"),
+            idle_key
+        );
+        assert!(reconcile_cache.is_current(&view, &interaction));
+
+        view.ownership_revision = view.ownership_revision.wrapping_add(1);
+        assert_ne!(
+            order_preview_key(&view, &interaction).expect("ownership idle key"),
+            idle_key
+        );
+        assert!(!reconcile_cache.is_current(&view, &interaction));
     }
 
     #[test]

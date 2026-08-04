@@ -286,6 +286,10 @@ pub struct MatchView {
     /// changes can affect command planning. Civilian-only and combat-overlay
     /// presentation changes intentionally leave this stable.
     pub planning_revision: u64,
+    /// Advances only when effective cell ownership may have changed, including
+    /// wholesale map rebuilds and a change to the locally controlled player.
+    /// Structural selection caches use this instead of following troop churn.
+    pub ownership_revision: u64,
     /// Advances when the transient combat overlay changes. This is separate
     /// from cell values so HUD totals and command previews stay cached.
     pub contest_revision: u64,
@@ -345,6 +349,7 @@ impl MatchView {
             chunk_index_revision: 0,
             cell_state_revision: 0,
             planning_revision: 0,
+            ownership_revision: 0,
             contest_revision: 0,
             local_player: u32::from(preferred_player),
             authority: AuthorityState::Connecting,
@@ -475,6 +480,7 @@ impl MatchView {
             chunk_index_revision: 1,
             cell_state_revision: 1,
             planning_revision: 1,
+            ownership_revision: 1,
             contest_revision: 0,
             local_player: PLAYER_ONE,
             authority: AuthorityState::Offline,
@@ -531,6 +537,10 @@ impl MatchView {
         self.planning_revision = self.planning_revision.wrapping_add(1);
     }
 
+    pub fn mark_ownership_changed(&mut self) {
+        self.ownership_revision = self.ownership_revision.wrapping_add(1);
+    }
+
     /// Replaces the transient combat projection and schedules both newly
     /// contested and newly cleared cells for chunk recoloring.
     pub fn set_contested_cells(&mut self, contested_cells: BTreeMap<Axial, ContestedCellView>) {
@@ -556,6 +566,7 @@ impl MatchView {
         self.chunk_index_revision = self.chunk_index_revision.wrapping_add(1);
         self.mark_cell_state_changed();
         self.mark_planning_changed();
+        self.mark_ownership_changed();
     }
 
     pub fn cells_in_chunk(&self, chunk: ChunkCoord) -> &[Axial] {
@@ -1155,11 +1166,13 @@ mod tests {
         let mut fixture = MatchView::offline_fixture();
         let before = fixture.chunk_index_revision;
         let before_state = fixture.cell_state_revision;
+        let before_ownership = fixture.ownership_revision;
 
         fixture.rebuild_chunk_index();
 
         assert_eq!(fixture.chunk_index_revision, before.wrapping_add(1));
         assert_eq!(fixture.cell_state_revision, before_state.wrapping_add(1));
+        assert_eq!(fixture.ownership_revision, before_ownership.wrapping_add(1));
     }
 
     #[test]
