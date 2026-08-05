@@ -9,7 +9,7 @@ use super::receipt_status_type::ReceiptStatus;
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct CommandReceipt {
-    pub receipt_key: String,
+    pub receipt_key: u128,
     pub player_id: u8,
     pub client_command_id: u64,
     pub command_name: String,
@@ -27,7 +27,7 @@ impl __sdk::InModule for CommandReceipt {
 ///
 /// Provides typed access to columns for query building.
 pub struct CommandReceiptCols {
-    pub receipt_key: __sdk::__query_builder::Col<CommandReceipt, String>,
+    pub receipt_key: __sdk::__query_builder::Col<CommandReceipt, u128>,
     pub player_id: __sdk::__query_builder::Col<CommandReceipt, u8>,
     pub client_command_id: __sdk::__query_builder::Col<CommandReceipt, u64>,
     pub command_name: __sdk::__query_builder::Col<CommandReceipt, String>,
@@ -58,7 +58,7 @@ impl __sdk::__query_builder::HasCols for CommandReceipt {
 /// Provides typed access to indexed columns for query building.
 pub struct CommandReceiptIxCols {
     pub player_id: __sdk::__query_builder::IxCol<CommandReceipt, u8>,
-    pub receipt_key: __sdk::__query_builder::IxCol<CommandReceipt, String>,
+    pub receipt_key: __sdk::__query_builder::IxCol<CommandReceipt, u128>,
 }
 
 impl __sdk::__query_builder::HasIxCols for CommandReceipt {

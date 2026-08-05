@@ -12,10 +12,6 @@ use std::{
 
 use bevy::prelude::*;
 use hex_core::{Axial, TerrainKind};
-#[cfg(debug_assertions)]
-use match_bindings::TransitPacketTableAccess;
-#[cfg(not(debug_assertions))]
-use match_bindings::VisiblePacketsTableAccess;
 use match_bindings::{
     CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, ClusterPolicyAssignment,
     ClusterPolicyAssignmentTableAccess, ClusterPolicyKind as RemoteClusterPolicyKind, CombatFront,
@@ -24,10 +20,15 @@ use match_bindings::{
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
     PlayerSlotTableAccess, ReceiptStatus, TransferDestination, TransferDestinationTableAccess,
     TransferOrder, TransferOrderTableAccess, TransferSource, TransferSourceTableAccess,
-    TransitPacket, cancel_orders, issue_attack_clusters, issue_balance, issue_core_load,
-    issue_expand_all, issue_expand_clusters, issue_front_load, issue_perimeter_load,
-    issue_push_front, issue_reshape, join_match, set_cluster_policy, set_mobilization_target,
+    TransitPacket, TransitRoute, cancel_orders, issue_attack_clusters, issue_balance,
+    issue_core_load, issue_expand_all, issue_expand_clusters, issue_front_load,
+    issue_perimeter_load, issue_push_front, issue_reshape, join_match, set_cluster_policy,
+    set_mobilization_target,
 };
+#[cfg(debug_assertions)]
+use match_bindings::{TransitPacketTableAccess, TransitRouteTableAccess};
+#[cfg(not(debug_assertions))]
+use match_bindings::{VisiblePacketsTableAccess, VisibleRoutesTableAccess};
 use spacetimedb_sdk::__codegen::InternalError;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 
@@ -100,11 +101,12 @@ enum LifecycleEvent {
 struct SharedSignals {
     dirty: AtomicU32,
     cell_changes: Mutex<BTreeMap<u32, CellState>>,
-    packet_changes: Mutex<BTreeMap<String, Option<TransitPacket>>>,
+    packet_changes: Mutex<BTreeMap<u64, Option<TransitPacket>>>,
+    route_changes: Mutex<BTreeMap<u64, Option<TransitRoute>>>,
     front_changes: Mutex<BTreeMap<String, Option<CombatFront>>>,
     order_changes: Mutex<BTreeMap<u64, Option<TransferOrder>>>,
-    source_changes: Mutex<BTreeMap<String, Option<TransferSource>>>,
-    destination_changes: Mutex<BTreeMap<String, Option<TransferDestination>>>,
+    source_changes: Mutex<BTreeMap<u128, Option<TransferSource>>>,
+    destination_changes: Mutex<BTreeMap<u128, Option<TransferDestination>>>,
     events: Mutex<VecDeque<LifecycleEvent>>,
 }
 
@@ -134,6 +136,7 @@ impl SharedSignals {
     fn take_tactical_changes(&self) -> TacticalChanges {
         TacticalChanges {
             packets: take_changes(&self.packet_changes),
+            routes: take_changes(&self.route_changes),
             fronts: take_changes(&self.front_changes),
             orders: take_changes(&self.order_changes),
             sources: take_changes(&self.source_changes),
@@ -169,20 +172,22 @@ fn record_change<K: Ord, V>(changes: &Mutex<BTreeMap<K, Option<V>>>, key: K, val
 
 #[derive(Default)]
 struct TacticalChanges {
-    packets: BTreeMap<String, Option<TransitPacket>>,
+    packets: BTreeMap<u64, Option<TransitPacket>>,
+    routes: BTreeMap<u64, Option<TransitRoute>>,
     fronts: BTreeMap<String, Option<CombatFront>>,
     orders: BTreeMap<u64, Option<TransferOrder>>,
-    sources: BTreeMap<String, Option<TransferSource>>,
-    destinations: BTreeMap<String, Option<TransferDestination>>,
+    sources: BTreeMap<u128, Option<TransferSource>>,
+    destinations: BTreeMap<u128, Option<TransferDestination>>,
 }
 
 #[derive(Default)]
 struct TacticalCache {
-    packets: BTreeMap<String, TransitPacket>,
+    packets: BTreeMap<u64, TransitPacket>,
+    routes: BTreeMap<u64, TransitRoute>,
     fronts: BTreeMap<String, CombatFront>,
     orders: BTreeMap<u64, TransferOrder>,
-    sources: BTreeMap<String, TransferSource>,
-    destinations: BTreeMap<String, TransferDestination>,
+    sources: BTreeMap<u128, TransferSource>,
+    destinations: BTreeMap<u128, TransferDestination>,
 }
 
 impl TacticalCache {
@@ -190,7 +195,11 @@ impl TacticalCache {
         Self {
             packets: subscribed_packets(connection)
                 .into_iter()
-                .map(|packet| (packet.packet_key.clone(), packet))
+                .map(|packet| (packet.packet_key, packet))
+                .collect(),
+            routes: subscribed_routes(connection)
+                .into_iter()
+                .map(|route| (route.route_id, route))
                 .collect(),
             fronts: connection
                 .db
@@ -209,19 +218,20 @@ impl TacticalCache {
                 .db
                 .transfer_source()
                 .iter()
-                .map(|source| (source.source_key.clone(), source))
+                .map(|source| (source.source_key, source))
                 .collect(),
             destinations: connection
                 .db
                 .transfer_destination()
                 .iter()
-                .map(|destination| (destination.destination_key.clone(), destination))
+                .map(|destination| (destination.destination_key, destination))
                 .collect(),
         }
     }
 
     fn apply(&mut self, changes: TacticalChanges) {
         apply_changes(&mut self.packets, changes.packets);
+        apply_changes(&mut self.routes, changes.routes);
         apply_changes(&mut self.fronts, changes.fronts);
         apply_changes(&mut self.orders, changes.orders);
         apply_changes(&mut self.sources, changes.sources);
@@ -304,7 +314,7 @@ struct OnlineTransport {
     id_to_coordinate: BTreeMap<u32, Axial>,
     tactical: TacticalCache,
     pending: BTreeMap<u64, PendingCommand>,
-    processed_receipts: BTreeSet<String>,
+    processed_receipts: BTreeSet<u128>,
     terminal_command_ids: BTreeSet<u64>,
     next_command_id: u64,
     bound_player: Option<u8>,
@@ -642,7 +652,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
             .on_insert(move |_context, row| {
                 record_change(
                     &packet_insert_signals.packet_changes,
-                    row.packet_key.clone(),
+                    row.packet_key,
                     Some(row.clone()),
                 );
                 packet_insert_signals.mark(FLOWS_DIRTY);
@@ -652,11 +662,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
             .db
             .transit_packet()
             .on_delete(move |_context, row| {
-                record_change(
-                    &packet_delete_signals.packet_changes,
-                    row.packet_key.clone(),
-                    None,
-                );
+                record_change(&packet_delete_signals.packet_changes, row.packet_key, None);
                 packet_delete_signals.mark(FLOWS_DIRTY);
             });
         let packet_update_signals = Arc::clone(signals);
@@ -666,7 +672,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
             .on_update(move |_context, _old, new| {
                 record_change(
                     &packet_update_signals.packet_changes,
-                    new.packet_key.clone(),
+                    new.packet_key,
                     Some(new.clone()),
                 );
                 packet_update_signals.mark(FLOWS_DIRTY);
@@ -681,7 +687,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
             .on_insert(move |_context, row| {
                 record_change(
                     &packet_insert_signals.packet_changes,
-                    row.packet_key.clone(),
+                    row.packet_key,
                     Some(row.clone()),
                 );
                 packet_insert_signals.mark(FLOWS_DIRTY);
@@ -691,12 +697,66 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
             .db
             .visible_packets()
             .on_delete(move |_context, row| {
-                record_change(
-                    &packet_delete_signals.packet_changes,
-                    row.packet_key.clone(),
-                    None,
-                );
+                record_change(&packet_delete_signals.packet_changes, row.packet_key, None);
                 packet_delete_signals.mark(FLOWS_DIRTY);
+            });
+    }
+    #[cfg(debug_assertions)]
+    {
+        let route_insert_signals = Arc::clone(signals);
+        connection
+            .db
+            .transit_route()
+            .on_insert(move |_context, row| {
+                record_change(
+                    &route_insert_signals.route_changes,
+                    row.route_id,
+                    Some(row.clone()),
+                );
+                route_insert_signals.mark(FLOWS_DIRTY);
+            });
+        let route_delete_signals = Arc::clone(signals);
+        connection
+            .db
+            .transit_route()
+            .on_delete(move |_context, row| {
+                record_change(&route_delete_signals.route_changes, row.route_id, None);
+                route_delete_signals.mark(FLOWS_DIRTY);
+            });
+        let route_update_signals = Arc::clone(signals);
+        connection
+            .db
+            .transit_route()
+            .on_update(move |_context, _old, new| {
+                record_change(
+                    &route_update_signals.route_changes,
+                    new.route_id,
+                    Some(new.clone()),
+                );
+                route_update_signals.mark(FLOWS_DIRTY);
+            });
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let route_insert_signals = Arc::clone(signals);
+        connection
+            .db
+            .visible_routes()
+            .on_insert(move |_context, row| {
+                record_change(
+                    &route_insert_signals.route_changes,
+                    row.route_id,
+                    Some(row.clone()),
+                );
+                route_insert_signals.mark(FLOWS_DIRTY);
+            });
+        let route_delete_signals = Arc::clone(signals);
+        connection
+            .db
+            .visible_routes()
+            .on_delete(move |_context, row| {
+                record_change(&route_delete_signals.route_changes, row.route_id, None);
+                route_delete_signals.mark(FLOWS_DIRTY);
             });
     }
     let front_insert_signals = Arc::clone(signals);
@@ -770,7 +830,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         .on_insert(move |_context, row| {
             record_change(
                 &source_insert_signals.source_changes,
-                row.source_key.clone(),
+                row.source_key,
                 Some(row.clone()),
             );
             source_insert_signals.mark(ORDERS_DIRTY);
@@ -780,11 +840,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         .db
         .transfer_source()
         .on_delete(move |_context, row| {
-            record_change(
-                &source_delete_signals.source_changes,
-                row.source_key.clone(),
-                None,
-            );
+            record_change(&source_delete_signals.source_changes, row.source_key, None);
             source_delete_signals.mark(ORDERS_DIRTY);
         });
     let source_update_signals = Arc::clone(signals);
@@ -794,7 +850,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         .on_update(move |_context, _old, new| {
             record_change(
                 &source_update_signals.source_changes,
-                new.source_key.clone(),
+                new.source_key,
                 Some(new.clone()),
             );
             source_update_signals.mark(ORDERS_DIRTY);
@@ -807,7 +863,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         .on_insert(move |_context, row| {
             record_change(
                 &destination_insert_signals.destination_changes,
-                row.destination_key.clone(),
+                row.destination_key,
                 Some(row.clone()),
             );
             destination_insert_signals.mark(ORDERS_DIRTY);
@@ -819,7 +875,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         .on_delete(move |_context, row| {
             record_change(
                 &destination_delete_signals.destination_changes,
-                row.destination_key.clone(),
+                row.destination_key,
                 None,
             );
             destination_delete_signals.mark(ORDERS_DIRTY);
@@ -831,7 +887,7 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         .on_update(move |_context, _old, new| {
             record_change(
                 &destination_update_signals.destination_changes,
-                new.destination_key.clone(),
+                new.destination_key,
                 Some(new.clone()),
             );
             destination_update_signals.mark(ORDERS_DIRTY);
@@ -1226,6 +1282,16 @@ fn subscribed_packets(connection: &DbConnection) -> Vec<TransitPacket> {
     connection.db.visible_packets().iter().collect()
 }
 
+#[cfg(debug_assertions)]
+fn subscribed_routes(connection: &DbConnection) -> Vec<TransitRoute> {
+    connection.db.transit_route().iter().collect()
+}
+
+#[cfg(not(debug_assertions))]
+fn subscribed_routes(connection: &DbConnection) -> Vec<TransitRoute> {
+    connection.db.visible_routes().iter().collect()
+}
+
 fn synchronize_authoritative_view(
     mut transport: ResMut<OnlineTransport>,
     mut view: ResMut<MatchView>,
@@ -1311,6 +1377,7 @@ fn synchronize_authoritative_view(
             &transport,
             &mut view,
             transport.tactical.packets.values(),
+            &transport.tactical.routes,
             transport.tactical.orders.values(),
             transport.config.debug_policy_flows,
         );
@@ -1327,6 +1394,7 @@ fn synchronize_authoritative_view(
             &view,
             transport.tactical.orders.values(),
             transport.tactical.packets.values(),
+            &transport.tactical.routes,
             transport.tactical.fronts.values(),
             transport.tactical.sources.values(),
             transport.tactical.destinations.values(),
@@ -1684,9 +1752,7 @@ fn seed_command_ids(
     {
         transport.observe_command_id(receipt.client_command_id);
         if !transport.pending.contains_key(&receipt.client_command_id) {
-            transport
-                .processed_receipts
-                .insert(receipt.receipt_key.clone());
+            transport.processed_receipts.insert(receipt.receipt_key);
             transport
                 .terminal_command_ids
                 .insert(receipt.client_command_id);
@@ -1712,10 +1778,7 @@ fn process_receipts(
             continue;
         }
         transport.observe_command_id(receipt.client_command_id);
-        if !transport
-            .processed_receipts
-            .insert(receipt.receipt_key.clone())
-        {
+        if !transport.processed_receipts.insert(receipt.receipt_key) {
             continue;
         }
 
@@ -1787,6 +1850,7 @@ fn packets_to_flows<'a>(
     transport: &OnlineTransport,
     view: &MatchView,
     packets: impl IntoIterator<Item = &'a TransitPacket>,
+    routes: &BTreeMap<u64, TransitRoute>,
     orders: impl IntoIterator<Item = &'a TransferOrder>,
     show_policy_flows: bool,
 ) -> Vec<ActiveFlow> {
@@ -1806,9 +1870,9 @@ fn packets_to_flows<'a>(
             if !order_flow_is_visible(order, show_policy_flows) {
                 return None;
             }
+            let resolved_route = resolved_packet_route(packet, routes)?;
             let route_index = packet.route_index as usize;
-            let route = packet
-                .route
+            let route = resolved_route
                 .get(route_index..)
                 .unwrap_or_default()
                 .iter()
@@ -1838,10 +1902,28 @@ fn replace_authoritative_flows<'a>(
     transport: &OnlineTransport,
     view: &mut MatchView,
     packets: impl IntoIterator<Item = &'a TransitPacket>,
+    routes: &BTreeMap<u64, TransitRoute>,
     orders: impl IntoIterator<Item = &'a TransferOrder>,
     show_policy_flows: bool,
 ) {
-    view.active_flows = packets_to_flows(transport, view, packets, orders, show_policy_flows);
+    view.active_flows =
+        packets_to_flows(transport, view, packets, routes, orders, show_policy_flows);
+}
+
+fn resolved_packet_route(
+    packet: &TransitPacket,
+    routes: &BTreeMap<u64, TransitRoute>,
+) -> Option<Vec<u32>> {
+    if packet.route_id == 0 {
+        return Some(if packet.current_cell == packet.destination_cell {
+            vec![packet.current_cell]
+        } else {
+            vec![packet.current_cell, packet.destination_cell]
+        });
+    }
+    routes
+        .get(&packet.route_id)
+        .map(|route| route.cells.clone())
 }
 
 const fn order_flow_is_visible(order: &TransferOrder, show_policy_flows: bool) -> bool {
@@ -1950,11 +2032,13 @@ fn fronts_to_overlays<'a>(
     (overlays, contested)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retask_projection_from_authority<'a, O, P, F, S, D>(
     transport: &OnlineTransport,
     view: &MatchView,
     orders: O,
     packets: P,
+    routes: &BTreeMap<u64, TransitRoute>,
     fronts: F,
     sources: S,
     destinations: D,
@@ -2040,7 +2124,9 @@ where
         }
 
         let next_index = packet.route_index as usize + 1;
-        if let Some(&next) = packet.route.get(next_index) {
+        if let Some(next) =
+            resolved_packet_route(packet, routes).and_then(|route| route.get(next_index).copied())
+        {
             orders_by_edge
                 .entry((packet.current_cell, next))
                 .or_default()
@@ -2233,26 +2319,27 @@ mod tests {
         let signals = SharedSignals::default();
         let mut cache = TacticalCache::default();
         let mut packet = TransitPacket {
-            packet_key: "7:10:11".to_owned(),
+            packet_key: 7,
             order_id: 7,
             owner_player_id: 1,
             origin_cell: 10,
             current_cell: 10,
             destination_cell: 11,
             infantry: 20,
+            pending_source_infantry: 0,
+            route_id: 0,
             route_index: 0,
-            route: vec![10, 11],
             updated_step: 1,
         };
         record_change(
             &signals.packet_changes,
-            packet.packet_key.clone(),
+            packet.packet_key,
             Some(packet.clone()),
         );
         packet.infantry = 12;
         record_change(
             &signals.packet_changes,
-            packet.packet_key.clone(),
+            packet.packet_key,
             Some(packet.clone()),
         );
 
@@ -2260,7 +2347,7 @@ mod tests {
         assert_eq!(cache.packets.len(), 1);
         assert_eq!(cache.packets[&packet.packet_key].infantry, 12);
 
-        record_change(&signals.packet_changes, packet.packet_key.clone(), None);
+        record_change(&signals.packet_changes, packet.packet_key, None);
         cache.apply(signals.take_tactical_changes());
         assert!(cache.packets.is_empty());
     }
@@ -2305,39 +2392,42 @@ mod tests {
         }
 
         let edge = TransitPacket {
-            packet_key: "7:10:11".to_owned(),
+            packet_key: 7,
             order_id: 7,
             owner_player_id: 1,
             origin_cell: u32::MAX,
             current_cell: 10,
             destination_cell: 11,
             infantry: 7,
+            pending_source_infantry: 0,
+            route_id: 0,
             route_index: 0,
-            route: vec![10, 11],
             updated_step: 1,
         };
         let hostile_edge = TransitPacket {
-            packet_key: "8:10:12".to_owned(),
+            packet_key: 8,
             order_id: 8,
             owner_player_id: 1,
             origin_cell: 10,
             current_cell: 10,
             destination_cell: 12,
             infantry: 9,
+            pending_source_infantry: 0,
+            route_id: 0,
             route_index: 0,
-            route: vec![10, 12],
             updated_step: 1,
         };
         let resting = TransitPacket {
-            packet_key: "7:11:11".to_owned(),
+            packet_key: 9,
             order_id: 7,
             owner_player_id: 1,
             origin_cell: u32::MAX,
             current_cell: 11,
             destination_cell: 11,
             infantry: 8,
+            pending_source_infantry: 0,
+            route_id: 0,
             route_index: 0,
-            route: vec![11],
             updated_step: 1,
         };
 
@@ -2349,6 +2439,7 @@ mod tests {
             &transport,
             &view,
             &[edge, hostile_edge, resting],
+            &BTreeMap::new(),
             &orders,
             false,
         );
@@ -2365,15 +2456,16 @@ mod tests {
         transport.id_to_coordinate.insert(11, Axial::new(1, 0));
         let view = MatchView::connecting(1);
         let packet = |order_id, infantry| TransitPacket {
-            packet_key: format!("{order_id}:10:11"),
+            packet_key: order_id,
             order_id,
             owner_player_id: 1,
             origin_cell: 10,
             current_cell: 10,
             destination_cell: 11,
             infantry,
+            pending_source_infantry: 0,
+            route_id: 0,
             route_index: 0,
-            route: vec![10, 11],
             updated_step: 1,
         };
         let packets = [
@@ -2392,13 +2484,20 @@ mod tests {
             test_order(22, 22, match_bindings::OrderKind::ExpandClusters),
         ];
 
-        let normal = packets_to_flows(&transport, &view, &packets, &orders, false);
+        let normal = packets_to_flows(
+            &transport,
+            &view,
+            &packets,
+            &BTreeMap::new(),
+            &orders,
+            false,
+        );
         assert_eq!(
             normal.iter().map(|flow| flow.strength).collect::<Vec<_>>(),
             vec![22]
         );
 
-        let debug = packets_to_flows(&transport, &view, &packets, &orders, true);
+        let debug = packets_to_flows(&transport, &view, &packets, &BTreeMap::new(), &orders, true);
         assert_eq!(
             debug.iter().map(|flow| flow.strength).collect::<Vec<_>>(),
             vec![20, 21, 22]
@@ -2511,22 +2610,30 @@ mod tests {
             lifetime: 60.0,
         });
         let packet = TransitPacket {
-            packet_key: "24:10:11".to_owned(),
+            packet_key: 24,
             order_id: 24,
             owner_player_id: 1,
             origin_cell: 10,
             current_cell: 10,
             destination_cell: 11,
             infantry: 24,
+            pending_source_infantry: 0,
+            route_id: 0,
             route_index: 0,
-            route: vec![10, 11],
             updated_step: 1,
         };
 
         // This models the packet-first callback window: replacement must
         // clear the old projection rather than retaining or exposing either
         // route while the matching order row is unavailable.
-        replace_authoritative_flows(&transport, &mut view, &[packet], &[], false);
+        replace_authoritative_flows(
+            &transport,
+            &mut view,
+            &[packet],
+            &BTreeMap::new(),
+            &[],
+            false,
+        );
         assert!(view.active_flows.is_empty());
     }
 
@@ -2708,21 +2815,22 @@ mod tests {
             created_step: 1,
             updated_step: 7,
         };
-        let packet = |packet_key: &str,
+        let packet = |packet_key: u64,
                       order_id,
                       current_cell,
                       destination_cell,
                       infantry,
-                      route: Vec<u32>| TransitPacket {
-            packet_key: packet_key.to_owned(),
+                      _route: Vec<u32>| TransitPacket {
+            packet_key,
             order_id,
             owner_player_id: 1,
             origin_cell: 10,
             current_cell,
             destination_cell,
             infantry,
+            pending_source_infantry: 0,
+            route_id: 0,
             route_index: 0,
-            route,
             updated_step: 7,
         };
         let orders = [
@@ -2758,35 +2866,35 @@ mod tests {
             ),
         ];
         let packets = [
-            packet("7:11:12", 7, 11, 12, 12, vec![11, 12]),
-            packet("7:10:10", 7, 10, 10, 8, vec![10]),
-            packet("8:10:10", 8, 10, 10, 5, vec![10]),
-            packet("9:10:10", 9, 10, 10, 99, vec![10]),
+            packet(1, 7, 11, 12, 12, vec![11, 12]),
+            packet(2, 7, 10, 10, 8, vec![10]),
+            packet(3, 8, 10, 10, 5, vec![10]),
+            packet(4, 9, 10, 10, 99, vec![10]),
         ];
         let destinations = [
             TransferDestination {
-                destination_key: "7:12".to_owned(),
+                destination_key: 1,
                 order_id: 7,
                 cell_id: 12,
                 target_infantry: 20,
                 received_infantry: 0,
             },
             TransferDestination {
-                destination_key: "9:11".to_owned(),
+                destination_key: 2,
                 order_id: 9,
                 cell_id: 11,
                 target_infantry: 20,
                 received_infantry: 0,
             },
             TransferDestination {
-                destination_key: "10:11".to_owned(),
+                destination_key: 3,
                 order_id: 10,
                 cell_id: 11,
                 target_infantry: 30,
                 received_infantry: 12,
             },
             TransferDestination {
-                destination_key: "11:10".to_owned(),
+                destination_key: 4,
                 order_id: 11,
                 cell_id: 10,
                 target_infantry: 20,
@@ -2795,14 +2903,14 @@ mod tests {
         ];
         let sources = [
             TransferSource {
-                source_key: "7:10".to_owned(),
+                source_key: 1,
                 order_id: 7,
                 cell_id: 10,
                 committed_infantry: 20,
                 queued_infantry: 0,
             },
             TransferSource {
-                source_key: "8:10".to_owned(),
+                source_key: 2,
                 order_id: 8,
                 cell_id: 10,
                 committed_infantry: 5,
@@ -2815,6 +2923,7 @@ mod tests {
             &view,
             &orders,
             &packets,
+            &BTreeMap::new(),
             &[combat],
             &sources,
             &destinations,
@@ -2909,8 +3018,16 @@ mod tests {
             ),
         ];
 
-        let projection =
-            retask_projection_from_authority(&transport, &view, &orders, &[], &[], &[], &[]);
+        let projection = retask_projection_from_authority(
+            &transport,
+            &view,
+            &orders,
+            &[],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+        );
 
         assert_eq!(projection.background_policy_order_ids, BTreeSet::from([1]));
     }

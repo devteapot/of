@@ -60,7 +60,10 @@ pub mod transfer_source_table;
 pub mod transfer_source_type;
 pub mod transit_packet_table;
 pub mod transit_packet_type;
+pub mod transit_route_table;
+pub mod transit_route_type;
 pub mod visible_packets_table;
+pub mod visible_routes_table;
 
 pub use cancel_orders_reducer::cancel_orders;
 pub use cell_state_table::*;
@@ -116,7 +119,10 @@ pub use transfer_source_table::*;
 pub use transfer_source_type::TransferSource;
 pub use transit_packet_table::*;
 pub use transit_packet_type::TransitPacket;
+pub use transit_route_table::*;
+pub use transit_route_type::TransitRoute;
 pub use visible_packets_table::*;
+pub use visible_routes_table::*;
 
 #[derive(Clone, PartialEq, Debug)]
 
@@ -393,7 +399,9 @@ pub struct DbUpdate {
     transfer_order: __sdk::TableUpdate<TransferOrder>,
     transfer_source: __sdk::TableUpdate<TransferSource>,
     transit_packet: __sdk::TableUpdate<TransitPacket>,
+    transit_route: __sdk::TableUpdate<TransitRoute>,
     visible_packets: __sdk::TableUpdate<TransitPacket>,
+    visible_routes: __sdk::TableUpdate<TransitRoute>,
 }
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
@@ -441,9 +449,15 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "transit_packet" => db_update
                     .transit_packet
                     .append(transit_packet_table::parse_table_update(table_update)?),
+                "transit_route" => db_update
+                    .transit_route
+                    .append(transit_route_table::parse_table_update(table_update)?),
                 "visible_packets" => db_update
                     .visible_packets
                     .append(visible_packets_table::parse_table_update(table_update)?),
+                "visible_routes" => db_update
+                    .visible_routes
+                    .append(visible_routes_table::parse_table_update(table_update)?),
 
                 unknown => {
                     return Err(__sdk::InternalError::unknown_name(
@@ -518,9 +532,15 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.transit_packet = cache
             .apply_diff_to_table::<TransitPacket>("transit_packet", &self.transit_packet)
             .with_updates_by_pk(|row| &row.packet_key);
+        diff.transit_route = cache
+            .apply_diff_to_table::<TransitRoute>("transit_route", &self.transit_route)
+            .with_updates_by_pk(|row| &row.route_id);
         diff.visible_packets = cache
             .apply_diff_to_table::<TransitPacket>("visible_packets", &self.visible_packets)
             .with_updates_by_pk(|row| &row.packet_key);
+        diff.visible_routes = cache
+            .apply_diff_to_table::<TransitRoute>("visible_routes", &self.visible_routes)
+            .with_updates_by_pk(|row| &row.route_id);
 
         diff
     }
@@ -567,8 +587,14 @@ impl __sdk::DbUpdate for DbUpdate {
                 "transit_packet" => db_update
                     .transit_packet
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "transit_route" => db_update
+                    .transit_route
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "visible_packets" => db_update
                     .visible_packets
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "visible_routes" => db_update
+                    .visible_routes
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -622,8 +648,14 @@ impl __sdk::DbUpdate for DbUpdate {
                 "transit_packet" => db_update
                     .transit_packet
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "transit_route" => db_update
+                    .transit_route
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "visible_packets" => db_update
                     .visible_packets
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "visible_routes" => db_update
+                    .visible_routes
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -653,7 +685,9 @@ pub struct AppliedDiff<'r> {
     transfer_order: __sdk::TableAppliedDiff<'r, TransferOrder>,
     transfer_source: __sdk::TableAppliedDiff<'r, TransferSource>,
     transit_packet: __sdk::TableAppliedDiff<'r, TransitPacket>,
+    transit_route: __sdk::TableAppliedDiff<'r, TransitRoute>,
     visible_packets: __sdk::TableAppliedDiff<'r, TransitPacket>,
+    visible_routes: __sdk::TableAppliedDiff<'r, TransitRoute>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
 
@@ -720,9 +754,19 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
             &self.transit_packet,
             event,
         );
+        callbacks.invoke_table_row_callbacks::<TransitRoute>(
+            "transit_route",
+            &self.transit_route,
+            event,
+        );
         callbacks.invoke_table_row_callbacks::<TransitPacket>(
             "visible_packets",
             &self.visible_packets,
+            event,
+        );
+        callbacks.invoke_table_row_callbacks::<TransitRoute>(
+            "visible_routes",
+            &self.visible_routes,
             event,
         );
     }
@@ -1398,7 +1442,9 @@ impl __sdk::SpacetimeModule for RemoteModule {
         transfer_order_table::register_table(client_cache);
         transfer_source_table::register_table(client_cache);
         transit_packet_table::register_table(client_cache);
+        transit_route_table::register_table(client_cache);
         visible_packets_table::register_table(client_cache);
+        visible_routes_table::register_table(client_cache);
     }
     const ALL_TABLE_NAMES: &'static [&'static str] = &[
         "cell_state",
@@ -1414,6 +1460,8 @@ impl __sdk::SpacetimeModule for RemoteModule {
         "transfer_order",
         "transfer_source",
         "transit_packet",
+        "transit_route",
         "visible_packets",
+        "visible_routes",
     ];
 }

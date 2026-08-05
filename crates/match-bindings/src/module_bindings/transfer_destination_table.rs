@@ -174,7 +174,7 @@ impl<'ctx> __sdk::WithUpdate for TransferDestinationTableHandle<'ctx> {
 /// but to directly chain method calls,
 /// like `ctx.db.transfer_destination().destination_key().find(...)`.
 pub struct TransferDestinationDestinationKeyUnique<'ctx> {
-    imp: __sdk::UniqueConstraintHandle<TransferDestination, String>,
+    imp: __sdk::UniqueConstraintHandle<TransferDestination, u128>,
     phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
@@ -182,7 +182,7 @@ impl<'ctx> TransferDestinationTableHandle<'ctx> {
     /// Get a handle on the `destination_key` unique index on the table `transfer_destination`.
     pub fn destination_key(&self) -> TransferDestinationDestinationKeyUnique<'ctx> {
         TransferDestinationDestinationKeyUnique {
-            imp: self.imp.get_unique_constraint::<String>("destination_key"),
+            imp: self.imp.get_unique_constraint::<u128>("destination_key"),
             phantom: std::marker::PhantomData,
         }
     }
@@ -191,7 +191,7 @@ impl<'ctx> TransferDestinationTableHandle<'ctx> {
 impl<'ctx> TransferDestinationDestinationKeyUnique<'ctx> {
     /// Find the subscribed row whose `destination_key` column value is equal to `col_val`,
     /// if such a row is present in the client cache.
-    pub fn find(&self, col_val: &String) -> Option<TransferDestination> {
+    pub fn find(&self, col_val: &u128) -> Option<TransferDestination> {
         self.imp.find(col_val)
     }
 }
@@ -199,7 +199,7 @@ impl<'ctx> TransferDestinationDestinationKeyUnique<'ctx> {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<TransferDestination>("transfer_destination");
-    _table.add_unique_constraint::<String>("destination_key", |row| &row.destination_key);
+    _table.add_unique_constraint::<u128>("destination_key", |row| &row.destination_key);
 }
 
 #[doc(hidden)]

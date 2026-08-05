@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    rc::Rc,
-};
+use std::{cmp::Reverse, collections::{BTreeMap, BTreeSet}, rc::Rc};
 
 use hex_core::{
     AttackFront, Axial, CombatConfig, EdgeLimits, HexMap, LogisticsConfig, MovementConfig,
@@ -13,17 +10,17 @@ use spacetimedb::{ReducerContext, Table};
 use crate::orders::{is_background_policy_order, maintain_cluster_policies};
 use crate::rules::{
     allocated_infantry_at_cell, cell_id_for_coordinate, cell_state, config, coordinate_for_cell,
-    core_cell, edge_runtime_limits, packet_key, state, terrain,
+    core_cell, edge_runtime_limits, order_cell_key, state, terrain,
 };
 use crate::schema::{
     CellState, CombatFront, EXPANSION_AGGREGATE_ORIGIN, ExpansionGarrisonDebt, ExpansionWave,
     MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus, PLAYER_ONE, PLAYER_TWO, TerrainClass,
-    TransferOrder, TransitPacket,
+    TransferOrder, TransferSource, TransitPacket,
 };
 use crate::schema::{
     cell_state as cell_state_table, combat_front, expansion_garrison_debt, expansion_wave,
     match_state, mobilization_policy, retreat_abandonment, transfer_destination, transfer_order,
-    transfer_source, transit_packet,
+    transfer_source, transit_packet, transit_route,
 };
 
 /// Transaction-local packet index for one simulation step.
@@ -36,20 +33,43 @@ use crate::schema::{
 /// indexed queries outside this module observe the current transaction state.
 #[derive(Clone)]
 struct TickPacket {
-    packet_key: String,
+    packet_key: u64,
     order_id: u64,
     owner_player_id: u8,
     origin_cell: u32,
     current_cell: u32,
     destination_cell: u32,
     infantry: u64,
+    pending_source_infantry: u64,
+    route_id: u64,
     route_index: u32,
     route: Rc<[u32]>,
     updated_step: u64,
 }
 
-impl From<TransitPacket> for TickPacket {
-    fn from(packet: TransitPacket) -> Self {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PacketMergeKey {
+    order_id: u64,
+    origin_cell: u32,
+    destination_cell: u32,
+    current_cell: u32,
+    route_index: u32,
+}
+
+impl From<&TickPacket> for PacketMergeKey {
+    fn from(packet: &TickPacket) -> Self {
+        Self {
+            order_id: packet.order_id,
+            origin_cell: packet.origin_cell,
+            destination_cell: packet.destination_cell,
+            current_cell: packet.current_cell,
+            route_index: packet.route_index,
+        }
+    }
+}
+
+impl TickPacket {
+    fn from_row(packet: TransitPacket, route: Rc<[u32]>) -> Self {
         Self {
             packet_key: packet.packet_key,
             order_id: packet.order_id,
@@ -58,25 +78,26 @@ impl From<TransitPacket> for TickPacket {
             current_cell: packet.current_cell,
             destination_cell: packet.destination_cell,
             infantry: packet.infantry,
+            pending_source_infantry: packet.pending_source_infantry,
+            route_id: packet.route_id,
             route_index: packet.route_index,
-            route: Rc::from(packet.route),
+            route,
             updated_step: packet.updated_step,
         }
     }
-}
 
-impl TickPacket {
     fn to_row(&self) -> TransitPacket {
         TransitPacket {
-            packet_key: self.packet_key.clone(),
+            packet_key: self.packet_key,
             order_id: self.order_id,
             owner_player_id: self.owner_player_id,
             origin_cell: self.origin_cell,
             current_cell: self.current_cell,
             destination_cell: self.destination_cell,
             infantry: self.infantry,
+            pending_source_infantry: self.pending_source_infantry,
+            route_id: self.route_id,
             route_index: self.route_index,
-            route: self.route.to_vec(),
             updated_step: self.updated_step,
         }
     }
@@ -84,27 +105,78 @@ impl TickPacket {
 
 #[derive(Default)]
 struct PacketTickState {
-    rows: BTreeMap<Rc<str>, TickPacket>,
-    by_order: BTreeMap<u64, BTreeSet<Rc<str>>>,
-    by_cell: BTreeMap<u32, BTreeSet<Rc<str>>>,
-    by_order_destination: BTreeMap<(u64, u32), BTreeSet<Rc<str>>>,
+    rows: BTreeMap<u64, TickPacket>,
+    by_order: BTreeMap<u64, BTreeSet<u64>>,
+    by_cell: BTreeMap<u32, BTreeSet<u64>>,
+    by_order_destination: BTreeMap<(u64, u32), BTreeSet<u64>>,
+    by_merge_key: BTreeMap<PacketMergeKey, u64>,
+    source_rows: BTreeMap<(u64, u32), TransferSource>,
+    sources_by_order: BTreeMap<u64, Vec<u32>>,
+    source_cursor_by_order: BTreeMap<u64, usize>,
+    dirty_sources: BTreeSet<(u64, u32)>,
 }
 
 impl PacketTickState {
-    fn load(ctx: &ReducerContext) -> Self {
+    fn load(ctx: &ReducerContext) -> Result<Self, String> {
         let mut state = Self::default();
-        for packet in ctx.db.transit_packet().iter() {
-            state.track(packet.into());
+        let routes = ctx
+            .db
+            .transit_route()
+            .iter()
+            .map(|route| (route.route_id, Rc::<[u32]>::from(route.cells)))
+            .collect::<BTreeMap<_, _>>();
+        for source in ctx.db.transfer_source().iter() {
+            state
+                .sources_by_order
+                .entry(source.order_id)
+                .or_default()
+                .push(source.cell_id);
+            state
+                .source_rows
+                .insert((source.order_id, source.cell_id), source);
         }
-        state
+        for cells in state.sources_by_order.values_mut() {
+            cells.sort_unstable();
+        }
+        state.source_cursor_by_order = state
+            .sources_by_order
+            .keys()
+            .copied()
+            .map(|order_id| (order_id, 0))
+            .collect();
+        for packet in ctx.db.transit_packet().iter() {
+            let route = if packet.route_id == 0 {
+                if packet.current_cell == packet.destination_cell {
+                    Rc::from([packet.current_cell])
+                } else {
+                    Rc::from([packet.current_cell, packet.destination_cell])
+                }
+            } else {
+                routes.get(&packet.route_id).cloned().ok_or_else(|| {
+                    format!(
+                        "packet {} references missing route {}",
+                        packet.packet_key, packet.route_id
+                    )
+                })?
+            };
+            state.track(TickPacket::from_row(packet, route));
+        }
+        Ok(state)
     }
 
     fn iter(&self) -> impl Iterator<Item = &TickPacket> {
         self.rows.values()
     }
 
-    fn find(&self, packet_key: &str) -> Option<TickPacket> {
+    fn find(&self, packet_key: &u64) -> Option<TickPacket> {
         self.rows.get(packet_key).cloned()
+    }
+
+    fn find_merge(&self, merge_key: PacketMergeKey) -> Option<TickPacket> {
+        self.by_merge_key
+            .get(&merge_key)
+            .and_then(|packet_key| self.rows.get(packet_key))
+            .cloned()
     }
 
     fn by_order(&self, order_id: u64) -> impl Iterator<Item = &TickPacket> {
@@ -136,7 +208,9 @@ impl PacketTickState {
     }
 
     fn insert(&mut self, ctx: &ReducerContext, packet: TickPacket) {
-        ctx.db.transit_packet().insert(packet.to_row());
+        let inserted = ctx.db.transit_packet().insert(packet.to_row());
+        let mut packet = packet;
+        packet.packet_key = inserted.packet_key;
         self.track(packet);
     }
 
@@ -146,37 +220,39 @@ impl PacketTickState {
         self.track(packet);
     }
 
-    fn delete(&mut self, ctx: &ReducerContext, packet_key: &str) {
+    fn delete(&mut self, ctx: &ReducerContext, packet_key: &u64) {
         if let Some(packet) = self.rows.get(packet_key) {
             ctx.db
                 .transit_packet()
                 .packet_key()
-                .delete(&packet.packet_key);
+                .delete(packet.packet_key);
         }
         self.untrack(packet_key);
     }
 
     fn track(&mut self, packet: TickPacket) {
-        let key = Rc::<str>::from(packet.packet_key.as_str());
+        let key = packet.packet_key;
+        self.by_merge_key.insert((&packet).into(), key);
         self.by_order
             .entry(packet.order_id)
             .or_default()
-            .insert(key.clone());
+            .insert(key);
         self.by_cell
             .entry(packet.current_cell)
             .or_default()
-            .insert(key.clone());
+            .insert(key);
         self.by_order_destination
             .entry((packet.order_id, packet.destination_cell))
             .or_default()
-            .insert(key.clone());
+            .insert(key);
         self.rows.insert(key, packet);
     }
 
-    fn untrack(&mut self, packet_key: &str) {
+    fn untrack(&mut self, packet_key: &u64) {
         let Some(packet) = self.rows.remove(packet_key) else {
             return;
         };
+        self.by_merge_key.remove(&PacketMergeKey::from(&packet));
         if let Some(keys) = self.by_order.get_mut(&packet.order_id) {
             keys.remove(packet_key);
         }
@@ -188,6 +264,108 @@ impl PacketTickState {
             .get_mut(&(packet.order_id, packet.destination_cell))
         {
             keys.remove(packet_key);
+        }
+    }
+
+    fn replace_route(
+        &mut self,
+        ctx: &ReducerContext,
+        route_id: u64,
+        route: Vec<u32>,
+    ) -> Result<(), String> {
+        if route_id == 0 {
+            return Err("inline expansion route cannot be extended".into());
+        }
+        let mut stored = ctx
+            .db
+            .transit_route()
+            .route_id()
+            .find(route_id)
+            .ok_or_else(|| format!("missing transit route {route_id}"))?;
+        stored.cells = route;
+        let shared = Rc::<[u32]>::from(stored.cells.clone());
+        ctx.db.transit_route().route_id().update(stored);
+        for packet in self.rows.values_mut() {
+            if packet.route_id == route_id {
+                packet.route = shared.clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn decrement_source_queue(
+        &mut self,
+        packet: &TickPacket,
+        amount: u64,
+    ) -> Result<(), String> {
+        if amount == 0 {
+            return Ok(());
+        }
+        if packet.origin_cell != EXPANSION_AGGREGATE_ORIGIN {
+            return self.decrement_source_row(packet.order_id, packet.origin_cell, amount);
+        }
+
+        let mut remaining = amount;
+        let mut cursor = self
+            .source_cursor_by_order
+            .get(&packet.order_id)
+            .copied()
+            .unwrap_or(0);
+        let source_count = self
+            .sources_by_order
+            .get(&packet.order_id)
+            .map_or(0, Vec::len);
+        while remaining > 0 && cursor < source_count {
+            let cell_id = self.sources_by_order[&packet.order_id][cursor];
+            let queued = self
+                .source_rows
+                .get(&(packet.order_id, cell_id))
+                .map_or(0, |source| source.queued_infantry);
+            let consumed = remaining.min(queued);
+            self.decrement_source_row(packet.order_id, cell_id, consumed)?;
+            remaining -= consumed;
+            if consumed == queued {
+                cursor += 1;
+            }
+        }
+        self.source_cursor_by_order.insert(packet.order_id, cursor);
+        if remaining > 0 {
+            return Err(format!(
+                "order {} source queue is short by {remaining} infantry",
+                packet.order_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn decrement_source_row(
+        &mut self,
+        order_id: u64,
+        cell_id: u32,
+        amount: u64,
+    ) -> Result<(), String> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let source = self
+            .source_rows
+            .get_mut(&(order_id, cell_id))
+            .ok_or_else(|| format!("transfer source {order_id}:{cell_id} is missing"))?;
+        if amount > source.queued_infantry {
+            return Err(format!(
+                "transfer source {order_id}:{cell_id} queue underflow"
+            ));
+        }
+        source.queued_infantry -= amount;
+        self.dirty_sources.insert((order_id, cell_id));
+        Ok(())
+    }
+
+    fn flush_source_queues(&mut self, ctx: &ReducerContext) {
+        for key in std::mem::take(&mut self.dirty_sources) {
+            if let Some(source) = self.source_rows.get(&key) {
+                ctx.db.transfer_source().source_key().update(source.clone());
+            }
         }
     }
 }
@@ -204,7 +382,7 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let logical_step = match_state.logical_step;
     ctx.db.match_state().singleton_id().update(match_state);
 
-    let mut packets = PacketTickState::load(ctx);
+    let mut packets = PacketTickState::load(ctx)?;
     trim_all_overallocated_packets(ctx, &mut packets, logical_step)?;
     branch_expand_waves(ctx, &mut packets, logical_step)?;
     stop_blocked_expand_edges(ctx, &mut packets, logical_step)?;
@@ -212,6 +390,7 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     stop_blocked_internal_edges(ctx, &mut packets, logical_step)?;
     resolve_combats(ctx, &mut packets, logical_step)?;
     clear_stale_combat_fronts(ctx, logical_step);
+    packets.flush_source_queues(ctx);
     finalize_orders(ctx, &packets, logical_step)?;
 
     let config = config(ctx)?;
@@ -267,7 +446,7 @@ fn stop_blocked_expand_edges(
             }
         }
     }
-    blocked_packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    blocked_packets.sort_unstable_by_key(|packet| packet.packet_key);
     for packet in blocked_packets {
         station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)?;
     }
@@ -308,7 +487,7 @@ fn stop_blocked_internal_edges(
             }
         }
     }
-    blocked_packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    blocked_packets.sort_unstable_by_key(|packet| packet.packet_key);
     for packet in blocked_packets {
         station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)?;
     }
@@ -360,7 +539,7 @@ fn branch_expand_waves(
         }
         let mut topology_changed = false;
         for (cell_id, mut contributions) in resting_by_cell {
-            contributions.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+            contributions.sort_unstable_by_key(|packet| packet.packet_key);
             topology_changed |= branch_expand_node(
                 ctx,
                 packets,
@@ -458,14 +637,20 @@ fn branch_expand_node(
         }
     }
     for (contribution_index, child, amount) in outgoing {
+        let contribution = &contributions[contribution_index];
+        let pending_source_infantry = match contribution.pending_source_infantry {
+            0 => 0,
+            pending if pending == contribution.infantry => amount,
+            _ => return Err("expand resting packet has partial source accounting".into()),
+        };
         insert_expand_edge_packet(
             ctx,
             packets,
             order,
-            &contributions[contribution_index],
             cell_id,
             child,
             amount,
+            pending_source_infantry,
             logical_step,
         )?;
     }
@@ -677,37 +862,43 @@ fn insert_expand_edge_packet(
     ctx: &ReducerContext,
     packets: &mut PacketTickState,
     order: &TransferOrder,
-    contribution: &TickPacket,
     from_cell: u32,
     to_cell: u32,
     amount: u64,
+    pending_source_infantry: u64,
     logical_step: u64,
 ) -> Result<(), String> {
     if amount == 0 {
         return Ok(());
     }
-    let key = packet_key(
-        order.order_id,
-        contribution.origin_cell,
-        to_cell,
-        from_cell,
-        0,
-    );
-    if let Some(mut existing) = packets.find(&key) {
+    let merge_key = PacketMergeKey {
+        order_id: order.order_id,
+        origin_cell: EXPANSION_AGGREGATE_ORIGIN,
+        destination_cell: to_cell,
+        current_cell: from_cell,
+        route_index: 0,
+    };
+    if let Some(mut existing) = packets.find_merge(merge_key) {
         existing.infantry = merged_expand_strength(existing.infantry, amount)?;
+        existing.pending_source_infantry = existing
+            .pending_source_infantry
+            .checked_add(pending_source_infantry)
+            .ok_or_else(|| "expand pending-source strength overflow".to_string())?;
         existing.updated_step = logical_step;
         packets.update(ctx, existing);
     } else {
         packets.insert(
             ctx,
             TickPacket {
-                packet_key: key,
+                packet_key: 0,
                 order_id: order.order_id,
                 owner_player_id: order.player_id,
-                origin_cell: contribution.origin_cell,
+                origin_cell: EXPANSION_AGGREGATE_ORIGIN,
                 current_cell: from_cell,
                 destination_cell: to_cell,
                 infantry: amount,
+                pending_source_infantry,
+                route_id: 0,
                 route_index: 0,
                 route: Rc::from([from_cell, to_cell]),
                 updated_step: logical_step,
@@ -1029,7 +1220,7 @@ fn move_friendly_packets(
             ));
         } else if should_station_capacity_blocked_packet(&order, &outcome.limits) {
             capacity_stopped_packets
-                .insert(intent.packet.packet_key.clone(), intent.packet.clone());
+                .insert(intent.packet.packet_key, intent.packet.clone());
         }
     }
 
@@ -1359,7 +1550,7 @@ fn apply_attacker_casualties(
     logical_step: u64,
 ) -> Result<(), String> {
     let mut sorted = packets.to_vec();
-    sorted.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    sorted.sort_unstable_by_key(|packet| packet.packet_key);
     for packet in sorted {
         if casualties == 0 {
             break;
@@ -1393,7 +1584,7 @@ fn occupy_after_combat(
         .iter()
         .filter_map(|packet| packet_state.find(&packet.packet_key))
         .collect();
-    packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    packets.sort_unstable_by_key(|packet| packet.packet_key);
     let offered: u64 = packets.iter().map(|packet| packet.infantry).sum();
     let occupancy = offered
         .min(limits.throughput_per_step)
@@ -1583,23 +1774,23 @@ fn advance_packet(
         .ok_or_else(|| "packet route ended before movement".to_string())?;
 
     if next_index as usize + 1 == packet.route.len() && arrival.may_extend_sustained_push() {
-        extend_sustained_lane(ctx, packets, &packet, next_cell, logical_step)?;
+        extend_sustained_lane(ctx, packets, &packet, next_cell)?;
         packet = packets
             .find(&packet.packet_key)
             .ok_or_else(|| "push packet disappeared while extending its lane".to_string())?;
     }
 
+    let source_debit = moved.min(packet.pending_source_infantry);
     if moved == packet.infantry {
         packets.delete(ctx, &packet.packet_key);
     } else {
         let mut remainder = packet.clone();
         remainder.infantry -= moved;
+        remainder.pending_source_infantry -= source_debit;
         remainder.updated_step = logical_step;
         packets.update(ctx, remainder);
     }
-    if packet_has_pending_source(&packet) {
-        decrement_source_queue(ctx, packet.order_id, packet.origin_cell, moved)?;
-    }
+    packets.decrement_source_queue(&packet, source_debit)?;
 
     if next_index as usize + 1 == packet.route.len() {
         increment_destination_received(ctx, packet.order_id, packet.destination_cell, moved)?;
@@ -1617,14 +1808,14 @@ fn advance_packet(
         return Ok(());
     }
 
-    let child_key = packet_key(
-        packet.order_id,
-        packet.origin_cell,
-        packet.destination_cell,
-        next_cell,
-        next_index,
-    );
-    if let Some(mut existing) = packets.find(&child_key) {
+    let child_merge_key = PacketMergeKey {
+        order_id: packet.order_id,
+        origin_cell: packet.origin_cell,
+        destination_cell: packet.destination_cell,
+        current_cell: next_cell,
+        route_index: next_index,
+    };
+    if let Some(mut existing) = packets.find_merge(child_merge_key) {
         existing.infantry = existing
             .infantry
             .checked_add(moved)
@@ -1635,13 +1826,15 @@ fn advance_packet(
         packets.insert(
             ctx,
             TickPacket {
-                packet_key: child_key,
+                packet_key: 0,
                 order_id: packet.order_id,
                 owner_player_id: packet.owner_player_id,
                 origin_cell: packet.origin_cell,
                 current_cell: next_cell,
                 destination_cell: packet.destination_cell,
                 infantry: moved,
+                pending_source_infantry: 0,
+                route_id: packet.route_id,
                 route_index: next_index,
                 route: packet.route.clone(),
                 updated_step: logical_step,
@@ -1663,26 +1856,26 @@ fn advance_expand_packet(
         return Err("expand edge packet has an invalid one-edge route".into());
     }
     let next_cell = packet.route[1];
+    let source_debit = moved.min(packet.pending_source_infantry);
     if moved == packet.infantry {
         packets.delete(ctx, &packet.packet_key);
     } else {
         let mut remainder = packet.clone();
         remainder.infantry -= moved;
+        remainder.pending_source_infantry -= source_debit;
         remainder.updated_step = logical_step;
         packets.update(ctx, remainder);
     }
-    if packet_has_pending_source(packet) {
-        decrement_source_queue(ctx, packet.order_id, packet.origin_cell, moved)?;
-    }
+    packets.decrement_source_queue(packet, source_debit)?;
 
-    let rest_key = packet_key(
-        packet.order_id,
-        EXPANSION_AGGREGATE_ORIGIN,
-        next_cell,
-        next_cell,
-        0,
-    );
-    if let Some(mut resting) = packets.find(&rest_key) {
+    let rest_merge_key = PacketMergeKey {
+        order_id: packet.order_id,
+        origin_cell: EXPANSION_AGGREGATE_ORIGIN,
+        destination_cell: next_cell,
+        current_cell: next_cell,
+        route_index: 0,
+    };
+    if let Some(mut resting) = packets.find_merge(rest_merge_key) {
         resting.infantry = merged_expand_strength(resting.infantry, moved)?;
         resting.updated_step = logical_step;
         packets.update(ctx, resting);
@@ -1690,13 +1883,15 @@ fn advance_expand_packet(
         packets.insert(
             ctx,
             TickPacket {
-                packet_key: rest_key,
+                packet_key: 0,
                 order_id: packet.order_id,
                 owner_player_id: packet.owner_player_id,
                 origin_cell: EXPANSION_AGGREGATE_ORIGIN,
                 current_cell: next_cell,
                 destination_cell: next_cell,
                 infantry: moved,
+                pending_source_infantry: 0,
+                route_id: 0,
                 route_index: 0,
                 route: Rc::from([next_cell]),
                 updated_step: logical_step,
@@ -1706,8 +1901,9 @@ fn advance_expand_packet(
     Ok(())
 }
 
+#[cfg(test)]
 fn packet_has_pending_source(packet: &TickPacket) -> bool {
-    packet.route_index == 0 && packet.origin_cell != EXPANSION_AGGREGATE_ORIGIN
+    packet.pending_source_infantry > 0
 }
 
 /// Resolves the immutable local normal of one Push lane from its persisted
@@ -1763,7 +1959,6 @@ fn extend_sustained_lane(
     packets: &mut PacketTickState,
     packet: &TickPacket,
     reached_cell: u32,
-    logical_step: u64,
 ) -> Result<bool, String> {
     let Some(order) = ctx.db.transfer_order().order_id().find(packet.order_id) else {
         return Err("push order is missing while extending a lane".into());
@@ -1804,17 +1999,19 @@ fn extend_sustained_lane(
         .cloned()
         .collect::<Vec<_>>();
     let mut extended = false;
-    for mut candidate in candidates {
+    let mut extended_routes = BTreeSet::new();
+    for candidate in candidates {
         if push_lane_direction(ctx, &order, &candidate)? != direction {
+            continue;
+        }
+        if !extended_routes.insert(candidate.route_id) {
             continue;
         }
         let mut route = candidate.route.to_vec();
         if !append_lane_layer(&mut route, reached_cell, next_cell) {
             continue;
         }
-        candidate.route = Rc::from(route);
-        candidate.updated_step = logical_step;
-        packets.update(ctx, candidate);
+        packets.replace_route(ctx, candidate.route_id, route)?;
         extended = true;
     }
     Ok(extended)
@@ -1838,36 +2035,18 @@ fn append_lane_layer(route: &mut Vec<u32>, reached_cell: u32, next_cell: u32) ->
     true
 }
 
-fn decrement_source_queue(
-    ctx: &ReducerContext,
-    order_id: u64,
-    origin_cell: u32,
-    amount: u64,
-) -> Result<(), String> {
-    let key = format!("{order_id}:{origin_cell}");
-    let mut source = ctx
-        .db
-        .transfer_source()
-        .source_key()
-        .find(&key)
-        .ok_or_else(|| "transfer source row is missing".to_string())?;
-    source.queued_infantry = source.queued_infantry.saturating_sub(amount);
-    ctx.db.transfer_source().source_key().update(source);
-    Ok(())
-}
-
 fn increment_destination_received(
     ctx: &ReducerContext,
     order_id: u64,
     destination_cell: u32,
     amount: u64,
 ) -> Result<(), String> {
-    let key = format!("{order_id}:{destination_cell}");
+    let key = order_cell_key(order_id, destination_cell);
     let mut destination = ctx
         .db
         .transfer_destination()
         .destination_key()
-        .find(&key)
+        .find(key)
         .ok_or_else(|| "transfer destination row is missing".to_string())?;
     destination.received_infantry = destination
         .received_infantry
@@ -1916,7 +2095,7 @@ fn station_capture_garrison(
         })
         .cloned()
         .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    candidates.sort_unstable_by_key(|packet| packet.packet_key);
     for packet in candidates {
         if remaining == 0 {
             break;
@@ -1966,7 +2145,7 @@ fn settle_stopped_sustained_lane(
         .by_order_destination(order_id, lane_anchor)
         .cloned()
         .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+    candidates.sort_unstable_by_key(|packet| packet.packet_key);
     for packet in candidates {
         if push_lane_direction(ctx, &order, &packet)? != direction {
             continue;
@@ -2023,21 +2202,18 @@ fn station_packet_allocation(
         .find(current.order_id)
         .ok_or_else(|| "order is missing while stationing infantry".to_string())?;
     let accounting = station_accounting(current.infantry, amount, order.delivered_infantry)?;
+    let source_debit = accounting
+        .stationed
+        .min(current.pending_source_infantry);
     if accounting.packet_remaining == 0 {
         packets.delete(ctx, &current.packet_key);
     } else {
         current.infantry = accounting.packet_remaining;
+        current.pending_source_infantry -= source_debit;
         current.updated_step = logical_step;
         packets.update(ctx, current.clone());
     }
-    if packet_has_pending_source(&current) {
-        decrement_source_queue(
-            ctx,
-            current.order_id,
-            current.origin_cell,
-            accounting.stationed,
-        )?;
-    }
+    packets.decrement_source_queue(&current, source_debit)?;
     order.delivered_infantry = accounting.delivered_after;
     order.updated_step = logical_step;
     ctx.db.transfer_order().order_id().update(order);
@@ -2053,16 +2229,16 @@ fn reduce_packet_metadata(
     count_casualty: bool,
 ) -> Result<(), String> {
     let lost = amount.min(packet.infantry);
+    let source_debit = lost.min(packet.pending_source_infantry);
     if lost == packet.infantry {
         packets.delete(ctx, &packet.packet_key);
     } else {
         packet.infantry -= lost;
+        packet.pending_source_infantry -= source_debit;
         packet.updated_step = logical_step;
         packets.update(ctx, packet.clone());
     }
-    if packet_has_pending_source(&packet) {
-        decrement_source_queue(ctx, packet.order_id, packet.origin_cell, lost)?;
-    }
+    packets.decrement_source_queue(&packet, source_debit)?;
     if count_casualty {
         let mut order = ctx
             .db
@@ -2090,7 +2266,7 @@ fn trim_packets_at_cell(
         .filter(|packet| packet.owner_player_id == owner_player_id)
         .cloned()
         .collect();
-    packets.sort_unstable_by(|left, right| right.packet_key.cmp(&left.packet_key));
+    packets.sort_unstable_by_key(|packet| Reverse(packet.packet_key));
     let allocated: u64 = packets.iter().map(|packet| packet.infantry).sum();
     let mut trim = packet_trim_required(
         cell.owner_player_id,
@@ -2140,7 +2316,7 @@ fn trim_all_overallocated_packets(
     }
     for ((cell_id, owner), mut packets) in packets_by_location {
         let cell = cell_state(ctx, cell_id)?;
-        packets.sort_unstable_by(|left, right| right.packet_key.cmp(&left.packet_key));
+        packets.sort_unstable_by_key(|packet| Reverse(packet.packet_key));
         let allocated = packets.iter().map(|packet| packet.infantry).sum();
         let mut trim = packet_trim_required(cell.owner_player_id, owner, cell.infantry, allocated);
         for packet in packets {
@@ -2185,6 +2361,16 @@ fn finalize_orders(
             order.status = status;
             complete_retreat_abandonments(ctx, packets, &order, logical_step)?;
             ctx.db.expansion_wave().order_id().delete(order.order_id);
+            let route_ids = ctx
+                .db
+                .transit_route()
+                .route_by_order()
+                .filter(order.order_id)
+                .map(|route| route.route_id)
+                .collect::<Vec<_>>();
+            for route_id in route_ids {
+                ctx.db.transit_route().route_id().delete(route_id);
+            }
         }
         if changed {
             order.in_transit_infantry = in_transit;
@@ -2251,7 +2437,7 @@ fn complete_retreat_abandonments(
         ctx.db
             .retreat_abandonment()
             .abandonment_key()
-            .delete(&candidate.abandonment_key);
+            .delete(candidate.abandonment_key);
     }
     Ok(())
 }
@@ -2447,13 +2633,15 @@ mod tests {
 
     fn test_packet(origin: u32, current: u32, destination: u32, route: Vec<u32>) -> TickPacket {
         TickPacket {
-            packet_key: "test".into(),
+            packet_key: 1,
             order_id: 1,
             owner_player_id: 1,
             origin_cell: origin,
             current_cell: current,
             destination_cell: destination,
             infantry: 10,
+            pending_source_infantry: 10,
+            route_id: 1,
             route_index: 0,
             route: Rc::from(route),
             updated_step: 0,
@@ -2464,9 +2652,9 @@ mod tests {
     fn packet_tick_indexes_track_insertions_and_removals() {
         let mut state = PacketTickState::default();
         let mut first = test_packet(10, 10, 11, vec![10, 11]);
-        first.packet_key = "1:10:11".into();
+        first.packet_key = 1;
         let mut second = test_packet(20, 20, 21, vec![20, 21]);
-        second.packet_key = "2:20:21".into();
+        second.packet_key = 2;
         second.order_id = 2;
         state.track(first.clone());
         state.track(second.clone());
@@ -2485,6 +2673,33 @@ mod tests {
     }
 
     #[test]
+    fn aggregated_expansion_debits_sources_deterministically_and_coalesces_writes() {
+        let mut state = PacketTickState::default();
+        for (cell_id, queued_infantry) in [(10, 7), (20, 8)] {
+            let source = TransferSource {
+                source_key: order_cell_key(1, cell_id),
+                order_id: 1,
+                cell_id,
+                committed_infantry: queued_infantry,
+                queued_infantry,
+            };
+            state.source_rows.insert((1, cell_id), source);
+            state.sources_by_order.entry(1).or_default().push(cell_id);
+        }
+        let aggregate = test_packet(EXPANSION_AGGREGATE_ORIGIN, 10, 11, vec![10, 11]);
+        state.decrement_source_queue(&aggregate, 12).unwrap();
+        assert_eq!(state.source_rows[&(1, 10)].queued_infantry, 0);
+        assert_eq!(state.source_rows[&(1, 20)].queued_infantry, 3);
+        assert_eq!(state.dirty_sources, BTreeSet::from([(1, 10), (1, 20)]));
+
+        let exact = test_packet(20, 20, 21, vec![20, 21]);
+        state.decrement_source_queue(&exact, 2).unwrap();
+        assert_eq!(state.source_rows[&(1, 20)].queued_infantry, 1);
+        assert_eq!(state.dirty_sources.len(), 2);
+        assert!(state.decrement_source_queue(&aggregate, 2).is_err());
+    }
+
+    #[test]
     fn expand_resting_nodes_and_one_edge_packets_are_unambiguous() {
         let resting = test_packet(5, 5, 5, vec![5]);
         let edge = test_packet(5, 5, 6, vec![5, 6]);
@@ -2492,7 +2707,8 @@ mod tests {
         assert!(!expansion_packet_is_resting(&edge));
         assert!(packet_has_pending_source(&resting));
 
-        let aggregate = test_packet(EXPANSION_AGGREGATE_ORIGIN, 8, 8, vec![8]);
+        let mut aggregate = test_packet(EXPANSION_AGGREGATE_ORIGIN, 8, 8, vec![8]);
+        aggregate.pending_source_infantry = 0;
         assert!(expansion_packet_is_resting(&aggregate));
         assert!(!packet_has_pending_source(&aggregate));
     }

@@ -173,7 +173,7 @@ impl<'ctx> __sdk::WithUpdate for CommandReceiptTableHandle<'ctx> {
 /// but to directly chain method calls,
 /// like `ctx.db.command_receipt().receipt_key().find(...)`.
 pub struct CommandReceiptReceiptKeyUnique<'ctx> {
-    imp: __sdk::UniqueConstraintHandle<CommandReceipt, String>,
+    imp: __sdk::UniqueConstraintHandle<CommandReceipt, u128>,
     phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
@@ -181,7 +181,7 @@ impl<'ctx> CommandReceiptTableHandle<'ctx> {
     /// Get a handle on the `receipt_key` unique index on the table `command_receipt`.
     pub fn receipt_key(&self) -> CommandReceiptReceiptKeyUnique<'ctx> {
         CommandReceiptReceiptKeyUnique {
-            imp: self.imp.get_unique_constraint::<String>("receipt_key"),
+            imp: self.imp.get_unique_constraint::<u128>("receipt_key"),
             phantom: std::marker::PhantomData,
         }
     }
@@ -190,7 +190,7 @@ impl<'ctx> CommandReceiptTableHandle<'ctx> {
 impl<'ctx> CommandReceiptReceiptKeyUnique<'ctx> {
     /// Find the subscribed row whose `receipt_key` column value is equal to `col_val`,
     /// if such a row is present in the client cache.
-    pub fn find(&self, col_val: &String) -> Option<CommandReceipt> {
+    pub fn find(&self, col_val: &u128) -> Option<CommandReceipt> {
         self.imp.find(col_val)
     }
 }
@@ -198,7 +198,7 @@ impl<'ctx> CommandReceiptReceiptKeyUnique<'ctx> {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<CommandReceipt>("command_receipt");
-    _table.add_unique_constraint::<String>("receipt_key", |row| &row.receipt_key);
+    _table.add_unique_constraint::<u128>("receipt_key", |row| &row.receipt_key);
 }
 
 #[doc(hidden)]

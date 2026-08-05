@@ -299,7 +299,7 @@ pub struct ClusterPolicyAssignment {
 )]
 pub struct CommandReceipt {
     #[primary_key]
-    pub receipt_key: String,
+    pub receipt_key: u128,
     pub player_id: u8,
     pub client_command_id: u64,
     pub command_name: String,
@@ -345,7 +345,7 @@ pub struct TransferOrder {
 )]
 pub struct TransferSource {
     #[primary_key]
-    pub source_key: String,
+    pub source_key: u128,
     pub order_id: u64,
     pub cell_id: u32,
     pub committed_infantry: u64,
@@ -363,7 +363,7 @@ pub struct TransferSource {
 )]
 pub struct RetreatAbandonment {
     #[primary_key]
-    pub abandonment_key: String,
+    pub abandonment_key: u128,
     pub order_id: u64,
     pub cell_id: u32,
 }
@@ -376,13 +376,30 @@ pub struct RetreatAbandonment {
 )]
 pub struct TransferDestination {
     #[primary_key]
-    pub destination_key: String,
+    pub destination_key: u128,
     pub order_id: u64,
     /// Destination for redistribution orders; stable first-front lane anchor
     /// for a sustained Push Front operation.
     pub cell_id: u32,
     pub target_infantry: u64,
     pub received_infantry: u64,
+}
+
+/// One immutable planned leg shared by every packet fragment traveling it.
+/// Sustained Push may extend the row, but ordinary packet movement updates
+/// only the compact packet metadata and never reserializes this vector.
+#[derive(Clone)]
+#[spacetimedb::table(
+    accessor = transit_route,
+    public,
+    index(accessor = route_by_order, btree(columns = [order_id]))
+)]
+pub struct TransitRoute {
+    #[primary_key]
+    #[auto_inc]
+    pub route_id: u64,
+    pub order_id: u64,
+    pub cells: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -398,15 +415,22 @@ pub struct TransferDestination {
 )]
 pub struct TransitPacket {
     #[primary_key]
-    pub packet_key: String,
+    #[auto_inc]
+    pub packet_key: u64,
     pub order_id: u64,
     pub owner_player_id: u8,
     pub origin_cell: u32,
     pub current_cell: u32,
     pub destination_cell: u32,
     pub infantry: u64,
+    /// Portion of `infantry` not yet debited from the order's source queue.
+    /// Expansion packets may aggregate several origins and consume the order
+    /// pool deterministically instead of retaining one row per origin.
+    pub pending_source_infantry: u64,
+    /// Zero identifies an expansion edge/rest packet whose one-edge route is
+    /// represented by `current_cell` and `destination_cell` directly.
+    pub route_id: u64,
     pub route_index: u32,
-    pub route: Vec<u32>,
     pub updated_step: u64,
 }
 
@@ -420,6 +444,18 @@ pub fn visible_packets(ctx: &AnonymousViewContext) -> impl Query<TransitPacket> 
         .r#where(|order| order.client_command_id.ne(0_u64))
         .right_semijoin(ctx.from.transit_packet(), |order, packet| {
             order.order_id.eq(packet.packet_by_order)
+        })
+}
+
+/// Route stream matching `visible_packets`; background policy routes stay
+/// authoritative but are not replicated to regular rendering clients.
+#[spacetimedb::view(accessor = visible_routes, public, primary_key = route_id)]
+pub fn visible_routes(ctx: &AnonymousViewContext) -> impl Query<TransitRoute> {
+    ctx.from
+        .transfer_order()
+        .r#where(|order| order.client_command_id.ne(0_u64))
+        .right_semijoin(ctx.from.transit_route(), |order, route| {
+            order.order_id.eq(route.route_by_order)
         })
 }
 

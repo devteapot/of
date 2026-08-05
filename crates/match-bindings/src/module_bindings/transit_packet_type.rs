@@ -7,15 +7,16 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct TransitPacket {
-    pub packet_key: String,
+    pub packet_key: u64,
     pub order_id: u64,
     pub owner_player_id: u8,
     pub origin_cell: u32,
     pub current_cell: u32,
     pub destination_cell: u32,
     pub infantry: u64,
+    pub pending_source_infantry: u64,
+    pub route_id: u64,
     pub route_index: u32,
-    pub route: Vec<u32>,
     pub updated_step: u64,
 }
 
@@ -27,15 +28,16 @@ impl __sdk::InModule for TransitPacket {
 ///
 /// Provides typed access to columns for query building.
 pub struct TransitPacketCols {
-    pub packet_key: __sdk::__query_builder::Col<TransitPacket, String>,
+    pub packet_key: __sdk::__query_builder::Col<TransitPacket, u64>,
     pub order_id: __sdk::__query_builder::Col<TransitPacket, u64>,
     pub owner_player_id: __sdk::__query_builder::Col<TransitPacket, u8>,
     pub origin_cell: __sdk::__query_builder::Col<TransitPacket, u32>,
     pub current_cell: __sdk::__query_builder::Col<TransitPacket, u32>,
     pub destination_cell: __sdk::__query_builder::Col<TransitPacket, u32>,
     pub infantry: __sdk::__query_builder::Col<TransitPacket, u64>,
+    pub pending_source_infantry: __sdk::__query_builder::Col<TransitPacket, u64>,
+    pub route_id: __sdk::__query_builder::Col<TransitPacket, u64>,
     pub route_index: __sdk::__query_builder::Col<TransitPacket, u32>,
-    pub route: __sdk::__query_builder::Col<TransitPacket, Vec<u32>>,
     pub updated_step: __sdk::__query_builder::Col<TransitPacket, u64>,
 }
 
@@ -50,8 +52,12 @@ impl __sdk::__query_builder::HasCols for TransitPacket {
             current_cell: __sdk::__query_builder::Col::new(table_name, "current_cell"),
             destination_cell: __sdk::__query_builder::Col::new(table_name, "destination_cell"),
             infantry: __sdk::__query_builder::Col::new(table_name, "infantry"),
+            pending_source_infantry: __sdk::__query_builder::Col::new(
+                table_name,
+                "pending_source_infantry",
+            ),
+            route_id: __sdk::__query_builder::Col::new(table_name, "route_id"),
             route_index: __sdk::__query_builder::Col::new(table_name, "route_index"),
-            route: __sdk::__query_builder::Col::new(table_name, "route"),
             updated_step: __sdk::__query_builder::Col::new(table_name, "updated_step"),
         }
     }
@@ -63,7 +69,7 @@ impl __sdk::__query_builder::HasCols for TransitPacket {
 pub struct TransitPacketIxCols {
     pub current_cell: __sdk::__query_builder::IxCol<TransitPacket, u32>,
     pub order_id: __sdk::__query_builder::IxCol<TransitPacket, u64>,
-    pub packet_key: __sdk::__query_builder::IxCol<TransitPacket, String>,
+    pub packet_key: __sdk::__query_builder::IxCol<TransitPacket, u64>,
 }
 
 impl __sdk::__query_builder::HasIxCols for TransitPacket {

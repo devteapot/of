@@ -172,7 +172,7 @@ impl<'ctx> __sdk::WithUpdate for TransferSourceTableHandle<'ctx> {
 /// but to directly chain method calls,
 /// like `ctx.db.transfer_source().source_key().find(...)`.
 pub struct TransferSourceSourceKeyUnique<'ctx> {
-    imp: __sdk::UniqueConstraintHandle<TransferSource, String>,
+    imp: __sdk::UniqueConstraintHandle<TransferSource, u128>,
     phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
@@ -180,7 +180,7 @@ impl<'ctx> TransferSourceTableHandle<'ctx> {
     /// Get a handle on the `source_key` unique index on the table `transfer_source`.
     pub fn source_key(&self) -> TransferSourceSourceKeyUnique<'ctx> {
         TransferSourceSourceKeyUnique {
-            imp: self.imp.get_unique_constraint::<String>("source_key"),
+            imp: self.imp.get_unique_constraint::<u128>("source_key"),
             phantom: std::marker::PhantomData,
         }
     }
@@ -189,7 +189,7 @@ impl<'ctx> TransferSourceTableHandle<'ctx> {
 impl<'ctx> TransferSourceSourceKeyUnique<'ctx> {
     /// Find the subscribed row whose `source_key` column value is equal to `col_val`,
     /// if such a row is present in the client cache.
-    pub fn find(&self, col_val: &String) -> Option<TransferSource> {
+    pub fn find(&self, col_val: &u128) -> Option<TransferSource> {
         self.imp.find(col_val)
     }
 }
@@ -197,7 +197,7 @@ impl<'ctx> TransferSourceSourceKeyUnique<'ctx> {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<TransferSource>("transfer_source");
-    _table.add_unique_constraint::<String>("source_key", |row| &row.source_key);
+    _table.add_unique_constraint::<u128>("source_key", |row| &row.source_key);
 }
 
 #[doc(hidden)]

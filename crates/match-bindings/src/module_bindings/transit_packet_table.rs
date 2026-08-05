@@ -172,7 +172,7 @@ impl<'ctx> __sdk::WithUpdate for TransitPacketTableHandle<'ctx> {
 /// but to directly chain method calls,
 /// like `ctx.db.transit_packet().packet_key().find(...)`.
 pub struct TransitPacketPacketKeyUnique<'ctx> {
-    imp: __sdk::UniqueConstraintHandle<TransitPacket, String>,
+    imp: __sdk::UniqueConstraintHandle<TransitPacket, u64>,
     phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
@@ -180,7 +180,7 @@ impl<'ctx> TransitPacketTableHandle<'ctx> {
     /// Get a handle on the `packet_key` unique index on the table `transit_packet`.
     pub fn packet_key(&self) -> TransitPacketPacketKeyUnique<'ctx> {
         TransitPacketPacketKeyUnique {
-            imp: self.imp.get_unique_constraint::<String>("packet_key"),
+            imp: self.imp.get_unique_constraint::<u64>("packet_key"),
             phantom: std::marker::PhantomData,
         }
     }
@@ -189,7 +189,7 @@ impl<'ctx> TransitPacketTableHandle<'ctx> {
 impl<'ctx> TransitPacketPacketKeyUnique<'ctx> {
     /// Find the subscribed row whose `packet_key` column value is equal to `col_val`,
     /// if such a row is present in the client cache.
-    pub fn find(&self, col_val: &String) -> Option<TransitPacket> {
+    pub fn find(&self, col_val: &u64) -> Option<TransitPacket> {
         self.imp.find(col_val)
     }
 }
@@ -197,7 +197,7 @@ impl<'ctx> TransitPacketPacketKeyUnique<'ctx> {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<TransitPacket>("transit_packet");
-    _table.add_unique_constraint::<String>("packet_key", |row| &row.packet_key);
+    _table.add_unique_constraint::<u64>("packet_key", |row| &row.packet_key);
 }
 
 #[doc(hidden)]

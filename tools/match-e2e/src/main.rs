@@ -23,9 +23,10 @@ use match_bindings::{
     MatchStateTableAccess, MobilizationPolicyTableAccess, OrderKind, OrderStatus,
     PlayerSlotTableAccess, ReceiptStatus, TerrainClass, TransferDestinationTableAccess,
     TransferOrder, TransferOrderTableAccess, TransferSourceTableAccess, TransitPacket,
-    TransitPacketTableAccess, cancel_orders as _, issue_attack_clusters as _,
-    issue_expand_all as _, issue_expand_clusters as _, issue_push_front as _, issue_reshape as _,
-    join_match as _, set_cluster_policy as _, set_mobilization_target as _,
+    TransitPacketTableAccess, TransitRouteTableAccess, cancel_orders as _,
+    issue_attack_clusters as _, issue_expand_all as _, issue_expand_clusters as _,
+    issue_push_front as _, issue_reshape as _, join_match as _, set_cluster_policy as _,
+    set_mobilization_target as _,
 };
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
@@ -42,6 +43,10 @@ const REQUIRED_LANE_CELLS: usize = 4;
 const OBSERVED_CAPTURE_LAYERS: usize = 2;
 const POST_CANCEL_STEPS: u64 = 2;
 const EXPANSION_AGGREGATE_ORIGIN: u32 = u32::MAX;
+
+const fn receipt_key(player_id: u8, command_id: u64) -> u128 {
+    (player_id as u128) << 64 | command_id as u128
+}
 
 #[derive(Debug, Parser)]
 #[command(about = "Exercise a live V1 match with two persistent anonymous identities")]
@@ -1555,6 +1560,20 @@ fn exercise_cluster_first_controls(
             else {
                 return Ok(None);
             };
+            let visible_packet_total = client
+                .conn
+                .db
+                .transit_packet()
+                .iter()
+                .filter(|packet| packet.order_id == order.order_id)
+                .map(|packet| packet.infantry)
+                .sum::<u64>();
+            if visible_packet_total != order.in_transit_infantry {
+                // Table callbacks from one transaction may reach the SDK
+                // cache in different turns. Wait for the coherent snapshot;
+                // a durable mismatch still times out and fails this phase.
+                return Ok(None);
+            }
             assert_cluster_action_order(
                 &client.conn,
                 &order,
@@ -1690,7 +1709,6 @@ fn exercise_cluster_first_controls(
                 .any(|packet| {
                     packet.current_cell == expand_candidate.focus_cell
                         || packet.destination_cell == expand_candidate.focus_cell
-                        || packet.route.contains(&expand_candidate.focus_cell)
                 });
             if !focus_owned && !focus_in_public_packet {
                 ensure!(
@@ -2792,7 +2810,7 @@ fn wait_for_slot(
 fn unused_command_id(conn: &DbConnection, player_id: u8, start: u64) -> Result<u64> {
     let mut candidate = start;
     loop {
-        let key = format!("{player_id}:{candidate}");
+        let key = receipt_key(player_id, candidate);
         if conn.db.command_receipt().receipt_key().find(&key).is_none() {
             return Ok(candidate);
         }
@@ -2828,7 +2846,7 @@ fn wait_for_receipt(
     timeout: Duration,
     poll: Duration,
 ) -> Result<CommandReceipt> {
-    let key = format!("{player_id}:{command_id}");
+    let key = receipt_key(player_id, command_id);
     let receipt = wait_until(
         &format!("{command_name} command receipt"),
         timeout,
@@ -2860,7 +2878,7 @@ fn wait_for_rejected_receipt(
     timeout: Duration,
     poll: Duration,
 ) -> Result<CommandReceipt> {
-    let key = format!("{player_id}:{command_id}");
+    let key = receipt_key(player_id, command_id);
     let receipt = wait_until(
         &format!("rejected {command_name} command receipt"),
         timeout,
@@ -4375,6 +4393,27 @@ fn assert_push_order(
     Ok(())
 }
 
+fn transit_packet_route(conn: &DbConnection, packet: &TransitPacket) -> Result<Vec<u32>> {
+    if packet.route_id == 0 {
+        return Ok(if packet.current_cell == packet.destination_cell {
+            vec![packet.current_cell]
+        } else {
+            vec![packet.current_cell, packet.destination_cell]
+        });
+    }
+    conn.db
+        .transit_route()
+        .route_id()
+        .find(&packet.route_id)
+        .map(|route| route.cells)
+        .with_context(|| {
+            format!(
+                "packet {} references missing route {}",
+                packet.packet_key, packet.route_id
+            )
+        })
+}
+
 fn assert_push_routes(
     conn: &DbConnection,
     candidate: &PushFrontCandidate,
@@ -4391,6 +4430,7 @@ fn assert_push_routes(
     let mut packet_total = 0_u64;
     let mut has_rear_corridor_route = false;
     for packet in packets {
+        let route = transit_packet_route(conn, packet)?;
         ensure!(
             packet.order_id == order.order_id && packet.owner_player_id == PLAYER_ONE,
             "front-push route packet belongs to another order or player"
@@ -4404,31 +4444,30 @@ fn assert_push_routes(
             "front-push packet did not retain its commanded front target"
         );
         ensure!(
-            packet.route.first() == Some(&packet.origin_cell),
+            route.first() == Some(&packet.origin_cell),
             "front-push packet route did not begin at its selected origin"
         );
         let route_index = usize::try_from(packet.route_index).context("route index overflow")?;
         ensure!(
-            packet.route.get(route_index) == Some(&packet.current_cell),
+            route.get(route_index) == Some(&packet.current_cell),
             "front-push packet current cell does not match its route index"
         );
-        let anchor_index = packet
-            .route
+        let anchor_index = route
             .iter()
             .position(|cell_id| *cell_id == candidate.lane_cells[0])
             .context("front-push route omitted its commanded front target")?;
         ensure!(
             anchor_index > 0
-                && packet.route[..anchor_index]
+                && route[..anchor_index]
                     .iter()
                     .all(|cell_id| selected.contains(cell_id)),
             "front-push packet escaped the submitted corridor before entering its lane"
         );
         ensure!(
-            packet.route.get(anchor_index - 1) == Some(&candidate.front_cell),
+            route.get(anchor_index - 1) == Some(&candidate.front_cell),
             "front-push packet did not leave through the selected front cell"
         );
-        let lane_suffix = &packet.route[anchor_index..];
+        let lane_suffix = &route[anchor_index..];
         ensure!(
             lane_suffix.len() <= candidate.lane_cells.len()
                 && lane_suffix
@@ -4437,7 +4476,7 @@ fn assert_push_routes(
                     .all(|(actual, expected)| actual == expected),
             "front-push packet route did not extend along the submitted axial ray"
         );
-        for cells in packet.route.windows(2) {
+        for cells in route.windows(2) {
             let from = terrain_by_id
                 .get(&cells[0])
                 .with_context(|| format!("route terrain {} disappeared", cells[0]))?;
@@ -4449,7 +4488,7 @@ fn assert_push_routes(
                 "front-push route contains a non-adjacent step"
             );
         }
-        for cells in packet.route[anchor_index - 1..].windows(2) {
+        for cells in route[anchor_index - 1..].windows(2) {
             let from = terrain_by_id
                 .get(&cells[0])
                 .with_context(|| format!("route terrain {} disappeared", cells[0]))?;
@@ -4565,11 +4604,6 @@ fn assert_expand_persistence(
     order: &TransferOrder,
 ) -> Result<()> {
     assert_expand_sources(conn, candidate, order.order_id, false)?;
-    let selected = candidate
-        .selected_cells
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
     ensure!(
         !conn
             .db
@@ -4590,20 +4624,21 @@ fn assert_expand_persistence(
         "active all-front order has no transit packets"
     );
     let mut packet_total = 0_u64;
-    let mut queued_by_source = HashMap::<u32, u64>::new();
+    let mut pending_source_total = 0_u64;
     for packet in packets {
+        let route = transit_packet_route(conn, &packet)?;
         ensure!(
             packet.owner_player_id == PLAYER_ONE,
             "all-front packet belongs to another player"
         );
         ensure!(
-            packet.route_index == 0 && packet.route.first() == Some(&packet.current_cell),
+            packet.route_index == 0 && route.first() == Some(&packet.current_cell),
             "all-front packet is not positioned at the start of its local route"
         );
-        let resting = packet.route.as_slice() == [packet.current_cell]
+        let resting = route.as_slice() == [packet.current_cell]
             && packet.destination_cell == packet.current_cell;
-        let crossing = packet.route.len() == 2
-            && packet.route[1] == packet.destination_cell
+        let crossing = route.len() == 2
+            && route[1] == packet.destination_cell
             && candidate
                 .children
                 .get(&packet.current_cell)
@@ -4617,13 +4652,13 @@ fn assert_expand_persistence(
                 || candidate.outside_depths.contains_key(&packet.current_cell),
             "all-front packet rests outside its accepted seed/wave topology"
         );
-        if packet.origin_cell != EXPANSION_AGGREGATE_ORIGIN {
-            ensure!(
-                selected.contains(&packet.origin_cell) && packet.current_cell == packet.origin_cell,
-                "unmerged all-front packet left or misidentified its selected source"
-            );
-            *queued_by_source.entry(packet.origin_cell).or_default() += packet.infantry;
-        }
+        ensure!(
+            packet.origin_cell == EXPANSION_AGGREGATE_ORIGIN,
+            "all-front packet retained per-origin accounting"
+        );
+        pending_source_total = pending_source_total
+            .checked_add(packet.pending_source_infantry)
+            .context("all-front pending-source accounting overflow")?;
         packet_total = packet_total
             .checked_add(packet.infantry)
             .context("all-front packet accounting overflow")?;
@@ -4633,20 +4668,17 @@ fn assert_expand_persistence(
         "all-front packet total {packet_total} differs from order in-transit infantry {}",
         order.in_transit_infantry
     );
-    for source in conn
+    let queued_source_total = conn
         .db
         .transfer_source()
         .iter()
         .filter(|source| source.order_id == order.order_id)
-    {
-        ensure!(
-            source.queued_infantry == queued_by_source.get(&source.cell_id).copied().unwrap_or(0),
-            "all-front source {} reports {} queued but has {} source-backed packet strength",
-            source.cell_id,
-            source.queued_infantry,
-            queued_by_source.get(&source.cell_id).copied().unwrap_or(0)
-        );
-    }
+        .map(|source| source.queued_infantry)
+        .sum::<u64>();
+    ensure!(
+        queued_source_total == pending_source_total,
+        "all-front sources report {queued_source_total} queued but packets retain {pending_source_total} pending"
+    );
     Ok(())
 }
 
@@ -4674,7 +4706,7 @@ fn stable_action_order_snapshot(
             .iter()
             .filter(|packet| packet.order_id == order.order_id)
             .collect::<Vec<_>>();
-        packets.sort_unstable_by(|left, right| left.packet_key.cmp(&right.packet_key));
+        packets.sort_unstable_by_key(|packet| packet.packet_key);
         let step_after = conn
             .db
             .match_state()
@@ -4916,6 +4948,7 @@ fn assert_attack_stays_in_target_mask(
     let mut packet_total = 0_u64;
     let mut mask_activity = false;
     for packet in packets {
+        let route = transit_packet_route(conn, &packet)?;
         packet_total = packet_total
             .checked_add(packet.infantry)
             .context("masked cluster-attack packet strength overflow")?;
@@ -4928,7 +4961,7 @@ fn assert_attack_stays_in_target_mask(
         );
         for cell_id in std::iter::once(packet.current_cell)
             .chain(std::iter::once(packet.destination_cell))
-            .chain(packet.route.iter().copied())
+            .chain(route.iter().copied())
         {
             ensure!(
                 source_component.contains(&cell_id) || target_component.contains(&cell_id),

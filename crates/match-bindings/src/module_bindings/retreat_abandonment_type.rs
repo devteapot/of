@@ -7,7 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct RetreatAbandonment {
-    pub abandonment_key: String,
+    pub abandonment_key: u128,
     pub order_id: u64,
     pub cell_id: u32,
 }
@@ -20,7 +20,7 @@ impl __sdk::InModule for RetreatAbandonment {
 ///
 /// Provides typed access to columns for query building.
 pub struct RetreatAbandonmentCols {
-    pub abandonment_key: __sdk::__query_builder::Col<RetreatAbandonment, String>,
+    pub abandonment_key: __sdk::__query_builder::Col<RetreatAbandonment, u128>,
     pub order_id: __sdk::__query_builder::Col<RetreatAbandonment, u64>,
     pub cell_id: __sdk::__query_builder::Col<RetreatAbandonment, u32>,
 }
@@ -40,7 +40,7 @@ impl __sdk::__query_builder::HasCols for RetreatAbandonment {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct RetreatAbandonmentIxCols {
-    pub abandonment_key: __sdk::__query_builder::IxCol<RetreatAbandonment, String>,
+    pub abandonment_key: __sdk::__query_builder::IxCol<RetreatAbandonment, u128>,
     pub order_id: __sdk::__query_builder::IxCol<RetreatAbandonment, u64>,
 }
 

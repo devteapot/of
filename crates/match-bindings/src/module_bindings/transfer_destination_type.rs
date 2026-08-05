@@ -7,7 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct TransferDestination {
-    pub destination_key: String,
+    pub destination_key: u128,
     pub order_id: u64,
     pub cell_id: u32,
     pub target_infantry: u64,
@@ -22,7 +22,7 @@ impl __sdk::InModule for TransferDestination {
 ///
 /// Provides typed access to columns for query building.
 pub struct TransferDestinationCols {
-    pub destination_key: __sdk::__query_builder::Col<TransferDestination, String>,
+    pub destination_key: __sdk::__query_builder::Col<TransferDestination, u128>,
     pub order_id: __sdk::__query_builder::Col<TransferDestination, u64>,
     pub cell_id: __sdk::__query_builder::Col<TransferDestination, u32>,
     pub target_infantry: __sdk::__query_builder::Col<TransferDestination, u64>,
@@ -46,7 +46,7 @@ impl __sdk::__query_builder::HasCols for TransferDestination {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct TransferDestinationIxCols {
-    pub destination_key: __sdk::__query_builder::IxCol<TransferDestination, String>,
+    pub destination_key: __sdk::__query_builder::IxCol<TransferDestination, u128>,
     pub order_id: __sdk::__query_builder::IxCol<TransferDestination, u64>,
 }
 

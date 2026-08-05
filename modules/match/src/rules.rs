@@ -65,8 +65,12 @@ pub fn require_running_player(ctx: &ReducerContext) -> Result<u8, String> {
         .ok_or_else(|| "the calling identity does not own a player slot".into())
 }
 
-pub fn command_key(player_id: u8, client_command_id: u64) -> String {
-    format!("{player_id}:{client_command_id}")
+pub const fn command_key(player_id: u8, client_command_id: u64) -> u128 {
+    (player_id as u128) << 64 | client_command_id as u128
+}
+
+pub const fn order_cell_key(order_id: u64, cell_id: u32) -> u128 {
+    (order_id as u128) << 32 | cell_id as u128
 }
 
 pub fn command_was_seen(ctx: &ReducerContext, player_id: u8, client_command_id: u64) -> bool {
@@ -246,14 +250,4 @@ pub fn allocated_infantry_at_cell(ctx: &ReducerContext, owner_player_id: u8, cel
         .filter(|packet| packet.owner_player_id == owner_player_id)
         .map(|packet| packet.infantry)
         .sum()
-}
-
-pub fn packet_key(
-    order_id: u64,
-    origin_cell: u32,
-    destination_cell: u32,
-    current_cell: u32,
-    route_index: u32,
-) -> String {
-    format!("{order_id}:{origin_cell}:{destination_cell}:{current_cell}:{route_index}")
 }

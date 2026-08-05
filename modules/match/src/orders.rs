@@ -14,19 +14,19 @@ use spacetimedb::{ReducerContext, Table, log_stopwatch::LogStopwatch};
 
 use crate::rules::{
     MAX_SELECTION_CELLS, allocated_infantry_at_cell, cell_state, command_was_seen, config,
-    coordinate_for_cell, core_cell, edge_runtime_limits, packet_key, require_running_player, state,
-    terrain, write_receipt,
+    coordinate_for_cell, core_cell, edge_runtime_limits, order_cell_key, require_running_player,
+    state, terrain, write_receipt,
 };
 use crate::schema::{
     CellState, CellTerrain, ClusterPolicyAssignment, ClusterPolicyKind, EXPANSION_AGGREGATE_ORIGIN,
     ExpansionWave, NEUTRAL_PLAYER, OrderKind, OrderStatus, PolicyReplanState, PolicyTopologyCache,
     ReceiptStatus, RetreatAbandonment, TerrainClass, TransferDestination, TransferOrder,
-    TransferSource, TransitPacket,
+    TransferSource, TransitPacket, TransitRoute,
 };
 use crate::schema::{
     cell_state as _, cell_terrain as _, cluster_policy_assignment, expansion_wave, match_state,
     mobilization_policy, policy_replan_state, policy_topology_cache, retreat_abandonment,
-    transfer_destination, transfer_order, transfer_source, transit_packet,
+    transfer_destination, transfer_order, transfer_source, transit_packet, transit_route,
 };
 
 #[derive(Clone)]
@@ -4101,23 +4101,28 @@ fn persist_prepared_order(
     });
 
     for leg in legs {
-        let key = packet_key(order.order_id, leg.source, leg.destination, leg.source, 0);
+        let route = ctx.db.transit_route().insert(TransitRoute {
+            route_id: 0,
+            order_id: order.order_id,
+            cells: leg.route,
+        });
         ctx.db.transit_packet().insert(TransitPacket {
-            packet_key: key,
+            packet_key: 0,
             order_id: order.order_id,
             owner_player_id: player_id,
             origin_cell: leg.source,
             current_cell: leg.source,
             destination_cell: leg.destination,
             infantry: leg.amount,
+            pending_source_infantry: leg.amount,
+            route_id: route.route_id,
             route_index: 0,
-            route: leg.route,
             updated_step: logical_step,
         });
     }
     for (cell_id, infantry) in source_totals {
         ctx.db.transfer_source().insert(TransferSource {
-            source_key: format!("{}:{cell_id}", order.order_id),
+            source_key: order_cell_key(order.order_id, cell_id),
             order_id: order.order_id,
             cell_id,
             committed_infantry: infantry,
@@ -4126,7 +4131,7 @@ fn persist_prepared_order(
     }
     for (cell_id, infantry) in destination_totals {
         ctx.db.transfer_destination().insert(TransferDestination {
-            destination_key: format!("{}:{cell_id}", order.order_id),
+            destination_key: order_cell_key(order.order_id, cell_id),
             order_id: order.order_id,
             cell_id,
             target_infantry: infantry,
@@ -4139,7 +4144,7 @@ fn persist_prepared_order(
 fn persist_retreat_abandonments(ctx: &ReducerContext, order_id: u64, abandonments: &BTreeSet<u32>) {
     for &cell_id in abandonments {
         ctx.db.retreat_abandonment().insert(RetreatAbandonment {
-            abandonment_key: format!("{order_id}:{cell_id}"),
+            abandonment_key: order_cell_key(order_id, cell_id),
             order_id,
             cell_id,
         });
@@ -4189,7 +4194,7 @@ fn persist_expand_order(
     for &cell_id in &plan.selected_cells {
         let infantry = plan.commitments.get(&cell_id).copied().unwrap_or(0);
         ctx.db.transfer_source().insert(TransferSource {
-            source_key: format!("{}:{cell_id}", order.order_id),
+            source_key: order_cell_key(order.order_id, cell_id),
             order_id: order.order_id,
             cell_id,
             committed_infantry: infantry,
@@ -4198,17 +4203,17 @@ fn persist_expand_order(
         if infantry == 0 {
             continue;
         }
-        let key = packet_key(order.order_id, cell_id, cell_id, cell_id, 0);
         ctx.db.transit_packet().insert(TransitPacket {
-            packet_key: key,
+            packet_key: 0,
             order_id: order.order_id,
             owner_player_id: player_id,
-            origin_cell: cell_id,
+            origin_cell: EXPANSION_AGGREGATE_ORIGIN,
             current_cell: cell_id,
             destination_cell: cell_id,
             infantry,
+            pending_source_infantry: infantry,
+            route_id: 0,
             route_index: 0,
-            route: vec![cell_id],
             updated_step: logical_step,
         });
     }
@@ -4310,7 +4315,17 @@ fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<()
         ctx.db
             .transit_packet()
             .packet_key()
-            .delete(&packet.packet_key);
+            .delete(packet.packet_key);
+    }
+    let route_ids = ctx
+        .db
+        .transit_route()
+        .route_by_order()
+        .filter(order_id)
+        .map(|route| route.route_id)
+        .collect::<Vec<_>>();
+    for route_id in route_ids {
+        ctx.db.transit_route().route_id().delete(route_id);
     }
     order.status = OrderStatus::Cancelled;
     order.in_transit_infantry = 0;
@@ -4325,7 +4340,7 @@ fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<()
         .map(|source| source.source_key)
         .collect();
     for source_key in source_keys {
-        if let Some(mut source) = ctx.db.transfer_source().source_key().find(&source_key) {
+        if let Some(mut source) = ctx.db.transfer_source().source_key().find(source_key) {
             source.queued_infantry = 0;
             ctx.db.transfer_source().source_key().update(source);
         }
@@ -4339,7 +4354,7 @@ fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<()
         .map(|abandonment| abandonment.abandonment_key)
         .collect::<Vec<_>>();
     for key in abandonment_keys {
-        ctx.db.retreat_abandonment().abandonment_key().delete(&key);
+        ctx.db.retreat_abandonment().abandonment_key().delete(key);
     }
     Ok(())
 }
