@@ -9,6 +9,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct TransferDestination {
     pub destination_key: u128,
     pub order_id: u64,
+    pub player_id: u16,
     pub cell_id: u32,
     pub target_infantry: u64,
     pub received_infantry: u64,
@@ -24,6 +25,7 @@ impl __sdk::InModule for TransferDestination {
 pub struct TransferDestinationCols {
     pub destination_key: __sdk::__query_builder::Col<TransferDestination, u128>,
     pub order_id: __sdk::__query_builder::Col<TransferDestination, u64>,
+    pub player_id: __sdk::__query_builder::Col<TransferDestination, u16>,
     pub cell_id: __sdk::__query_builder::Col<TransferDestination, u32>,
     pub target_infantry: __sdk::__query_builder::Col<TransferDestination, u64>,
     pub received_infantry: __sdk::__query_builder::Col<TransferDestination, u64>,
@@ -35,6 +37,7 @@ impl __sdk::__query_builder::HasCols for TransferDestination {
         TransferDestinationCols {
             destination_key: __sdk::__query_builder::Col::new(table_name, "destination_key"),
             order_id: __sdk::__query_builder::Col::new(table_name, "order_id"),
+            player_id: __sdk::__query_builder::Col::new(table_name, "player_id"),
             cell_id: __sdk::__query_builder::Col::new(table_name, "cell_id"),
             target_infantry: __sdk::__query_builder::Col::new(table_name, "target_infantry"),
             received_infantry: __sdk::__query_builder::Col::new(table_name, "received_infantry"),
@@ -48,6 +51,7 @@ impl __sdk::__query_builder::HasCols for TransferDestination {
 pub struct TransferDestinationIxCols {
     pub destination_key: __sdk::__query_builder::IxCol<TransferDestination, u128>,
     pub order_id: __sdk::__query_builder::IxCol<TransferDestination, u64>,
+    pub player_id: __sdk::__query_builder::IxCol<TransferDestination, u16>,
 }
 
 impl __sdk::__query_builder::HasIxCols for TransferDestination {
@@ -56,6 +60,7 @@ impl __sdk::__query_builder::HasIxCols for TransferDestination {
         TransferDestinationIxCols {
             destination_key: __sdk::__query_builder::IxCol::new(table_name, "destination_key"),
             order_id: __sdk::__query_builder::IxCol::new(table_name, "order_id"),
+            player_id: __sdk::__query_builder::IxCol::new(table_name, "player_id"),
         }
     }
 }

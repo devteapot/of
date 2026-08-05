@@ -8,8 +8,8 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub struct CombatFront {
     pub front_key: String,
-    pub attacker_player_id: u8,
-    pub defender_player_id: u8,
+    pub attacker_player_id: u16,
+    pub defender_player_id: u16,
     pub from_cell: u32,
     pub to_cell: u32,
     pub queued_infantry: u64,
@@ -31,8 +31,8 @@ impl __sdk::InModule for CombatFront {
 /// Provides typed access to columns for query building.
 pub struct CombatFrontCols {
     pub front_key: __sdk::__query_builder::Col<CombatFront, String>,
-    pub attacker_player_id: __sdk::__query_builder::Col<CombatFront, u8>,
-    pub defender_player_id: __sdk::__query_builder::Col<CombatFront, u8>,
+    pub attacker_player_id: __sdk::__query_builder::Col<CombatFront, u16>,
+    pub defender_player_id: __sdk::__query_builder::Col<CombatFront, u16>,
     pub from_cell: __sdk::__query_builder::Col<CombatFront, u32>,
     pub to_cell: __sdk::__query_builder::Col<CombatFront, u32>,
     pub queued_infantry: __sdk::__query_builder::Col<CombatFront, u64>,
@@ -76,6 +76,8 @@ impl __sdk::__query_builder::HasCols for CombatFront {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct CombatFrontIxCols {
+    pub attacker_player_id: __sdk::__query_builder::IxCol<CombatFront, u16>,
+    pub defender_player_id: __sdk::__query_builder::IxCol<CombatFront, u16>,
     pub front_key: __sdk::__query_builder::IxCol<CombatFront, String>,
     pub to_cell: __sdk::__query_builder::IxCol<CombatFront, u32>,
 }
@@ -84,6 +86,14 @@ impl __sdk::__query_builder::HasIxCols for CombatFront {
     type IxCols = CombatFrontIxCols;
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         CombatFrontIxCols {
+            attacker_player_id: __sdk::__query_builder::IxCol::new(
+                table_name,
+                "attacker_player_id",
+            ),
+            defender_player_id: __sdk::__query_builder::IxCol::new(
+                table_name,
+                "defender_player_id",
+            ),
             front_key: __sdk::__query_builder::IxCol::new(table_name, "front_key"),
             to_cell: __sdk::__query_builder::IxCol::new(table_name, "to_cell"),
         }

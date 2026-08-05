@@ -152,9 +152,9 @@ Air power could provide reconnaissance, transport, interception, or time-bounded
 
 ## Diplomacy
 
-Alliances, access agreements, shared vision, trade, ceasefires, and betrayal could support matches with more than two players. Diplomacy should have explicit rules for troops in allied territory, shared infrastructure, victory, and what happens when a relationship changes.
+Alliances, access agreements, shared vision, trade, ceasefires, and betrayal could add relationships to the existing multiplayer matches. Diplomacy should have explicit rules for troops in allied territory, shared infrastructure, victory, and what happens when a relationship changes.
 
-**Depends on:** multiplayer beyond the initial two-player session, player relationships separate from ownership, robust disconnect and surrender handling, and victory modes designed to resist kingmaking or indefinite stalemates.
+**Depends on:** player relationships separate from ownership, robust disconnect and surrender handling, and victory modes designed to resist kingmaking or indefinite stalemates.
 
 ## Objectives, modes, and match clocks
 

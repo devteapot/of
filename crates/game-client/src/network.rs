@@ -594,13 +594,11 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
     }
 
     if view.authoritative_control.is_none() {
-        let one = view.conquest_percent(1);
-        let two = view.conquest_percent(2);
         let target = view.conquest_threshold_bps as f32 / 100.0;
-        if one >= target {
-            view.phase = MatchPhase::Victory(1);
-        } else if two >= target {
-            view.phase = MatchPhase::Victory(2);
+        if let Some(winner) = (1..=u32::from(view.player_count))
+            .find(|player| view.conquest_percent(*player) >= target)
+        {
+            view.phase = MatchPhase::Victory(winner);
         }
     }
 }

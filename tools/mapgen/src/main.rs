@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use worldgen::{MapPreset, generate, generate_preset, validate};
+use worldgen::{MapPreset, generate_for_players, generate_preset_for_players, validate};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PresetArg {
@@ -30,6 +30,10 @@ struct Arguments {
     #[arg(long)]
     seed: Option<u64>,
 
+    /// Number of players to seed (2 through 500).
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(2..=500))]
+    players: u16,
+
     #[arg(long)]
     output: Option<PathBuf>,
 }
@@ -39,9 +43,15 @@ fn main() -> Result<()> {
     let preset = MapPreset::from(arguments.preset);
     let generated = if let Some(seed) = arguments.seed {
         let (width, height) = preset.dimensions();
-        generate(format!("{}-{seed}", preset.name()), width, height, seed)
+        generate_for_players(
+            format!("{}-{seed}", preset.name()),
+            width,
+            height,
+            seed,
+            arguments.players,
+        )
     } else {
-        generate_preset(preset)
+        generate_preset_for_players(preset, arguments.players)
     };
     let report = validate(&generated).map_err(anyhow::Error::msg)?;
 
@@ -60,10 +70,11 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "{}: {}x{}, {} capturable / {} ground, {} slopes, {} cliffs, hash {:016x}",
+        "{}: {}x{}, {} players, {} capturable / {} ground, {} slopes, {} cliffs, hash {:016x}",
         generated.manifest.name,
         generated.manifest.width,
         generated.manifest.height,
+        generated.manifest.player_count,
         report.capturable_cells,
         report.ground_cells,
         report.slopes,

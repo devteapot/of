@@ -755,21 +755,17 @@ fn update_hud(
     slider: Single<(Entity, &SliderValue), With<MobilizationSlider>>,
     mut selection_totals: Local<SelectionTotalsCache>,
 ) {
-    let p1 = view.conquest_percent(1);
-    let p2 = view.conquest_percent(2);
+    let player_status = player_status_summary(&view);
     {
         let mut top = texts.p0();
         set_text(
             &mut top,
             format!(
-                "LOCAL P{}  /  AUTH {:<22}     P1 {:<15}     P1  {:>5.1}%     {}     P2  {:>5.1}%     P2 {:<15}",
+                "LOCAL P{}  /  AUTH {}     {}     {}",
                 view.local_player,
                 view.authority.label(),
-                view.connection[0].label(),
-                p1,
                 view.phase.label(view.conquest_threshold_bps),
-                p2,
-                view.connection[1].label(),
+                player_status,
             ),
         );
     }
@@ -994,6 +990,65 @@ fn update_slider_visuals(
     };
 }
 
+fn player_status_summary(view: &MatchView) -> String {
+    if view.player_count <= 8 {
+        return (1..=view.player_count)
+            .map(|player_id| {
+                let connection = view
+                    .connection
+                    .get(usize::from(player_id - 1))
+                    .copied()
+                    .unwrap_or(crate::model::ConnectionState::Syncing);
+                format!(
+                    "P{player_id} {:>5.1}% {}",
+                    view.conquest_percent(u32::from(player_id)),
+                    connection.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+    }
+
+    let mut connected = 0_u16;
+    let mut open = 0_u16;
+    for state in &view.connection {
+        match state {
+            crate::model::ConnectionState::Open => open += 1,
+            crate::model::ConnectionState::Connected => connected += 1,
+            crate::model::ConnectionState::ClaimedOffline
+            | crate::model::ConnectionState::Syncing
+            | crate::model::ConnectionState::Offline => {}
+        }
+    }
+    // Prefer the authoritative MatchState counter; Syncing seats are not claims.
+    let claimed = view.claimed_players;
+    let leader = (1..=view.player_count)
+        .max_by(|left, right| {
+            view.conquest_percent(u32::from(*left))
+                .partial_cmp(&view.conquest_percent(u32::from(*right)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(left.cmp(right))
+        })
+        .unwrap_or(1);
+    let local_connection = view
+        .connection
+        .get(usize::from(view.local_player.saturating_sub(1) as u16))
+        .copied()
+        .unwrap_or(crate::model::ConnectionState::Syncing);
+    format!(
+        "{}p cfg · {} claimed · {} conn · {} open · lead P{} {:>5.1}% · local P{} {} {:>5.1}%",
+        view.player_count,
+        claimed,
+        connected,
+        open,
+        leader,
+        view.conquest_percent(u32::from(leader)),
+        view.local_player,
+        local_connection.label(),
+        view.conquest_percent(view.local_player),
+    )
+}
+
 fn set_text(text: &mut Text, value: String) {
     if **text != value {
         **text = value;
@@ -1185,6 +1240,28 @@ mod tests {
         }
         assert!(!FIELD_MANUAL.contains("P  PUSH FRONT"));
         assert!(!FIELD_MANUAL.contains("STOP / RETASK"));
+    }
+
+    #[test]
+    fn high_scale_status_summary_stays_compact() {
+        let mut view = MatchView::connecting(500);
+        view.player_count = 500;
+        view.claimed_players = 2;
+        view.connection = vec![crate::model::ConnectionState::Open; 500];
+        view.connection[0] = crate::model::ConnectionState::Connected;
+        view.connection[1] = crate::model::ConnectionState::ClaimedOffline;
+        // Syncing must not inflate the claimed counter.
+        view.connection[2] = crate::model::ConnectionState::Syncing;
+        view.local_player = 1;
+        view.authoritative_control =
+            Some(std::collections::BTreeMap::from([(1, 10), (2, 40), (9, 5)]));
+        view.capturable_cells = 100;
+        let summary = player_status_summary(&view);
+        assert!(summary.contains("500p cfg"), "{summary}");
+        assert!(summary.contains("2 claimed"), "{summary}");
+        assert!(summary.contains("lead P2"), "{summary}");
+        assert!(summary.contains("local P1"), "{summary}");
+        assert!(!summary.contains("P500 "), "{summary}");
     }
 
     #[test]

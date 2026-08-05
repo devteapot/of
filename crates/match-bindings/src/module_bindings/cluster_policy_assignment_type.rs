@@ -10,7 +10,7 @@ use super::cluster_policy_kind_type::ClusterPolicyKind;
 #[sats(crate = __lib)]
 pub struct ClusterPolicyAssignment {
     pub cell_id: u32,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub kind: ClusterPolicyKind,
     pub orientation_q: i32,
     pub orientation_r: i32,
@@ -26,7 +26,7 @@ impl __sdk::InModule for ClusterPolicyAssignment {
 /// Provides typed access to columns for query building.
 pub struct ClusterPolicyAssignmentCols {
     pub cell_id: __sdk::__query_builder::Col<ClusterPolicyAssignment, u32>,
-    pub owner_player_id: __sdk::__query_builder::Col<ClusterPolicyAssignment, u8>,
+    pub owner_player_id: __sdk::__query_builder::Col<ClusterPolicyAssignment, u16>,
     pub kind: __sdk::__query_builder::Col<ClusterPolicyAssignment, ClusterPolicyKind>,
     pub orientation_q: __sdk::__query_builder::Col<ClusterPolicyAssignment, i32>,
     pub orientation_r: __sdk::__query_builder::Col<ClusterPolicyAssignment, i32>,
@@ -52,7 +52,7 @@ impl __sdk::__query_builder::HasCols for ClusterPolicyAssignment {
 /// Provides typed access to indexed columns for query building.
 pub struct ClusterPolicyAssignmentIxCols {
     pub cell_id: __sdk::__query_builder::IxCol<ClusterPolicyAssignment, u32>,
-    pub owner_player_id: __sdk::__query_builder::IxCol<ClusterPolicyAssignment, u8>,
+    pub owner_player_id: __sdk::__query_builder::IxCol<ClusterPolicyAssignment, u16>,
 }
 
 impl __sdk::__query_builder::HasIxCols for ClusterPolicyAssignment {

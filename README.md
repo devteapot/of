@@ -1,6 +1,6 @@
 # Hex RTS V1
 
-A native two-player RTS prototype about moving conserved aggregate forces across
+A native 2–500 player RTS prototype about moving conserved aggregate forces across
 a stepped 2.5D hex world. The primary interaction is cluster-first: select one
 or more complete owned traversable clusters, then click neutral ground to expand
 their full perimeters toward that focus or click complete enemy clusters to
@@ -15,7 +15,7 @@ formation-policy loop. The exact control contract lives in
 
 ## What V1 includes
 
-- Two human players in one authoritative match; no bots or NPC factions.
+- Two to 500 human players in one authoritative match (default two), with contiguous u16 IDs starting at 1 and neutral ownership encoded as 0; no bots or NPC factions.
 - Conquest victory at 80% of a fixed capturable-land denominator.
 - Deterministic 64×64, 128×128, and 192×192 stepped-island map presets.
 - Per-hex civilians, infantry, civilian capacity, and military capacity.
@@ -76,7 +76,7 @@ applies that initial state to both clients). Release builds expose neither the
 key nor the argument. This changes only flow overlays, never policy execution or
 troop accounting.
 
-## Local two-player match
+## Local multiplayer match
 
 Use separate terminals from the repository root.
 
@@ -101,16 +101,26 @@ Use separate terminals from the repository root.
    changes the persisted schema and reducer surface, so an older local database must be
    recreated with the fresh command above.
 
-3. Before either player joins, optionally choose a map preset. The development
-   map is already the default:
+3. Before any player joins, optionally choose both map and player scale. The
+   default is `dev64` with two players:
+
+   ```bash
+   spacetime call --server local of-match-dev configure_match '{"playtest128":{}}' 4
+   ```
+
+   Player counts from 2 through 500 are supported. Counts above eight use one-cell high-scale spawns, a compact HUD summary, and selective local tactical subscriptions. Other presets are `dev64` and
+   `validation192`. Lobby configuration is one-shot: the first successful
+   `configure_match` or `configure_map` locks it against further regeneration
+   without claiming a player slot. Every configured slot remains open for a
+   normal `join_match` call. The compatibility reducer `configure_map` changes
+   only the preset while retaining the currently configured player count:
 
    ```bash
    spacetime call --server local of-match-dev configure_map '{"playtest128":{}}'
    ```
 
-   Other values are `dev64` and `validation192`.
-
-4. Start player one and player two with distinct persistent profiles:
+4. Start one client per configured slot with distinct persistent profiles. For
+   the default two-player match:
 
    ```bash
    OF_PLAYER=1 OF_NAME="Player One" OF_PROFILE=player-one \
@@ -122,7 +132,8 @@ Use separate terminals from the repository root.
      ./scripts/run-client.sh
    ```
 
-The match begins when both slots are claimed. Profile tokens are stored below
+The match begins when every configured slot is claimed. Use `OF_PLAYER=3`
+through `OF_PLAYER=8` for larger matches. Profile tokens are stored below
 the ignored `.spacetime-data/` directory; reuse the same profile to reclaim a
 slot after reconnecting. If a different identity tries to enter a fully claimed
 match, the client remains an unbound observer and reports the exact slot error;
@@ -265,6 +276,30 @@ multi-front attack progression, Share-once accounting, policy inheritance, and
 policy exclusion of explicit action packets, atomic maintenance yield/resume,
 and Stop's exclusion of background maintenance.
 
+Generate inspectable maps at a chosen player scale with, for example,
+`cargo run -p mapgen -- --preset playtest --players 8`. For a short live scaling
+profile, freshly publish an isolated database and run the distributed-capable
+`match-perf` harness (it never overwrites an existing run directory):
+
+```bash
+spacetime publish --server local --module-path modules/match \
+  --delete-data=always --yes of-match-perf
+cargo run -p match-perf -- run-local --database of-match-perf --preset playtest \
+  --players 4 --shard-size 2 --expand-steps 20 --policy-steps 20 --attack-steps 0
+```
+
+`run-local` spawns one coordinator telemetry observer plus worker process shards.
+`coordinator` and `worker` can also run on different hosts. Outputs land in a new
+`match-perf-runs/…` directory: `timeline.csv`, long-form `players.csv`, per-shard
+`worker-*.jsonl`, `metadata.json`, and `summary.json`. Prefer logical-step phase
+durations for distributed synchronization; wall-second aliases remain available.
+Required expansion/policy commands fail the run if rejected; an attack phase also
+fails unless each player has a real adjacent owned/enemy front. Do not point the
+profiler at an in-progress database: the coordinator calls one-shot
+`configure_match` before workers join. See [Performance profiling](docs/performance.md)
+for multi-host usage, the destructive matrix script, OS connection limits at 500
+clients, and the authority caveat (client load is distributed; simulation is not).
+
 ## Repository map
 
 - `crates/hex-core` — deterministic coordinates, traversal, routing, branching,
@@ -275,11 +310,13 @@ and Stop's exclusion of background maintenance.
 - `modules/match` — authoritative SpacetimeDB schema, reducers, and scheduler.
 - `tools/mapgen` — curated map generator/validator CLI.
 - `tools/match-e2e` — real-server two-client acceptance smoke test.
+- `tools/match-perf` — distributed-capable live-match load driver and step-rate profiler.
 - `docs` — the game design, architecture, UI direction, implementation notes,
-  and deliberately deferred ideas.
+  performance profiling, and deliberately deferred ideas.
 
 Start with [the V1 game design](docs/v1-game-design.md) and
-[the implementation guide](docs/implementation.md). Deferred mechanics such as
+[the implementation guide](docs/implementation.md). Live scale measurement is
+covered in [Performance profiling](docs/performance.md). Deferred mechanics such as
 roads, cities and economy, fog of war, armor, naval/air play, mutable terrain,
 diplomacy, and demobilization are preserved in
 [the future backlog](docs/future-ideas.md).

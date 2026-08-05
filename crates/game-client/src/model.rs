@@ -8,6 +8,17 @@ use crate::geometry::chunk_of;
 pub const PLAYER_ONE: u32 = 1;
 pub const PLAYER_TWO: u32 = 2;
 
+const OFFLINE_PLAYER_ANCHORS: [Axial; 8] = [
+    Axial::new(-14, 0),
+    Axial::new(-10, -8),
+    Axial::new(0, -14),
+    Axial::new(10, -10),
+    Axial::new(14, 0),
+    Axial::new(10, 8),
+    Axial::new(0, 14),
+    Axial::new(-10, 10),
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum ConnectionState {
@@ -294,8 +305,12 @@ pub struct MatchView {
     /// from cell values so HUD totals and command previews stay cached.
     pub contest_revision: u64,
     pub local_player: u32,
+    pub player_count: u16,
+    /// Authoritative `MatchState.claimed_players` when online. High-scale HUD
+    /// uses this instead of treating Syncing seats as claimed.
+    pub claimed_players: u16,
     pub authority: AuthorityState,
-    pub connection: [ConnectionState; 2],
+    pub connection: Vec<ConnectionState>,
     pub phase: MatchPhase,
     pub conquest_threshold_bps: u32,
     pub max_elevation_step: u16,
@@ -305,7 +320,7 @@ pub struct MatchView {
     /// so the sparse negative set keeps those callers lightweight while online
     /// snapshots retain the full terrain distinction needed by command previews.
     pub non_capturable_cells: BTreeSet<Axial>,
-    pub authoritative_control: Option<[u64; 2]>,
+    pub authoritative_control: Option<BTreeMap<u32, u64>>,
     pub capturable_cells: u64,
     pub required_control: u64,
     pub logical_step: u64,
@@ -348,7 +363,8 @@ impl MatchView {
         })
     }
 
-    pub fn connecting(preferred_player: u8) -> Self {
+    pub fn connecting(preferred_player: u16) -> Self {
+        let player_count = preferred_player.max(2);
         Self {
             cells: BTreeMap::new(),
             cells_by_chunk: BTreeMap::new(),
@@ -358,8 +374,10 @@ impl MatchView {
             ownership_revision: 0,
             contest_revision: 0,
             local_player: u32::from(preferred_player),
+            player_count,
+            claimed_players: 0,
             authority: AuthorityState::Connecting,
-            connection: [ConnectionState::Syncing, ConnectionState::Syncing],
+            connection: vec![ConnectionState::Syncing; usize::from(player_count)],
             phase: MatchPhase::Lobby,
             conquest_threshold_bps: 8_000,
             max_elevation_step: 1,
@@ -387,6 +405,11 @@ impl MatchView {
     }
 
     pub fn offline_fixture() -> Self {
+        Self::offline_fixture_for_players(2)
+    }
+
+    pub fn offline_fixture_for_players(player_count: u16) -> Self {
+        let player_count = player_count.clamp(2, 500);
         let mut cells = BTreeMap::new();
         let radius = 19;
 
@@ -434,13 +457,7 @@ impl MatchView {
                 } else {
                     TerrainKind::Plains
                 };
-                let owner = if q <= -5 {
-                    Some(PLAYER_ONE)
-                } else if q >= 6 {
-                    Some(PLAYER_TWO)
-                } else {
-                    None
-                };
+                let owner = offline_owner(coordinate, player_count);
                 let capacity = match terrain {
                     TerrainKind::Plains => 100,
                     TerrainKind::Hills => 82,
@@ -448,12 +465,9 @@ impl MatchView {
                     TerrainKind::Water => 0,
                 };
                 let variation = u64::from((q * 19 + r * 31).unsigned_abs() % 37);
-                let infantry = match owner {
-                    Some(PLAYER_ONE) => 24 + variation,
-                    Some(PLAYER_TWO) => 30 + variation,
-                    _ => 0,
-                }
-                .min(capacity);
+                let infantry = owner
+                    .map_or(0, |player| 18 + u64::from(player) * 6 + variation)
+                    .min(capacity);
                 let civilians = if owner.is_some() {
                     55 + u64::from((q * 11 + r * 17).unsigned_abs() % 80)
                 } else {
@@ -491,8 +505,10 @@ impl MatchView {
             ownership_revision: 1,
             contest_revision: 0,
             local_player: PLAYER_ONE,
+            player_count,
+            claimed_players: player_count,
             authority: AuthorityState::Offline,
-            connection: [ConnectionState::Offline, ConnectionState::Offline],
+            connection: vec![ConnectionState::Offline; usize::from(player_count)],
             phase: MatchPhase::Running,
             conquest_threshold_bps: 8_000,
             max_elevation_step: 1,
@@ -837,11 +853,12 @@ impl MatchView {
     }
 
     pub fn conquest_percent(&self, player: u32) -> f32 {
-        if let Some(controlled) = self.authoritative_control
+        if let Some(controlled) = &self.authoritative_control
             && self.capturable_cells > 0
-            && matches!(player, 1 | 2)
+            && (1..=u32::from(self.player_count)).contains(&player)
         {
-            return controlled[(player - 1) as usize] as f32 * 100.0 / self.capturable_cells as f32;
+            return controlled.get(&player).copied().unwrap_or(0) as f32 * 100.0
+                / self.capturable_cells as f32;
         }
         let capturable = self.cells.values().filter(|cell| cell.is_land()).count();
         if capturable == 0 {
@@ -928,6 +945,50 @@ impl MatchView {
     pub fn flow_count(&self) -> usize {
         self.active_flows.len() + self.authoritative_flows.len()
     }
+}
+
+fn offline_owner(coordinate: Axial, player_count: u16) -> Option<u32> {
+    if player_count == 2 {
+        return if coordinate.q <= -5 {
+            Some(PLAYER_ONE)
+        } else if coordinate.q >= 6 {
+            Some(PLAYER_TWO)
+        } else {
+            None
+        };
+    }
+    if coordinate.distance(Axial::ZERO) < 8 {
+        return None;
+    }
+    let anchors = offline_player_anchors(player_count);
+    anchors
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, anchor)| (coordinate.distance(**anchor), *index))
+        .and_then(|(index, anchor)| {
+            let radius = if player_count <= 8 { 7 } else { 2 };
+            (coordinate.distance(*anchor) <= radius).then(|| u32::try_from(index + 1).unwrap_or(1))
+        })
+}
+
+fn offline_player_anchors(player_count: u16) -> Vec<Axial> {
+    if player_count <= 8 {
+        return OFFLINE_PLAYER_ANCHORS
+            .iter()
+            .copied()
+            .take(usize::from(player_count))
+            .collect();
+    }
+    let count = usize::from(player_count);
+    let mut anchors = Vec::with_capacity(count);
+    for index in 0..count {
+        let angle = (index as f32) * std::f32::consts::TAU / count as f32;
+        let radius = 12.0 + (index % 5) as f32;
+        let q = (radius * angle.cos()).round() as i32;
+        let r = (radius * angle.sin()).round() as i32;
+        anchors.push(Axial::new(q, r));
+    }
+    anchors
 }
 
 fn index_cells_by_chunk(cells: &BTreeMap<Axial, CellView>) -> BTreeMap<ChunkCoord, Vec<Axial>> {
@@ -1114,6 +1175,44 @@ mod tests {
                 .values()
                 .any(|cell| cell.owner == Some(PLAYER_TWO))
         );
+    }
+
+    #[test]
+    fn offline_fixture_supports_all_eight_player_colors_and_connections() {
+        let fixture = MatchView::offline_fixture_for_players(8);
+        let owners = fixture
+            .cells
+            .values()
+            .filter_map(|cell| cell.owner)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(owners, (1..=8).collect());
+        assert_eq!(fixture.player_count, 8);
+        assert_eq!(fixture.connection, vec![ConnectionState::Offline; 8]);
+    }
+
+    #[test]
+    fn offline_fixture_accepts_high_scale_player_counts() {
+        let fixture = MatchView::offline_fixture_for_players(500);
+        assert_eq!(fixture.player_count, 500);
+        assert_eq!(fixture.connection.len(), 500);
+        assert_eq!(fixture.connection, vec![ConnectionState::Offline; 500]);
+        let owners = fixture
+            .cells
+            .values()
+            .filter_map(|cell| cell.owner)
+            .collect::<BTreeSet<_>>();
+        assert!(owners.contains(&1));
+        assert!(owners.iter().any(|owner| *owner > 8));
+    }
+
+    #[test]
+    fn authoritative_control_projection_is_keyed_for_every_player() {
+        let mut view = MatchView::connecting(4);
+        view.capturable_cells = 100;
+        view.authoritative_control = Some(BTreeMap::from([(1, 10), (3, 25), (4, 80)]));
+        for (player, expected) in [(1, 10.0), (2, 0.0), (3, 25.0), (4, 80.0), (5, 0.0)] {
+            assert!((view.conquest_percent(player) - expected).abs() < f32::EPSILON);
+        }
     }
 
     #[test]

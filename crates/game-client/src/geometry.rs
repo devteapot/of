@@ -17,6 +17,29 @@ pub fn axial_to_plane(coord: Axial) -> Vec2 {
     )
 }
 
+/// Inverse of [`axial_to_plane`]: map a world XZ plane point to the nearest axial hex.
+pub fn plane_to_axial(plane: Vec2) -> Axial {
+    let q = plane.x / (HEX_RADIUS * 1.5);
+    let r = plane.y / (HEX_RADIUS * 3.0_f32.sqrt()) - q * 0.5;
+    axial_round(q, r)
+}
+
+fn axial_round(q: f32, r: f32) -> Axial {
+    let s = -q - r;
+    let mut rq = q.round();
+    let mut rr = r.round();
+    let rs = s.round();
+    let q_diff = (rq - q).abs();
+    let r_diff = (rr - r).abs();
+    let s_diff = (rs - s).abs();
+    if q_diff > r_diff && q_diff > s_diff {
+        rq = -rr - rs;
+    } else if r_diff > s_diff {
+        rr = -rq - rs;
+    }
+    Axial::new(rq as i32, rr as i32)
+}
+
 pub fn cell_top(elevation: i16, water: bool) -> f32 {
     if water {
         SEA_LEVEL
@@ -67,6 +90,23 @@ mod tests {
             .map(|neighbor| axial_to_plane(neighbor).distance(origin));
         for distance in distances {
             assert!((distance - HEX_RADIUS * 3.0_f32.sqrt()).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn plane_to_axial_inverts_axial_to_plane_for_nearby_cells() {
+        for coord in [
+            Axial::ZERO,
+            Axial::new(1, 0),
+            Axial::new(0, 1),
+            Axial::new(-3, 2),
+            Axial::new(7, -4),
+            Axial::new(-12, -8),
+        ] {
+            let plane = axial_to_plane(coord);
+            assert_eq!(plane_to_axial(plane), coord);
+            // Small offsets toward the center still round back to the same hex.
+            assert_eq!(plane_to_axial(plane + Vec2::new(0.05, -0.04)), coord);
         }
     }
 

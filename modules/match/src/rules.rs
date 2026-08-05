@@ -6,8 +6,8 @@ use crate::schema::{
     SINGLETON_ID, TerrainClass,
 };
 use crate::schema::{
-    cell_state, cell_terrain, command_receipt, match_config, match_state, player_slot,
-    static_edge_limit, transit_packet,
+    cell_state, cell_terrain, command_receipt, match_config, match_state, player_identity,
+    player_slot, static_edge_limit, transit_packet,
 };
 
 pub const BASIS_POINTS: u64 = 10_000;
@@ -52,20 +52,42 @@ pub fn state(ctx: &ReducerContext) -> Result<MatchState, String> {
         .ok_or_else(|| "match state is missing".into())
 }
 
-pub fn require_running_player(ctx: &ReducerContext) -> Result<u8, String> {
+pub fn require_running_player(ctx: &ReducerContext) -> Result<u16, String> {
     if state(ctx)?.phase != MatchPhase::Running {
         return Err("commands are only accepted while the match is running".into());
     }
     let sender = ctx.sender();
-    ctx.db
+    let player_id = ctx
+        .db
+        .player_identity()
+        .identity()
+        .find(sender)
+        .map(|row| row.player_id)
+        .or_else(|| {
+            ctx.db
+                .player_slot()
+                .iter()
+                .find(|slot| slot.identity.as_ref() == Some(&sender))
+                .map(|slot| slot.player_id)
+        })
+        .ok_or_else(|| "the calling identity does not own a player slot".to_owned())?;
+    let player_count = config(ctx)?.player_count;
+    if !(1..=player_count).contains(&player_id) {
+        return Err("the calling identity owns an out-of-range player slot".into());
+    }
+    let slot = ctx
+        .db
         .player_slot()
-        .iter()
-        .find(|slot| slot.identity.as_ref() == Some(&sender))
-        .map(|slot| slot.player_id)
-        .ok_or_else(|| "the calling identity does not own a player slot".into())
+        .player_id()
+        .find(player_id)
+        .ok_or_else(|| "the calling identity does not own a player slot".to_owned())?;
+    if slot.identity.as_ref() != Some(&sender) {
+        return Err("the calling identity does not own a player slot".into());
+    }
+    Ok(player_id)
 }
 
-pub const fn command_key(player_id: u8, client_command_id: u64) -> u128 {
+pub const fn command_key(player_id: u16, client_command_id: u64) -> u128 {
     (player_id as u128) << 64 | client_command_id as u128
 }
 
@@ -73,7 +95,7 @@ pub const fn order_cell_key(order_id: u64, cell_id: u32) -> u128 {
     (order_id as u128) << 32 | cell_id as u128
 }
 
-pub fn command_was_seen(ctx: &ReducerContext, player_id: u8, client_command_id: u64) -> bool {
+pub fn command_was_seen(ctx: &ReducerContext, player_id: u16, client_command_id: u64) -> bool {
     ctx.db
         .command_receipt()
         .receipt_key()
@@ -83,7 +105,7 @@ pub fn command_was_seen(ctx: &ReducerContext, player_id: u8, client_command_id: 
 
 pub fn write_receipt(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     client_command_id: u64,
     command_name: &str,
     status: ReceiptStatus,
@@ -242,7 +264,7 @@ pub fn calculate_edge_runtime_limits(
     })
 }
 
-pub fn allocated_infantry_at_cell(ctx: &ReducerContext, owner_player_id: u8, cell_id: u32) -> u64 {
+pub fn allocated_infantry_at_cell(ctx: &ReducerContext, owner_player_id: u16, cell_id: u32) -> u64 {
     ctx.db
         .transit_packet()
         .packet_by_cell()

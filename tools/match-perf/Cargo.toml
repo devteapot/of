@@ -3,12 +3,18 @@ name = "match-perf"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Live-match load driver and step-rate profiler"
+description = "Distributed-capable live-match load driver and step-rate profiler"
+
+[[bin]]
+name = "match-perf"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
 match-bindings = { path = "../../crates/match-bindings" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 spacetimedb-sdk = { workspace = true }
 
 [lints]

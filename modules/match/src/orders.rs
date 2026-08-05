@@ -96,7 +96,7 @@ struct PolicyComponentSnapshot {
     component_key: u64,
     shape_hash: u64,
     ownership_revision: u64,
-    player_id: u8,
+    player_id: u16,
     cell_ids: Vec<u32>,
     cell_set: BTreeSet<u32>,
     map: HexMap,
@@ -109,7 +109,7 @@ struct PolicyComponentSnapshot {
 
 struct PolicyWorldSnapshot {
     components: Vec<PolicyComponentSnapshot>,
-    owner_by_cell_id: Vec<u8>,
+    owner_by_cell_id: Vec<u16>,
 }
 
 struct PolicyDistributionPlan {
@@ -208,7 +208,7 @@ impl FrontRouteTree {
 
 fn receipt_result(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     client_command_id: u64,
     command_name: &str,
     result: Result<Option<u64>, String>,
@@ -778,7 +778,7 @@ pub fn cancel_orders(
 
 fn resolve_retask_selection(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     source_cells: &[u32],
     supersede_order_ids: &[u64],
     label: &str,
@@ -886,7 +886,7 @@ fn validate_client_supersede_order(order: &TransferOrder) -> Result<(), String> 
 /// current cluster, including cells gained or merged since the UI snapshot.
 fn resolve_single_cluster_retask_selection(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     source_seed_cells: &[u32],
     supersede_order_ids: &[u64],
     label: &str,
@@ -987,7 +987,7 @@ fn selection_component(
 
 fn validate_owned_passable_cells(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     cells: &BTreeSet<u32>,
     label: &str,
 ) -> Result<(), String> {
@@ -1008,7 +1008,7 @@ fn validate_owned_passable_cells(
 /// redistribution itself.
 fn owned_component_partitions(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     relevant: &BTreeSet<u32>,
 ) -> Result<Vec<BTreeSet<u32>>, String> {
     Ok(owned_components(ctx, player_id)?
@@ -1025,7 +1025,7 @@ fn owned_component_partitions(
 
 /// Complete current owned components under the same passability and elevation
 /// rules used by internal routes and client cluster selection.
-fn owned_components(ctx: &ReducerContext, player_id: u8) -> Result<Vec<BTreeSet<u32>>, String> {
+fn owned_components(ctx: &ReducerContext, player_id: u16) -> Result<Vec<BTreeSet<u32>>, String> {
     let max_elevation_step = u32::from(config(ctx)?.max_elevation_step);
     let mut owned = BTreeMap::<Axial, (u32, i16)>::new();
     for state in ctx
@@ -1066,11 +1066,11 @@ fn owned_components(ctx: &ReducerContext, player_id: u8) -> Result<Vec<BTreeSet<
     Ok(result)
 }
 
-fn policy_component_key(player_id: u8, minimum_cell_id: u32) -> u64 {
+fn policy_component_key(player_id: u16, minimum_cell_id: u32) -> u64 {
     (u64::from(player_id) << 32) | u64::from(minimum_cell_id)
 }
 
-fn policy_shape_hash(player_id: u8, cell_ids: &[u32]) -> u64 {
+fn policy_shape_hash(player_id: u16, cell_ids: &[u32]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = (OFFSET ^ u64::from(player_id)).wrapping_mul(PRIME);
@@ -1433,7 +1433,7 @@ fn load_policy_component_snapshot(
 /// orders remain allocated and are never implicitly retasked.
 fn complete_owned_component_selection(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     seed_cells: &[u32],
     label: &str,
 ) -> Result<RetaskSelection, String> {
@@ -1451,7 +1451,7 @@ fn complete_owned_component_selection(
 
 fn complete_enemy_component_selection(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     seed_cells: &[u32],
     label: &str,
 ) -> Result<BTreeSet<u32>, String> {
@@ -1475,7 +1475,7 @@ fn complete_enemy_component_selection(
 
 fn complete_components_for_seeds(
     ctx: &ReducerContext,
-    owner_player_id: u8,
+    owner_player_id: u16,
     seed_cells: &[u32],
     label: &str,
 ) -> Result<BTreeSet<u32>, String> {
@@ -1485,7 +1485,7 @@ fn complete_components_for_seeds(
 
 fn complete_components_for_seed_set(
     ctx: &ReducerContext,
-    owner_player_id: u8,
+    owner_player_id: u16,
     seeds: &BTreeSet<u32>,
     label: &str,
 ) -> Result<BTreeSet<u32>, String> {
@@ -1533,8 +1533,8 @@ fn normalized_policy_spec(
 
 fn reconciled_policy_specs(
     components: &[BTreeSet<u32>],
-    existing: &BTreeMap<u32, (u8, ClusterPolicySpec)>,
-    player_id: u8,
+    existing: &BTreeMap<u32, (u16, ClusterPolicySpec)>,
+    player_id: u16,
 ) -> BTreeMap<u32, ClusterPolicySpec> {
     let mut reconciled = BTreeMap::new();
     for component in components {
@@ -1562,7 +1562,7 @@ fn reconciled_policy_specs(
 fn upsert_cluster_policy_assignment(
     ctx: &ReducerContext,
     cell_id: u32,
-    player_id: u8,
+    player_id: u16,
     spec: ClusterPolicySpec,
 ) {
     let row = ClusterPolicyAssignment {
@@ -1604,7 +1604,7 @@ fn reconcile_cluster_policy_assignments(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut components_by_player = BTreeMap::<u8, Vec<BTreeSet<u32>>>::new();
+    let mut components_by_player = BTreeMap::<u16, Vec<BTreeSet<u32>>>::new();
     for component in &world.components {
         components_by_player
             .entry(component.player_id)
@@ -1665,7 +1665,7 @@ fn policy_order_matches(order: &TransferOrder, spec: ClusterPolicySpec) -> bool 
 
 fn active_policy_orders_intersecting(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     cells: &BTreeSet<u32>,
 ) -> Vec<TransferOrder> {
     active_orders_intersecting(ctx, player_id, cells)
@@ -1676,7 +1676,7 @@ fn active_policy_orders_intersecting(
 
 fn active_orders_intersecting(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     cells: &BTreeSet<u32>,
 ) -> Vec<TransferOrder> {
     ctx.db
@@ -1717,7 +1717,7 @@ fn active_orders_intersecting(
 /// source cluster while releasing remote survivors without teleporting them.
 fn include_background_policy_yield(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: RetaskSelection,
 ) -> Result<RetaskSelection, String> {
     let policy_order_ids =
@@ -1786,7 +1786,7 @@ fn merge_background_policy_yield_snapshot(
 
 fn set_cluster_policy_inner(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     seed_cells: &[u32],
     kind: ClusterPolicyKind,
     orientation: Axial,
@@ -1858,10 +1858,14 @@ pub(crate) fn maintain_cluster_policies(
     logical_step: u64,
 ) -> Result<(), String> {
     let mut match_state = state(ctx)?;
-    let population_interval = u64::from(config(ctx)?.population_step_interval.max(1));
-    // Population already performs the largest regular write batch. Policy
-    // work uses the intervening ticks so the two costs never stack.
-    if logical_step.is_multiple_of(population_interval) {
+    let config_row = config(ctx)?;
+    let population_interval = u64::from(config_row.population_step_interval.max(1));
+    let high_scale = config_row.player_count > crate::schema::HIGH_SCALE_PLAYER_THRESHOLD;
+    // Low-scale: population already performs the largest regular write batch,
+    // so policy uses the intervening ticks. High-scale population is sharded
+    // every tick; policy still advances one component so work stays bounded
+    // and fair under the durable cursor.
+    if !high_scale && logical_step.is_multiple_of(population_interval) {
         return Ok(());
     }
 
@@ -2059,7 +2063,7 @@ fn maintain_cluster_policy_snapshot(
 
 fn maintain_cluster_policy_component(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     component: &BTreeSet<u32>,
 ) -> Result<(), String> {
     let _component_stopwatch = LogStopwatch::new("cluster_policy_component");
@@ -2241,8 +2245,8 @@ fn policy_horizon_legs(
 
 fn validate_superseded_order_claim(
     order_id: u64,
-    requester_player_id: u8,
-    order_player_id: u8,
+    requester_player_id: u16,
+    order_player_id: u16,
     status: OrderStatus,
     has_surviving_packets: bool,
 ) -> Result<(), String> {
@@ -2329,7 +2333,7 @@ fn unaffected_after_retask_release(
 
 fn plan_push_front(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     direction: Axial,
     commitment_bps: u32,
@@ -2482,7 +2486,7 @@ fn plan_push_front(
 /// when the selected region touches several hostile arcs.
 fn plan_local_arc_push(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     commitment_bps: u32,
 ) -> Result<(u64, Vec<PlannedLeg>, BTreeSet<u32>), String> {
@@ -2623,7 +2627,7 @@ fn plan_local_arc_push(
 
 fn plan_expand_all(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     commitment_bps: u32,
 ) -> Result<PlannedExpansion, String> {
@@ -2639,7 +2643,7 @@ fn plan_expand_all(
 
 fn plan_expand_clusters(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     focus_cell_id: u32,
     commitment_bps: u32,
@@ -2664,7 +2668,7 @@ fn plan_expand_clusters(
 
 fn plan_neutral_expansion(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     commitment_bps: u32,
     kind: OrderKind,
@@ -2778,7 +2782,7 @@ fn plan_neutral_expansion(
 
 fn plan_attack_clusters(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     target_cells: &BTreeSet<u32>,
     commitment_bps: u32,
@@ -2917,7 +2921,7 @@ fn seed_inward_depths(
 fn outside_wave_depths(
     ctx: &ReducerContext,
     match_config: &crate::schema::MatchConfig,
-    player_id: u8,
+    player_id: u16,
     selected_ids: &BTreeSet<u32>,
     first_ring: &BTreeSet<u32>,
     cell_count: usize,
@@ -3045,7 +3049,7 @@ fn validate_attack_target_reachability(
 }
 
 fn expand_target_is_eligible(
-    target_owner: u8,
+    target_owner: u16,
     passable: bool,
     capturable: bool,
     traversable: bool,
@@ -3170,8 +3174,8 @@ fn local_arc_selection_message(error: FrontSelectionError) -> String {
 /// its capturability flag is irrelevant; passability and the runtime edge
 /// constraint still apply to both cases.
 fn initial_push_target_is_eligible(
-    player_id: u8,
-    target_owner: u8,
+    player_id: u16,
+    target_owner: u16,
     passable: bool,
     capturable: bool,
     traversable: bool,
@@ -3183,8 +3187,8 @@ fn initial_push_target_is_eligible(
 /// remains Shift+P, while friendly-facing movement remains the explicit
 /// directional retreat gesture.
 fn local_arc_target_is_eligible(
-    player_id: u8,
-    target_owner: u8,
+    player_id: u16,
+    target_owner: u16,
     passable: bool,
     capturable: bool,
     traversable: bool,
@@ -3241,7 +3245,7 @@ fn front_route_tree(
 
 fn distribution_plan(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     preset: DistributionPreset,
 ) -> Result<PlannedDistribution, String> {
@@ -3569,7 +3573,7 @@ fn plan_policy_distribution_legs(
 
 fn shape_distribution_plan(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     target_cells: &[u32],
 ) -> Result<PlannedDistribution, String> {
@@ -3676,7 +3680,7 @@ fn shape_distribution_plan(
 /// shape and drains excluded sources; a component without a target is a no-op.
 fn best_effort_shape_targets(
     map: &HexMap,
-    player_id: u8,
+    player_id: u16,
     target_membership: &BTreeMap<Axial, bool>,
     total: u64,
 ) -> Result<BTreeMap<Axial, u64>, String> {
@@ -3703,7 +3707,7 @@ fn best_effort_shape_targets(
 
 fn active_destination_reservations(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     excluded_order_ids: &BTreeSet<u64>,
 ) -> BTreeMap<u32, u64> {
     let mut reservations = BTreeMap::<u32, u64>::new();
@@ -3731,7 +3735,7 @@ fn active_destination_reservations(
 
 fn active_internal_reservation_is_relevant(
     order: &TransferOrder,
-    player_id: u8,
+    player_id: u16,
     excluded_order_ids: &BTreeSet<u64>,
 ) -> bool {
     order.status == OrderStatus::Active
@@ -3833,7 +3837,7 @@ fn exact_order_ids(order_ids: &[u64]) -> Result<BTreeSet<u64>, String> {
 
 fn plan_distribution_legs(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     selection: &RetaskSelection,
     plan: PlannedDistribution,
     max_legs: Option<usize>,
@@ -3981,7 +3985,7 @@ fn plan_distribution_legs(
 #[allow(clippy::too_many_arguments)]
 fn persist_order(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     client_command_id: u64,
     kind: OrderKind,
     requested: u64,
@@ -4065,7 +4069,7 @@ fn coalesced_order_legs(legs: Vec<PlannedLeg>) -> Result<Vec<PlannedLeg>, String
 /// order immediately before committing the prepared replacement.
 fn persist_prepared_order(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     client_command_id: u64,
     kind: OrderKind,
     orientation: Axial,
@@ -4100,6 +4104,7 @@ fn persist_prepared_order(
         let route = ctx.db.transit_route().insert(TransitRoute {
             route_id: 0,
             order_id: order.order_id,
+            player_id,
             cells: leg.route,
         });
         ctx.db.transit_packet().insert(TransitPacket {
@@ -4120,6 +4125,7 @@ fn persist_prepared_order(
         ctx.db.transfer_source().insert(TransferSource {
             source_key: order_cell_key(order.order_id, cell_id),
             order_id: order.order_id,
+            player_id,
             cell_id,
             committed_infantry: infantry,
             queued_infantry: infantry,
@@ -4129,6 +4135,7 @@ fn persist_prepared_order(
         ctx.db.transfer_destination().insert(TransferDestination {
             destination_key: order_cell_key(order.order_id, cell_id),
             order_id: order.order_id,
+            player_id,
             cell_id,
             target_infantry: infantry,
             received_infantry: 0,
@@ -4149,7 +4156,7 @@ fn persist_retreat_abandonments(ctx: &ReducerContext, order_id: u64, abandonment
 
 fn persist_expand_order(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     client_command_id: u64,
     plan: PlannedExpansion,
 ) -> Result<u64, String> {
@@ -4192,6 +4199,7 @@ fn persist_expand_order(
         ctx.db.transfer_source().insert(TransferSource {
             source_key: order_cell_key(order.order_id, cell_id),
             order_id: order.order_id,
+            player_id,
             cell_id,
             committed_infantry: infantry,
             queued_infantry: infantry,
@@ -4227,7 +4235,7 @@ fn persist_expand_order(
 
 fn cancel_superseded_orders(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     order_ids: &BTreeSet<u64>,
 ) -> Result<(), String> {
     for &order_id in order_ids {
@@ -4238,7 +4246,7 @@ fn cancel_superseded_orders(
 
 fn preflight_cancel_order(
     ctx: &ReducerContext,
-    player_id: u8,
+    player_id: u16,
     order_id: u64,
 ) -> Result<(), String> {
     let order = ctx
@@ -4269,8 +4277,8 @@ fn preflight_cancel_order(
 
 fn validate_cancel_claim(
     order_id: u64,
-    requester_player_id: u8,
-    order_player_id: u8,
+    requester_player_id: u16,
+    order_player_id: u16,
     status: OrderStatus,
 ) -> Result<(), String> {
     if order_player_id != requester_player_id {
@@ -4282,7 +4290,7 @@ fn validate_cancel_claim(
     Ok(())
 }
 
-fn cancel_order(ctx: &ReducerContext, player_id: u8, order_id: u64) -> Result<(), String> {
+fn cancel_order(ctx: &ReducerContext, player_id: u16, order_id: u64) -> Result<(), String> {
     preflight_cancel_order(ctx, player_id, order_id)?;
     let mut order = ctx
         .db
@@ -4395,7 +4403,7 @@ mod tests {
 
     fn reservation_order(
         order_id: u64,
-        player_id: u8,
+        player_id: u16,
         kind: OrderKind,
         status: OrderStatus,
     ) -> TransferOrder {
@@ -4445,6 +4453,9 @@ mod tests {
                     civilian_capacity: 0,
                     infantry: 0,
                     military_capacity: 100,
+                    population_shard: 0,
+                    chunk_q: 0,
+                    chunk_r: 0,
                     last_changed_step: 0,
                     last_policy_changed_step: 0,
                 },

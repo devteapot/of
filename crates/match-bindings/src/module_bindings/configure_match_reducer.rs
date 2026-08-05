@@ -4,51 +4,53 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+use super::map_preset_type::MapPreset;
+
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct JoinMatchArgs {
-    pub preferred_player_id: u16,
-    pub display_name: String,
+pub(super) struct ConfigureMatchArgs {
+    pub preset: MapPreset,
+    pub player_count: u16,
 }
 
-impl From<JoinMatchArgs> for super::Reducer {
-    fn from(args: JoinMatchArgs) -> Self {
-        Self::JoinMatch {
-            preferred_player_id: args.preferred_player_id,
-            display_name: args.display_name,
+impl From<ConfigureMatchArgs> for super::Reducer {
+    fn from(args: ConfigureMatchArgs) -> Self {
+        Self::ConfigureMatch {
+            preset: args.preset,
+            player_count: args.player_count,
         }
     }
 }
 
-impl __sdk::InModule for JoinMatchArgs {
+impl __sdk::InModule for ConfigureMatchArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `join_match`.
+/// Extension trait for access to the reducer `configure_match`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait join_match {
-    /// Request that the remote module invoke the reducer `join_match` to run as soon as possible.
+pub trait configure_match {
+    /// Request that the remote module invoke the reducer `configure_match` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`join_match:join_match_then`] to run a callback after the reducer completes.
-    fn join_match(&self, preferred_player_id: u16, display_name: String) -> __sdk::Result<()> {
-        self.join_match_then(preferred_player_id, display_name, |_, _| {})
+    /// /// Use [`configure_match:configure_match_then`] to run a callback after the reducer completes.
+    fn configure_match(&self, preset: MapPreset, player_count: u16) -> __sdk::Result<()> {
+        self.configure_match_then(preset, player_count, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `join_match` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `configure_match` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn join_match_then(
+    fn configure_match_then(
         &self,
-        preferred_player_id: u16,
-        display_name: String,
+        preset: MapPreset,
+        player_count: u16,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -58,11 +60,11 @@ pub trait join_match {
     ) -> __sdk::Result<()>;
 }
 
-impl join_match for super::RemoteReducers {
-    fn join_match_then(
+impl configure_match for super::RemoteReducers {
+    fn configure_match_then(
         &self,
-        preferred_player_id: u16,
-        display_name: String,
+        preset: MapPreset,
+        player_count: u16,
 
         callback: impl FnOnce(
             &super::ReducerEventContext,
@@ -71,9 +73,9 @@ impl join_match for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            JoinMatchArgs {
-                preferred_player_id,
-                display_name,
+            ConfigureMatchArgs {
+                preset,
+                player_count,
             },
             callback,
         )

@@ -4,7 +4,7 @@ Status: implemented V1 gameplay baseline, ready for playtesting. Values explicit
 
 ## Vision
 
-Build a native two-player RTS on a stepped 2.5D hex world. The player controls territory and the movement and distribution of aggregate forces, not individual foot soldiers.
+Build a native 2–8 player RTS on a stepped 2.5D hex world. The player controls territory and the movement and distribution of aggregate forces, not individual foot soldiers.
 
 The defining mechanic is **spatially conserved troop flow**:
 
@@ -20,7 +20,7 @@ policies, and fighting over a height-aware hex map understandable and fun?
 
 ### Match and victory
 
-- A match has exactly two human players.
+- A match has 2–8 human players (default two) with contiguous player IDs; ownership ID 0 is neutral.
 - There are no bots, NPC factions, nations, or tribes.
 - The initial game mode is **Conquest**.
 - The first player to control 80% of capturable land wins.
@@ -329,7 +329,7 @@ Later, the Bevy client may render a small deterministic sample of representative
 - Precise cell-to-cell commands for aggregate infantry; exact movement may be
   revisited for future discrete vehicles or vessels.
 - Bots or NPC AI.
-- More than two players, teams, diplomacy, alliances, or betrayal.
+- Teams, diplomacy, alliances, or betrayal.
 - Fog of war.
 - A defeat-critical HQ or capital-capture victory condition.
 - Game modes other than Conquest.
@@ -376,7 +376,7 @@ Also provisional:
 The vertical slice is ready for gameplay evaluation when all of the following
 are true:
 
-1. Two human players can join and finish Conquest on a curated stepped island;
+1. Two to 500 human players can join and finish Conquest on a curated stepped island;
    victory occurs at 80% of the fixed capturable-land denominator.
 2. The same rules operate on the 128 x 128 playtest and representative 192 x 192
    validation maps.

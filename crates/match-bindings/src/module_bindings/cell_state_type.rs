@@ -8,11 +8,14 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub struct CellState {
     pub cell_id: u32,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub civilians: u64,
     pub civilian_capacity: u64,
     pub infantry: u64,
     pub military_capacity: u64,
+    pub population_shard: u16,
+    pub chunk_q: i16,
+    pub chunk_r: i16,
     pub last_changed_step: u64,
     pub last_policy_changed_step: u64,
 }
@@ -26,11 +29,14 @@ impl __sdk::InModule for CellState {
 /// Provides typed access to columns for query building.
 pub struct CellStateCols {
     pub cell_id: __sdk::__query_builder::Col<CellState, u32>,
-    pub owner_player_id: __sdk::__query_builder::Col<CellState, u8>,
+    pub owner_player_id: __sdk::__query_builder::Col<CellState, u16>,
     pub civilians: __sdk::__query_builder::Col<CellState, u64>,
     pub civilian_capacity: __sdk::__query_builder::Col<CellState, u64>,
     pub infantry: __sdk::__query_builder::Col<CellState, u64>,
     pub military_capacity: __sdk::__query_builder::Col<CellState, u64>,
+    pub population_shard: __sdk::__query_builder::Col<CellState, u16>,
+    pub chunk_q: __sdk::__query_builder::Col<CellState, i16>,
+    pub chunk_r: __sdk::__query_builder::Col<CellState, i16>,
     pub last_changed_step: __sdk::__query_builder::Col<CellState, u64>,
     pub last_policy_changed_step: __sdk::__query_builder::Col<CellState, u64>,
 }
@@ -45,6 +51,9 @@ impl __sdk::__query_builder::HasCols for CellState {
             civilian_capacity: __sdk::__query_builder::Col::new(table_name, "civilian_capacity"),
             infantry: __sdk::__query_builder::Col::new(table_name, "infantry"),
             military_capacity: __sdk::__query_builder::Col::new(table_name, "military_capacity"),
+            population_shard: __sdk::__query_builder::Col::new(table_name, "population_shard"),
+            chunk_q: __sdk::__query_builder::Col::new(table_name, "chunk_q"),
+            chunk_r: __sdk::__query_builder::Col::new(table_name, "chunk_r"),
             last_changed_step: __sdk::__query_builder::Col::new(table_name, "last_changed_step"),
             last_policy_changed_step: __sdk::__query_builder::Col::new(
                 table_name,
@@ -59,7 +68,8 @@ impl __sdk::__query_builder::HasCols for CellState {
 /// Provides typed access to indexed columns for query building.
 pub struct CellStateIxCols {
     pub cell_id: __sdk::__query_builder::IxCol<CellState, u32>,
-    pub owner_player_id: __sdk::__query_builder::IxCol<CellState, u8>,
+    pub owner_player_id: __sdk::__query_builder::IxCol<CellState, u16>,
+    pub population_shard: __sdk::__query_builder::IxCol<CellState, u16>,
 }
 
 impl __sdk::__query_builder::HasIxCols for CellState {
@@ -68,6 +78,7 @@ impl __sdk::__query_builder::HasIxCols for CellState {
         CellStateIxCols {
             cell_id: __sdk::__query_builder::IxCol::new(table_name, "cell_id"),
             owner_player_id: __sdk::__query_builder::IxCol::new(table_name, "owner_player_id"),
+            population_shard: __sdk::__query_builder::IxCol::new(table_name, "population_shard"),
         }
     }
 }

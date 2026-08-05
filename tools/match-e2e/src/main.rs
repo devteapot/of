@@ -30,8 +30,8 @@ use match_bindings::{
 };
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
-const PLAYER_ONE: u8 = 1;
-const PLAYER_TWO: u8 = 2;
+const PLAYER_ONE: u16 = 1;
+const PLAYER_TWO: u16 = 2;
 const SINGLETON_ID: u8 = 0;
 const COMMAND_ID_FLOOR: u64 = 9_000_000_000;
 const PUSH_COMMITMENT_BPS: u32 = 5_000;
@@ -44,7 +44,7 @@ const OBSERVED_CAPTURE_LAYERS: usize = 2;
 const POST_CANCEL_STEPS: u64 = 2;
 const EXPANSION_AGGREGATE_ORIGIN: u32 = u32::MAX;
 
-const fn receipt_key(player_id: u8, command_id: u64) -> u128 {
+const fn receipt_key(player_id: u16, command_id: u64) -> u128 {
     (player_id as u128) << 64 | command_id as u128
 }
 
@@ -176,7 +176,7 @@ impl Client {
         })
     }
 
-    fn join_match(&self, player_id: u8, display_name: &str, timeout: Duration) -> Result<()> {
+    fn join_match(&self, player_id: u16, display_name: &str, timeout: Duration) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         self.conn
             .reducers
@@ -1973,8 +1973,8 @@ fn exercise_cluster_first_controls(
 #[allow(clippy::too_many_lines)]
 fn establish_cluster_contact_with_expansions(
     client: &Client,
-    player_id: u8,
-    enemy_player_id: u8,
+    player_id: u16,
+    enemy_player_id: u16,
     previous_command_id: u64,
     timeout: Duration,
     poll: Duration,
@@ -2194,8 +2194,8 @@ fn establish_cluster_contact_with_expansions(
 
 fn assert_expansion_claimed_only_neutral(
     conn: &DbConnection,
-    player_id: u8,
-    owners_before: &HashMap<u32, u8>,
+    player_id: u16,
+    owners_before: &HashMap<u32, u16>,
 ) -> Result<()> {
     for cell_id in owner_changes_for_player(conn, player_id, owners_before) {
         ensure!(
@@ -2416,7 +2416,7 @@ fn wait_for_internal_order_completion(
 
 fn wait_for_policy_quiescence(
     client: &Client,
-    player_id: u8,
+    player_id: u16,
     timeout: Duration,
     poll: Duration,
 ) -> Result<()> {
@@ -2464,7 +2464,7 @@ fn wait_for_policy_quiescence(
 
 fn wait_for_completed_background_policy_delivery(
     client: &Client,
-    player_id: u8,
+    player_id: u16,
     order_id_floor: u64,
     timeout: Duration,
     poll: Duration,
@@ -2762,7 +2762,7 @@ fn write_token(path: &Path, token: &str) -> Result<()> {
 
 fn assert_slot_available_or_owned(
     client: &Client,
-    player_id: u8,
+    player_id: u16,
     expected_identity: Identity,
 ) -> Result<()> {
     let slot = client
@@ -2783,7 +2783,7 @@ fn assert_slot_available_or_owned(
 
 fn wait_for_slot(
     client: &Client,
-    player_id: u8,
+    player_id: u16,
     identity: Identity,
     timeout: Duration,
     poll: Duration,
@@ -2807,7 +2807,7 @@ fn wait_for_slot(
     )
 }
 
-fn unused_command_id(conn: &DbConnection, player_id: u8, start: u64) -> Result<u64> {
+fn unused_command_id(conn: &DbConnection, player_id: u16, start: u64) -> Result<u64> {
     let mut candidate = start;
     loop {
         let key = receipt_key(player_id, candidate);
@@ -2840,7 +2840,7 @@ fn unused_order_id(conn: &DbConnection) -> Result<u64> {
 
 fn wait_for_receipt(
     client: &Client,
-    player_id: u8,
+    player_id: u16,
     command_id: u64,
     command_name: &str,
     timeout: Duration,
@@ -2872,7 +2872,7 @@ fn wait_for_receipt(
 
 fn wait_for_rejected_receipt(
     client: &Client,
-    player_id: u8,
+    player_id: u16,
     command_id: u64,
     command_name: &str,
     timeout: Duration,
@@ -2901,7 +2901,7 @@ fn wait_for_rejected_receipt(
 #[allow(clippy::too_many_lines)]
 fn select_cluster_reshape_candidate(
     conn: &DbConnection,
-    player_id: u8,
+    player_id: u16,
 ) -> Result<ClusterReshapeCandidate> {
     let terrain_by_id = conn
         .db
@@ -3023,7 +3023,7 @@ fn select_cluster_reshape_candidate(
 fn projected_reshape_plan(
     map: &HexMap,
     id_by_coordinate: &BTreeMap<Axial, u32>,
-    player_id: u8,
+    player_id: u16,
     source_coordinates: &BTreeSet<Axial>,
     target_coordinates: &BTreeSet<Axial>,
 ) -> Option<(InternalPlan, u64)> {
@@ -3117,7 +3117,7 @@ const fn core_terrain(terrain: TerrainClass) -> TerrainKind {
 }
 
 #[allow(clippy::too_many_lines)]
-fn select_push_front_candidate(conn: &DbConnection, player_id: u8) -> Result<PushFrontCandidate> {
+fn select_push_front_candidate(conn: &DbConnection, player_id: u16) -> Result<PushFrontCandidate> {
     let terrain_by_id: HashMap<u32, CellTerrain> = conn
         .db
         .cell_terrain()
@@ -3285,7 +3285,7 @@ fn select_push_front_candidate(conn: &DbConnection, player_id: u8) -> Result<Pus
 }
 
 #[allow(clippy::too_many_lines)]
-fn select_expand_all_candidate(conn: &DbConnection, player_id: u8) -> Result<ExpandAllCandidate> {
+fn select_expand_all_candidate(conn: &DbConnection, player_id: u16) -> Result<ExpandAllCandidate> {
     let terrain_by_id: HashMap<u32, CellTerrain> = conn
         .db
         .cell_terrain()
@@ -3469,7 +3469,7 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u8) -> Result<Exp
 
 fn select_focused_cluster_expand_candidate(
     conn: &DbConnection,
-    player_id: u8,
+    player_id: u16,
     commitment_bps: u32,
 ) -> Result<FocusedClusterExpandCandidate> {
     let terrain_by_id = conn
@@ -3561,8 +3561,8 @@ fn select_focused_cluster_expand_candidate(
 
 fn select_contact_cluster_expand_candidate(
     conn: &DbConnection,
-    player_id: u8,
-    enemy_player_id: u8,
+    player_id: u16,
+    enemy_player_id: u16,
     commitment_bps: u32,
 ) -> Result<FocusedClusterExpandCandidate> {
     let terrain_by_id = conn
@@ -3647,7 +3647,7 @@ fn select_contact_cluster_expand_candidate(
 
 fn nearest_neutral_focus_toward_enemy(
     source_component: &BTreeSet<u32>,
-    enemy_player_id: u8,
+    enemy_player_id: u16,
     terrain_by_id: &HashMap<u32, CellTerrain>,
     cell_by_id: &HashMap<u32, CellState>,
     cell_by_coordinate: &HashMap<Axial, u32>,
@@ -3731,8 +3731,8 @@ fn nearest_neutral_focus_toward_enemy(
 #[allow(clippy::too_many_lines)]
 fn select_cluster_attack_candidate(
     conn: &DbConnection,
-    player_id: u8,
-    enemy_player_id: u8,
+    player_id: u16,
+    enemy_player_id: u16,
     commitment_bps: u32,
 ) -> Result<ClusterAttackCandidate> {
     let terrain_by_id = conn
@@ -3889,8 +3889,8 @@ fn current_max_elevation_step(conn: &DbConnection) -> Result<u16> {
 
 fn players_share_traversable_front(
     conn: &DbConnection,
-    player_id: u8,
-    enemy_player_id: u8,
+    player_id: u16,
+    enemy_player_id: u16,
 ) -> Result<bool> {
     let terrain_by_id = conn
         .db
@@ -3937,7 +3937,7 @@ fn players_share_traversable_front(
     Ok(false)
 }
 
-fn owned_traversable_components(conn: &DbConnection, player_id: u8) -> Result<Vec<BTreeSet<u32>>> {
+fn owned_traversable_components(conn: &DbConnection, player_id: u16) -> Result<Vec<BTreeSet<u32>>> {
     let terrain_by_id = conn
         .db
         .cell_terrain()
@@ -3992,7 +3992,7 @@ fn owned_traversable_components(conn: &DbConnection, player_id: u8) -> Result<Ve
 
 fn owned_component_containing(
     conn: &DbConnection,
-    player_id: u8,
+    player_id: u16,
     seed_cell: u32,
 ) -> Result<BTreeSet<u32>> {
     owned_traversable_components(conn, player_id)?
@@ -4005,7 +4005,7 @@ fn owned_component_containing(
         })
 }
 
-fn allocated_infantry_by_cell(conn: &DbConnection, player_id: u8) -> Result<HashMap<u32, u64>> {
+fn allocated_infantry_by_cell(conn: &DbConnection, player_id: u16) -> Result<HashMap<u32, u64>> {
     let mut allocated = HashMap::<u32, u64>::new();
     for packet in conn
         .db
@@ -4023,7 +4023,7 @@ fn allocated_infantry_by_cell(conn: &DbConnection, player_id: u8) -> Result<Hash
 
 fn explicit_action_allocated_infantry_by_cell(
     conn: &DbConnection,
-    player_id: u8,
+    player_id: u16,
 ) -> Result<HashMap<u32, u64>> {
     let mut allocated = HashMap::<u32, u64>::new();
     for packet in conn
@@ -4140,7 +4140,7 @@ fn wave_seed_depths(
 }
 
 fn wave_outside_depths(
-    player_id: u8,
+    player_id: u16,
     selected: &BTreeSet<u32>,
     first_ring: &BTreeSet<u32>,
     terrain_by_id: &HashMap<u32, CellTerrain>,
@@ -4343,7 +4343,7 @@ fn expected_occupation_garrison(terrain: &CellTerrain, cell: &CellState) -> u64 
         .min(cell.military_capacity)
 }
 
-fn lane_owners(conn: &DbConnection, lane_cells: &[u32]) -> Result<Vec<u8>> {
+fn lane_owners(conn: &DbConnection, lane_cells: &[u32]) -> Result<Vec<u16>> {
     lane_cells
         .iter()
         .map(|cell_id| {
@@ -4739,7 +4739,7 @@ fn stable_action_order_snapshot(
 fn assert_cluster_action_order(
     conn: &DbConnection,
     order: &TransferOrder,
-    player_id: u8,
+    player_id: u16,
     command_id: u64,
     kind: OrderKind,
     expected_requested: u64,
@@ -4872,7 +4872,7 @@ fn assert_cluster_action_order(
 
 fn assert_complete_cluster_policy_assignment(
     conn: &DbConnection,
-    player_id: u8,
+    player_id: u16,
     expected_component: &BTreeSet<u32>,
     seed_cell: u32,
     expected_kind: ClusterPolicyKind,
@@ -4932,11 +4932,11 @@ fn assert_complete_cluster_policy_assignment(
 fn assert_attack_stays_in_target_mask(
     conn: &DbConnection,
     order: &TransferOrder,
-    player_id: u8,
+    player_id: u16,
     source_component: &BTreeSet<u32>,
     target_component: &BTreeSet<u32>,
     outside_guard_cells: &BTreeSet<u32>,
-    owners_before: &HashMap<u32, u8>,
+    owners_before: &HashMap<u32, u16>,
 ) -> Result<bool> {
     assert_order_conservation(order)?;
     let packets = conn
@@ -5001,8 +5001,8 @@ fn assert_attack_stays_in_target_mask(
 
 fn owner_changes_for_player(
     conn: &DbConnection,
-    player_id: u8,
-    before: &HashMap<u32, u8>,
+    player_id: u16,
+    before: &HashMap<u32, u16>,
 ) -> BTreeSet<u32> {
     conn.db
         .cell_state()
@@ -5015,7 +5015,7 @@ fn owner_changes_for_player(
         .collect()
 }
 
-fn owner_snapshot(conn: &DbConnection) -> HashMap<u32, u8> {
+fn owner_snapshot(conn: &DbConnection) -> HashMap<u32, u16> {
     conn.db
         .cell_state()
         .iter()

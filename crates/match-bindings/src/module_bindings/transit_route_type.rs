@@ -9,6 +9,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct TransitRoute {
     pub route_id: u64,
     pub order_id: u64,
+    pub player_id: u16,
     pub cells: Vec<u32>,
 }
 
@@ -22,6 +23,7 @@ impl __sdk::InModule for TransitRoute {
 pub struct TransitRouteCols {
     pub route_id: __sdk::__query_builder::Col<TransitRoute, u64>,
     pub order_id: __sdk::__query_builder::Col<TransitRoute, u64>,
+    pub player_id: __sdk::__query_builder::Col<TransitRoute, u16>,
     pub cells: __sdk::__query_builder::Col<TransitRoute, Vec<u32>>,
 }
 
@@ -31,6 +33,7 @@ impl __sdk::__query_builder::HasCols for TransitRoute {
         TransitRouteCols {
             route_id: __sdk::__query_builder::Col::new(table_name, "route_id"),
             order_id: __sdk::__query_builder::Col::new(table_name, "order_id"),
+            player_id: __sdk::__query_builder::Col::new(table_name, "player_id"),
             cells: __sdk::__query_builder::Col::new(table_name, "cells"),
         }
     }
@@ -41,6 +44,7 @@ impl __sdk::__query_builder::HasCols for TransitRoute {
 /// Provides typed access to indexed columns for query building.
 pub struct TransitRouteIxCols {
     pub order_id: __sdk::__query_builder::IxCol<TransitRoute, u64>,
+    pub player_id: __sdk::__query_builder::IxCol<TransitRoute, u16>,
     pub route_id: __sdk::__query_builder::IxCol<TransitRoute, u64>,
 }
 
@@ -49,6 +53,7 @@ impl __sdk::__query_builder::HasIxCols for TransitRoute {
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         TransitRouteIxCols {
             order_id: __sdk::__query_builder::IxCol::new(table_name, "order_id"),
+            player_id: __sdk::__query_builder::IxCol::new(table_name, "player_id"),
             route_id: __sdk::__query_builder::IxCol::new(table_name, "route_id"),
         }
     }

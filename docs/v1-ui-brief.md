@@ -4,7 +4,7 @@ Status: canonical cluster-first design input
 
 ## Objective
 
-Design a readable native-desktop graybox interface for a two-player 2.5D hex
+Design a readable native-desktop graybox interface for a 2–500 player 2.5D hex
 RTS. The interface tests aggregate troop logistics through complete territorial
 clusters, not individual units or painted sub-cluster fronts.
 
@@ -84,7 +84,10 @@ Source selection should survive successful commands and ordinary rejections.
 
 - Preserve map readability at 1280 x 720.
 - Keep the top status strip, right inspector/order summary, bottom contextual
-  strip, and mobilization control compact.
+  strip, and mobilization control compact. For `player_count <= 8` the status
+  strip may list every seat; above eight it must stay aggregate (configured /
+  claimed / connected / open, plus leader and local status) rather than 500
+  inline entries.
 - Do not obscure the map with a command grid or long permanent help copy.
 - Use text labels and line/heatmap overlays before adding bespoke iconography.
 - Keep overlay categories composable and color-blind distinguishable through

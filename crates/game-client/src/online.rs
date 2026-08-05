@@ -18,23 +18,24 @@ use match_bindings::{
     CombatFrontTableAccess, CommandReceipt, CommandReceiptTableAccess, DbConnection, MatchConfig,
     MatchConfigTableAccess, MatchPhase as RemoteMatchPhase, MatchState, MatchStateTableAccess,
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
-    PlayerSlotTableAccess, ReceiptStatus, TransferDestination, TransferDestinationTableAccess,
-    TransferOrder, TransferOrderTableAccess, TransferSource, TransferSourceTableAccess,
-    TransitPacket, TransitRoute, cancel_orders, issue_attack_clusters, issue_balance,
-    issue_core_load, issue_expand_all, issue_expand_clusters, issue_front_load,
-    issue_perimeter_load, issue_push_front, issue_reshape, join_match, set_cluster_policy,
-    set_mobilization_target,
+    PlayerSlotTableAccess, PlayerState, PlayerStateTableAccess, ReceiptStatus, SubscriptionHandle,
+    TransferDestination, TransferDestinationTableAccess, TransferOrder, TransferOrderTableAccess,
+    TransferSource, TransferSourceTableAccess, TransitPacket, TransitRoute, cancel_orders,
+    issue_attack_clusters, issue_balance, issue_core_load, issue_expand_all, issue_expand_clusters,
+    issue_front_load, issue_perimeter_load, issue_push_front, issue_reshape, join_match,
+    set_cluster_policy, set_mobilization_target,
 };
 #[cfg(debug_assertions)]
 use match_bindings::{TransitPacketTableAccess, TransitRouteTableAccess};
 #[cfg(not(debug_assertions))]
 use match_bindings::{VisiblePacketsTableAccess, VisibleRoutesTableAccess};
 use spacetimedb_sdk::__codegen::InternalError;
-use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
+use spacetimedb_sdk::{DbContext, SubscriptionHandle as _, Table, TableWithPrimaryKey};
 
 use crate::{
+    camera::{CameraRig, GameCamera},
     config::ClientConfig,
-    geometry::chunk_of,
+    geometry::{axial_to_plane, chunk_of, plane_to_axial},
     map_view::MapViewMode,
     model::{
         ActiveFlow, ActiveFront, AuthorityState, CellView, ClusterPolicyView, ConnectionState,
@@ -55,30 +56,213 @@ const ORDERS_DIRTY: u32 = 1 << 8;
 const POLICIES_DIRTY: u32 = 1 << 9;
 const ALL_DIRTY: u32 = (1 << 10) - 1;
 
-/// Debug builds retain the raw packet stream for the F4 policy-route
-/// diagnostic. Release builds use the server-maintained tactical view, so
+/// Debug builds retain the raw packet/route stream for the F4 policy-route
+/// diagnostic. Release builds use the server-maintained tactical views, so
 /// background rebalancing packets never cross the network.
 #[cfg(debug_assertions)]
-const PACKET_STREAM_QUERY: &str = "SELECT * FROM transit_packet";
+const PACKET_TABLE: &str = "transit_packet";
 #[cfg(not(debug_assertions))]
-const PACKET_STREAM_QUERY: &str = "SELECT * FROM visible_packets";
+const PACKET_TABLE: &str = "visible_packets";
+#[cfg(debug_assertions)]
+const ROUTE_TABLE: &str = "transit_route";
+#[cfg(not(debug_assertions))]
+const ROUTE_TABLE: &str = "visible_routes";
 
-/// Subscribe only to the public state used by the game client.
-const CLIENT_SUBSCRIPTIONS: [&str; 13] = [
-    "SELECT * FROM cell_state",
+/// Immutable terrain + match/player metadata only. Bootstrap must not flood the
+/// client with `cell_state` / combat / tactical rows before the local seat is known.
+const BOOTSTRAP_CLIENT_SUBSCRIPTIONS: [&str; 5] = [
     "SELECT * FROM cell_terrain",
-    "SELECT * FROM cluster_policy_assignment",
-    "SELECT * FROM combat_front",
-    "SELECT * FROM command_receipt",
     "SELECT * FROM match_config",
     "SELECT * FROM match_state",
-    "SELECT * FROM mobilization_policy",
     "SELECT * FROM player_slot",
-    "SELECT * FROM transfer_destination",
-    "SELECT * FROM transfer_order",
-    "SELECT * FROM transfer_source",
-    PACKET_STREAM_QUERY,
+    "SELECT * FROM player_state",
 ];
+
+const HIGH_SCALE_PLAYER_THRESHOLD: u16 = 8;
+/// Moving viewport interest radius in cell-state chunk units (server `chunk_size`,
+/// typically 16). Bandwidth interest only — not a security boundary. Local-owned
+/// cells stay on the one-time tactical subscription globally; this radius only
+/// bounds the separate spatial `CellState` handle around the camera focus.
+pub const HIGH_SCALE_INTEREST_CHUNK_RADIUS: i16 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpatialInterest {
+    /// Center chunk of the spatial `CellState` subscription (spawn until the
+    /// camera is available, then camera focus chunk).
+    focus_chunk_q: i16,
+    focus_chunk_r: i16,
+    radius: i16,
+}
+
+impl SpatialInterest {
+    const fn center(self) -> (i16, i16) {
+        (self.focus_chunk_q, self.focus_chunk_r)
+    }
+}
+
+/// Bootstrap / lobby projections only.
+fn bootstrap_subscription_queries() -> Vec<String> {
+    BOOTSTRAP_CLIENT_SUBSCRIPTIONS
+        .iter()
+        .map(|query| (*query).to_owned())
+        .collect()
+}
+
+fn packet_query(player_filter: Option<u16>) -> String {
+    match player_filter {
+        Some(player) => format!("SELECT * FROM {PACKET_TABLE} WHERE owner_player_id = {player}"),
+        None => format!("SELECT * FROM {PACKET_TABLE}"),
+    }
+}
+
+fn route_query(player_filter: Option<u16>) -> String {
+    match player_filter {
+        Some(player) => format!("SELECT * FROM {ROUTE_TABLE} WHERE player_id = {player}"),
+        None => format!("SELECT * FROM {ROUTE_TABLE}"),
+    }
+}
+
+/// Tactical-only queries for a bound seat (one-time handle).
+///
+/// - `player_count <= 8`: full `cell_state` + `combat_front` + full tactical rows.
+/// - `player_count > 8`: all local-owned `CellState` globally, local attacker/
+///   defender combat fronts, and local tactical rows. Spatial remote `CellState`
+///   around the camera lives on a **separate** moving subscription handle.
+///
+/// Intentionally excludes bootstrap globals so the tactical subscription does not
+/// duplicate them. Missing remote state rows render as neutral defaults.
+fn tactical_subscription_queries(player_count: u16, local_player: u16) -> Vec<String> {
+    if player_count <= HIGH_SCALE_PLAYER_THRESHOLD {
+        return vec![
+            "SELECT * FROM cell_state".to_owned(),
+            "SELECT * FROM combat_front".to_owned(),
+            "SELECT * FROM cluster_policy_assignment".to_owned(),
+            "SELECT * FROM command_receipt".to_owned(),
+            "SELECT * FROM mobilization_policy".to_owned(),
+            "SELECT * FROM transfer_destination".to_owned(),
+            "SELECT * FROM transfer_order".to_owned(),
+            "SELECT * FROM transfer_source".to_owned(),
+            route_query(None),
+            packet_query(None),
+        ];
+    }
+    vec![
+        format!("SELECT * FROM cell_state WHERE owner_player_id = {local_player}"),
+        format!("SELECT * FROM combat_front WHERE attacker_player_id = {local_player}"),
+        format!("SELECT * FROM combat_front WHERE defender_player_id = {local_player}"),
+        format!("SELECT * FROM cluster_policy_assignment WHERE owner_player_id = {local_player}"),
+        format!("SELECT * FROM command_receipt WHERE player_id = {local_player}"),
+        format!("SELECT * FROM mobilization_policy WHERE player_id = {local_player}"),
+        format!("SELECT * FROM transfer_destination WHERE player_id = {local_player}"),
+        format!("SELECT * FROM transfer_order WHERE player_id = {local_player}"),
+        format!("SELECT * FROM transfer_source WHERE player_id = {local_player}"),
+        route_query(Some(local_player)),
+        packet_query(Some(local_player)),
+    ]
+}
+
+/// Separate high-scale spatial `CellState` interest around a focus chunk.
+/// Bandwidth only — not auth. Does not include local-owned (that stays tactical).
+fn spatial_cell_state_queries(interest: SpatialInterest) -> Vec<String> {
+    let qmin = interest.focus_chunk_q.saturating_sub(interest.radius);
+    let qmax = interest.focus_chunk_q.saturating_add(interest.radius);
+    let rmin = interest.focus_chunk_r.saturating_sub(interest.radius);
+    let rmax = interest.focus_chunk_r.saturating_add(interest.radius);
+    vec![format!(
+        "SELECT * FROM cell_state WHERE chunk_q >= {qmin} AND chunk_q <= {qmax} AND chunk_r >= {rmin} AND chunk_r <= {rmax}"
+    )]
+}
+
+/// Full query set a bound client ends up with (bootstrap + tactical + optional
+/// spatial cell interest). Unbound observers keep bootstrap only.
+#[cfg(test)]
+fn client_subscription_queries(
+    player_count: u16,
+    local_player: Option<u16>,
+    interest: Option<SpatialInterest>,
+) -> Vec<String> {
+    let mut queries = bootstrap_subscription_queries();
+    if let Some(local_player) = local_player {
+        queries.extend(tactical_subscription_queries(player_count, local_player));
+        if player_count > HIGH_SCALE_PLAYER_THRESHOLD {
+            let interest = interest.unwrap_or(SpatialInterest {
+                focus_chunk_q: 0,
+                focus_chunk_r: 0,
+                radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
+            });
+            queries.extend(spatial_cell_state_queries(interest));
+        }
+    }
+    queries
+}
+
+fn chunk_coords_for_cell_id(cell_id: u32, map_width: u16, chunk_size: u16) -> (i16, i16) {
+    let width = u32::from(map_width.max(1));
+    let size = i32::from(chunk_size.max(1));
+    let column = i32::try_from(cell_id % width).unwrap_or(0);
+    let row = i32::try_from(cell_id / width).unwrap_or(0);
+    (
+        i16::try_from(column.div_euclid(size)).unwrap_or(0),
+        i16::try_from(row.div_euclid(size)).unwrap_or(0),
+    )
+}
+
+fn chunk_coords_for_axial(
+    coordinate: Axial,
+    map_origin_q: i32,
+    map_origin_r: i32,
+    chunk_size: u16,
+) -> (i16, i16) {
+    let size = i32::from(chunk_size.max(1));
+    let column = coordinate.q - map_origin_q;
+    let row = coordinate.r - map_origin_r;
+    (
+        i16::try_from(column.div_euclid(size)).unwrap_or(0),
+        i16::try_from(row.div_euclid(size)).unwrap_or(0),
+    )
+}
+
+/// Tracks bootstrap vs tactical readiness so commands cannot fire after the
+/// lobby snapshot alone. Reconnect clears both flags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SubscriptionLifecycle {
+    bootstrap_ready: bool,
+    tactical_ready: bool,
+}
+
+impl SubscriptionLifecycle {
+    const fn commands_ready(self) -> bool {
+        self.bootstrap_ready && self.tactical_ready
+    }
+
+    const fn reset() -> Self {
+        Self {
+            bootstrap_ready: false,
+            tactical_ready: false,
+        }
+    }
+
+    const fn on_bootstrap_applied(self) -> Self {
+        Self {
+            bootstrap_ready: true,
+            tactical_ready: self.tactical_ready,
+        }
+    }
+
+    const fn on_tactical_start(self) -> Self {
+        Self {
+            bootstrap_ready: self.bootstrap_ready,
+            tactical_ready: false,
+        }
+    }
+
+    const fn on_tactical_applied(self) -> Self {
+        Self {
+            bootstrap_ready: self.bootstrap_ready,
+            tactical_ready: true,
+        }
+    }
+}
 
 #[cfg(debug_assertions)]
 const POLICY_FLOW_DEBUG_KEY: KeyCode = KeyCode::F4;
@@ -89,7 +273,8 @@ pub struct OnlineSyncSet;
 #[derive(Clone, Debug)]
 enum LifecycleEvent {
     Connected { generation: u64 },
-    Subscribed { generation: u64 },
+    BootstrapSubscribed { generation: u64 },
+    TacticalSubscribed { generation: u64 },
     JoinFailed { generation: u64, reason: String },
     ConnectionFailed { generation: u64, reason: String },
     Disconnected { generation: u64, reason: String },
@@ -101,6 +286,9 @@ enum LifecycleEvent {
 struct SharedSignals {
     dirty: AtomicU32,
     cell_changes: Mutex<BTreeMap<u32, CellState>>,
+    /// Cells removed from the client cache (interest leave / map replace).
+    /// Projected to neutral/default without requiring a full terrain rebuild.
+    cell_absences: Mutex<BTreeSet<u32>>,
     packet_changes: Mutex<BTreeMap<u64, Option<TransitPacket>>>,
     route_changes: Mutex<BTreeMap<u64, Option<TransitRoute>>>,
     front_changes: Mutex<BTreeMap<String, Option<CombatFront>>>,
@@ -119,9 +307,52 @@ impl SharedSignals {
         self.dirty.swap(0, Ordering::AcqRel)
     }
 
+    /// Drop every pending row delta and dirty bit. Used on reconnect so a new
+    /// generation cannot apply stale callbacks from the previous connection.
+    fn clear_pending_deltas(&self) {
+        self.dirty.store(0, Ordering::Release);
+        if let Ok(mut cells) = self.cell_changes.lock() {
+            cells.clear();
+        }
+        if let Ok(mut absences) = self.cell_absences.lock() {
+            absences.clear();
+        }
+        if let Ok(mut packets) = self.packet_changes.lock() {
+            packets.clear();
+        }
+        if let Ok(mut routes) = self.route_changes.lock() {
+            routes.clear();
+        }
+        if let Ok(mut fronts) = self.front_changes.lock() {
+            fronts.clear();
+        }
+        if let Ok(mut orders) = self.order_changes.lock() {
+            orders.clear();
+        }
+        if let Ok(mut sources) = self.source_changes.lock() {
+            sources.clear();
+        }
+        if let Ok(mut destinations) = self.destination_changes.lock() {
+            destinations.clear();
+        }
+    }
+
     fn record_cell(&self, cell: &CellState) {
+        if let Ok(mut absences) = self.cell_absences.lock() {
+            absences.remove(&cell.cell_id);
+        }
         if let Ok(mut changes) = self.cell_changes.lock() {
             changes.insert(cell.cell_id, cell.clone());
+        }
+        self.mark(CELLS_DIRTY);
+    }
+
+    fn record_cell_absence(&self, cell_id: u32) {
+        if let Ok(mut changes) = self.cell_changes.lock() {
+            changes.remove(&cell_id);
+        }
+        if let Ok(mut absences) = self.cell_absences.lock() {
+            absences.insert(cell_id);
         }
         self.mark(CELLS_DIRTY);
     }
@@ -130,6 +361,13 @@ impl SharedSignals {
         self.cell_changes.lock().map_or_else(
             |_| Vec::new(),
             |mut changes| std::mem::take(&mut *changes).into_values().collect(),
+        )
+    }
+
+    fn take_cell_absences(&self) -> BTreeSet<u32> {
+        self.cell_absences.lock().map_or_else(
+            |_| BTreeSet::new(),
+            |mut absences| std::mem::take(&mut *absences),
         )
     }
 
@@ -415,8 +653,21 @@ struct OnlineTransport {
     processed_receipts: BTreeSet<u128>,
     terminal_command_ids: BTreeSet<u64>,
     next_command_id: u64,
-    bound_player: Option<u8>,
-    subscription_ready: bool,
+    bound_player: Option<u16>,
+    /// Bootstrap (globals) and tactical readiness are tracked separately so
+    /// lobby snapshots never unlock commands before the seat-scoped tactical
+    /// subscription has applied.
+    subscription_lifecycle: SubscriptionLifecycle,
+    /// Player id used for the single post-bind tactical subscription.
+    tactical_subscription_player: Option<u16>,
+    /// One-time tactical handle (local-owned + combat + tactical tables).
+    tactical_subscription_handle: Option<SubscriptionHandle>,
+    /// Separate moving spatial `CellState` interest handle (high-scale only).
+    spatial_cell_handle: Option<SubscriptionHandle>,
+    /// Currently subscribed spatial interest center/radius, if any.
+    spatial_interest: Option<SpatialInterest>,
+    /// Pending old spatial handle awaiting drop after the replacement applies.
+    retiring_spatial_handle: Option<SubscriptionHandle>,
     command_ids_ready: bool,
     active_generation: u64,
     failed_generation: Option<u64>,
@@ -443,7 +694,12 @@ impl OnlineTransport {
             terminal_command_ids: BTreeSet::new(),
             next_command_id: session_command_floor(),
             bound_player: None,
-            subscription_ready: false,
+            subscription_lifecycle: SubscriptionLifecycle::default(),
+            tactical_subscription_player: None,
+            tactical_subscription_handle: None,
+            spatial_cell_handle: None,
+            spatial_interest: None,
+            retiring_spatial_handle: None,
             command_ids_ready: false,
             active_generation: 0,
             failed_generation: None,
@@ -451,6 +707,20 @@ impl OnlineTransport {
             reconnect_delay_seconds: 0.0,
             connection_disabled: false,
         }
+    }
+
+    fn clear_subscription_handles(&mut self) {
+        if let Some(handle) = self.tactical_subscription_handle.take() {
+            let _ = handle.unsubscribe();
+        }
+        if let Some(handle) = self.spatial_cell_handle.take() {
+            let _ = handle.unsubscribe();
+        }
+        if let Some(handle) = self.retiring_spatial_handle.take() {
+            let _ = handle.unsubscribe();
+        }
+        self.spatial_interest = None;
+        self.tactical_subscription_player = None;
     }
 
     fn allocate_command_id(&mut self) -> Option<u64> {
@@ -498,7 +768,12 @@ impl Plugin for OnlineTransportPlugin {
         app.insert_resource(OnlineTransport::new(config))
             .add_systems(
                 Update,
-                (maintain_connection, send_online_intents, frame_tick)
+                (
+                    maintain_connection,
+                    maintain_moving_viewport_interest,
+                    send_online_intents,
+                    frame_tick,
+                )
                     .chain()
                     .in_set(NetworkSet::Transport),
             )
@@ -601,8 +876,12 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     transport.active_generation = transport.active_generation.wrapping_add(1).max(1);
     let generation = transport.active_generation;
     transport.failed_generation = None;
-    transport.subscription_ready = false;
+    transport.subscription_lifecycle = SubscriptionLifecycle::reset();
+    transport.clear_subscription_handles();
     transport.command_ids_ready = false;
+    transport.signals.clear_pending_deltas();
+    transport.tactical = TacticalCache::default();
+    clear_tactical_presentation(view);
     view.authority = AuthorityState::Connecting;
 
     let token_path = transport.config.token_path();
@@ -644,7 +923,7 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
                 .subscription_builder()
                 .on_applied(move |context| {
                     applied_signals.mark(ALL_DIRTY);
-                    applied_signals.push(LifecycleEvent::Subscribed { generation });
+                    applied_signals.push(LifecycleEvent::BootstrapSubscribed { generation });
                     let join_signals = Arc::clone(&applied_signals);
                     if let Err(error) = context.reducers.join_match_then(
                         preferred_player,
@@ -665,10 +944,10 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
                 .on_error(move |_context, error| {
                     subscription_error_signals.push(LifecycleEvent::ConnectionFailed {
                         generation,
-                        reason: format!("subscription failed: {error}"),
+                        reason: format!("bootstrap subscription failed: {error}"),
                     });
                 })
-                .subscribe(CLIENT_SUBSCRIPTIONS);
+                .subscribe(bootstrap_subscription_queries());
         })
         .on_connect_error(move |_context, error| {
             connect_error_signals.push(LifecycleEvent::ConnectionFailed {
@@ -705,8 +984,10 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
 
 fn disable_invalid_host(transport: &mut OnlineTransport, view: &mut MatchView, reason: &str) {
     transport.connection_disabled = true;
-    transport.subscription_ready = false;
+    transport.subscription_lifecycle = SubscriptionLifecycle::default();
+    transport.clear_subscription_handles();
     transport.command_ids_ready = false;
+    clear_tactical_presentation(view);
     view.authority = AuthorityState::ConnectionUnavailable {
         reason: format!("invalid host: {reason}"),
     };
@@ -742,15 +1023,17 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         .cell_state()
         .on_update(move |_context, _old, new| cell_update_signals.record_cell(new));
     let cell_delete_signals = Arc::clone(signals);
-    connection.db.cell_state().on_delete(move |_context, _row| {
-        // Cell deletion only occurs during lobby map replacement. Force a
-        // terrain-backed rebuild so removed cells cannot remain in the view.
-        cell_delete_signals.mark(TERRAIN_DIRTY | CELLS_DIRTY);
+    connection.db.cell_state().on_delete(move |_context, row| {
+        // Interest leave (moving viewport) and lobby map replacement both delete
+        // rows from the client cache. Project absence to neutral/default so stale
+        // remote state cannot linger when the spatial handle moves.
+        cell_delete_signals.record_cell_absence(row.cell_id);
     });
     watch_table!(connection.db.cluster_policy_assignment(), POLICIES_DIRTY);
     watch_table!(connection.db.match_config(), MATCH_DIRTY);
     watch_table!(connection.db.match_state(), MATCH_DIRTY);
     watch_table!(connection.db.player_slot(), PLAYERS_DIRTY);
+    watch_table!(connection.db.player_state(), MATCH_DIRTY);
     watch_table!(connection.db.mobilization_policy(), MOBILIZATION_DIRTY);
     watch_table!(connection.db.command_receipt(), RECEIPTS_DIRTY);
     #[cfg(debug_assertions)]
@@ -810,6 +1093,18 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
                 record_change(&packet_delete_signals.packet_changes, row.packet_key, None);
                 packet_delete_signals.mark(FLOWS_DIRTY);
             });
+        let packet_update_signals = Arc::clone(signals);
+        connection
+            .db
+            .visible_packets()
+            .on_update(move |_context, _old, new| {
+                record_change(
+                    &packet_update_signals.packet_changes,
+                    new.packet_key,
+                    Some(new.clone()),
+                );
+                packet_update_signals.mark(FLOWS_DIRTY);
+            });
     }
     #[cfg(debug_assertions)]
     {
@@ -867,6 +1162,18 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
             .on_delete(move |_context, row| {
                 record_change(&route_delete_signals.route_changes, row.route_id, None);
                 route_delete_signals.mark(FLOWS_DIRTY);
+            });
+        let route_update_signals = Arc::clone(signals);
+        connection
+            .db
+            .visible_routes()
+            .on_update(move |_context, _old, new| {
+                record_change(
+                    &route_update_signals.route_changes,
+                    new.route_id,
+                    Some(new.clone()),
+                );
+                route_update_signals.mark(FLOWS_DIRTY);
             });
     }
     let front_insert_signals = Arc::clone(signals);
@@ -1023,7 +1330,7 @@ fn send_online_intents(
     mut updates: MessageWriter<ServerUpdate>,
 ) {
     for intent in intents.read() {
-        if !transport.subscription_ready || !transport.command_ids_ready {
+        if !transport.subscription_lifecycle.commands_ready() || !transport.command_ids_ready {
             updates.write(ServerUpdate::Rejected {
                 command_id: None,
                 reason: view.authority.command_block_reason(),
@@ -1344,6 +1651,7 @@ struct AuthoritySnapshot {
     cluster_policies: Option<Vec<ClusterPolicyAssignment>>,
     config: Option<MatchConfig>,
     match_state: Option<MatchState>,
+    player_states: Option<Vec<PlayerState>>,
     players: Option<Vec<PlayerSlot>>,
     mobilization: Option<Vec<MobilizationPolicy>>,
     receipts: Option<Vec<CommandReceipt>>,
@@ -1369,6 +1677,8 @@ impl AuthoritySnapshot {
             match_state: (dirty & MATCH_DIRTY != 0)
                 .then(|| connection.db.match_state().iter().next())
                 .flatten(),
+            player_states: (dirty & MATCH_DIRTY != 0)
+                .then(|| connection.db.player_state().iter().collect()),
             players: (dirty & PLAYERS_DIRTY != 0)
                 .then(|| connection.db.player_slot().iter().collect()),
             mobilization: (dirty & MOBILIZATION_DIRTY != 0)
@@ -1525,6 +1835,7 @@ fn synchronize_authoritative_view(
     if dirty == 0 {
         return;
     }
+    let cell_absences = transport.signals.take_cell_absences();
     let snapshot = {
         let Some(connection) = &transport.connection else {
             return;
@@ -1552,13 +1863,26 @@ fn synchronize_authoritative_view(
             terrain,
             snapshot.cells.as_deref(),
         );
-    } else if let Some(cells) = snapshot.cells {
-        update_cells(&transport, &mut view, &cells, *mode);
+    } else {
+        if let Some(cells) = snapshot.cells {
+            update_cells(&transport, &mut view, &cells, *mode);
+        }
+        if !cell_absences.is_empty() {
+            neutralize_absent_cells(&transport, &mut view, &cell_absences, *mode);
+        }
     }
 
     if let Some(config) = snapshot.config {
+        view.player_count = config.player_count;
+        view.connection
+            .resize(usize::from(config.player_count), ConnectionState::Syncing);
         view.conquest_threshold_bps = config.conquest_threshold_bps;
         view.max_elevation_step = u16::from(config.max_elevation_step);
+        // Config may arrive after the local seat bind in a later dirty batch;
+        // issue the single tactical subscription only once both are known.
+        if let Some(local_player) = transport.bound_player {
+            ensure_tactical_subscriptions(&mut transport, config.player_count, local_player);
+        }
     }
     if let Some(state) = snapshot.match_state {
         view.phase = match state.phase {
@@ -1569,8 +1893,15 @@ fn synchronize_authoritative_view(
         view.logical_step = state.logical_step;
         view.capturable_cells = state.capturable_cells;
         view.required_control = state.required_control;
-        view.authoritative_control =
-            Some([state.player_one_controlled, state.player_two_controlled]);
+        view.claimed_players = state.claimed_players;
+    }
+    if let Some(player_states) = snapshot.player_states {
+        view.authoritative_control = Some(
+            player_states
+                .into_iter()
+                .map(|state| (u32::from(state.player_id), state.controlled_cells))
+                .collect(),
+        );
     }
     if let Some(players) = snapshot.players {
         update_players(&mut transport, &mut view, snapshot.identity, &players);
@@ -1588,7 +1919,7 @@ fn synchronize_authoritative_view(
     }
 
     if !transport.command_ids_ready
-        && transport.subscription_ready
+        && transport.subscription_lifecycle.commands_ready()
         && snapshot.identity.is_some()
         && let Some(receipts) = snapshot.receipts.as_deref()
         && transport.bound_player.is_some()
@@ -1650,14 +1981,27 @@ fn apply_lifecycle_event(
             view.authority = AuthorityState::Connecting;
             "Connected · subscribing to authoritative tables…".clone_into(&mut view.latest_result);
         }
-        LifecycleEvent::Subscribed { generation }
+        LifecycleEvent::BootstrapSubscribed { generation }
             if lifecycle_is_current(transport, generation) =>
         {
             transport.reconnect_attempt = 0;
             transport.reconnect_delay_seconds = 0.0;
-            transport.subscription_ready = true;
+            transport.subscription_lifecycle =
+                transport.subscription_lifecycle.on_bootstrap_applied();
             view.authority = AuthorityState::Connecting;
-            "Authoritative snapshot applied · joining match…".clone_into(&mut view.latest_result);
+            "Authoritative lobby snapshot applied · joining match…"
+                .clone_into(&mut view.latest_result);
+        }
+        LifecycleEvent::TacticalSubscribed { generation }
+            if lifecycle_is_current(transport, generation) =>
+        {
+            transport.subscription_lifecycle =
+                transport.subscription_lifecycle.on_tactical_applied();
+            if transport.bound_player.is_some() {
+                view.authority = AuthorityState::Ready;
+                "Authoritative controls ready · tactical subscription applied"
+                    .clone_into(&mut view.latest_result);
+            }
         }
         LifecycleEvent::JoinFailed { generation, reason }
             if lifecycle_is_current(transport, generation) =>
@@ -1699,7 +2043,8 @@ fn apply_lifecycle_event(
             message,
         } if generation == transport.active_generation => view.push_log(message),
         LifecycleEvent::Connected { .. }
-        | LifecycleEvent::Subscribed { .. }
+        | LifecycleEvent::BootstrapSubscribed { .. }
+        | LifecycleEvent::TacticalSubscribed { .. }
         | LifecycleEvent::JoinFailed { .. }
         | LifecycleEvent::TokenWarning { .. } => {}
     }
@@ -1707,7 +2052,12 @@ fn apply_lifecycle_event(
 
 fn mark_join_failed(transport: &mut OnlineTransport, view: &mut MatchView, reason: String) {
     transport.bound_player = None;
+    transport.clear_subscription_handles();
+    // Keep bootstrap readiness; the lobby snapshot is still valid. Clear only
+    // tactical readiness so a later successful seat claim re-subscribes.
+    transport.subscription_lifecycle.tactical_ready = false;
     transport.command_ids_ready = false;
+    clear_tactical_presentation(view);
     view.authority = AuthorityState::SlotUnavailable {
         reason: reason.clone(),
     };
@@ -1737,9 +2087,13 @@ fn handle_connection_loss(
         return;
     }
 
-    transport.subscription_ready = false;
+    transport.subscription_lifecycle = SubscriptionLifecycle::reset();
     transport.command_ids_ready = false;
     transport.bound_player = None;
+    transport.clear_subscription_handles();
+    transport.signals.clear_pending_deltas();
+    transport.tactical = TacticalCache::default();
+    clear_tactical_presentation(view);
     view.authority = AuthorityState::Connecting;
     if let Some(connection) = transport.connection.take() {
         let _ = connection.disconnect();
@@ -1759,7 +2113,7 @@ fn handle_connection_loss(
     }
 
     transport.schedule_reconnect();
-    view.connection = [ConnectionState::Syncing, ConnectionState::Syncing];
+    view.connection = vec![ConnectionState::Syncing; usize::from(view.player_count)];
     view.latest_result = format!(
         "Connection lost · retrying in {:.1}s",
         transport.reconnect_delay_seconds
@@ -1887,7 +2241,7 @@ fn cell_view_from_rows(
     }
 }
 
-const fn owner(player_id: u8) -> Option<u32> {
+const fn owner(player_id: u16) -> Option<u32> {
     if player_id == 0 {
         None
     } else {
@@ -1901,25 +2255,34 @@ fn update_players(
     identity: Option<spacetimedb_sdk::Identity>,
     players: &[PlayerSlot],
 ) {
-    for player_id in [1_u8, 2] {
-        view.connection[usize::from(player_id - 1)] = players
-            .iter()
-            .find(|slot| slot.player_id == player_id)
-            .map_or(ConnectionState::Syncing, |slot| {
-                if slot.identity.is_none() {
-                    ConnectionState::Open
-                } else if slot.connected {
-                    ConnectionState::Connected
-                } else {
-                    ConnectionState::ClaimedOffline
-                }
-            });
+    view.connection
+        .resize(usize::from(view.player_count), ConnectionState::Syncing);
+    // Single linear pass over the snapshot; index by player_id instead of a
+    // nested scan per configured seat. Missing seats stay Syncing until the
+    // authority projects them.
+    for state in &mut view.connection {
+        *state = ConnectionState::Syncing;
     }
-    if let Some(identity) = identity
-        && let Some(slot) = players
-            .iter()
-            .find(|slot| slot.identity.as_ref() == Some(&identity))
-    {
+    let mut local_slot = None;
+    for slot in players {
+        let Some(index) = (slot.player_id as usize).checked_sub(1) else {
+            continue;
+        };
+        if index >= view.connection.len() {
+            continue;
+        }
+        view.connection[index] = if slot.identity.is_none() {
+            ConnectionState::Open
+        } else if slot.connected {
+            ConnectionState::Connected
+        } else {
+            ConnectionState::ClaimedOffline
+        };
+        if identity.is_some() && slot.identity.as_ref() == identity.as_ref() {
+            local_slot = Some(slot);
+        }
+    }
+    if let Some(slot) = local_slot {
         let local_player = u32::from(slot.player_id);
         if view.local_player != local_player {
             view.local_player = local_player;
@@ -1929,12 +2292,244 @@ fn update_players(
         if transport.bound_player != Some(slot.player_id) {
             transport.bound_player = Some(slot.player_id);
             transport.command_ids_ready = false;
-            view.authority = AuthorityState::Ready;
+            view.authority = AuthorityState::Connecting;
             view.latest_result = format!(
-                "Authoritative controls ready · bound to Player {}",
+                "Bound to Player {} · subscribing to tactical tables…",
                 slot.player_id
             );
+            ensure_tactical_subscriptions(transport, view.player_count, slot.player_id);
         }
+    }
+}
+
+fn ensure_tactical_subscriptions(
+    transport: &mut OnlineTransport,
+    player_count: u16,
+    local_player: u16,
+) {
+    // Exactly one tactical subscription after the seat and count are known.
+    // Bootstrap is metadata/terrain only, so this second handle stacks safely
+    // without replacing or duplicating those projections. High-scale spatial
+    // CellState interest is a third, movable handle installed separately.
+    if transport.tactical_subscription_player == Some(local_player) {
+        return;
+    }
+    let Some(connection) = transport.connection.as_ref() else {
+        return;
+    };
+    let queries = tactical_subscription_queries(player_count, local_player);
+    let applied_signals = Arc::clone(&transport.signals);
+    let error_signals = Arc::clone(&transport.signals);
+    let generation = transport.active_generation;
+    let handle = connection
+        .subscription_builder()
+        .on_applied(move |_| {
+            applied_signals.mark(ALL_DIRTY);
+            applied_signals.push(LifecycleEvent::TacticalSubscribed { generation });
+        })
+        .on_error(move |_, error| {
+            error_signals.push(LifecycleEvent::ConnectionFailed {
+                generation,
+                reason: format!("tactical subscription failed: {error}"),
+            });
+        })
+        .subscribe(queries);
+    if let Some(previous) = transport.tactical_subscription_handle.replace(handle) {
+        let _ = previous.unsubscribe();
+    }
+    transport.tactical_subscription_player = Some(local_player);
+    transport.subscription_lifecycle = transport.subscription_lifecycle.on_tactical_start();
+
+    // Spawn-centered initial spatial interest before camera state is available.
+    if player_count > HIGH_SCALE_PLAYER_THRESHOLD {
+        let config = connection.db.match_config().iter().next();
+        let spawn_cell = connection
+            .db
+            .player_state()
+            .iter()
+            .find(|state| state.player_id == local_player)
+            .map_or(0, |state| state.spawn_cell_id);
+        let (chunk_q, chunk_r) = config.map_or((0, 0), |config| {
+            chunk_coords_for_cell_id(spawn_cell, config.map_width, config.chunk_size)
+        });
+        let interest = SpatialInterest {
+            focus_chunk_q: chunk_q,
+            focus_chunk_r: chunk_r,
+            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
+        };
+        install_spatial_cell_subscription(transport, interest);
+    }
+}
+
+fn install_spatial_cell_subscription(transport: &mut OnlineTransport, interest: SpatialInterest) {
+    if transport.spatial_interest == Some(interest) {
+        return;
+    }
+    let Some(connection) = transport.connection.as_ref() else {
+        return;
+    };
+    let queries = spatial_cell_state_queries(interest);
+    let applied_signals = Arc::clone(&transport.signals);
+    let error_signals = Arc::clone(&transport.signals);
+    let generation = transport.active_generation;
+    let handle = connection
+        .subscription_builder()
+        .on_applied(move |_| {
+            // Spatial interest only carries CellState bandwidth rows.
+            applied_signals.mark(CELLS_DIRTY);
+        })
+        .on_error(move |_, error| {
+            error_signals.push(LifecycleEvent::ConnectionFailed {
+                generation,
+                reason: format!("spatial cell interest subscription failed: {error}"),
+            });
+        })
+        .subscribe(queries);
+
+    // Keep at most one live + one retiring spatial handle. Drop any already-
+    // retiring handle immediately so subscriptions never accumulate.
+    if let Some(previous) = transport.spatial_cell_handle.replace(handle)
+        && let Some(stale) = transport.retiring_spatial_handle.replace(previous)
+    {
+        let _ = stale.unsubscribe();
+    }
+    transport.spatial_interest = Some(interest);
+}
+
+fn finish_retiring_spatial_handle(transport: &mut OnlineTransport) {
+    let ready = transport
+        .spatial_cell_handle
+        .as_ref()
+        .is_some_and(SubscriptionHandle::is_active);
+    if ready && let Some(old) = transport.retiring_spatial_handle.take() {
+        let _ = old.unsubscribe();
+    }
+}
+
+/// High-scale bandwidth interest: resubscribe the spatial `CellState` handle when
+/// the camera focus crosses a server chunk boundary. Local-owned cells remain on
+/// the one-time tactical subscription.
+fn maintain_moving_viewport_interest(
+    mut transport: ResMut<OnlineTransport>,
+    view: Res<MatchView>,
+    camera: Option<Single<&CameraRig, With<GameCamera>>>,
+) {
+    finish_retiring_spatial_handle(&mut transport);
+    if view.player_count <= HIGH_SCALE_PLAYER_THRESHOLD {
+        return;
+    }
+    if transport.bound_player.is_none() || transport.connection.is_none() {
+        return;
+    }
+    if !transport.subscription_lifecycle.tactical_ready {
+        return;
+    }
+    let Some(rig) = camera else {
+        return;
+    };
+    let Some(interest) = camera_focus_spatial_interest(&transport, &rig) else {
+        return;
+    };
+    if transport
+        .spatial_interest
+        .is_some_and(|current| current.center() == interest.center())
+    {
+        return;
+    }
+    install_spatial_cell_subscription(&mut transport, interest);
+}
+
+fn camera_focus_spatial_interest(
+    transport: &OnlineTransport,
+    rig: &CameraRig,
+) -> Option<SpatialInterest> {
+    let connection = transport.connection.as_ref()?;
+    let config = connection.db.match_config().iter().next()?;
+    let plane = Vec2::new(rig.focus.x, rig.focus.z);
+    let focus = plane_to_axial(plane);
+    let (chunk_q, chunk_r) = if transport.coordinate_to_id.contains_key(&focus) {
+        chunk_coords_for_axial(focus, config.map_q_min, config.map_r_min, config.chunk_size)
+    } else if let Some((&coordinate, _)) =
+        transport
+            .coordinate_to_id
+            .iter()
+            .min_by_key(|(coordinate, _)| {
+                let center = axial_to_plane(**coordinate);
+                ordered_float_key(center.distance_squared(plane))
+            })
+    {
+        chunk_coords_for_axial(
+            coordinate,
+            config.map_q_min,
+            config.map_r_min,
+            config.chunk_size,
+        )
+    } else {
+        chunk_coords_for_axial(focus, config.map_q_min, config.map_r_min, config.chunk_size)
+    };
+    Some(SpatialInterest {
+        focus_chunk_q: chunk_q,
+        focus_chunk_r: chunk_r,
+        radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
+    })
+}
+
+fn ordered_float_key(value: f32) -> u32 {
+    // distance_squared is non-negative; keep a total order for BTree min_by_key.
+    value.to_bits()
+}
+
+fn clear_tactical_presentation(view: &mut MatchView) {
+    view.clear_authoritative_flows();
+    view.active_flows.clear();
+    view.active_fronts.clear();
+    view.set_contested_cells(BTreeMap::new());
+    if view.retask_projection != RetaskProjection::default() {
+        view.retask_projection = RetaskProjection::default();
+        view.retask_revision = view.retask_revision.wrapping_add(1);
+    }
+    view.cluster_policies.clear();
+}
+
+fn neutralize_absent_cells(
+    transport: &OnlineTransport,
+    view: &mut MatchView,
+    absences: &BTreeSet<u32>,
+    mode: MapViewMode,
+) {
+    let mut planning_changed = false;
+    let mut ownership_changed = false;
+    for &cell_id in absences {
+        let Some(coordinate) = transport.id_to_coordinate.get(&cell_id).copied() else {
+            continue;
+        };
+        let Some(cell) = view.cells.get_mut(&coordinate) else {
+            continue;
+        };
+        let rendering_changed = cell.owner.is_some()
+            || cell.infantry != 0
+            || (mode == MapViewMode::Civilians && cell.civilians != 0);
+        ownership_changed |= cell.owner.is_some();
+        planning_changed |=
+            cell.owner.is_some() || cell.infantry != 0 || cell.military_capacity != 0;
+        if rendering_changed {
+            view.dirty_chunks.insert(chunk_of(coordinate));
+        }
+        // Project subscription absence to neutral/default. Terrain stays;
+        // remote dynamic state is unknown outside interest.
+        cell.owner = None;
+        cell.civilians = 0;
+        cell.infantry = 0;
+        cell.military_capacity = 0;
+    }
+    if planning_changed {
+        view.mark_planning_changed();
+    }
+    if ownership_changed {
+        view.mark_ownership_changed();
+    }
+    if !absences.is_empty() {
+        view.mark_cell_state_changed();
     }
 }
 
@@ -3662,6 +4257,7 @@ mod tests {
             TransferDestination {
                 destination_key: 1,
                 order_id: 7,
+                player_id: 1,
                 cell_id: 12,
                 target_infantry: 20,
                 received_infantry: 0,
@@ -3669,6 +4265,7 @@ mod tests {
             TransferDestination {
                 destination_key: 2,
                 order_id: 9,
+                player_id: 1,
                 cell_id: 11,
                 target_infantry: 20,
                 received_infantry: 0,
@@ -3676,6 +4273,7 @@ mod tests {
             TransferDestination {
                 destination_key: 3,
                 order_id: 10,
+                player_id: 1,
                 cell_id: 11,
                 target_infantry: 30,
                 received_infantry: 12,
@@ -3683,6 +4281,7 @@ mod tests {
             TransferDestination {
                 destination_key: 4,
                 order_id: 11,
+                player_id: 1,
                 cell_id: 10,
                 target_infantry: 20,
                 received_infantry: 0,
@@ -3692,6 +4291,7 @@ mod tests {
             TransferSource {
                 source_key: 1,
                 order_id: 7,
+                player_id: 1,
                 cell_id: 10,
                 committed_infantry: 20,
                 queued_infantry: 0,
@@ -3699,6 +4299,7 @@ mod tests {
             TransferSource {
                 source_key: 2,
                 order_id: 8,
+                player_id: 1,
                 cell_id: 10,
                 committed_infantry: 5,
                 queued_infantry: 0,
@@ -3849,7 +4450,7 @@ mod tests {
 
         assert!(transport.connection_disabled);
         assert!(transport.connection.is_none());
-        assert!(!transport.subscription_ready);
+        assert!(!transport.subscription_lifecycle.commands_ready());
         assert!(matches!(
             view.authority,
             AuthorityState::ConnectionUnavailable { .. }
@@ -3872,7 +4473,10 @@ mod tests {
     #[test]
     fn join_failure_is_terminal_and_preserves_the_authoritative_reason() {
         let mut transport = OnlineTransport::new(test_config());
-        transport.subscription_ready = true;
+        transport.subscription_lifecycle = SubscriptionLifecycle {
+            bootstrap_ready: true,
+            tactical_ready: true,
+        };
         transport.command_ids_ready = true;
         transport.bound_player = Some(1);
         let mut view = MatchView::connecting(1);
@@ -3883,7 +4487,9 @@ mod tests {
             "both player slots are already claimed".to_owned(),
         );
 
-        assert!(transport.subscription_ready);
+        assert!(transport.subscription_lifecycle.bootstrap_ready);
+        assert!(!transport.subscription_lifecycle.tactical_ready);
+        assert!(!transport.subscription_lifecycle.commands_ready());
         assert!(!transport.command_ids_ready);
         assert_eq!(transport.bound_player, None);
         assert_eq!(
@@ -4005,11 +4611,14 @@ mod tests {
             &mut view,
             &[CellState {
                 cell_id: 42,
-                owner_player_id: original.owner.unwrap_or_default() as u8,
+                owner_player_id: original.owner.unwrap_or_default() as u16,
                 civilians: original.civilians + 1,
                 civilian_capacity: original.civilians + 100,
                 infantry: original.infantry,
                 military_capacity: original.military_capacity,
+                population_shard: 0,
+                chunk_q: 0,
+                chunk_r: 0,
                 last_changed_step: 1,
                 last_policy_changed_step: 1,
             }],
@@ -4039,11 +4648,14 @@ mod tests {
             &mut view,
             &[CellState {
                 cell_id: 43,
-                owner_player_id: original.owner.unwrap_or_default() as u8,
+                owner_player_id: original.owner.unwrap_or_default() as u16,
                 civilians: original.civilians + 1,
                 civilian_capacity: original.civilians + 100,
                 infantry: original.infantry,
                 military_capacity: original.military_capacity,
+                population_shard: 0,
+                chunk_q: 0,
+                chunk_r: 0,
                 last_changed_step: 1,
                 last_policy_changed_step: 1,
             }],
@@ -4079,6 +4691,9 @@ mod tests {
             civilian_capacity: original.civilians,
             infantry,
             military_capacity: original.military_capacity,
+            population_shard: 0,
+            chunk_q: 0,
+            chunk_r: 0,
             last_changed_step: 1,
             last_policy_changed_step: 1,
         };
@@ -4131,5 +4746,319 @@ mod tests {
         );
         fs::remove_file(&path).expect("remove test token");
         fs::remove_dir(&directory).expect("remove token test directory");
+    }
+
+    #[test]
+    fn bootstrap_subscription_is_metadata_and_terrain_only() {
+        let bootstrap = bootstrap_subscription_queries();
+        assert_eq!(bootstrap.len(), BOOTSTRAP_CLIENT_SUBSCRIPTIONS.len());
+        assert!(bootstrap.iter().all(|query| {
+            BOOTSTRAP_CLIENT_SUBSCRIPTIONS
+                .iter()
+                .any(|expected| expected == query)
+        }));
+        assert!(bootstrap.iter().all(|query| {
+            !query.contains("transfer_")
+                && !query.contains("transit_")
+                && !query.contains("command_receipt")
+                && !query.contains("mobilization_policy")
+                && !query.contains("cluster_policy")
+                && !query.contains("cell_state")
+                && !query.contains("combat_front")
+        }));
+        assert!(bootstrap.iter().any(|q| q.contains("cell_terrain")));
+        assert!(bootstrap.iter().any(|q| q.contains("match_config")));
+    }
+
+    #[test]
+    fn tactical_subscription_excludes_bootstrap_and_filters_high_scale() {
+        let low = tactical_subscription_queries(8, 3);
+        assert!(low.iter().any(|q| q == "SELECT * FROM transfer_order"));
+        assert!(low.iter().any(|q| q == "SELECT * FROM cell_state"));
+        assert!(low.iter().any(|q| q == "SELECT * FROM combat_front"));
+        assert!(low.iter().all(|q| !q.contains("WHERE player_id")));
+        assert!(low.iter().all(|q| {
+            !BOOTSTRAP_CLIENT_SUBSCRIPTIONS
+                .iter()
+                .any(|global| global == q)
+        }));
+        assert!(low.iter().any(|q| q == &route_query(None)));
+        assert!(low.iter().any(|q| q == &packet_query(None)));
+
+        let high = tactical_subscription_queries(500, 42);
+        assert!(
+            high.iter()
+                .any(|q| q == "SELECT * FROM transfer_order WHERE player_id = 42")
+        );
+        assert!(
+            high.iter()
+                .any(|q| q == "SELECT * FROM cell_state WHERE owner_player_id = 42")
+        );
+        // Spatial chunk interest is not on the tactical handle.
+        assert!(high.iter().all(|q| !q.contains("chunk_q")));
+        assert!(
+            high.iter()
+                .any(|q| q == "SELECT * FROM combat_front WHERE attacker_player_id = 42")
+        );
+        assert!(
+            high.iter()
+                .any(|q| q == "SELECT * FROM combat_front WHERE defender_player_id = 42")
+        );
+        assert!(high.iter().any(|q| q == &route_query(Some(42))));
+        assert!(high.iter().any(|q| q == &packet_query(Some(42))));
+        assert!(high.iter().all(|q| !q.contains("FROM match_config")));
+        assert!(high.iter().all(|q| !q.contains("FROM cell_terrain")));
+    }
+
+    #[test]
+    fn spatial_cell_queries_follow_focus_chunk_radius() {
+        let interest = SpatialInterest {
+            focus_chunk_q: 4,
+            focus_chunk_r: -2,
+            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
+        };
+        let queries = spatial_cell_state_queries(interest);
+        assert_eq!(queries.len(), 1);
+        assert!(queries[0].contains("FROM cell_state WHERE chunk_q >= 2"));
+        assert!(queries[0].contains("chunk_q <= 6"));
+        assert!(queries[0].contains("chunk_r >= -4"));
+        assert!(queries[0].contains("chunk_r <= 0"));
+        assert!(!queries[0].contains("owner_player_id"));
+    }
+
+    #[test]
+    fn high_scale_subscriptions_include_spatial_interest_and_local_rows() {
+        let low = client_subscription_queries(8, Some(3), None);
+        assert!(low.iter().any(|q| q == "SELECT * FROM transfer_order"));
+        assert!(low.iter().all(|q| !q.contains("WHERE player_id")));
+        assert!(low.iter().any(|q| q == "SELECT * FROM cell_state"));
+        // cell_state lives only in the tactical handle at low scale.
+        assert_eq!(
+            low.iter().filter(|q| q.contains("FROM cell_state")).count(),
+            1
+        );
+
+        let unbound = client_subscription_queries(64, None, None);
+        assert_eq!(unbound, bootstrap_subscription_queries());
+        assert!(unbound.iter().all(|q| !q.contains("transfer_order")));
+        assert!(unbound.iter().all(|q| !q.contains("cell_state")));
+
+        let interest = SpatialInterest {
+            focus_chunk_q: 1,
+            focus_chunk_r: 1,
+            radius: 2,
+        };
+        let high = client_subscription_queries(500, Some(42), Some(interest));
+        assert!(
+            high.iter()
+                .any(|q| q == "SELECT * FROM transfer_order WHERE player_id = 42")
+        );
+        assert!(
+            high.iter()
+                .any(|q| q == "SELECT * FROM cell_state WHERE owner_player_id = 42")
+        );
+        assert!(
+            high.iter()
+                .any(|q| q.contains("chunk_q >= -1") && q.contains("chunk_r <= 3"))
+        );
+        assert!(high.iter().any(|q| q == &packet_query(Some(42))));
+        // Bootstrap terrain once; no full unfiltered cell_state flood.
+        assert_eq!(
+            high.iter()
+                .filter(|q| *q == "SELECT * FROM cell_terrain")
+                .count(),
+            1
+        );
+        assert!(high.iter().all(|q| *q != "SELECT * FROM cell_state"));
+        // Local-owned tactical + separate spatial handle = two cell_state queries.
+        assert_eq!(
+            high.iter()
+                .filter(|q| q.contains("FROM cell_state"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn camera_focus_chunk_changes_only_when_crossing_boundaries() {
+        let first = SpatialInterest {
+            focus_chunk_q: 2,
+            focus_chunk_r: 3,
+            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
+        };
+        let same_center = SpatialInterest {
+            focus_chunk_q: 2,
+            focus_chunk_r: 3,
+            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
+        };
+        let moved = SpatialInterest {
+            focus_chunk_q: 3,
+            focus_chunk_r: 3,
+            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
+        };
+        assert_eq!(first.center(), same_center.center());
+        assert_ne!(first.center(), moved.center());
+        // cell_id 0 is the map corner at (q_min, r_min).
+        assert_eq!(
+            chunk_coords_for_axial(Axial::new(-32, -32), -32, -32, 16),
+            chunk_coords_for_cell_id(0, 64, 16)
+        );
+        // Axial (0,0) on a centered 64 map is column/row 32 → chunk (2,2).
+        assert_eq!(
+            chunk_coords_for_axial(Axial::new(0, 0), -32, -32, 16),
+            (2, 2)
+        );
+        assert_eq!(chunk_coords_for_cell_id(32 + 32 * 64, 64, 16), (2, 2));
+    }
+
+    #[test]
+    fn cell_absence_projects_to_neutral_defaults() {
+        let mut transport = OnlineTransport::new(test_config());
+        let mut view = MatchView::connecting(2);
+        let coordinate = Axial::new(1, 2);
+        transport.coordinate_to_id.insert(coordinate, 9);
+        transport.id_to_coordinate.insert(9, coordinate);
+        view.cells.insert(
+            coordinate,
+            CellView {
+                coordinate,
+                terrain: TerrainKind::Plains,
+                elevation: 1,
+                owner: Some(3),
+                civilians: 40,
+                infantry: 12,
+                military_capacity: 100,
+                blocked: false,
+            },
+        );
+        neutralize_absent_cells(
+            &transport,
+            &mut view,
+            &BTreeSet::from([9]),
+            MapViewMode::Soldiers,
+        );
+        let cell = view.cells.get(&coordinate).expect("cell retained");
+        assert_eq!(cell.owner, None);
+        assert_eq!(cell.infantry, 0);
+        assert_eq!(cell.civilians, 0);
+        assert_eq!(cell.military_capacity, 0);
+        assert_eq!(cell.terrain, TerrainKind::Plains);
+    }
+
+    #[test]
+    fn clear_tactical_presentation_drops_stale_reconnect_state() {
+        let mut view = MatchView::connecting(2);
+        view.active_flows.push(ActiveFlow {
+            route: vec![Axial::ZERO],
+            strength: 1,
+            attacking: false,
+            age: 0.0,
+            lifetime: 1.0,
+        });
+        view.active_fronts.push(ActiveFront {
+            friendly: Axial::ZERO,
+            hostile: Axial::new(1, 0),
+            intensity: 1.0,
+            age: 0.0,
+        });
+        view.set_authoritative_flow(
+            7,
+            Some(ActiveFlow {
+                route: vec![Axial::new(1, 0)],
+                strength: 2,
+                attacking: true,
+                age: 0.0,
+                lifetime: 1.0,
+            }),
+        );
+        clear_tactical_presentation(&mut view);
+        assert!(view.active_flows.is_empty());
+        assert!(view.active_fronts.is_empty());
+        assert!(view.authoritative_flows.is_empty());
+        assert!(view.contested_cells.is_empty());
+        assert!(view.retask_projection.active_order_ids.is_empty());
+    }
+
+    #[test]
+    fn packet_and_route_queries_are_cfg_dependent() {
+        #[cfg(debug_assertions)]
+        {
+            assert!(packet_query(None).contains("transit_packet"));
+            assert!(route_query(Some(9)).contains("transit_route"));
+            assert!(!packet_query(None).contains("visible_packets"));
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(packet_query(None).contains("visible_packets"));
+            assert!(route_query(Some(9)).contains("visible_routes"));
+            assert!(!packet_query(None).contains("transit_packet"));
+        }
+        assert!(packet_query(Some(7)).contains("owner_player_id = 7"));
+        assert!(route_query(Some(7)).contains("player_id = 7"));
+    }
+
+    #[test]
+    fn chunk_coords_for_spawn_cell_match_server_div_euclid() {
+        // cell_id = row * width + column, chunk = column/size, row/size
+        assert_eq!(chunk_coords_for_cell_id(0, 64, 16), (0, 0));
+        assert_eq!(chunk_coords_for_cell_id(16, 64, 16), (1, 0));
+        assert_eq!(chunk_coords_for_cell_id(64 * 16, 64, 16), (0, 1));
+        assert_eq!(chunk_coords_for_cell_id(64 * 16 + 33, 64, 16), (2, 1));
+    }
+
+    #[test]
+    fn subscription_lifecycle_requires_bootstrap_and_tactical() {
+        let mut lifecycle = SubscriptionLifecycle::default();
+        assert!(!lifecycle.commands_ready());
+
+        lifecycle = lifecycle.on_bootstrap_applied();
+        assert!(lifecycle.bootstrap_ready);
+        assert!(!lifecycle.commands_ready());
+
+        lifecycle = lifecycle.on_tactical_start();
+        assert!(!lifecycle.tactical_ready);
+        assert!(!lifecycle.commands_ready());
+
+        lifecycle = lifecycle.on_tactical_applied();
+        assert!(lifecycle.commands_ready());
+
+        lifecycle = SubscriptionLifecycle::reset();
+        assert!(!lifecycle.bootstrap_ready);
+        assert!(!lifecycle.tactical_ready);
+        assert!(!lifecycle.commands_ready());
+    }
+
+    #[test]
+    fn update_players_is_linear_over_the_snapshot() {
+        let mut transport = OnlineTransport::new(ClientConfig {
+            offline: true,
+            host: String::new(),
+            database: String::new(),
+            preferred_player: 2,
+            display_name: "t".into(),
+            profile: "t".into(),
+            debug_policy_flows: false,
+        });
+        let mut view = MatchView::connecting(4);
+        view.player_count = 4;
+        let identity = spacetimedb_sdk::Identity::ZERO;
+        let players = (1..=4)
+            .map(|player_id| PlayerSlot {
+                player_id,
+                identity: if player_id == 2 { Some(identity) } else { None },
+                display_name: format!("P{player_id}"),
+                connected: player_id == 2,
+                has_reconnected: false,
+                reconnect_count: 0,
+                ready: true,
+                joined_at_us: 0,
+                last_seen_at_us: 0,
+            })
+            .collect::<Vec<_>>();
+        update_players(&mut transport, &mut view, Some(identity), &players);
+        assert_eq!(view.local_player, 2);
+        assert_eq!(transport.bound_player, Some(2));
+        assert_eq!(view.connection[0], ConnectionState::Open);
+        assert_eq!(view.connection[1], ConnectionState::Connected);
     }
 }

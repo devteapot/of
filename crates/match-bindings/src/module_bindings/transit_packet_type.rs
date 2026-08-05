@@ -9,7 +9,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct TransitPacket {
     pub packet_key: u64,
     pub order_id: u64,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub origin_cell: u32,
     pub current_cell: u32,
     pub destination_cell: u32,
@@ -30,7 +30,7 @@ impl __sdk::InModule for TransitPacket {
 pub struct TransitPacketCols {
     pub packet_key: __sdk::__query_builder::Col<TransitPacket, u64>,
     pub order_id: __sdk::__query_builder::Col<TransitPacket, u64>,
-    pub owner_player_id: __sdk::__query_builder::Col<TransitPacket, u8>,
+    pub owner_player_id: __sdk::__query_builder::Col<TransitPacket, u16>,
     pub origin_cell: __sdk::__query_builder::Col<TransitPacket, u32>,
     pub current_cell: __sdk::__query_builder::Col<TransitPacket, u32>,
     pub destination_cell: __sdk::__query_builder::Col<TransitPacket, u32>,
@@ -69,6 +69,7 @@ impl __sdk::__query_builder::HasCols for TransitPacket {
 pub struct TransitPacketIxCols {
     pub current_cell: __sdk::__query_builder::IxCol<TransitPacket, u32>,
     pub order_id: __sdk::__query_builder::IxCol<TransitPacket, u64>,
+    pub owner_player_id: __sdk::__query_builder::IxCol<TransitPacket, u16>,
     pub packet_key: __sdk::__query_builder::IxCol<TransitPacket, u64>,
 }
 
@@ -78,6 +79,7 @@ impl __sdk::__query_builder::HasIxCols for TransitPacket {
         TransitPacketIxCols {
             current_cell: __sdk::__query_builder::IxCol::new(table_name, "current_cell"),
             order_id: __sdk::__query_builder::IxCol::new(table_name, "order_id"),
+            owner_player_id: __sdk::__query_builder::IxCol::new(table_name, "owner_player_id"),
             packet_key: __sdk::__query_builder::IxCol::new(table_name, "packet_key"),
         }
     }

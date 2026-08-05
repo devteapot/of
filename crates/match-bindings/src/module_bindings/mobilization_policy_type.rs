@@ -7,7 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct MobilizationPolicy {
-    pub player_id: u8,
+    pub player_id: u16,
     pub target_bps: u32,
 }
 
@@ -19,7 +19,7 @@ impl __sdk::InModule for MobilizationPolicy {
 ///
 /// Provides typed access to columns for query building.
 pub struct MobilizationPolicyCols {
-    pub player_id: __sdk::__query_builder::Col<MobilizationPolicy, u8>,
+    pub player_id: __sdk::__query_builder::Col<MobilizationPolicy, u16>,
     pub target_bps: __sdk::__query_builder::Col<MobilizationPolicy, u32>,
 }
 
@@ -37,7 +37,7 @@ impl __sdk::__query_builder::HasCols for MobilizationPolicy {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct MobilizationPolicyIxCols {
-    pub player_id: __sdk::__query_builder::IxCol<MobilizationPolicy, u8>,
+    pub player_id: __sdk::__query_builder::IxCol<MobilizationPolicy, u16>,
 }
 
 impl __sdk::__query_builder::HasIxCols for MobilizationPolicy {

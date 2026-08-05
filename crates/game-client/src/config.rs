@@ -25,9 +25,9 @@ struct ClientArgs {
     #[arg(long)]
     database: Option<String>,
 
-    /// Preferred player slot, 1 or 2 (env: `OF_PLAYER`).
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
-    player: Option<u8>,
+    /// Preferred player slot, 1 through 500 (env: `OF_PLAYER`).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=500))]
+    player: Option<u16>,
 
     /// Display name used by `join_match` (env: `OF_NAME`).
     #[arg(long)]
@@ -51,7 +51,7 @@ pub struct ClientConfig {
     pub offline: bool,
     pub host: String,
     pub database: String,
-    pub preferred_player: u8,
+    pub preferred_player: u16,
     pub display_name: String,
     pub profile: String,
     /// Presentation-only diagnostic state. Debug clients may toggle it at
@@ -66,8 +66,8 @@ impl ClientConfig {
         let debug_policy_flows = debug_policy_flows(&args);
         let preferred_player = args
             .player
-            .or_else(|| env_u8("OF_PLAYER"))
-            .filter(|player| matches!(player, 1 | 2))
+            .or_else(|| env_u16("OF_PLAYER"))
+            .filter(|player| (1..=500).contains(player))
             .unwrap_or(1);
         let profile = args
             .profile
@@ -128,8 +128,8 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn env_u8(name: &str) -> Option<u8> {
-    env_nonempty(name).and_then(|value| value.parse().ok())
+fn env_u16(key: &str) -> Option<u16> {
+    env_nonempty(key)?.parse().ok()
 }
 
 fn env_flag(name: &str) -> bool {

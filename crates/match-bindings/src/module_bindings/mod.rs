@@ -19,6 +19,7 @@ pub mod combat_front_type;
 pub mod command_receipt_table;
 pub mod command_receipt_type;
 pub mod configure_map_reducer;
+pub mod configure_match_reducer;
 pub mod expansion_garrison_debt_type;
 pub mod expansion_wave_type;
 pub mod issue_attack_clusters_reducer;
@@ -41,8 +42,11 @@ pub mod mobilization_policy_table;
 pub mod mobilization_policy_type;
 pub mod order_kind_type;
 pub mod order_status_type;
+pub mod player_identity_type;
 pub mod player_slot_table;
 pub mod player_slot_type;
+pub mod player_state_table;
+pub mod player_state_type;
 pub mod policy_replan_state_type;
 pub mod policy_topology_cache_type;
 pub mod receipt_status_type;
@@ -78,6 +82,7 @@ pub use combat_front_type::CombatFront;
 pub use command_receipt_table::*;
 pub use command_receipt_type::CommandReceipt;
 pub use configure_map_reducer::configure_map;
+pub use configure_match_reducer::configure_match;
 pub use expansion_garrison_debt_type::ExpansionGarrisonDebt;
 pub use expansion_wave_type::ExpansionWave;
 pub use issue_attack_clusters_reducer::issue_attack_clusters;
@@ -100,8 +105,11 @@ pub use mobilization_policy_table::*;
 pub use mobilization_policy_type::MobilizationPolicy;
 pub use order_kind_type::OrderKind;
 pub use order_status_type::OrderStatus;
+pub use player_identity_type::PlayerIdentity;
 pub use player_slot_table::*;
 pub use player_slot_type::PlayerSlot;
+pub use player_state_table::*;
+pub use player_state_type::PlayerState;
 pub use policy_replan_state_type::PolicyReplanState;
 pub use policy_topology_cache_type::PolicyTopologyCache;
 pub use receipt_status_type::ReceiptStatus;
@@ -138,6 +146,10 @@ pub enum Reducer {
     },
     ConfigureMap {
         preset: MapPreset,
+    },
+    ConfigureMatch {
+        preset: MapPreset,
+        player_count: u16,
     },
     IssueAttackClusters {
         client_command_id: u64,
@@ -194,7 +206,7 @@ pub enum Reducer {
         supersede_order_ids: Vec<u64>,
     },
     JoinMatch {
-        preferred_player_id: u8,
+        preferred_player_id: u16,
         display_name: String,
     },
     SetClusterPolicy {
@@ -219,6 +231,7 @@ impl __sdk::Reducer for Reducer {
         match self {
             Reducer::CancelOrders { .. } => "cancel_orders",
             Reducer::ConfigureMap { .. } => "configure_map",
+            Reducer::ConfigureMatch { .. } => "configure_match",
             Reducer::IssueAttackClusters { .. } => "issue_attack_clusters",
             Reducer::IssueBalance { .. } => "issue_balance",
             Reducer::IssueCoreLoad { .. } => "issue_core_load",
@@ -249,6 +262,13 @@ impl __sdk::Reducer for Reducer {
                     preset: preset.clone(),
                 })
             }
+            Reducer::ConfigureMatch {
+                preset,
+                player_count,
+            } => __sats::bsatn::to_vec(&configure_match_reducer::ConfigureMatchArgs {
+                preset: preset.clone(),
+                player_count: player_count.clone(),
+            }),
             Reducer::IssueAttackClusters {
                 client_command_id,
                 source_seed_cells,
@@ -395,6 +415,7 @@ pub struct DbUpdate {
     match_state: __sdk::TableUpdate<MatchState>,
     mobilization_policy: __sdk::TableUpdate<MobilizationPolicy>,
     player_slot: __sdk::TableUpdate<PlayerSlot>,
+    player_state: __sdk::TableUpdate<PlayerState>,
     transfer_destination: __sdk::TableUpdate<TransferDestination>,
     transfer_order: __sdk::TableUpdate<TransferOrder>,
     transfer_source: __sdk::TableUpdate<TransferSource>,
@@ -437,6 +458,9 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "player_slot" => db_update
                     .player_slot
                     .append(player_slot_table::parse_table_update(table_update)?),
+                "player_state" => db_update
+                    .player_state
+                    .append(player_state_table::parse_table_update(table_update)?),
                 "transfer_destination" => db_update.transfer_destination.append(
                     transfer_destination_table::parse_table_update(table_update)?,
                 ),
@@ -517,6 +541,9 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.player_slot = cache
             .apply_diff_to_table::<PlayerSlot>("player_slot", &self.player_slot)
             .with_updates_by_pk(|row| &row.player_id);
+        diff.player_state = cache
+            .apply_diff_to_table::<PlayerState>("player_state", &self.player_state)
+            .with_updates_by_pk(|row| &row.player_id);
         diff.transfer_destination = cache
             .apply_diff_to_table::<TransferDestination>(
                 "transfer_destination",
@@ -574,6 +601,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "player_slot" => db_update
                     .player_slot
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "player_state" => db_update
+                    .player_state
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "transfer_destination" => db_update
                     .transfer_destination
@@ -636,6 +666,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "player_slot" => db_update
                     .player_slot
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "player_state" => db_update
+                    .player_state
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "transfer_destination" => db_update
                     .transfer_destination
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -681,6 +714,7 @@ pub struct AppliedDiff<'r> {
     match_state: __sdk::TableAppliedDiff<'r, MatchState>,
     mobilization_policy: __sdk::TableAppliedDiff<'r, MobilizationPolicy>,
     player_slot: __sdk::TableAppliedDiff<'r, PlayerSlot>,
+    player_state: __sdk::TableAppliedDiff<'r, PlayerState>,
     transfer_destination: __sdk::TableAppliedDiff<'r, TransferDestination>,
     transfer_order: __sdk::TableAppliedDiff<'r, TransferOrder>,
     transfer_source: __sdk::TableAppliedDiff<'r, TransferSource>,
@@ -734,6 +768,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
             event,
         );
         callbacks.invoke_table_row_callbacks::<PlayerSlot>("player_slot", &self.player_slot, event);
+        callbacks.invoke_table_row_callbacks::<PlayerState>(
+            "player_state",
+            &self.player_state,
+            event,
+        );
         callbacks.invoke_table_row_callbacks::<TransferDestination>(
             "transfer_destination",
             &self.transfer_destination,
@@ -1438,6 +1477,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
         match_state_table::register_table(client_cache);
         mobilization_policy_table::register_table(client_cache);
         player_slot_table::register_table(client_cache);
+        player_state_table::register_table(client_cache);
         transfer_destination_table::register_table(client_cache);
         transfer_order_table::register_table(client_cache);
         transfer_source_table::register_table(client_cache);
@@ -1456,6 +1496,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
         "match_state",
         "mobilization_policy",
         "player_slot",
+        "player_state",
         "transfer_destination",
         "transfer_order",
         "transfer_source",

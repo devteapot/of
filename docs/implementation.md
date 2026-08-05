@@ -43,13 +43,24 @@ recreate it and regenerate bindings before connecting clients:
 ./scripts/publish-local.sh --fresh --confirm-delete-of-match-dev
 ```
 
-The match starts after both identity-bound player slots are claimed. A private
-scheduled table advances the simulation every 250 milliseconds. Movement and
-combat operate on active packets/fronts/orders; the provisional one-second
-population cadence scans habitable state. Client commands carry stable IDs and
-produce public receipts, making retries idempotent. A reconnecting client reuses
-its stored SpacetimeDB token, subscribes to a fresh snapshot, reclaims its slot,
-and continues above the highest observed command ID.
+The match starts after every configured identity-bound player slot is claimed
+(verified seat count equals `player_count`; both fresh claims and recovered/
+repaired identity joins recompute `claimed_players` from verified seats and may
+start Running—no preliminary counter bump). A private scheduled table
+advances the simulation every 250 milliseconds as one atomic tick. Movement and
+combat operate on the complete active packet set; route/source loading is
+scoped via `source_by_order` to packet order IDs and active transfer orders
+(covering queued sources with no packet yet) without sharding shared combat.
+Low-scale matches (`player_count <= 8`) keep the historical full population scan
+every population interval; high-scale matches shard population by denormalized
+`population_shard` so each cell still updates once per interval while work stays
+bounded. Client commands carry stable IDs and produce public receipts, making
+retries idempotent. A reconnecting client reuses its stored SpacetimeDB token,
+recovers its seat from `player_identity` and/or slot identity (repairing a
+missing index without a new claim, then reconciling verified claims so a
+repaired final seat can start the lobby), clears generation-scoped pending
+deltas and stale tactical presentation immediately, subscribes to a fresh
+snapshot, and continues above the highest observed command ID.
 
 Every committed infantry point is represented by its current cell plus order
 allocation metadata. A logical step must satisfy:
@@ -65,16 +76,20 @@ passability. Combat separately enforces frontage and the uphill modifier.
 
 Public state is split by read/update pattern:
 
-- `player_slot`, `match_config`, `match_state`, and `mobilization_policy` hold
-  match-wide state;
+- `player_slot`, `player_identity`, `player_state`, `match_config`, `match_state`,
+  and `mobilization_policy` hold match-wide state. Authoritative player IDs are
+  `u16` with neutral `0` and configured seats `1..=player_count` (`2..=500`);
 - `cell_terrain` is immutable after lobby configuration;
-- `cell_state` holds mutable ownership, population, infantry, and capacities;
+- `cell_state` holds mutable ownership, population, infantry, capacities, a
+  deterministic `population_shard` (`u16`, validated against the interval), and
+  denormalized `chunk_q`/`chunk_r` for high-scale spatial interest;
 - `cluster_policy_assignment` stores public per-cell policy lineage and explicit
   policy revisions; clusters themselves remain derived connected components;
 - `command_receipt` records accepted and rejected idempotent commands;
-- `transfer_order`, `transfer_source`, `transfer_destination`, and
-  `transit_packet` expose generic internal aggregate-flow progress and
-  congestion;
+- `transfer_order`, `transfer_source`, `transfer_destination`, `transit_route`,
+  and `transit_packet` expose generic internal aggregate-flow progress and
+  congestion. Child source/destination/route rows denormalize `player_id` so
+  high-scale clients can subscribe selectively by seat;
 - `combat_front` exposes the current contested edges and casualties.
 
 `simulation_schedule`, `expansion_wave`, and `expansion_garrison_debt` are
@@ -90,8 +105,9 @@ call the scheduled reducer as a player identity.
 
 The cluster-first client uses these gameplay reducers:
 
-- `configure_map` — select Dev64, Playtest128, or Validation192 before joining.
-- `join_match` — claim or reclaim one of the two player slots.
+- `configure_map` — make the lobby's one-shot map selection while retaining the configured player count.
+- `configure_match` — make the lobby's one-shot map and 2–500 contiguous-player selection. Configuration locks further regeneration but does not claim a slot.
+- `join_match` — separately claim or reclaim one of the configured player slots; every slot remains open after configuration.
 - `set_mobilization_target` — change the global recruitment target in basis
   points.
 - `issue_expand_clusters` — expand every complete owned cluster touched by the
@@ -308,6 +324,9 @@ selection-adjacent presentation from the new authoritative snapshot.
 - The real-server two-identity harness covers slot claims, match start,
   subscriptions, idempotent receipts, public cluster actions and policies,
   conserved movement, cancellation, and reconnect.
+- The distributed `match-perf` harness (`coordinator` / `worker` / `run-local`)
+  profiles client-observed step dilation under multi-process load through 500
+  seats; see [Performance profiling](./performance.md).
 - CI repeats formatting, workspace tests/lints, module tests/lints/build, and
   generated-binding drift detection.
 

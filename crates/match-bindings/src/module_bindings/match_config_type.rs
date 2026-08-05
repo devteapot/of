@@ -11,6 +11,8 @@ use super::map_preset_type::MapPreset;
 pub struct MatchConfig {
     pub singleton_id: u8,
     pub map_preset: MapPreset,
+    pub player_count: u16,
+    pub lobby_configuration_locked: bool,
     pub map_seed: u64,
     pub map_width: u16,
     pub map_height: u16,
@@ -29,8 +31,6 @@ pub struct MatchConfig {
     pub mobilization_per_population_step: u64,
     pub conquest_threshold_bps: u32,
     pub map_hash: u64,
-    pub spawn_one_cell: u32,
-    pub spawn_two_cell: u32,
 }
 
 impl __sdk::InModule for MatchConfig {
@@ -43,6 +43,8 @@ impl __sdk::InModule for MatchConfig {
 pub struct MatchConfigCols {
     pub singleton_id: __sdk::__query_builder::Col<MatchConfig, u8>,
     pub map_preset: __sdk::__query_builder::Col<MatchConfig, MapPreset>,
+    pub player_count: __sdk::__query_builder::Col<MatchConfig, u16>,
+    pub lobby_configuration_locked: __sdk::__query_builder::Col<MatchConfig, bool>,
     pub map_seed: __sdk::__query_builder::Col<MatchConfig, u64>,
     pub map_width: __sdk::__query_builder::Col<MatchConfig, u16>,
     pub map_height: __sdk::__query_builder::Col<MatchConfig, u16>,
@@ -61,8 +63,6 @@ pub struct MatchConfigCols {
     pub mobilization_per_population_step: __sdk::__query_builder::Col<MatchConfig, u64>,
     pub conquest_threshold_bps: __sdk::__query_builder::Col<MatchConfig, u32>,
     pub map_hash: __sdk::__query_builder::Col<MatchConfig, u64>,
-    pub spawn_one_cell: __sdk::__query_builder::Col<MatchConfig, u32>,
-    pub spawn_two_cell: __sdk::__query_builder::Col<MatchConfig, u32>,
 }
 
 impl __sdk::__query_builder::HasCols for MatchConfig {
@@ -71,6 +71,11 @@ impl __sdk::__query_builder::HasCols for MatchConfig {
         MatchConfigCols {
             singleton_id: __sdk::__query_builder::Col::new(table_name, "singleton_id"),
             map_preset: __sdk::__query_builder::Col::new(table_name, "map_preset"),
+            player_count: __sdk::__query_builder::Col::new(table_name, "player_count"),
+            lobby_configuration_locked: __sdk::__query_builder::Col::new(
+                table_name,
+                "lobby_configuration_locked",
+            ),
             map_seed: __sdk::__query_builder::Col::new(table_name, "map_seed"),
             map_width: __sdk::__query_builder::Col::new(table_name, "map_width"),
             map_height: __sdk::__query_builder::Col::new(table_name, "map_height"),
@@ -113,8 +118,6 @@ impl __sdk::__query_builder::HasCols for MatchConfig {
                 "conquest_threshold_bps",
             ),
             map_hash: __sdk::__query_builder::Col::new(table_name, "map_hash"),
-            spawn_one_cell: __sdk::__query_builder::Col::new(table_name, "spawn_one_cell"),
-            spawn_two_cell: __sdk::__query_builder::Col::new(table_name, "spawn_two_cell"),
         }
     }
 }

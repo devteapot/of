@@ -11,7 +11,7 @@ use super::order_status_type::OrderStatus;
 #[sats(crate = __lib)]
 pub struct TransferOrder {
     pub order_id: u64,
-    pub player_id: u8,
+    pub player_id: u16,
     pub client_command_id: u64,
     pub kind: OrderKind,
     pub status: OrderStatus,
@@ -35,7 +35,7 @@ impl __sdk::InModule for TransferOrder {
 /// Provides typed access to columns for query building.
 pub struct TransferOrderCols {
     pub order_id: __sdk::__query_builder::Col<TransferOrder, u64>,
-    pub player_id: __sdk::__query_builder::Col<TransferOrder, u8>,
+    pub player_id: __sdk::__query_builder::Col<TransferOrder, u16>,
     pub client_command_id: __sdk::__query_builder::Col<TransferOrder, u64>,
     pub kind: __sdk::__query_builder::Col<TransferOrder, OrderKind>,
     pub status: __sdk::__query_builder::Col<TransferOrder, OrderStatus>,
@@ -80,7 +80,7 @@ impl __sdk::__query_builder::HasCols for TransferOrder {
 /// Provides typed access to indexed columns for query building.
 pub struct TransferOrderIxCols {
     pub order_id: __sdk::__query_builder::IxCol<TransferOrder, u64>,
-    pub player_id: __sdk::__query_builder::IxCol<TransferOrder, u8>,
+    pub player_id: __sdk::__query_builder::IxCol<TransferOrder, u16>,
     pub status: __sdk::__query_builder::IxCol<TransferOrder, OrderStatus>,
 }
 

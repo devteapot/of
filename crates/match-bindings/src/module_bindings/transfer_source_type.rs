@@ -9,6 +9,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct TransferSource {
     pub source_key: u128,
     pub order_id: u64,
+    pub player_id: u16,
     pub cell_id: u32,
     pub committed_infantry: u64,
     pub queued_infantry: u64,
@@ -24,6 +25,7 @@ impl __sdk::InModule for TransferSource {
 pub struct TransferSourceCols {
     pub source_key: __sdk::__query_builder::Col<TransferSource, u128>,
     pub order_id: __sdk::__query_builder::Col<TransferSource, u64>,
+    pub player_id: __sdk::__query_builder::Col<TransferSource, u16>,
     pub cell_id: __sdk::__query_builder::Col<TransferSource, u32>,
     pub committed_infantry: __sdk::__query_builder::Col<TransferSource, u64>,
     pub queued_infantry: __sdk::__query_builder::Col<TransferSource, u64>,
@@ -35,6 +37,7 @@ impl __sdk::__query_builder::HasCols for TransferSource {
         TransferSourceCols {
             source_key: __sdk::__query_builder::Col::new(table_name, "source_key"),
             order_id: __sdk::__query_builder::Col::new(table_name, "order_id"),
+            player_id: __sdk::__query_builder::Col::new(table_name, "player_id"),
             cell_id: __sdk::__query_builder::Col::new(table_name, "cell_id"),
             committed_infantry: __sdk::__query_builder::Col::new(table_name, "committed_infantry"),
             queued_infantry: __sdk::__query_builder::Col::new(table_name, "queued_infantry"),
@@ -47,6 +50,7 @@ impl __sdk::__query_builder::HasCols for TransferSource {
 /// Provides typed access to indexed columns for query building.
 pub struct TransferSourceIxCols {
     pub order_id: __sdk::__query_builder::IxCol<TransferSource, u64>,
+    pub player_id: __sdk::__query_builder::IxCol<TransferSource, u16>,
     pub source_key: __sdk::__query_builder::IxCol<TransferSource, u128>,
 }
 
@@ -55,6 +59,7 @@ impl __sdk::__query_builder::HasIxCols for TransferSource {
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         TransferSourceIxCols {
             order_id: __sdk::__query_builder::IxCol::new(table_name, "order_id"),
+            player_id: __sdk::__query_builder::IxCol::new(table_name, "player_id"),
             source_key: __sdk::__query_builder::IxCol::new(table_name, "source_key"),
         }
     }

@@ -3912,6 +3912,8 @@ dependencies = [
  "anyhow",
  "clap",
  "match-bindings",
+ "serde",
+ "serde_json",
  "spacetimedb-sdk",
 ]
 

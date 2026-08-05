@@ -1,15 +1,15 @@
 use hex_core::{Axial, ConquestRule, TerrainKind};
 use spacetimedb::{ReducerContext, Table};
-use worldgen::{generate, validate};
+use worldgen::{generate_for_players, validate};
 
 use crate::rules::{calculate_edge_runtime_limits, edge_key};
 use crate::schema::{
     CellState, CellTerrain, ClusterPolicyAssignment, ClusterPolicyKind, MapPreset, MatchConfig,
-    MatchPhase, MatchState, NEUTRAL_PLAYER, PLAYER_ONE, PLAYER_TWO, SINGLETON_ID, StaticEdgeLimit,
+    MatchPhase, MatchState, NEUTRAL_PLAYER, PlayerState, SINGLETON_ID, StaticEdgeLimit,
     TerrainClass,
 };
 use crate::schema::{
-    cell_state, cell_terrain, cluster_policy_assignment, match_config, match_state,
+    cell_state, cell_terrain, cluster_policy_assignment, match_config, match_state, player_state,
     policy_replan_state, policy_topology_cache, static_edge_limit,
 };
 
@@ -18,6 +18,8 @@ pub fn default_config() -> MatchConfig {
     MatchConfig {
         singleton_id: SINGLETON_ID,
         map_preset: preset,
+        player_count: crate::schema::DEFAULT_PLAYER_COUNT,
+        lobby_configuration_locked: false,
         map_seed: preset.seed(),
         map_width: preset.side(),
         map_height: preset.side(),
@@ -36,15 +38,19 @@ pub fn default_config() -> MatchConfig {
         mobilization_per_population_step: 2,
         conquest_threshold_bps: 8_000,
         map_hash: 0,
-        spawn_one_cell: 0,
-        spawn_two_cell: 0,
     }
 }
 
-pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Result<(), String> {
+pub fn regenerate_map(
+    ctx: &ReducerContext,
+    preset: MapPreset,
+    seed: u64,
+    player_count: u16,
+    lobby_configuration_locked: bool,
+) -> Result<(), String> {
     clear_map(ctx);
     let side = preset.side();
-    let generated = generate(
+    let generated = generate_for_players(
         match preset {
             MapPreset::Dev64 => "dev-stepped-island",
             MapPreset::Playtest128 => "playtest-stepped-island",
@@ -53,16 +59,19 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
         side,
         side,
         seed,
+        player_count,
     );
     validate(&generated).map_err(|error| format!("generated map is invalid: {error}"))?;
     let manifest = &generated.manifest;
     let width = manifest.width;
     let height = manifest.height;
-    let spawn_one_cell = cell_id_for_manifest(manifest, manifest.spawn_cells[0])?;
-    let spawn_two_cell = cell_id_for_manifest(manifest, manifest.spawn_cells[1])?;
+    let spawn_cell_ids = manifest
+        .spawn_cells
+        .iter()
+        .map(|spawn| cell_id_for_manifest(manifest, *spawn))
+        .collect::<Result<Vec<_>, _>>()?;
     let capturable = u64::from(manifest.capturable_land);
-    let mut controlled_one = 0_u64;
-    let mut controlled_two = 0_u64;
+    let mut controlled = vec![0_u64; usize::from(player_count)];
     for cell in generated.cells.cells() {
         let coordinate = cell.coordinate;
         let cell_id = cell_id_for_manifest(manifest, coordinate)?;
@@ -72,21 +81,31 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
             TerrainKind::Hills => TerrainClass::Hills,
             TerrainKind::Mountain => TerrainClass::Mountain,
         };
-        let owner = u8::try_from(cell.owner.unwrap_or_default())
+        let owner = u16::try_from(cell.owner.unwrap_or_default())
             .map_err(|_| "world generator emitted an unsupported owner")?;
-        if cell.capturable && owner == PLAYER_ONE {
-            controlled_one += 1;
-        } else if cell.capturable && owner == PLAYER_TWO {
-            controlled_two += 1;
+        if cell.capturable && owner != NEUTRAL_PLAYER {
+            let index = usize::from(owner - 1);
+            let count = controlled
+                .get_mut(index)
+                .ok_or("world generator emitted an unsupported owner")?;
+            *count += 1;
         }
         let column = coordinate.q - manifest.q_min;
         let row = coordinate.r - manifest.r_min;
+        let population_interval = default_config().population_step_interval.max(1);
+        if population_interval > u32::from(u16::MAX) {
+            return Err(format!(
+                "population_step_interval {population_interval} exceeds u16 shard storage"
+            ));
+        }
+        let chunk_q = i16::try_from(column.div_euclid(16)).map_err(|_| "chunk q overflow")?;
+        let chunk_r = i16::try_from(row.div_euclid(16)).map_err(|_| "chunk r overflow")?;
         ctx.db.cell_terrain().insert(CellTerrain {
             cell_id,
             q: coordinate.q,
             r: coordinate.r,
-            chunk_q: i16::try_from(column.div_euclid(16)).map_err(|_| "chunk q overflow")?,
-            chunk_r: i16::try_from(row.div_euclid(16)).map_err(|_| "chunk r overflow")?,
+            chunk_q,
+            chunk_r,
             terrain,
             elevation: cell.elevation,
             passable: cell.terrain.ground_passable(),
@@ -100,10 +119,14 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
             civilian_capacity: cell.civilian_capacity,
             infantry: cell.force(),
             military_capacity: cell.military_capacity,
+            population_shard: u16::try_from(cell_id % population_interval)
+                .map_err(|_| "population shard overflow")?,
+            chunk_q,
+            chunk_r,
             last_changed_step: 0,
             last_policy_changed_step: 0,
         });
-        if matches!(owner, PLAYER_ONE | PLAYER_TWO) {
+        if owner != NEUTRAL_PLAYER && owner <= player_count {
             ctx.db
                 .cluster_policy_assignment()
                 .insert(ClusterPolicyAssignment {
@@ -119,14 +142,14 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
 
     let mut config = default_config();
     config.map_preset = preset;
+    config.player_count = player_count;
+    config.lobby_configuration_locked = lobby_configuration_locked;
     config.map_seed = seed;
     config.map_width = width;
     config.map_height = height;
     config.map_q_min = manifest.q_min;
     config.map_r_min = manifest.r_min;
     config.map_hash = manifest.content_hash;
-    config.spawn_one_cell = spawn_one_cell;
-    config.spawn_two_cell = spawn_two_cell;
 
     for from in generated.cells.cells() {
         let from_cell = cell_id_for_manifest(manifest, from.coordinate)?;
@@ -169,15 +192,22 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
     let rule = ConquestRule::new(capturable, 8_000)
         .map_err(|error| format!("invalid conquest map: {error:?}"))?;
     ctx.db.match_config().insert(config);
+    for (index, spawn_cell_id) in spawn_cell_ids.into_iter().enumerate() {
+        let player_id = u16::try_from(index + 1).map_err(|_| "player ID overflow")?;
+        ctx.db.player_state().insert(PlayerState {
+            player_id,
+            spawn_cell_id,
+            controlled_cells: controlled[index],
+        });
+    }
     ctx.db.match_state().insert(MatchState {
         singleton_id: SINGLETON_ID,
         phase: MatchPhase::Lobby,
         logical_step: 0,
         capturable_cells: capturable,
         required_control: rule.required_control(),
-        player_one_controlled: controlled_one,
-        player_two_controlled: controlled_two,
         winner_player_id: NEUTRAL_PLAYER,
+        claimed_players: 0,
         latest_cluster_policy_revision: 0,
         ownership_revision: 1,
         policy_topology_revision: 0,
@@ -189,6 +219,15 @@ pub fn regenerate_map(ctx: &ReducerContext, preset: MapPreset, seed: u64) -> Res
 }
 
 fn clear_map(ctx: &ReducerContext) {
+    let player_ids = ctx
+        .db
+        .player_state()
+        .iter()
+        .map(|row| row.player_id)
+        .collect::<Vec<_>>();
+    for player_id in player_ids {
+        ctx.db.player_state().player_id().delete(player_id);
+    }
     let replan_keys = ctx
         .db
         .policy_replan_state()
@@ -267,6 +306,11 @@ fn cell_id_for_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_map_configuration_is_unlocked() {
+        assert!(!default_config().lobby_configuration_locked);
+    }
 
     #[test]
     fn presets_have_the_locked_dimensions() {

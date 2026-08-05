@@ -10,7 +10,7 @@ use super::terrain_class_type::TerrainClass;
 #[sats(crate = __lib)]
 pub struct PolicyTopologyCache {
     pub component_key: u64,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub ownership_revision: u64,
     pub shape_hash: u64,
     pub cell_ids: Vec<u32>,
@@ -34,7 +34,7 @@ impl __sdk::InModule for PolicyTopologyCache {
 /// Provides typed access to columns for query building.
 pub struct PolicyTopologyCacheCols {
     pub component_key: __sdk::__query_builder::Col<PolicyTopologyCache, u64>,
-    pub owner_player_id: __sdk::__query_builder::Col<PolicyTopologyCache, u8>,
+    pub owner_player_id: __sdk::__query_builder::Col<PolicyTopologyCache, u16>,
     pub ownership_revision: __sdk::__query_builder::Col<PolicyTopologyCache, u64>,
     pub shape_hash: __sdk::__query_builder::Col<PolicyTopologyCache, u64>,
     pub cell_ids: __sdk::__query_builder::Col<PolicyTopologyCache, Vec<u32>>,

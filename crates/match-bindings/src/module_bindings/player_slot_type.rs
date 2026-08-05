@@ -7,7 +7,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct PlayerSlot {
-    pub player_id: u8,
+    pub player_id: u16,
     pub identity: Option<__sdk::Identity>,
     pub display_name: String,
     pub connected: bool,
@@ -26,7 +26,7 @@ impl __sdk::InModule for PlayerSlot {
 ///
 /// Provides typed access to columns for query building.
 pub struct PlayerSlotCols {
-    pub player_id: __sdk::__query_builder::Col<PlayerSlot, u8>,
+    pub player_id: __sdk::__query_builder::Col<PlayerSlot, u16>,
     pub identity: __sdk::__query_builder::Col<PlayerSlot, Option<__sdk::Identity>>,
     pub display_name: __sdk::__query_builder::Col<PlayerSlot, String>,
     pub connected: __sdk::__query_builder::Col<PlayerSlot, bool>,
@@ -58,7 +58,7 @@ impl __sdk::__query_builder::HasCols for PlayerSlot {
 ///
 /// Provides typed access to indexed columns for query building.
 pub struct PlayerSlotIxCols {
-    pub player_id: __sdk::__query_builder::IxCol<PlayerSlot, u8>,
+    pub player_id: __sdk::__query_builder::IxCol<PlayerSlot, u16>,
 }
 
 impl __sdk::__query_builder::HasIxCols for PlayerSlot {

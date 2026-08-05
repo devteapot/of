@@ -15,7 +15,7 @@ use hex_core::{Axial, ChunkCoord, TerrainKind};
 use crate::{
     geometry::{COLUMN_FLOOR, cell_top, corner, edge_index_for_direction, world_center},
     map_view::{MapViewMode, normalized_cell_value, normalized_soldier_strength},
-    model::{CellView, ContestedCellView, MatchView, PLAYER_ONE, PLAYER_TWO},
+    model::{CellView, ContestedCellView, MatchView},
 };
 
 /// Mesh creation is deliberately amortized: a future world-scale map may
@@ -599,12 +599,47 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
     linear.to_f32_array()
 }
 
+const PLAYER_PALETTE: [(f32, f32, f32); 8] = [
+    (0.06, 0.48, 0.58),
+    (0.76, 0.24, 0.16),
+    (0.50, 0.32, 0.78),
+    (0.75, 0.62, 0.12),
+    (0.20, 0.62, 0.30),
+    (0.86, 0.34, 0.62),
+    (0.25, 0.43, 0.86),
+    (0.72, 0.43, 0.18),
+];
+
 fn player_color(player: u32) -> Option<Color> {
-    match player {
-        PLAYER_ONE => Some(Color::srgb(0.06, 0.48, 0.58)),
-        PLAYER_TWO => Some(Color::srgb(0.76, 0.24, 0.16)),
-        _ => None,
+    if player == 0 || player > 500 {
+        return None;
     }
+    if let Some((r, g, b)) = PLAYER_PALETTE.get((player - 1) as usize) {
+        return Some(Color::srgb(*r, *g, *b));
+    }
+    // Deterministic generated colors for IDs above the curated eight-color set.
+    // Golden-ratio hue walk keeps neighbors visually distinct without a table.
+    let index = player - 1;
+    let hue = ((index as f32) * 0.618_034).fract();
+    let saturation = 0.55 + 0.25 * (((index * 3) % 5) as f32 / 4.0);
+    let lightness = 0.42 + 0.16 * (((index * 5) % 4) as f32 / 3.0);
+    Some(hsl_color(hue, saturation, lightness))
+}
+
+fn hsl_color(hue: f32, saturation: f32, lightness: f32) -> Color {
+    let c = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let h = hue * 6.0;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = lightness - c * 0.5;
+    Color::srgb(r1 + m, g1 + m, b1 + m)
 }
 
 fn terrain_color(terrain: TerrainKind) -> Color {
@@ -678,6 +713,7 @@ fn shade(color: [f32; 4], factor: f32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{PLAYER_ONE, PLAYER_TWO};
 
     const fn test_chunk(q: i32, r: i32) -> ChunkCoord {
         ChunkCoord { q, r }
@@ -694,6 +730,46 @@ mod tests {
             military_capacity,
             blocked: false,
         }
+    }
+
+    #[test]
+    fn every_supported_player_has_a_distinct_color() {
+        let colors = (1..=8)
+            .map(|player| player_color(player).expect("supported player color"))
+            .collect::<Vec<_>>();
+        for (index, color) in colors.iter().enumerate() {
+            assert!(colors.iter().skip(index + 1).all(|other| other != color));
+        }
+        assert!(player_color(0).is_none());
+        assert!(player_color(9).is_some());
+        assert!(player_color(500).is_some());
+        assert!(player_color(501).is_none());
+        // Curated first-eight palette stays pinned.
+        assert_eq!(player_color(1), Some(Color::srgb(0.06, 0.48, 0.58)));
+        assert_eq!(player_color(2), Some(Color::srgb(0.76, 0.24, 0.16)));
+    }
+
+    #[test]
+    fn player_colors_cover_one_through_five_hundred_deterministically() {
+        let mut seen = std::collections::BTreeSet::new();
+        for player in 1_u32..=500 {
+            let color = player_color(player).expect("supported player color");
+            let components = LinearRgba::from(color).to_f32_array();
+            // Neutral/default black is forbidden; perfect uniqueness is not required.
+            assert!(
+                components[0] + components[1] + components[2] > 0.05,
+                "player {player} color is too near neutral"
+            );
+            assert_eq!(player_color(player), Some(color));
+            seen.insert(format!(
+                "{:.4}/{:.4}/{:.4}",
+                components[0], components[1], components[2]
+            ));
+        }
+        // Deterministic non-collapse: far more distinct samples than the curated eight.
+        assert!(seen.len() >= 64, "only {} distinct colors", seen.len());
+        assert!(player_color(0).is_none());
+        assert!(player_color(501).is_none());
     }
 
     #[test]

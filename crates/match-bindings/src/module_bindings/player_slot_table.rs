@@ -172,7 +172,7 @@ impl<'ctx> __sdk::WithUpdate for PlayerSlotTableHandle<'ctx> {
 /// but to directly chain method calls,
 /// like `ctx.db.player_slot().player_id().find(...)`.
 pub struct PlayerSlotPlayerIdUnique<'ctx> {
-    imp: __sdk::UniqueConstraintHandle<PlayerSlot, u8>,
+    imp: __sdk::UniqueConstraintHandle<PlayerSlot, u16>,
     phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
@@ -180,7 +180,7 @@ impl<'ctx> PlayerSlotTableHandle<'ctx> {
     /// Get a handle on the `player_id` unique index on the table `player_slot`.
     pub fn player_id(&self) -> PlayerSlotPlayerIdUnique<'ctx> {
         PlayerSlotPlayerIdUnique {
-            imp: self.imp.get_unique_constraint::<u8>("player_id"),
+            imp: self.imp.get_unique_constraint::<u16>("player_id"),
             phantom: std::marker::PhantomData,
         }
     }
@@ -189,7 +189,7 @@ impl<'ctx> PlayerSlotTableHandle<'ctx> {
 impl<'ctx> PlayerSlotPlayerIdUnique<'ctx> {
     /// Find the subscribed row whose `player_id` column value is equal to `col_val`,
     /// if such a row is present in the client cache.
-    pub fn find(&self, col_val: &u8) -> Option<PlayerSlot> {
+    pub fn find(&self, col_val: &u16) -> Option<PlayerSlot> {
         self.imp.find(col_val)
     }
 }
@@ -197,7 +197,7 @@ impl<'ctx> PlayerSlotPlayerIdUnique<'ctx> {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<PlayerSlot>("player_slot");
-    _table.add_unique_constraint::<u8>("player_id", |row| &row.player_id);
+    _table.add_unique_constraint::<u16>("player_id", |row| &row.player_id);
 }
 
 #[doc(hidden)]

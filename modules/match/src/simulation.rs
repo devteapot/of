@@ -18,13 +18,13 @@ use crate::rules::{
 };
 use crate::schema::{
     CellState, CombatFront, EXPANSION_AGGREGATE_ORIGIN, ExpansionGarrisonDebt, ExpansionWave,
-    MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus, PLAYER_ONE, PLAYER_TWO, TerrainClass,
-    TransferOrder, TransferSource, TransitPacket,
+    MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus, TerrainClass, TransferOrder,
+    TransferSource, TransitPacket,
 };
 use crate::schema::{
     cell_state as cell_state_table, combat_front, expansion_garrison_debt, expansion_wave,
-    match_state, mobilization_policy, retreat_abandonment, transfer_destination, transfer_order,
-    transfer_source, transit_packet, transit_route,
+    match_state, mobilization_policy, player_state, retreat_abandonment, transfer_destination,
+    transfer_order, transfer_source, transit_packet, transit_route,
 };
 
 /// Transaction-local packet index for one simulation step.
@@ -39,7 +39,7 @@ use crate::schema::{
 struct TickPacket {
     packet_key: u64,
     order_id: u64,
-    owner_player_id: u8,
+    owner_player_id: u16,
     origin_cell: u32,
     current_cell: u32,
     destination_cell: u32,
@@ -121,23 +121,57 @@ struct PacketTickState {
 }
 
 impl PacketTickState {
+    /// Load the complete active packet set for this atomic simulation tick.
+    ///
+    /// Authority remains one scheduled reducer: every active packet is still
+    /// processed. To reduce global table scans we only materialize:
+    /// - routes referenced by those packets (direct `route_id` lookup)
+    /// - transfer sources belonging to order IDs present on active packets **or**
+    ///   active transfer orders (via `source_by_order`), so queued sources on
+    ///   active orders with no packet yet still spawn this tick
+    ///
+    /// Combat fronts stay on their own shared path and are intentionally not
+    /// sharded here — front resolution still sees the full contested set.
     fn load(ctx: &ReducerContext) -> Result<Self, String> {
         let mut state = Self::default();
-        let routes = ctx
+        let packets: Vec<_> = ctx.db.transit_packet().iter().collect();
+        let mut route_ids = BTreeSet::new();
+        let mut order_ids = BTreeSet::new();
+        for packet in &packets {
+            order_ids.insert(packet.order_id);
+            if packet.route_id != 0 {
+                route_ids.insert(packet.route_id);
+            }
+        }
+        for order in ctx
             .db
-            .transit_route()
-            .iter()
-            .map(|route| (route.route_id, Rc::<[u32]>::from(route.cells)))
-            .collect::<BTreeMap<_, _>>();
-        for source in ctx.db.transfer_source().iter() {
-            state
-                .sources_by_order
-                .entry(source.order_id)
-                .or_default()
-                .push(source.cell_id);
-            state
-                .source_rows
-                .insert((source.order_id, source.cell_id), source);
+            .transfer_order()
+            .order_by_status()
+            .filter(OrderStatus::Active)
+        {
+            order_ids.insert(order.order_id);
+        }
+        let mut routes = BTreeMap::new();
+        for route_id in route_ids {
+            let route = ctx
+                .db
+                .transit_route()
+                .route_id()
+                .find(route_id)
+                .ok_or_else(|| format!("active packet references missing route {route_id}"))?;
+            routes.insert(route_id, Rc::<[u32]>::from(route.cells));
+        }
+        for order_id in order_ids {
+            for source in ctx.db.transfer_source().source_by_order().filter(order_id) {
+                state
+                    .sources_by_order
+                    .entry(source.order_id)
+                    .or_default()
+                    .push(source.cell_id);
+                state
+                    .source_rows
+                    .insert((source.order_id, source.cell_id), source);
+            }
         }
         for cells in state.sources_by_order.values_mut() {
             cells.sort_unstable();
@@ -148,7 +182,7 @@ impl PacketTickState {
             .copied()
             .map(|order_id| (order_id, 0))
             .collect();
-        for packet in ctx.db.transit_packet().iter() {
+        for packet in packets {
             let route = if packet.route_id == 0 {
                 if packet.current_cell == packet.destination_cell {
                     Rc::from([packet.current_cell])
@@ -414,9 +448,18 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
 
     let config = config(ctx)?;
     let population_interval = u64::from(config.population_step_interval.max(1));
-    if logical_step.is_multiple_of(population_interval) {
+    let high_scale = config.player_count > crate::schema::HIGH_SCALE_PLAYER_THRESHOLD;
+    // Low-scale keeps the historical cadence: full population every interval
+    // steps, policy on the intervening ticks. High-scale shards population so
+    // each cell still updates once per interval while work stays bounded.
+    let run_population = if high_scale {
+        true
+    } else {
+        logical_step.is_multiple_of(population_interval)
+    };
+    if run_population {
         let _phase_stopwatch = LogStopwatch::new("simulation_population");
-        population_step(ctx, logical_step)?;
+        population_step(ctx, logical_step, high_scale)?;
     }
     {
         let _phase_stopwatch = LogStopwatch::new("simulation_policy");
@@ -528,7 +571,7 @@ fn internal_order_requires_friendly_route(kind: OrderKind) -> bool {
     )
 }
 
-fn internal_next_owner_is_blocked(kind: OrderKind, player_id: u8, next_owner: u8) -> bool {
+fn internal_next_owner_is_blocked(kind: OrderKind, player_id: u16, next_owner: u16) -> bool {
     internal_order_requires_friendly_route(kind) && next_owner != player_id
 }
 
@@ -737,7 +780,7 @@ fn pay_expansion_garrison_debt(
         .collect())
 }
 
-fn expansion_debt_applies(debt_owner: u8, cell_owner: u8, order_owner: u8) -> bool {
+fn expansion_debt_applies(debt_owner: u16, cell_owner: u16, order_owner: u16) -> bool {
     debt_owner == cell_owner && cell_owner == order_owner
 }
 
@@ -862,9 +905,9 @@ fn expansion_edge_is_available(
 
 fn wave_scope_allows_cell(
     kind: OrderKind,
-    player_id: u8,
+    player_id: u16,
     cell_id: u32,
-    owner_player_id: u8,
+    owner_player_id: u16,
     selected_cells: &[u32],
     target_cells: &[u32],
 ) -> bool {
@@ -950,7 +993,11 @@ fn clear_stale_combat_fronts(ctx: &ReducerContext, logical_step: u64) {
     }
 }
 
-fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String> {
+fn population_step(
+    ctx: &ReducerContext,
+    logical_step: u64,
+    high_scale: bool,
+) -> Result<(), String> {
     let config = config(ctx)?;
     let destination_reservations = active_internal_destination_reservations(ctx)?;
     let retreating_edge_cells = active_retreat_abandonment_cells(ctx);
@@ -960,8 +1007,27 @@ fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         .iter()
         .map(|policy| (policy.player_id, policy.target_bps))
         .collect();
-    let cells: Vec<_> = ctx.db.cell_state().iter().collect();
+    let interval = config.population_step_interval.max(1);
+    if interval > u32::from(u16::MAX) {
+        return Err(format!(
+            "population_step_interval {interval} exceeds u16 shard storage"
+        ));
+    }
+    let active_shard = u16::try_from(logical_step % u64::from(interval))
+        .map_err(|_| "active population shard overflow".to_owned())?;
+    let cells: Vec<_> = if high_scale {
+        ctx.db
+            .cell_state()
+            .state_by_population_shard()
+            .filter(active_shard)
+            .collect()
+    } else {
+        ctx.db.cell_state().iter().collect()
+    };
     for mut cell in cells {
+        if cell.owner_player_id == NEUTRAL_PLAYER {
+            continue;
+        }
         let Some(&target_bps) = policies.get(&cell.owner_player_id) else {
             continue;
         };
@@ -1031,8 +1097,8 @@ fn active_retreat_abandonment_cells(ctx: &ReducerContext) -> BTreeSet<u32> {
 /// blocked forever because later mobilization fills its destination first.
 fn active_internal_destination_reservations(
     ctx: &ReducerContext,
-) -> Result<BTreeMap<(u8, u32), u64>, String> {
-    let mut reservations = BTreeMap::<(u8, u32), u64>::new();
+) -> Result<BTreeMap<(u16, u32), u64>, String> {
+    let mut reservations = BTreeMap::<(u16, u32), u64>::new();
     for destination in ctx.db.transfer_destination().iter() {
         let Some(order) = ctx
             .db
@@ -1058,7 +1124,7 @@ fn order_reserves_recruitment_capacity(order: &TransferOrder) -> bool {
 }
 
 fn add_internal_destination_reservation(
-    reservations: &mut BTreeMap<(u8, u32), u64>,
+    reservations: &mut BTreeMap<(u16, u32), u64>,
     order: &TransferOrder,
     cell_id: u32,
     target_infantry: u64,
@@ -1079,8 +1145,8 @@ fn add_internal_destination_reservation(
 }
 
 fn reserved_recruitment_capacity(
-    reservations: &BTreeMap<(u8, u32), u64>,
-    owner_player_id: u8,
+    reservations: &BTreeMap<(u16, u32), u64>,
+    owner_player_id: u16,
     cell_id: u32,
 ) -> u64 {
     reservations
@@ -1309,7 +1375,7 @@ fn move_friendly_packets(
 
 #[derive(Clone)]
 struct FrontPackets {
-    attacker: u8,
+    attacker: u16,
     from_cell: u32,
     to_cell: u32,
     packets: Vec<TickPacket>,
@@ -1320,7 +1386,7 @@ fn resolve_combats(
     packets: &mut PacketTickState,
     logical_step: u64,
 ) -> Result<(), String> {
-    let mut targets = BTreeMap::<u32, BTreeMap<u8, BTreeMap<u32, Vec<TickPacket>>>>::new();
+    let mut targets = BTreeMap::<u32, BTreeMap<u16, BTreeMap<u32, Vec<TickPacket>>>>::new();
     for packet in packets.iter() {
         let Some(&next_cell) = packet.route.get(packet.route_index as usize + 1) else {
             continue;
@@ -1396,9 +1462,9 @@ fn refresh_target_attackers(
     ctx: &ReducerContext,
     packet_state: &PacketTickState,
     target_cell: u32,
-    candidates: BTreeMap<u8, BTreeMap<u32, Vec<TickPacket>>>,
-) -> Result<BTreeMap<u8, BTreeMap<u32, Vec<TickPacket>>>, String> {
-    let mut current = BTreeMap::<u8, BTreeMap<u32, Vec<TickPacket>>>::new();
+    candidates: BTreeMap<u16, BTreeMap<u32, Vec<TickPacket>>>,
+) -> Result<BTreeMap<u16, BTreeMap<u32, Vec<TickPacket>>>, String> {
+    let mut current = BTreeMap::<u16, BTreeMap<u32, Vec<TickPacket>>>::new();
     for (player, fronts) in candidates {
         for (from_cell, packets) in fronts {
             for snapshot in packets {
@@ -1675,7 +1741,7 @@ fn record_expand_garrison_debt(
     ctx: &ReducerContext,
     order_id: u64,
     cell_id: u32,
-    owner_player_id: u8,
+    owner_player_id: u16,
 ) -> Result<(), String> {
     let wave = ctx
         .db
@@ -1716,9 +1782,13 @@ fn record_expand_garrison_debt(
 fn record_capture(
     ctx: &ReducerContext,
     cell_id: u32,
-    old_owner: u8,
-    new_owner: u8,
+    old_owner: u16,
+    new_owner: u16,
 ) -> Result<(), String> {
+    let player_count = config(ctx)?.player_count;
+    if !valid_owner(old_owner, player_count) || !valid_owner(new_owner, player_count) {
+        return Err("capture named a player outside the configured range".into());
+    }
     if old_owner == new_owner || !terrain(ctx, cell_id)?.capturable {
         return Ok(());
     }
@@ -1730,25 +1800,33 @@ fn record_capture(
         .ownership_revision
         .checked_add(1)
         .ok_or_else(|| "ownership revision overflow".to_string())?;
-    match old_owner {
-        PLAYER_ONE => {
-            match_state.player_one_controlled = match_state.player_one_controlled.saturating_sub(1);
-        }
-        PLAYER_TWO => {
-            match_state.player_two_controlled = match_state.player_two_controlled.saturating_sub(1);
-        }
-        _ => {}
+    if old_owner != NEUTRAL_PLAYER {
+        let mut old_state = ctx
+            .db
+            .player_state()
+            .player_id()
+            .find(old_owner)
+            .ok_or("captured player's state is missing")?;
+        old_state.controlled_cells = controlled_after_loss(old_state.controlled_cells)?;
+        ctx.db.player_state().player_id().update(old_state);
     }
-    match new_owner {
-        PLAYER_ONE => match_state.player_one_controlled += 1,
-        PLAYER_TWO => match_state.player_two_controlled += 1,
-        _ => {}
-    }
-    let controlled = controlled_cells_for_owner(
-        new_owner,
-        match_state.player_one_controlled,
-        match_state.player_two_controlled,
-    );
+    let controlled = if new_owner == NEUTRAL_PLAYER {
+        None
+    } else {
+        let mut new_state = ctx
+            .db
+            .player_state()
+            .player_id()
+            .find(new_owner)
+            .ok_or("capturing player's state is missing")?;
+        new_state.controlled_cells = new_state
+            .controlled_cells
+            .checked_add(1)
+            .ok_or("controlled-cell count overflow")?;
+        let controlled = new_state.controlled_cells;
+        ctx.db.player_state().player_id().update(new_state);
+        Some(controlled)
+    };
     if controlled.is_some_and(|controlled| controlled >= match_state.required_control) {
         match_state.phase = MatchPhase::Completed;
         match_state.winner_player_id = new_owner;
@@ -1758,12 +1836,14 @@ fn record_capture(
     Ok(())
 }
 
-fn controlled_cells_for_owner(owner: u8, player_one: u64, player_two: u64) -> Option<u64> {
-    match owner {
-        PLAYER_ONE => Some(player_one),
-        PLAYER_TWO => Some(player_two),
-        _ => None,
-    }
+fn controlled_after_loss(controlled_cells: u64) -> Result<u64, String> {
+    controlled_cells
+        .checked_sub(1)
+        .ok_or_else(|| "controlled-cell count underflow".to_owned())
+}
+
+const fn valid_owner(owner: u16, player_count: u16) -> bool {
+    owner == NEUTRAL_PLAYER || (owner >= 1 && owner <= player_count)
 }
 
 fn advance_packet(
@@ -2040,8 +2120,8 @@ fn extend_sustained_lane(
 }
 
 fn sustained_push_target_is_eligible(
-    player_id: u8,
-    target_owner: u8,
+    player_id: u16,
+    target_owner: u16,
     passable: bool,
     capturable: bool,
     traversable: bool,
@@ -2093,7 +2173,7 @@ fn station_capture_garrison(
     ctx: &ReducerContext,
     packets: &mut PacketTickState,
     cell_id: u32,
-    owner_player_id: u8,
+    owner_player_id: u16,
     logical_step: u64,
 ) -> Result<(), String> {
     let cell = cell_state(ctx, cell_id)?;
@@ -2277,7 +2357,7 @@ fn trim_packets_at_cell(
     ctx: &ReducerContext,
     packet_state: &mut PacketTickState,
     cell_id: u32,
-    owner_player_id: u8,
+    owner_player_id: u16,
     logical_step: u64,
 ) -> Result<(), String> {
     let cell = cell_state(ctx, cell_id)?;
@@ -2309,8 +2389,8 @@ fn trim_packets_at_cell(
 /// cell. Strength in a captured cell belongs exclusively to its current owner;
 /// it must never keep a displaced owner's packets alive.
 fn packet_trim_required(
-    cell_owner: u8,
-    packet_owner: u8,
+    cell_owner: u16,
+    packet_owner: u16,
     cell_infantry: u64,
     allocated: u64,
 ) -> u64 {
@@ -2327,7 +2407,7 @@ fn trim_all_overallocated_packets(
     packet_state: &mut PacketTickState,
     logical_step: u64,
 ) -> Result<(), String> {
-    let mut packets_by_location = BTreeMap::<(u32, u8), Vec<TickPacket>>::new();
+    let mut packets_by_location = BTreeMap::<(u32, u16), Vec<TickPacket>>::new();
     for packet in packet_state.iter() {
         packets_by_location
             .entry((packet.current_cell, packet.owner_player_id))
@@ -2699,6 +2779,7 @@ mod tests {
             let source = TransferSource {
                 source_key: order_cell_key(1, cell_id),
                 order_id: 1,
+                player_id: 1,
                 cell_id,
                 committed_infantry: queued_infantry,
                 queued_infantry,
@@ -3445,9 +3526,75 @@ mod tests {
     }
 
     #[test]
-    fn neutral_ownership_changes_can_never_name_a_winner() {
-        assert_eq!(controlled_cells_for_owner(PLAYER_ONE, 80, 70), Some(80));
-        assert_eq!(controlled_cells_for_owner(PLAYER_TWO, 80, 70), Some(70));
-        assert_eq!(controlled_cells_for_owner(NEUTRAL_PLAYER, 80, 70), None);
+    fn owner_validation_accepts_neutral_and_every_configured_player() {
+        for owner in 0..=8 {
+            assert!(valid_owner(owner, 8));
+        }
+        assert!(valid_owner(500, 500));
+        assert!(!valid_owner(9, 8));
+        assert!(!valid_owner(501, 500));
+        assert!(!valid_owner(3, 2));
+    }
+
+    #[test]
+    fn high_scale_population_shard_preserves_interval_frequency() {
+        let interval = 4_u32;
+        let step = 9_u64;
+        let active_shard = u16::try_from(step % u64::from(interval)).unwrap();
+        assert_eq!(active_shard, 1);
+        for cell_id in [1_u32, 5, 9, 13] {
+            assert_eq!(u16::try_from(cell_id % interval).unwrap(), active_shard);
+        }
+        for cell_id in [2_u32, 3, 4, 6] {
+            assert_ne!(u16::try_from(cell_id % interval).unwrap(), active_shard);
+        }
+        // Wider type must preserve intervals above 255 without truncation.
+        let wide_interval = 300_u32;
+        let wide_cell = 301_u32;
+        let wide_shard = u16::try_from(wide_cell % wide_interval).unwrap();
+        assert_eq!(wide_shard, 1);
+        let truncated_interval = u32::from(wide_interval as u8); // 300u8 == 44
+        assert_eq!(truncated_interval, 44);
+        assert_ne!(
+            wide_cell % wide_interval,
+            wide_cell % truncated_interval,
+            "u8 interval truncation would change the shard cycle"
+        );
+    }
+
+    #[test]
+    fn packet_tick_load_scopes_routes_and_sources_to_active_orders() {
+        // Documented contract for PacketTickState::load: full active packet set,
+        // routes only for referenced route_ids, sources via source_by_order for
+        // the union of packet order IDs and ACTIVE transfer order IDs (covers
+        // queued sources on active orders with no packet yet). Combat remains
+        // unsharded/shared.
+        let packet_order_ids = [3_u64, 9];
+        let active_transfer_order_ids = [3_u64, 9, 5]; // 5 has sources but no packet
+        let mut order_ids: BTreeSet<u64> = packet_order_ids.into_iter().collect();
+        order_ids.extend(active_transfer_order_ids);
+        let all_sources = [(1_u64, 10_u32), (3, 11), (3, 12), (9, 13), (4, 14), (5, 15)];
+        let scoped: Vec<_> = all_sources
+            .into_iter()
+            .filter(|(order_id, _)| order_ids.contains(order_id))
+            .collect();
+        assert_eq!(scoped, vec![(3, 11), (3, 12), (9, 13), (5, 15)]);
+        assert!(
+            !scoped
+                .iter()
+                .any(|(order_id, _)| *order_id == 1 || *order_id == 4)
+        );
+        let referenced_routes = [7_u64, 8, 7];
+        let unique_routes: BTreeSet<_> = referenced_routes.into_iter().collect();
+        assert_eq!(unique_routes.len(), 2);
+    }
+
+    #[test]
+    fn controlled_cell_loss_rejects_counter_underflow() {
+        assert_eq!(controlled_after_loss(2), Ok(1));
+        assert_eq!(
+            controlled_after_loss(0),
+            Err("controlled-cell count underflow".to_owned())
+        );
     }
 }

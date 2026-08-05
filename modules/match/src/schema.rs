@@ -3,9 +3,12 @@ use spacetimedb::{AnonymousViewContext, Identity, Query, ScheduleAt, SpacetimeTy
 use crate::simulation_tick;
 
 pub const SINGLETON_ID: u8 = 0;
-pub const PLAYER_ONE: u8 = 1;
-pub const PLAYER_TWO: u8 = 2;
-pub const NEUTRAL_PLAYER: u8 = 0;
+pub const NEUTRAL_PLAYER: u16 = 0;
+pub const DEFAULT_PLAYER_COUNT: u16 = 2;
+pub const MIN_PLAYER_COUNT: u16 = 2;
+pub const MAX_PLAYER_COUNT: u16 = 500;
+/// Compact HUD and full tactical subscriptions stay in the low-scale band.
+pub const HIGH_SCALE_PLAYER_THRESHOLD: u16 = 8;
 /// Sentinel used after an Expand All contribution has left its real source.
 /// Map cell identifiers are always below this value.
 pub const EXPANSION_AGGREGATE_ORIGIN: u32 = u32::MAX;
@@ -93,7 +96,7 @@ pub enum ClusterPolicyKind {
 #[spacetimedb::table(accessor = player_slot, public)]
 pub struct PlayerSlot {
     #[primary_key]
-    pub player_id: u8,
+    pub player_id: u16,
     pub identity: Option<Identity>,
     pub display_name: String,
     pub connected: bool,
@@ -104,12 +107,26 @@ pub struct PlayerSlot {
     pub last_seen_at_us: u64,
 }
 
+/// O(1) identity → player lookup used by join, reconnect, disconnect, and
+/// command authorization. Slots alone would force a linear scan of every
+/// configured seat at 500-player scale.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = player_identity)]
+pub struct PlayerIdentity {
+    #[primary_key]
+    pub identity: Identity,
+    #[unique]
+    pub player_id: u16,
+}
+
 #[derive(Clone)]
 #[spacetimedb::table(accessor = match_config, public)]
 pub struct MatchConfig {
     #[primary_key]
     pub singleton_id: u8,
     pub map_preset: MapPreset,
+    pub player_count: u16,
+    pub lobby_configuration_locked: bool,
     pub map_seed: u64,
     pub map_width: u16,
     pub map_height: u16,
@@ -128,8 +145,6 @@ pub struct MatchConfig {
     pub mobilization_per_population_step: u64,
     pub conquest_threshold_bps: u32,
     pub map_hash: u64,
-    pub spawn_one_cell: u32,
-    pub spawn_two_cell: u32,
 }
 
 #[derive(Clone)]
@@ -141,9 +156,11 @@ pub struct MatchState {
     pub logical_step: u64,
     pub capturable_cells: u64,
     pub required_control: u64,
-    pub player_one_controlled: u64,
-    pub player_two_controlled: u64,
-    pub winner_player_id: u8,
+    pub winner_player_id: u16,
+    /// Number of configured seats that currently have a claimed identity.
+    /// Join uses this instead of scanning every slot to decide when the match
+    /// can leave the lobby.
+    pub claimed_players: u16,
     /// Monotonic authority-owned revision for explicit cluster-policy changes.
     pub latest_cluster_policy_revision: u64,
     /// Monotonic durable ownership/topology revision. Every capture or
@@ -159,11 +176,22 @@ pub struct MatchState {
     pub completed_at_us: u64,
 }
 
+/// Public per-player match projection. IDs are contiguous from one through
+/// `MatchConfig::player_count`; zero is always neutral.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = player_state, public)]
+pub struct PlayerState {
+    #[primary_key]
+    pub player_id: u16,
+    pub spawn_cell_id: u32,
+    pub controlled_cells: u64,
+}
+
 #[derive(Clone)]
 #[spacetimedb::table(accessor = mobilization_policy, public)]
 pub struct MobilizationPolicy {
     #[primary_key]
-    pub player_id: u8,
+    pub player_id: u16,
     pub target_bps: u32,
 }
 
@@ -192,17 +220,31 @@ pub struct CellTerrain {
 #[spacetimedb::table(
     accessor = cell_state,
     public,
-    index(accessor = state_by_owner, btree(columns = [owner_player_id]))
+    index(accessor = state_by_owner, btree(columns = [owner_player_id])),
+    index(accessor = state_by_population_shard, btree(columns = [population_shard])),
+    index(accessor = state_by_chunk, btree(columns = [chunk_q, chunk_r]))
 )]
 pub struct CellState {
     #[primary_key]
     #[index(direct)]
     pub cell_id: u32,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub civilians: u64,
     pub civilian_capacity: u64,
     pub infantry: u64,
     pub military_capacity: u64,
+    /// Deterministic shard used by high-scale population updates. Equals
+    /// `cell_id % population_step_interval` at map generation so each cell keeps
+    /// the same update frequency as the low-scale full-scan path.
+    ///
+    /// Stored as `u16` so `population_step_interval` values above 255 are not
+    /// silently truncated when sharded.
+    pub population_shard: u16,
+    /// Denormalized terrain chunk coordinates (same formula as `CellTerrain`)
+    /// so high-scale clients can subscribe to a bounded interest square without
+    /// joining through the immutable terrain table.
+    pub chunk_q: i16,
+    pub chunk_r: i16,
     pub last_changed_step: u64,
     /// Last step at which ownership, infantry, or capacity changed. Civilian-
     /// only growth does not dirty military distribution plans.
@@ -228,7 +270,7 @@ pub struct PolicyReplanState {
 pub struct PolicyTopologyCache {
     #[primary_key]
     pub component_key: u64,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub ownership_revision: u64,
     pub shape_hash: u64,
     pub cell_ids: Vec<u32>,
@@ -283,7 +325,7 @@ pub struct StaticEdgeLimit {
 pub struct ClusterPolicyAssignment {
     #[primary_key]
     pub cell_id: u32,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub kind: ClusterPolicyKind,
     /// Exact fixed-point axial facing used only by `Directional`.
     pub orientation_q: i32,
@@ -300,7 +342,7 @@ pub struct ClusterPolicyAssignment {
 pub struct CommandReceipt {
     #[primary_key]
     pub receipt_key: u128,
-    pub player_id: u8,
+    pub player_id: u16,
     pub client_command_id: u64,
     pub command_name: String,
     pub status: ReceiptStatus,
@@ -320,7 +362,7 @@ pub struct TransferOrder {
     #[primary_key]
     #[auto_inc]
     pub order_id: u64,
-    pub player_id: u8,
+    pub player_id: u16,
     pub client_command_id: u64,
     pub kind: OrderKind,
     pub status: OrderStatus,
@@ -341,12 +383,15 @@ pub struct TransferOrder {
 #[spacetimedb::table(
     accessor = transfer_source,
     public,
-    index(accessor = source_by_order, btree(columns = [order_id]))
+    index(accessor = source_by_order, btree(columns = [order_id])),
+    index(accessor = source_by_player, btree(columns = [player_id]))
 )]
 pub struct TransferSource {
     #[primary_key]
     pub source_key: u128,
     pub order_id: u64,
+    /// Denormalized owner for selective high-scale client subscriptions.
+    pub player_id: u16,
     pub cell_id: u32,
     pub committed_infantry: u64,
     pub queued_infantry: u64,
@@ -372,12 +417,15 @@ pub struct RetreatAbandonment {
 #[spacetimedb::table(
     accessor = transfer_destination,
     public,
-    index(accessor = destination_by_order, btree(columns = [order_id]))
+    index(accessor = destination_by_order, btree(columns = [order_id])),
+    index(accessor = destination_by_player, btree(columns = [player_id]))
 )]
 pub struct TransferDestination {
     #[primary_key]
     pub destination_key: u128,
     pub order_id: u64,
+    /// Denormalized owner for selective high-scale client subscriptions.
+    pub player_id: u16,
     /// Destination for redistribution orders; stable first-front lane anchor
     /// for a sustained Push Front operation.
     pub cell_id: u32,
@@ -392,13 +440,16 @@ pub struct TransferDestination {
 #[spacetimedb::table(
     accessor = transit_route,
     public,
-    index(accessor = route_by_order, btree(columns = [order_id]))
+    index(accessor = route_by_order, btree(columns = [order_id])),
+    index(accessor = route_by_player, btree(columns = [player_id]))
 )]
 pub struct TransitRoute {
     #[primary_key]
     #[auto_inc]
     pub route_id: u64,
     pub order_id: u64,
+    /// Denormalized owner for selective high-scale client subscriptions.
+    pub player_id: u16,
     pub cells: Vec<u32>,
 }
 
@@ -411,14 +462,15 @@ pub struct TransitRoute {
         accessor = packet_by_order_destination,
         btree(columns = [order_id, destination_cell])
     ),
-    index(accessor = packet_by_cell, btree(columns = [current_cell]))
+    index(accessor = packet_by_cell, btree(columns = [current_cell])),
+    index(accessor = packet_by_owner, btree(columns = [owner_player_id]))
 )]
 pub struct TransitPacket {
     #[primary_key]
     #[auto_inc]
     pub packet_key: u64,
     pub order_id: u64,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub origin_cell: u32,
     pub current_cell: u32,
     pub destination_cell: u32,
@@ -492,7 +544,7 @@ pub struct ExpansionWave {
 pub struct ExpansionGarrisonDebt {
     #[primary_key]
     pub cell_id: u32,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub remaining_infantry: u64,
 }
 
@@ -500,13 +552,15 @@ pub struct ExpansionGarrisonDebt {
 #[spacetimedb::table(
     accessor = combat_front,
     public,
-    index(accessor = front_by_target, btree(columns = [to_cell]))
+    index(accessor = front_by_target, btree(columns = [to_cell])),
+    index(accessor = front_by_attacker, btree(columns = [attacker_player_id])),
+    index(accessor = front_by_defender, btree(columns = [defender_player_id]))
 )]
 pub struct CombatFront {
     #[primary_key]
     pub front_key: String,
-    pub attacker_player_id: u8,
-    pub defender_player_id: u8,
+    pub attacker_player_id: u16,
+    pub defender_player_id: u16,
     pub from_cell: u32,
     pub to_cell: u32,
     pub queued_infantry: u64,

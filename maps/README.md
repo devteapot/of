@@ -5,7 +5,8 @@
 Generate an inspectable JSON fixture with:
 
 ```bash
-cargo run -p mapgen -- --preset dev --output maps/generated/dev-stepped-island.json
+cargo run -p mapgen -- --preset dev --players 2 \
+  --output maps/generated/dev-stepped-island.json
 ```
 
-The larger playtest and validation maps are generated on demand so tens of thousands of derived cell rows do not need to be committed.
+The larger playtest and validation maps are generated on demand so tens of thousands of derived cell rows do not need to be committed. `--players` accepts 2 through 500 (default 2); manifests record `player_count` (`u16`, legacy JSON defaults to 2) and a deterministic ordered spawn-cell vector. Counts `2..=8` keep multi-cell ring footprints; counts above eight use deterministic farthest-point one-cell starts. Custom two-player generation requires dimensions of at least 24 by 24, while custom maps with more than two players require at least 32 by 32; the Rust API panics when these dimension or player-count preconditions are violated. Generator-version-1 JSON written before `player_count` existed remains readable as a two-player manifest, and the existing two-player terrain/spawn output is unchanged.

@@ -85,7 +85,7 @@ this stack.
 ### First playable version
 
 Publish the match module manually as one development database, `of-match-dev` by
-default. It hosts exactly one two-player match at a time. This avoids building a
+default. It hosts exactly one configurable 2–500 player match at a time. This avoids building a
 lobby before the cluster conquest loop has been validated.
 
 ### Concurrent matches
@@ -443,16 +443,18 @@ The map format must not assume a square world. Initial performance fixtures shou
 - 256 x 256 bounds: 65,536 cells before masking, a future stretch fixture that
   is not currently exposed as a match preset.
 
-V1 may subscribe both players to the complete map because there is no fog of war. The protocol and renderer should nevertheless retain chunk keys so larger maps can move to interest subscriptions or region summaries without changing cell identity.
+V1 has no fog of war, but high-scale clients still use bandwidth-oriented interest. Clients bootstrap with immutable full terrain plus match/player metadata only, then after the authoritative player count and local seat are known issue a one-time tactical subscription: full `cell_state`/`combat_front` and tactical tables at `player_count <= 8`; above that threshold, all local-owned cells globally plus local attacker/defender fronts and player-filtered tactical rows. High-scale remote `CellState` interest is a separate moving spatial subscription around the camera focus chunk (spawn-centered until the camera is available), debounced on server chunk-boundary crossings with a configurable chunk radius on denormalized `chunk_q`/`chunk_r`. Old spatial handles are retired so subscriptions never accumulate; cells leaving interest project to neutral/default. This is bandwidth interest plus local ownership—not security authorization. The tactical handle never repeats the bootstrap query set, and commands stay blocked until bootstrap + tactical have applied. Chunk keys remain first-class so interest radii can be tuned without changing cell identity.
 
 Store the authoritative map hash in the match database. During V1, terrain chunks may also live in database tables for a self-contained join. A later optimization may load a matching immutable baked map locally and subscribe only to authoritative dynamic state, but the client must reject or fetch a map when its local hash differs.
 
 ## SpacetimeDB subscriptions and the Bevy cache bridge
 
-On join, the client subscribes to match metadata, its player slot, map
-manifest/chunks, dynamic cell state, cluster-policy assignments, active orders,
-active fronts, command receipts, and match result. The SpacetimeDB client cache
-is the network-facing source of truth for the client.
+On connect, the client first subscribes to match metadata, player projections,
+and immutable terrain. After the local seat binds, it adds one tactical
+subscription for cell state / combat (full or spatial+local-owned by scale),
+cluster-policy assignments, active orders, routes/packets, mobilization, and
+command receipts. The SpacetimeDB client cache is the network-facing source of
+truth for the client.
 
 A narrow adapter advances the SpacetimeDB connection in the Bevy update loop as required by the selected SDK version. It translates inserted, updated, and deleted rows into ordered application events and dirty chunk/cell markers. Bevy systems consume those markers; rendering systems do not synchronously query the network and network callbacks do not directly mutate arbitrary ECS state.
 
@@ -525,10 +527,10 @@ gate.
 
 ## Reconnect and recovery
 
-Keep these identities distinct even though V1 is two human players:
+Keep these identities distinct even though V1 supports 2–500 human players:
 
 - connection/account identity;
-- match player slot;
+- match player slot (`u16`, neutral 0);
 - territory owner or faction ID.
 
 A reconnect reducer reclaims an existing player slot using authenticated identity and explicit match rules. Disconnection does not delete troops, cancel orders, transfer ownership, or imply immediate defeat. Any timeout or surrender behavior belongs to the game mode, not the transport layer.
@@ -621,7 +623,7 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
 
 1. **Compatibility gate:** pin the tested Rust, Bevy, SpacetimeDB, and code-generation toolchain; prove native connection and generated bindings. Browser/WASM compatibility is a later gate.
 2. **Workspace skeleton:** create `hex-core`, match module, generated-bindings crate, Bevy client, map tool, formatting/lint/test CI, and one tiny deterministic fixture map.
-3. **Network walking skeleton:** manually publish one match database; connect two native clients; claim two player slots; mutate one test cell through a validated reducer and subscription.
+3. **Network walking skeleton:** manually publish one match database; connect the configured native clients; claim every player slot; mutate one test cell through a validated reducer and subscription.
 4. **Map interaction slice:** load authoritative chunked terrain, render stepped
    graybox hexes, implement camera and height-aware picking, and select complete
    owned clusters with multi-select and Select All.
@@ -661,4 +663,4 @@ The following questions stay open until profiling or playtesting supplies eviden
 - Multi-hex armored formations and deliberate spatial blocking. These remain separate from scalar infantry flow and must be prototyped after V1.
 - AI opponents, teams, spectators, matchmaking, and long-term persistence beyond match results.
 
-These research items must not leak speculative complexity into the shared core or V1 schema. Preserve extension points through clear coordinate, movement-profile, relation, map-chunk, and order boundaries; add concrete systems only after the core two-player loop is validated.
+These research items must not leak speculative complexity into the shared core or V1 schema. Preserve extension points through clear coordinate, movement-profile, relation, map-chunk, and order boundaries; add concrete systems only after the core multiplayer loop is validated.

@@ -8,7 +8,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[sats(crate = __lib)]
 pub struct ExpansionGarrisonDebt {
     pub cell_id: u32,
-    pub owner_player_id: u8,
+    pub owner_player_id: u16,
     pub remaining_infantry: u64,
 }
 
@@ -21,7 +21,7 @@ impl __sdk::InModule for ExpansionGarrisonDebt {
 /// Provides typed access to columns for query building.
 pub struct ExpansionGarrisonDebtCols {
     pub cell_id: __sdk::__query_builder::Col<ExpansionGarrisonDebt, u32>,
-    pub owner_player_id: __sdk::__query_builder::Col<ExpansionGarrisonDebt, u8>,
+    pub owner_player_id: __sdk::__query_builder::Col<ExpansionGarrisonDebt, u16>,
     pub remaining_infantry: __sdk::__query_builder::Col<ExpansionGarrisonDebt, u64>,
 }
 
