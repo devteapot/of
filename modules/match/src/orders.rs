@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
+};
 
 use hex_core::{
-    Axial, BALANCE_WEIGHT, DistributionPreset, FrontSelectionError, HexMap, MovementConfig,
-    ground_traversal, redistribution_targets, redistribution_targets_with_fallback_constraints,
-    selected_all_front_edges, selected_directional_routes, selected_front_edges,
-    selected_local_front_routes, shortest_path,
+    Axial, BALANCE_WEIGHT, Cell, DistributionPreset, ForceComposition, FrontSelectionError, HexMap,
+    MovementConfig, TerrainKind, distribution_weights_dense, ground_traversal,
+    redistribution_targets, redistribution_targets_dense_with_weights,
+    redistribution_targets_with_fallback_constraints, selected_all_front_edges,
+    selected_directional_routes, selected_front_edges, selected_local_front_routes, shortest_path,
 };
 use spacetimedb::{ReducerContext, Table, log_stopwatch::LogStopwatch};
 
@@ -14,13 +18,15 @@ use crate::rules::{
     terrain, write_receipt,
 };
 use crate::schema::{
-    ClusterPolicyAssignment, ClusterPolicyKind, EXPANSION_AGGREGATE_ORIGIN, ExpansionWave,
-    NEUTRAL_PLAYER, OrderKind, OrderStatus, ReceiptStatus, RetreatAbandonment, TransferDestination,
-    TransferOrder, TransferSource, TransitPacket,
+    CellState, CellTerrain, ClusterPolicyAssignment, ClusterPolicyKind, EXPANSION_AGGREGATE_ORIGIN,
+    ExpansionWave, NEUTRAL_PLAYER, OrderKind, OrderStatus, PolicyReplanState, PolicyTopologyCache,
+    ReceiptStatus, RetreatAbandonment, TerrainClass, TransferDestination, TransferOrder,
+    TransferSource, TransitPacket,
 };
 use crate::schema::{
-    cell_state as _, cluster_policy_assignment, expansion_wave, match_state, mobilization_policy,
-    retreat_abandonment, transfer_destination, transfer_order, transfer_source, transit_packet,
+    cell_state as _, cell_terrain as _, cluster_policy_assignment, expansion_wave, match_state,
+    mobilization_policy, policy_replan_state, policy_topology_cache, retreat_abandonment,
+    transfer_destination, transfer_order, transfer_source, transit_packet,
 };
 
 #[derive(Clone)]
@@ -82,6 +88,35 @@ const POLICY_MAINTENANCE_COMMAND_ID: u64 = 0;
 /// Receding-horizon maintenance may finish a large redistribution over
 /// several passes. This caps routing and persistence work in any one tick.
 const MAX_POLICY_REPLAN_LEGS: usize = 128;
+/// Preserve the established four-second freshness target at the 4 Hz
+/// simulation cadence while distributing components across separate ticks.
+const POLICY_REPLAN_INTERVAL_STEPS: u64 = 16;
+#[derive(Clone)]
+struct PolicyComponentSnapshot {
+    component_key: u64,
+    shape_hash: u64,
+    ownership_revision: u64,
+    player_id: u8,
+    cell_ids: Vec<u32>,
+    cell_set: BTreeSet<u32>,
+    map: HexMap,
+    cell_ids_by_coordinate: BTreeMap<Axial, u32>,
+    coordinates_by_cell_id: BTreeMap<u32, Axial>,
+    states_by_cell_id: BTreeMap<u32, CellState>,
+    allocated_by_cell_id: BTreeMap<u32, u64>,
+    max_policy_changed_step: u64,
+}
+
+struct PolicyWorldSnapshot {
+    components: Vec<PolicyComponentSnapshot>,
+    owner_by_cell_id: Vec<u8>,
+}
+
+struct PolicyDistributionPlan {
+    source_limits: BTreeMap<u32, u64>,
+    demands: BTreeMap<u32, u64>,
+    amount: u64,
+}
 
 impl RetaskSelection {
     fn released_at(&self, cell_id: u32) -> u64 {
@@ -1031,6 +1066,371 @@ fn owned_components(ctx: &ReducerContext, player_id: u8) -> Result<Vec<BTreeSet<
     Ok(result)
 }
 
+fn policy_component_key(player_id: u8, minimum_cell_id: u32) -> u64 {
+    (u64::from(player_id) << 32) | u64::from(minimum_cell_id)
+}
+
+fn policy_shape_hash(player_id: u8, cell_ids: &[u32]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = (OFFSET ^ u64::from(player_id)).wrapping_mul(PRIME);
+    for cell_id in cell_ids {
+        hash ^= u64::from(*cell_id);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn core_terrain_kind(terrain: TerrainClass) -> TerrainKind {
+    match terrain {
+        TerrainClass::Water => TerrainKind::Water,
+        TerrainClass::Plains => TerrainKind::Plains,
+        TerrainClass::Hills => TerrainKind::Hills,
+        TerrainClass::Mountain => TerrainKind::Mountain,
+    }
+}
+
+fn schema_terrain_class(terrain: TerrainKind) -> TerrainClass {
+    match terrain {
+        TerrainKind::Water => TerrainClass::Water,
+        TerrainKind::Plains => TerrainClass::Plains,
+        TerrainKind::Hills => TerrainClass::Hills,
+        TerrainKind::Mountain => TerrainClass::Mountain,
+    }
+}
+
+fn snapshot_core_cell(terrain: &CellTerrain, state: &CellState) -> Cell {
+    let coordinate = Axial::new(terrain.q, terrain.r);
+    let owner =
+        (state.owner_player_id != NEUTRAL_PLAYER).then_some(u32::from(state.owner_player_id));
+    Cell {
+        coordinate,
+        terrain: core_terrain_kind(terrain.terrain),
+        elevation: terrain.elevation,
+        capturable: terrain.capturable,
+        habitable: terrain.habitable,
+        owner,
+        civilian_population: state.civilians,
+        civilian_capacity: state.civilian_capacity,
+        forces: ForceComposition::infantry(state.infantry),
+        military_capacity: state.military_capacity,
+    }
+}
+
+/// Loads terrain and state once, then labels every owner's traversable
+/// components in a shared pass. No player-specific full-map scan remains in
+/// periodic policy reconciliation.
+fn load_policy_world_snapshot(
+    ctx: &ReducerContext,
+    ownership_revision: u64,
+) -> Result<PolicyWorldSnapshot, String> {
+    let terrain_rows = ctx.db.cell_terrain().iter().collect::<Vec<_>>();
+    let state_rows = ctx.db.cell_state().iter().collect::<Vec<_>>();
+    let slot_count = terrain_rows
+        .iter()
+        .map(|row| row.cell_id)
+        .chain(state_rows.iter().map(|row| row.cell_id))
+        .max()
+        .map_or(0, |maximum| maximum as usize + 1);
+    let mut terrain_by_cell_id = vec![None; slot_count];
+    let mut state_by_cell_id = vec![None; slot_count];
+    let mut owner_by_cell_id = vec![NEUTRAL_PLAYER; slot_count];
+    let mut cell_ids_by_coordinate = BTreeMap::new();
+    for terrain in terrain_rows {
+        let cell_id = terrain.cell_id;
+        cell_ids_by_coordinate.insert(Axial::new(terrain.q, terrain.r), terrain.cell_id);
+        terrain_by_cell_id[cell_id as usize] = Some(terrain);
+    }
+    for state in state_rows {
+        let cell_id = state.cell_id;
+        owner_by_cell_id[cell_id as usize] = state.owner_player_id;
+        state_by_cell_id[cell_id as usize] = Some(state);
+    }
+
+    let max_elevation_step = u32::from(config(ctx)?.max_elevation_step);
+    let mut visited = vec![false; slot_count];
+    let mut components = Vec::new();
+    for seed_id in 0..slot_count {
+        if visited[seed_id] {
+            continue;
+        }
+        visited[seed_id] = true;
+        let Some(seed_state) = state_by_cell_id[seed_id].as_ref() else {
+            continue;
+        };
+        let Some(seed_terrain) = terrain_by_cell_id[seed_id].as_ref() else {
+            continue;
+        };
+        if seed_state.owner_player_id == NEUTRAL_PLAYER || !seed_terrain.passable {
+            continue;
+        }
+        let player_id = seed_state.owner_player_id;
+        let mut pending = VecDeque::from([seed_id as u32]);
+        let mut cell_ids = Vec::new();
+        while let Some(cell_id) = pending.pop_front() {
+            cell_ids.push(cell_id);
+            let terrain = terrain_by_cell_id[cell_id as usize]
+                .as_ref()
+                .expect("queued policy cell has terrain");
+            let coordinate = Axial::new(terrain.q, terrain.r);
+            for neighbor in coordinate.neighbors() {
+                let Some(&neighbor_id) = cell_ids_by_coordinate.get(&neighbor) else {
+                    continue;
+                };
+                let neighbor_index = neighbor_id as usize;
+                if visited[neighbor_index] {
+                    continue;
+                }
+                let Some(neighbor_state) = state_by_cell_id[neighbor_index].as_ref() else {
+                    visited[neighbor_index] = true;
+                    continue;
+                };
+                let Some(neighbor_terrain) = terrain_by_cell_id[neighbor_index].as_ref() else {
+                    visited[neighbor_index] = true;
+                    continue;
+                };
+                if neighbor_state.owner_player_id != player_id || !neighbor_terrain.passable {
+                    continue;
+                }
+                let elevation_delta = (i32::from(terrain.elevation)
+                    - i32::from(neighbor_terrain.elevation))
+                .unsigned_abs();
+                if elevation_delta <= max_elevation_step {
+                    visited[neighbor_index] = true;
+                    pending.push_back(neighbor_id);
+                }
+            }
+        }
+        cell_ids.sort_unstable();
+        let minimum_cell_id = *cell_ids
+            .first()
+            .expect("a component seeded with one cell is non-empty");
+        let component_key = policy_component_key(player_id, minimum_cell_id);
+        let shape_hash = policy_shape_hash(player_id, &cell_ids);
+        let mut map = HexMap::new();
+        let mut component_ids_by_coordinate = BTreeMap::new();
+        let mut coordinates_by_cell_id = BTreeMap::new();
+        let mut states_by_cell_id = BTreeMap::new();
+        let mut max_policy_changed_step = 0;
+        for &cell_id in &cell_ids {
+            let terrain = terrain_by_cell_id[cell_id as usize]
+                .as_ref()
+                .expect("component cell has terrain");
+            let state = state_by_cell_id[cell_id as usize]
+                .as_ref()
+                .expect("component cell has state");
+            let coordinate = Axial::new(terrain.q, terrain.r);
+            map.insert(snapshot_core_cell(terrain, state));
+            component_ids_by_coordinate.insert(coordinate, cell_id);
+            coordinates_by_cell_id.insert(cell_id, coordinate);
+            states_by_cell_id.insert(cell_id, state.clone());
+            max_policy_changed_step = max_policy_changed_step.max(state.last_policy_changed_step);
+        }
+        components.push(PolicyComponentSnapshot {
+            component_key,
+            shape_hash,
+            ownership_revision,
+            player_id,
+            cell_set: cell_ids.iter().copied().collect(),
+            cell_ids,
+            map,
+            cell_ids_by_coordinate: component_ids_by_coordinate,
+            coordinates_by_cell_id,
+            states_by_cell_id,
+            allocated_by_cell_id: BTreeMap::new(),
+            max_policy_changed_step,
+        });
+    }
+    components.sort_unstable_by_key(|component| component.component_key);
+    Ok(PolicyWorldSnapshot {
+        components,
+        owner_by_cell_id,
+    })
+}
+
+fn hydrate_policy_allocations(ctx: &ReducerContext, component: &mut PolicyComponentSnapshot) {
+    component.allocated_by_cell_id = component
+        .cell_ids
+        .iter()
+        .copied()
+        .map(|cell_id| {
+            (
+                cell_id,
+                allocated_infantry_at_cell(ctx, component.player_id, cell_id),
+            )
+        })
+        .collect();
+}
+
+fn rebuild_policy_topologies(
+    ctx: &ReducerContext,
+    ownership_revision: u64,
+) -> Result<Vec<PolicyTopologyCache>, String> {
+    let world = load_policy_world_snapshot(ctx, ownership_revision)?;
+    reconcile_cluster_policy_assignments(ctx, &world)?;
+    let existing = ctx
+        .db
+        .policy_topology_cache()
+        .iter()
+        .map(|row| (row.component_key, row))
+        .collect::<BTreeMap<_, _>>();
+    let live_keys = world
+        .components
+        .iter()
+        .map(|component| component.component_key)
+        .collect::<BTreeSet<_>>();
+    let mut rows = Vec::with_capacity(world.components.len());
+    for component in &world.components {
+        let core_weights = existing
+            .get(&component.component_key)
+            .filter(|row| {
+                row.shape_hash == component.shape_hash
+                    && row.cell_ids == component.cell_ids
+                    && row.core_weights.len() == component.cell_ids.len()
+            })
+            .map_or_else(Vec::new, |row| row.core_weights.clone());
+        let cells = component
+            .cell_ids
+            .iter()
+            .map(|cell_id| {
+                let coordinate = component.coordinates_by_cell_id[cell_id];
+                component
+                    .map
+                    .get(coordinate)
+                    .expect("policy topology cell exists in its map")
+            })
+            .collect::<Vec<_>>();
+        let row = PolicyTopologyCache {
+            component_key: component.component_key,
+            owner_player_id: component.player_id,
+            ownership_revision,
+            shape_hash: component.shape_hash,
+            cell_ids: component.cell_ids.clone(),
+            q: cells.iter().map(|cell| cell.coordinate.q).collect(),
+            r: cells.iter().map(|cell| cell.coordinate.r).collect(),
+            terrain: cells
+                .iter()
+                .map(|cell| schema_terrain_class(cell.terrain))
+                .collect(),
+            elevation: cells.iter().map(|cell| cell.elevation).collect(),
+            capturable: cells.iter().map(|cell| cell.capturable).collect(),
+            habitable: cells.iter().map(|cell| cell.habitable).collect(),
+            civilian_capacity: cells.iter().map(|cell| cell.civilian_capacity).collect(),
+            military_capacity: cells.iter().map(|cell| cell.military_capacity).collect(),
+            core_weights,
+        };
+        if existing.contains_key(&component.component_key) {
+            ctx.db
+                .policy_topology_cache()
+                .component_key()
+                .update(row.clone());
+        } else {
+            ctx.db.policy_topology_cache().insert(row.clone());
+        }
+        rows.push(row);
+    }
+    for component_key in existing.keys().copied() {
+        if !live_keys.contains(&component_key) {
+            ctx.db
+                .policy_topology_cache()
+                .component_key()
+                .delete(component_key);
+        }
+    }
+    for row in ctx.db.policy_replan_state().iter().collect::<Vec<_>>() {
+        if !live_keys.contains(&row.component_key) {
+            ctx.db
+                .policy_replan_state()
+                .component_key()
+                .delete(row.component_key);
+        }
+    }
+    rows.sort_unstable_by_key(|row| row.component_key);
+    Ok(rows)
+}
+
+fn load_policy_component_snapshot(
+    ctx: &ReducerContext,
+    topology: &PolicyTopologyCache,
+) -> Result<PolicyComponentSnapshot, String> {
+    let expected_len = topology.cell_ids.len();
+    let aligned_lengths = [
+        topology.q.len(),
+        topology.r.len(),
+        topology.terrain.len(),
+        topology.elevation.len(),
+        topology.capturable.len(),
+        topology.habitable.len(),
+        topology.civilian_capacity.len(),
+        topology.military_capacity.len(),
+    ];
+    if aligned_lengths
+        .iter()
+        .any(|length| *length != expected_len)
+    {
+        return Err(format!(
+            "policy topology {} has misaligned static data",
+            topology.component_key
+        ));
+    }
+
+    let cell_set = topology.cell_ids.iter().copied().collect::<BTreeSet<_>>();
+    let owner_states = ctx
+        .db
+        .cell_state()
+        .state_by_owner()
+        .filter(topology.owner_player_id)
+        .filter(|cell| cell_set.contains(&cell.cell_id))
+        .map(|cell| (cell.cell_id, cell))
+        .collect::<BTreeMap<_, _>>();
+    if owner_states.len() != expected_len {
+        return Err(format!(
+            "policy topology revision {} is stale for player {}",
+            topology.ownership_revision, topology.owner_player_id
+        ));
+    }
+
+    let mut map = HexMap::new();
+    let mut cell_ids_by_coordinate = BTreeMap::new();
+    let mut coordinates_by_cell_id = BTreeMap::new();
+    let mut states_by_cell_id = BTreeMap::new();
+    let mut max_policy_changed_step = 0;
+    for (index, &cell_id) in topology.cell_ids.iter().enumerate() {
+        let cell = owner_states[&cell_id].clone();
+        let coordinate = Axial::new(topology.q[index], topology.r[index]);
+        map.insert(Cell {
+            coordinate,
+            terrain: core_terrain_kind(topology.terrain[index]),
+            elevation: topology.elevation[index],
+            capturable: topology.capturable[index],
+            habitable: topology.habitable[index],
+            owner: Some(u32::from(topology.owner_player_id)),
+            civilian_population: cell.civilians,
+            civilian_capacity: topology.civilian_capacity[index],
+            forces: ForceComposition::infantry(cell.infantry),
+            military_capacity: topology.military_capacity[index],
+        });
+        cell_ids_by_coordinate.insert(coordinate, cell_id);
+        coordinates_by_cell_id.insert(cell_id, coordinate);
+        max_policy_changed_step = max_policy_changed_step.max(cell.last_policy_changed_step);
+        states_by_cell_id.insert(cell_id, cell);
+    }
+    Ok(PolicyComponentSnapshot {
+        component_key: topology.component_key,
+        shape_hash: topology.shape_hash,
+        ownership_revision: topology.ownership_revision,
+        player_id: topology.owner_player_id,
+        cell_set,
+        cell_ids: topology.cell_ids.clone(),
+        map,
+        cell_ids_by_coordinate,
+        coordinates_by_cell_id,
+        states_by_cell_id,
+        allocated_by_cell_id: BTreeMap::new(),
+        max_policy_changed_step,
+    })
+}
+
 /// Resolves sparse UI seeds into complete authoritative owned components, then
 /// prepares any intersecting policy-maintenance order to yield. Explicit action
 /// orders remain allocated and are never implicitly retasked.
@@ -1191,7 +1591,8 @@ fn upsert_cluster_policy_assignment(
 
 fn reconcile_cluster_policy_assignments(
     ctx: &ReducerContext,
-) -> Result<BTreeMap<u8, Vec<BTreeSet<u32>>>, String> {
+    world: &PolicyWorldSnapshot,
+) -> Result<(), String> {
     let existing = ctx
         .db
         .cluster_policy_assignment()
@@ -1206,9 +1607,14 @@ fn reconcile_cluster_policy_assignments(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut components_by_player = BTreeMap::new();
-    for player_id in [crate::schema::PLAYER_ONE, crate::schema::PLAYER_TWO] {
-        let components = owned_components(ctx, player_id)?;
+    let mut components_by_player = BTreeMap::<u8, Vec<BTreeSet<u32>>>::new();
+    for component in &world.components {
+        components_by_player
+            .entry(component.player_id)
+            .or_default()
+            .push(component.cell_set.clone());
+    }
+    for (player_id, components) in components_by_player {
         let reconciled = reconciled_policy_specs(&components, &existing, player_id);
         for (cell_id, spec) in reconciled {
             let current = existing.get(&cell_id).copied();
@@ -1216,7 +1622,6 @@ fn reconcile_cluster_policy_assignments(
                 upsert_cluster_policy_assignment(ctx, cell_id, player_id, spec);
             }
         }
-        components_by_player.insert(player_id, components);
     }
 
     let assignments = ctx
@@ -1226,14 +1631,20 @@ fn reconcile_cluster_policy_assignments(
         .collect::<Vec<_>>();
     let mut stale = Vec::new();
     for row in assignments {
-        if cell_state(ctx, row.cell_id)?.owner_player_id != row.owner_player_id {
+        if world
+            .owner_by_cell_id
+            .get(row.cell_id as usize)
+            .copied()
+            .unwrap_or(NEUTRAL_PLAYER)
+            != row.owner_player_id
+        {
             stale.push(row.cell_id);
         }
     }
     for cell_id in stale {
         ctx.db.cluster_policy_assignment().cell_id().delete(cell_id);
     }
-    Ok(components_by_player)
+    Ok(())
 }
 
 const fn is_policy_distribution_kind(kind: OrderKind) -> bool {
@@ -1439,25 +1850,214 @@ fn set_cluster_policy_inner(
     Ok(())
 }
 
-/// Reconciles policy lineage after ownership topology changes, then starts at
-/// most one background redistribution over each component's genuinely free
-/// pool. No explicit action order is superseded: its live packets stay frozen in
+/// Reconciles policy lineage after ownership topology changes, then considers
+/// one cached component per eligible non-population tick. The durable cursor
+/// staggers work
+/// deterministically, and an unchanged component stops after its state probe.
+/// No explicit action order is superseded: its live packets stay frozen in
 /// `redistribution_cell_projection` and continue to consume cell capacity.
-pub(crate) fn maintain_cluster_policies(ctx: &ReducerContext) -> Result<(), String> {
-    let reconciliation_stopwatch = LogStopwatch::new("cluster_policy_reconciliation");
-    let components_by_player = reconcile_cluster_policy_assignments(ctx)?;
-    reconciliation_stopwatch.end();
-    for (player_id, components) in components_by_player {
-        for component in components {
-            // Policy movement is opportunistic. An explicit action, temporary
-            // capacity pressure, or a newly changed route can make this
-            // component impossible to redistribute on this population step;
-            // that must not reject the surrounding simulation tick. The
-            // persistent assignment remains authoritative and is retried on
-            // the next maintenance pass.
-            let _maintenance_result = maintain_cluster_policy_component(ctx, player_id, &component);
-        }
+pub(crate) fn maintain_cluster_policies(
+    ctx: &ReducerContext,
+    logical_step: u64,
+) -> Result<(), String> {
+    let mut match_state = state(ctx)?;
+    let population_interval = u64::from(config(ctx)?.population_step_interval.max(1));
+    // Population already performs the largest regular write batch. Policy
+    // work uses the intervening ticks so the two costs never stack.
+    if logical_step.is_multiple_of(population_interval) {
+        return Ok(());
     }
+
+    let topology_was_stale =
+        match_state.policy_topology_revision != match_state.ownership_revision;
+    // During an expansion wave ownership may change every tick. Component
+    // topology is allowed the same four-second staleness as redistribution;
+    // rebuilding once in that window coalesces all captures into one scan.
+    if topology_was_stale && logical_step % POLICY_REPLAN_INTERVAL_STEPS != 1 {
+        return Ok(());
+    }
+    let mut topologies = if topology_was_stale {
+        let reconciliation_stopwatch = LogStopwatch::new("cluster_policy_reconciliation");
+        rebuild_policy_topologies(ctx, match_state.ownership_revision)?;
+        reconciliation_stopwatch.end();
+        match_state.policy_topology_revision = match_state.ownership_revision;
+        match_state.policy_replan_cursor = 0;
+        ctx.db.match_state().singleton_id().update(match_state);
+        // Keep the cold topology scan and component planning on separate
+        // transactions so neither can recreate the old synchronized spike.
+        return Ok(());
+    } else {
+        ctx.db.policy_topology_cache().iter().collect::<Vec<_>>()
+    };
+    topologies.sort_unstable_by_key(|row| row.component_key);
+
+    if topologies.is_empty() {
+        match_state.policy_replan_cursor = 0;
+        if topology_was_stale {
+            ctx.db.match_state().singleton_id().update(match_state);
+        }
+        return Ok(());
+    }
+
+    let start = topologies
+        .partition_point(|topology| topology.component_key <= match_state.policy_replan_cursor);
+    let topology = &topologies[start % topologies.len()];
+    match_state.policy_replan_cursor = topology.component_key;
+
+    let first_cell = *topology
+        .cell_ids
+        .first()
+        .expect("policy components are non-empty");
+    let assignment = ctx
+        .db
+        .cluster_policy_assignment()
+        .cell_id()
+        .find(first_cell)
+        .ok_or_else(|| format!("cluster policy is missing cell {first_cell}"))?;
+    let prior = ctx
+        .db
+        .policy_replan_state()
+        .component_key()
+        .find(topology.component_key);
+    let topology_or_policy_changed = prior.as_ref().is_none_or(|prior| {
+        prior.shape_hash != topology.shape_hash || prior.policy_revision != assignment.revision
+    });
+    let replan_is_due = prior.as_ref().is_none_or(|prior| {
+        logical_step.saturating_sub(prior.last_plan_step) >= POLICY_REPLAN_INTERVAL_STEPS
+    });
+    if !topology_or_policy_changed && !replan_is_due {
+        ctx.db.match_state().singleton_id().update(match_state);
+        return Ok(());
+    }
+
+    let mut component = load_policy_component_snapshot(ctx, topology)?;
+    if policy_component_needs_replan(&component, assignment.revision, prior.as_ref()) {
+        let _maintenance_result = maintain_cluster_policy_snapshot(ctx, &mut component);
+    }
+    let row = PolicyReplanState {
+        component_key: component.component_key,
+        shape_hash: component.shape_hash,
+        policy_revision: assignment.revision,
+        last_plan_step: logical_step,
+    };
+    if prior.is_some() {
+        ctx.db.policy_replan_state().component_key().update(row);
+    } else {
+        ctx.db.policy_replan_state().insert(row);
+    }
+
+    // Advancing after consideration (including a best-effort planning
+    // failure) prevents one component from starving every other component.
+    ctx.db.match_state().singleton_id().update(match_state);
+    Ok(())
+}
+
+fn policy_component_needs_replan(
+    component: &PolicyComponentSnapshot,
+    policy_revision: u64,
+    prior: Option<&PolicyReplanState>,
+) -> bool {
+    prior.is_none_or(|prior| {
+        prior.shape_hash != component.shape_hash
+            || prior.policy_revision != policy_revision
+            || component.max_policy_changed_step > prior.last_plan_step
+    })
+}
+
+fn maintain_cluster_policy_snapshot(
+    ctx: &ReducerContext,
+    component: &mut PolicyComponentSnapshot,
+) -> Result<(), String> {
+    let _component_stopwatch = LogStopwatch::new("cluster_policy_component");
+    if component.cell_ids.len() > MAX_SELECTION_CELLS {
+        return Err(format!(
+            "cluster policy component exceeds the {MAX_SELECTION_CELLS}-cell command limit"
+        ));
+    }
+    let first_cell = *component
+        .cell_ids
+        .first()
+        .ok_or_else(|| "cluster policy component is empty".to_string())?;
+    let assignment = ctx
+        .db
+        .cluster_policy_assignment()
+        .cell_id()
+        .find(first_cell)
+        .ok_or_else(|| format!("cluster policy is missing cell {first_cell}"))?;
+    let spec = ClusterPolicySpec::from_assignment(&assignment);
+    let active = active_policy_orders_intersecting(ctx, component.player_id, &component.cell_set);
+    let incompatible = active
+        .iter()
+        .filter(|order| !policy_order_matches(order, spec))
+        .map(|order| order.order_id)
+        .collect::<BTreeSet<_>>();
+    for &order_id in &incompatible {
+        preflight_cancel_order(ctx, component.player_id, order_id)?;
+    }
+    for order_id in incompatible {
+        cancel_order(ctx, component.player_id, order_id)?;
+    }
+
+    hydrate_policy_allocations(ctx, component);
+    let selection = include_background_policy_yield(
+        ctx,
+        component.player_id,
+        RetaskSelection {
+            source_cells: component.cell_set.clone(),
+            superseded_order_ids: BTreeSet::new(),
+            released_by_cell: BTreeMap::new(),
+        },
+    )?;
+    let (kind, preset, orientation) = spec.distribution();
+    let distribution_stopwatch = LogStopwatch::new("cluster_policy_distribution");
+    let plan = policy_distribution_plan(ctx, component, &selection, preset)?;
+    distribution_stopwatch.end();
+    if plan.amount == 0 {
+        cancel_superseded_orders(ctx, component.player_id, &selection.superseded_order_ids)?;
+        return Ok(());
+    }
+
+    let routing_stopwatch = LogStopwatch::new("cluster_policy_routing");
+    let match_config = config(ctx)?;
+    let movement = MovementConfig {
+        max_elevation_step: u16::from(match_config.max_elevation_step),
+        level_cost: 10,
+        uphill_cost: 15,
+        downhill_cost: 10,
+    };
+    let legs = plan_policy_distribution_legs(component, plan, MAX_POLICY_REPLAN_LEGS, &movement)?;
+    routing_stopwatch.end();
+    let relay_availability = component
+        .cell_ids
+        .iter()
+        .copied()
+        .map(|cell_id| {
+            let cell = &component.states_by_cell_id[&cell_id];
+            let allocated = component
+                .allocated_by_cell_id
+                .get(&cell_id)
+                .copied()
+                .unwrap_or(0);
+            available_after_retask_release(cell.infantry, allocated, selection.released_at(cell_id))
+                .map(|available| (cell_id, available))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let legs = policy_horizon_legs(legs, relay_availability)?;
+    let horizon_amount = legs.iter().try_fold(0_u64, |total, leg| {
+        total
+            .checked_add(leg.amount)
+            .ok_or_else(|| "policy horizon infantry overflow".to_string())
+    })?;
+    let prepared = prepare_order_persistence(ctx, horizon_amount, legs)?;
+    cancel_superseded_orders(ctx, component.player_id, &selection.superseded_order_ids)?;
+    persist_prepared_order(
+        ctx,
+        component.player_id,
+        POLICY_MAINTENANCE_COMMAND_ID,
+        kind,
+        orientation,
+        prepared,
+    );
     Ok(())
 }
 
@@ -2719,6 +3319,258 @@ fn distribution_plan(
     })
 }
 
+fn policy_distribution_weights(
+    ctx: &ReducerContext,
+    component: &PolicyComponentSnapshot,
+    preset: DistributionPreset,
+) -> Result<Vec<u32>, String> {
+    let coordinates = component
+        .cell_ids
+        .iter()
+        .map(|cell_id| component.coordinates_by_cell_id[cell_id])
+        .collect::<Vec<_>>();
+    if !matches!(
+        preset,
+        DistributionPreset::CoreLoad | DistributionPreset::PerimeterLoad
+    ) {
+        return distribution_weights_dense(&coordinates, preset)
+            .map_err(|error| format!("invalid redistribution weights: {error:?}"));
+    }
+
+    let cached = ctx
+        .db
+        .policy_topology_cache()
+        .component_key()
+        .find(component.component_key);
+    let valid_cached_weights = cached.as_ref().filter(|cache| {
+            cache.shape_hash == component.shape_hash
+                && cache.ownership_revision == component.ownership_revision
+                && cache.cell_ids == component.cell_ids
+                && cache.core_weights.len() == component.cell_ids.len()
+        });
+    let core_weights = if let Some(cache) = valid_cached_weights {
+        cache.core_weights.clone()
+    } else {
+        let core_weights =
+            distribution_weights_dense(&coordinates, DistributionPreset::CoreLoad)
+                .map_err(|error| format!("invalid policy topology weights: {error:?}"))?;
+        let mut row = cached.ok_or_else(|| {
+            format!(
+                "policy topology {} disappeared during planning",
+                component.component_key
+            )
+        })?;
+        row.core_weights = core_weights.clone();
+        ctx.db.policy_topology_cache().component_key().update(row);
+        core_weights
+    };
+    Ok(if preset == DistributionPreset::CoreLoad {
+        core_weights
+    } else {
+        core_weights
+            .into_iter()
+            .map(|weight| BALANCE_WEIGHT.saturating_mul(2).saturating_sub(weight))
+            .collect()
+    })
+}
+
+fn policy_distribution_plan(
+    ctx: &ReducerContext,
+    component: &PolicyComponentSnapshot,
+    selection: &RetaskSelection,
+    preset: DistributionPreset,
+) -> Result<PolicyDistributionPlan, String> {
+    let mut unaffected_by_cell = BTreeMap::new();
+    let mut residual_capacities = Vec::with_capacity(component.cell_ids.len());
+    let mut total = 0_u64;
+    for &cell_id in &component.cell_ids {
+        let cell = component
+            .states_by_cell_id
+            .get(&cell_id)
+            .ok_or_else(|| format!("policy snapshot is missing cell {cell_id}"))?;
+        if cell.owner_player_id != component.player_id {
+            return Err(format!("redistribution cell {cell_id} is not owned"));
+        }
+        let allocated = component
+            .allocated_by_cell_id
+            .get(&cell_id)
+            .copied()
+            .unwrap_or(0);
+        let projected = redistribution_cell_projection(
+            cell.infantry,
+            cell.military_capacity,
+            allocated,
+            selection.released_at(cell_id),
+        )?;
+        total = total
+            .checked_add(projected.affected)
+            .ok_or_else(|| "redistribution strength overflow".to_string())?;
+        unaffected_by_cell.insert(cell_id, projected.unaffected);
+        residual_capacities.push(projected.residual_capacity);
+    }
+    let coordinates = component
+        .cell_ids
+        .iter()
+        .map(|cell_id| component.coordinates_by_cell_id[cell_id])
+        .collect::<Vec<_>>();
+    let weights = policy_distribution_weights(ctx, component, preset)?;
+    let targets = redistribution_targets_dense_with_weights(
+        &coordinates,
+        &residual_capacities,
+        total,
+        weights,
+    )
+    .map_err(|error| format!("invalid redistribution: {error:?}"))?;
+    debug_assert_eq!(targets.unassigned, 0);
+
+    let reservations =
+        active_destination_reservations(ctx, component.player_id, &selection.superseded_order_ids);
+    let mut source_limits = BTreeMap::new();
+    let mut demands = BTreeMap::new();
+    let mut total_demand = 0_u64;
+    for (index, &cell_id) in component.cell_ids.iter().enumerate() {
+        let current = component.states_by_cell_id[&cell_id].infantry;
+        let target = unaffected_by_cell[&cell_id]
+            .checked_add(targets.targets[index])
+            .ok_or_else(|| "redistribution target overflow".to_string())?;
+        if current > target {
+            source_limits.insert(cell_id, current - target);
+        } else if target > current {
+            let demand =
+                (target - current).saturating_sub(reservations.get(&cell_id).copied().unwrap_or(0));
+            if demand > 0 {
+                demands.insert(cell_id, demand);
+                total_demand = total_demand.saturating_add(demand);
+            }
+        }
+    }
+    Ok(PolicyDistributionPlan {
+        source_limits,
+        demands,
+        amount: total_demand,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PolicyFlowLabel {
+    cost: u64,
+    destination: u32,
+    next_cell: u32,
+}
+
+/// Builds one reverse shortest-path field from every current deficit cell.
+/// Each source extracts a route by following `next_cell`; policy maintenance
+/// may leave excess source strength for a later horizon rather than rebuilding
+/// the field after each destination becomes full.
+fn plan_policy_distribution_legs(
+    component: &PolicyComponentSnapshot,
+    plan: PolicyDistributionPlan,
+    max_legs: usize,
+    movement: &MovementConfig,
+) -> Result<Vec<PlannedLeg>, String> {
+    if plan.source_limits.is_empty() {
+        return Err("source selection is empty".into());
+    }
+    if plan.demands.is_empty() {
+        return Err("destination selection is empty".into());
+    }
+    let slot_count = component
+        .cell_ids
+        .last()
+        .copied()
+        .map_or(0, |maximum| maximum as usize + 1);
+    let mut labels = vec![None::<PolicyFlowLabel>; slot_count];
+    let mut pending = BinaryHeap::new();
+    for &destination in plan.demands.keys() {
+        labels[destination as usize] = Some(PolicyFlowLabel {
+            cost: 0,
+            destination,
+            next_cell: destination,
+        });
+        pending.push(Reverse((0_u64, destination, destination)));
+    }
+    while let Some(Reverse((cost, destination, current))) = pending.pop() {
+        let Some(label) = labels[current as usize] else {
+            continue;
+        };
+        if label.cost != cost || label.destination != destination {
+            continue;
+        }
+        let current_coordinate = component.coordinates_by_cell_id[&current];
+        let current_cell = component
+            .map
+            .get(current_coordinate)
+            .expect("flow-field cell exists in component map");
+        for neighbor_coordinate in current_coordinate.neighbors() {
+            let Some(&neighbor) = component.cell_ids_by_coordinate.get(&neighbor_coordinate) else {
+                continue;
+            };
+            let neighbor_cell = component
+                .map
+                .get(neighbor_coordinate)
+                .expect("flow-field neighbor exists in component map");
+            let Some(traversal) = ground_traversal(neighbor_cell, current_cell, movement) else {
+                continue;
+            };
+            let candidate = PolicyFlowLabel {
+                cost: cost
+                    .checked_add(u64::from(traversal.cost))
+                    .ok_or_else(|| "policy route cost overflow".to_string())?,
+                destination,
+                next_cell: current,
+            };
+            let slot = &mut labels[neighbor as usize];
+            if slot.is_none_or(|existing| candidate < existing) {
+                *slot = Some(candidate);
+                pending.push(Reverse((candidate.cost, candidate.destination, neighbor)));
+            }
+        }
+    }
+
+    let mut demands = plan.demands;
+    let mut legs = Vec::new();
+    for (source, available) in plan.source_limits {
+        if legs.len() >= max_legs {
+            break;
+        }
+        let Some(label) = labels.get(source as usize).and_then(|label| *label) else {
+            continue;
+        };
+        let demand = demands.get(&label.destination).copied().unwrap_or(0);
+        let amount = available.min(demand);
+        if amount == 0 {
+            continue;
+        }
+        let mut route = vec![source];
+        let mut current = source;
+        while current != label.destination {
+            let next = labels
+                .get(current as usize)
+                .and_then(|label| *label)
+                .ok_or_else(|| format!("policy flow field lost route from cell {current}"))?
+                .next_cell;
+            if next == current || route.len() > component.cell_ids.len() {
+                return Err("policy flow field contains a cycle".into());
+            }
+            route.push(next);
+            current = next;
+        }
+        *demands
+            .get_mut(&label.destination)
+            .expect("flow destination remains indexed") -= amount;
+        legs.push(PlannedLeg {
+            source,
+            destination: label.destination,
+            amount,
+            route,
+        });
+    }
+    if legs.is_empty() && plan.amount > 0 {
+        return Err("no redistribution demand can be routed in this horizon".into());
+    }
+    Ok(legs)
+}
+
 fn shape_distribution_plan(
     ctx: &ReducerContext,
     player_id: u8,
@@ -3560,6 +4412,105 @@ mod tests {
             orientation,
             revision,
         }
+    }
+
+    fn policy_line_snapshot(length: u32) -> PolicyComponentSnapshot {
+        let cell_ids = (0..length).collect::<Vec<_>>();
+        let mut map = HexMap::new();
+        let mut cell_ids_by_coordinate = BTreeMap::new();
+        let mut coordinates_by_cell_id = BTreeMap::new();
+        let mut states_by_cell_id = BTreeMap::new();
+        for cell_id in 0..length {
+            let coordinate = Axial::new(cell_id as i32, 0);
+            map.insert(Cell::ground(coordinate, 0, Some(1), 100));
+            cell_ids_by_coordinate.insert(coordinate, cell_id);
+            coordinates_by_cell_id.insert(cell_id, coordinate);
+            states_by_cell_id.insert(
+                cell_id,
+                CellState {
+                    cell_id,
+                    owner_player_id: 1,
+                    civilians: 0,
+                    civilian_capacity: 0,
+                    infantry: 0,
+                    military_capacity: 100,
+                    last_changed_step: 0,
+                    last_policy_changed_step: 0,
+                },
+            );
+        }
+        PolicyComponentSnapshot {
+            component_key: policy_component_key(1, 0),
+            shape_hash: policy_shape_hash(1, &cell_ids),
+            ownership_revision: 1,
+            player_id: 1,
+            cell_set: cell_ids.iter().copied().collect(),
+            cell_ids,
+            map,
+            cell_ids_by_coordinate,
+            coordinates_by_cell_id,
+            states_by_cell_id,
+            allocated_by_cell_id: BTreeMap::new(),
+            max_policy_changed_step: 0,
+        }
+    }
+
+    #[test]
+    fn reverse_policy_flow_routes_once_and_leaves_excess_for_the_next_horizon() {
+        let component = policy_line_snapshot(5);
+        let legs = plan_policy_distribution_legs(
+            &component,
+            PolicyDistributionPlan {
+                source_limits: BTreeMap::from([(0, 50), (4, 50)]),
+                demands: BTreeMap::from([(2, 30), (3, 70)]),
+                amount: 100,
+            },
+            128,
+            &MovementConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].route, vec![0, 1, 2]);
+        assert_eq!(legs[0].amount, 30);
+        assert_eq!(legs[1].route, vec![4, 3]);
+        assert_eq!(legs[1].amount, 50);
+    }
+
+    #[test]
+    fn reverse_policy_flow_breaks_equal_distance_ties_by_destination_cell() {
+        let component = policy_line_snapshot(5);
+        let legs = plan_policy_distribution_legs(
+            &component,
+            PolicyDistributionPlan {
+                source_limits: BTreeMap::from([(2, 10)]),
+                demands: BTreeMap::from([(0, 10), (4, 10)]),
+                amount: 20,
+            },
+            128,
+            &MovementConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(legs[0].destination, 0);
+        assert_eq!(legs[0].route, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn policy_replan_state_skips_clean_components_only() {
+        let mut component = policy_line_snapshot(3);
+        let prior = PolicyReplanState {
+            component_key: component.component_key,
+            shape_hash: component.shape_hash,
+            policy_revision: 7,
+            last_plan_step: 20,
+        };
+        assert!(!policy_component_needs_replan(&component, 7, Some(&prior)));
+        component.max_policy_changed_step = 21;
+        assert!(policy_component_needs_replan(&component, 7, Some(&prior)));
+        component.max_policy_changed_step = 20;
+        assert!(policy_component_needs_replan(&component, 8, Some(&prior)));
+        component.shape_hash ^= 1;
+        assert!(policy_component_needs_replan(&component, 7, Some(&prior)));
+        assert!(policy_component_needs_replan(&component, 7, None));
     }
 
     #[test]

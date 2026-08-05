@@ -216,6 +216,255 @@ pub struct TargetDistribution {
     pub unassigned: Strength,
 }
 
+/// Dense counterpart to [`TargetDistribution`] for authoritative hot paths
+/// that already keep component cells in a stable vector. Every output entry is
+/// aligned with the corresponding input coordinate/capacity entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseTargetDistribution {
+    pub weights: Vec<u32>,
+    pub targets: Vec<Strength>,
+    pub assigned: Strength,
+    pub unassigned: Strength,
+}
+
+/// Produces the same deterministic weights as [`distribution_weights`] without
+/// allocating one tree node per cell. Coordinate lookup is used only by the
+/// boundary BFS; all mutable work stays in contiguous vectors.
+pub fn distribution_weights_dense(
+    coordinates: &[Axial],
+    preset: DistributionPreset,
+) -> Result<Vec<u32>, DistributionError> {
+    if coordinates.is_empty() {
+        return Err(DistributionError::EmptySelection);
+    }
+    match preset {
+        DistributionPreset::Balance => Ok(vec![BALANCE_WEIGHT; coordinates.len()]),
+        DistributionPreset::FrontLoad {
+            direction,
+            rear_weight,
+            front_weight,
+        } => {
+            if direction == Axial::ZERO {
+                return Err(DistributionError::ZeroDirection);
+            }
+            if rear_weight == 0 || front_weight < rear_weight {
+                return Err(DistributionError::InvalidWeights);
+            }
+            let projections = coordinates
+                .iter()
+                .map(|&coordinate| axial_dot_twice(coordinate, direction))
+                .collect::<Vec<_>>();
+            let minimum = *projections.iter().min().expect("coordinates are not empty");
+            let maximum = *projections.iter().max().expect("coordinates are not empty");
+            let span = maximum - minimum;
+            let weight_span = u128::from(front_weight - rear_weight);
+            projections
+                .into_iter()
+                .map(|projection| {
+                    let weight = if span == 0 {
+                        u128::from(rear_weight) + weight_span / 2
+                    } else {
+                        u128::from(rear_weight)
+                            + weight_span * (projection - minimum) as u128 / span as u128
+                    };
+                    Ok(weight as u32)
+                })
+                .collect()
+        }
+        DistributionPreset::CoreLoad | DistributionPreset::PerimeterLoad => {
+            dense_boundary_depth_weights(coordinates, preset)
+        }
+    }
+}
+
+fn dense_boundary_depth_weights(
+    coordinates: &[Axial],
+    preset: DistributionPreset,
+) -> Result<Vec<u32>, DistributionError> {
+    let index_by_coordinate = coordinates
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, coordinate)| (coordinate, index))
+        .collect::<BTreeMap<_, _>>();
+    if index_by_coordinate.len() != coordinates.len() {
+        return Err(DistributionError::ConstraintCellsMismatch);
+    }
+    let mut depths = vec![u64::MAX; coordinates.len()];
+    let mut pending = VecDeque::new();
+    for (index, &coordinate) in coordinates.iter().enumerate() {
+        if coordinate
+            .neighbors()
+            .into_iter()
+            .any(|neighbor| !index_by_coordinate.contains_key(&neighbor))
+        {
+            depths[index] = 0;
+            pending.push_back(index);
+        }
+    }
+    while let Some(index) = pending.pop_front() {
+        let next_depth = depths[index]
+            .checked_add(1)
+            .ok_or(DistributionError::ArithmeticOverflow)?;
+        for neighbor in coordinates[index].neighbors() {
+            let Some(&neighbor_index) = index_by_coordinate.get(&neighbor) else {
+                continue;
+            };
+            if depths[neighbor_index] == u64::MAX {
+                depths[neighbor_index] = next_depth;
+                pending.push_back(neighbor_index);
+            }
+        }
+    }
+    let max_depth = depths
+        .iter()
+        .copied()
+        .max()
+        .expect("coordinates are not empty");
+    if max_depth == 0 {
+        return Ok(vec![BALANCE_WEIGHT; coordinates.len()]);
+    }
+    let weight_span = u128::from(DEPTH_HIGH_WEIGHT - DEPTH_LOW_WEIGHT);
+    depths
+        .into_iter()
+        .map(|depth| {
+            let offset = weight_span
+                .checked_mul(u128::from(depth))
+                .ok_or(DistributionError::ArithmeticOverflow)?
+                / u128::from(max_depth);
+            let offset =
+                u32::try_from(offset).map_err(|_| DistributionError::ArithmeticOverflow)?;
+            Ok(match preset {
+                DistributionPreset::CoreLoad => DEPTH_LOW_WEIGHT + offset,
+                DistributionPreset::PerimeterLoad => DEPTH_HIGH_WEIGHT - offset,
+                DistributionPreset::Balance | DistributionPreset::FrontLoad { .. } => {
+                    unreachable!("dense boundary weights only accept depth presets")
+                }
+            })
+        })
+        .collect()
+}
+
+/// Dense full-participation redistribution used by policy maintenance.
+pub fn redistribution_targets_dense(
+    coordinates: &[Axial],
+    capacities: &[Strength],
+    total_strength: Strength,
+    preset: DistributionPreset,
+) -> Result<DenseTargetDistribution, DistributionError> {
+    let weights = distribution_weights_dense(coordinates, preset)?;
+    redistribution_targets_dense_with_weights(coordinates, capacities, total_strength, weights)
+}
+
+/// Applies precomputed dense weights. This permits durable topology caches to
+/// skip the boundary-depth BFS while retaining the exact apportionment rules.
+pub fn redistribution_targets_dense_with_weights(
+    coordinates: &[Axial],
+    capacities: &[Strength],
+    total_strength: Strength,
+    weights: Vec<u32>,
+) -> Result<DenseTargetDistribution, DistributionError> {
+    if coordinates.is_empty() {
+        return Err(DistributionError::EmptySelection);
+    }
+    if coordinates.len() != capacities.len() || coordinates.len() != weights.len() {
+        return Err(DistributionError::ConstraintCellsMismatch);
+    }
+    let capacity_total = capacities.iter().try_fold(0_u64, |total, capacity| {
+        total
+            .checked_add(*capacity)
+            .ok_or(DistributionError::ArithmeticOverflow)
+    })?;
+    let goal = total_strength.min(capacity_total);
+    let mut remaining = goal;
+    let mut targets = vec![0; coordinates.len()];
+    let mut unsaturated = vec![true; coordinates.len()];
+    let mut unsaturated_count = coordinates.len();
+
+    while remaining > 0 && unsaturated_count > 0 {
+        let total_score = (0..coordinates.len()).try_fold(0_u128, |total, index| {
+            if !unsaturated[index] {
+                return Ok(total);
+            }
+            total
+                .checked_add(u128::from(capacities[index]) * u128::from(weights[index]))
+                .ok_or(DistributionError::ArithmeticOverflow)
+        })?;
+        if total_score == 0 {
+            break;
+        }
+
+        let saturated = (0..coordinates.len())
+            .filter(|&index| {
+                if !unsaturated[index] {
+                    return false;
+                }
+                let capacity = capacities[index];
+                let score = u128::from(capacity) * u128::from(weights[index]);
+                u128::from(remaining)
+                    .checked_mul(score)
+                    .is_some_and(|numerator| numerator > u128::from(capacity) * total_score)
+            })
+            .collect::<Vec<_>>();
+        if !saturated.is_empty() {
+            for index in saturated {
+                targets[index] = capacities[index];
+                remaining = remaining
+                    .checked_sub(capacities[index])
+                    .ok_or(DistributionError::ArithmeticOverflow)?;
+                unsaturated[index] = false;
+                unsaturated_count -= 1;
+            }
+            continue;
+        }
+
+        let mut floor_sum = 0_u64;
+        let mut remainders = Vec::with_capacity(unsaturated_count);
+        for index in 0..coordinates.len() {
+            if !unsaturated[index] {
+                continue;
+            }
+            let score = u128::from(capacities[index]) * u128::from(weights[index]);
+            let numerator = u128::from(remaining)
+                .checked_mul(score)
+                .ok_or(DistributionError::ArithmeticOverflow)?;
+            let floor = Strength::try_from(numerator / total_score)
+                .map_err(|_| DistributionError::ArithmeticOverflow)?;
+            targets[index] = floor;
+            floor_sum = floor_sum
+                .checked_add(floor)
+                .ok_or(DistributionError::ArithmeticOverflow)?;
+            remainders.push((numerator % total_score, coordinates[index], index));
+        }
+        let leftover = remaining
+            .checked_sub(floor_sum)
+            .ok_or(DistributionError::ArithmeticOverflow)?;
+        remainders.sort_unstable_by(
+            |(left_remainder, left_coordinate, _), (right_remainder, right_coordinate, _)| {
+                right_remainder
+                    .cmp(left_remainder)
+                    .then_with(|| left_coordinate.cmp(right_coordinate))
+            },
+        );
+        for &(_, _, index) in remainders.iter().take(leftover as usize) {
+            targets[index] += 1;
+        }
+        remaining = 0;
+    }
+
+    let assigned = targets.iter().try_fold(0_u64, |total, target| {
+        total
+            .checked_add(*target)
+            .ok_or(DistributionError::ArithmeticOverflow)
+    })?;
+    Ok(DenseTargetDistribution {
+        weights,
+        targets,
+        assigned,
+        unassigned: total_strength - assigned,
+    })
+}
+
 /// Converts density weights into capacity-safe integer strength targets.
 ///
 /// The result assigns `min(total_strength, selected capacity)` exactly. Cells
@@ -893,6 +1142,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dense_targets_match_tree_targets_for_every_preset_and_input_order() {
+        let selection = hex_disk(3);
+        let mut map = HexMap::new();
+        for (index, coordinate) in selection.iter().copied().enumerate() {
+            map.insert(Cell::ground(
+                coordinate,
+                0,
+                Some(1),
+                10 + (index as u64 * 17 % 91),
+            ));
+        }
+        let mut coordinates = selection.iter().copied().rev().collect::<Vec<_>>();
+        coordinates.rotate_left(7);
+        let capacities = coordinates
+            .iter()
+            .map(|coordinate| map.get(*coordinate).unwrap().military_capacity)
+            .collect::<Vec<_>>();
+
+        for total in [0, 1, 37, 500, 10_000] {
+            for preset in [
+                DistributionPreset::Balance,
+                DistributionPreset::front_load(Axial::new(2, -1)),
+                DistributionPreset::CoreLoad,
+                DistributionPreset::PerimeterLoad,
+            ] {
+                let tree =
+                    redistribution_targets(&map, 1, coordinates.iter().copied(), total, preset)
+                        .unwrap();
+                let dense =
+                    redistribution_targets_dense(&coordinates, &capacities, total, preset).unwrap();
+                assert_eq!(dense.assigned, tree.assigned);
+                assert_eq!(dense.unassigned, tree.unassigned);
+                for (index, coordinate) in coordinates.iter().enumerate() {
+                    assert_eq!(dense.weights[index], tree.weights[coordinate]);
+                    assert_eq!(dense.targets[index], tree.targets[coordinate]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_dense_weights_preserve_target_apportionment() {
+        let coordinates = hex_disk(4).into_iter().collect::<Vec<_>>();
+        let capacities = (0..coordinates.len())
+            .map(|index| 20 + index as u64 % 13)
+            .collect::<Vec<_>>();
+        let weights =
+            distribution_weights_dense(&coordinates, DistributionPreset::CoreLoad).unwrap();
+        let direct = redistribution_targets_dense(
+            &coordinates,
+            &capacities,
+            1_000,
+            DistributionPreset::CoreLoad,
+        )
+        .unwrap();
+        let cached =
+            redistribution_targets_dense_with_weights(&coordinates, &capacities, 1_000, weights)
+                .unwrap();
+        assert_eq!(cached, direct);
     }
 
     #[test]

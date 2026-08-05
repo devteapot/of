@@ -3107,6 +3107,7 @@ mod tests {
                 infantry: original.infantry,
                 military_capacity: original.military_capacity,
                 last_changed_step: 1,
+                last_policy_changed_step: 1,
             }],
             MapViewMode::Civilians,
         );
@@ -3140,6 +3141,7 @@ mod tests {
                 infantry: original.infantry,
                 military_capacity: original.military_capacity,
                 last_changed_step: 1,
+                last_policy_changed_step: 1,
             }],
             MapViewMode::Soldiers,
         );
@@ -3174,6 +3176,7 @@ mod tests {
             infantry,
             military_capacity: original.military_capacity,
             last_changed_step: 1,
+            last_policy_changed_step: 1,
         };
         update_cells(
             &transport,

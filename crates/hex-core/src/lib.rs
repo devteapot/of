@@ -43,7 +43,9 @@ pub use movement::{
 };
 pub use pathfinding::{Path, shortest_path};
 pub use redistribution::{
-    BALANCE_WEIGHT, DistributionError, DistributionPreset, TargetDistribution,
-    distribution_weights, redistribution_targets, redistribution_targets_with_commitment,
-    redistribution_targets_with_constraints, redistribution_targets_with_fallback_constraints,
+    BALANCE_WEIGHT, DenseTargetDistribution, DistributionError, DistributionPreset,
+    TargetDistribution, distribution_weights, distribution_weights_dense, redistribution_targets,
+    redistribution_targets_dense, redistribution_targets_dense_with_weights,
+    redistribution_targets_with_commitment, redistribution_targets_with_constraints,
+    redistribution_targets_with_fallback_constraints,
 };

@@ -18,6 +18,9 @@ pub struct MatchState {
     pub player_two_controlled: u64,
     pub winner_player_id: u8,
     pub latest_cluster_policy_revision: u64,
+    pub ownership_revision: u64,
+    pub policy_topology_revision: u64,
+    pub policy_replan_cursor: u64,
     pub started_at_us: u64,
     pub completed_at_us: u64,
 }
@@ -39,6 +42,9 @@ pub struct MatchStateCols {
     pub player_two_controlled: __sdk::__query_builder::Col<MatchState, u64>,
     pub winner_player_id: __sdk::__query_builder::Col<MatchState, u8>,
     pub latest_cluster_policy_revision: __sdk::__query_builder::Col<MatchState, u64>,
+    pub ownership_revision: __sdk::__query_builder::Col<MatchState, u64>,
+    pub policy_topology_revision: __sdk::__query_builder::Col<MatchState, u64>,
+    pub policy_replan_cursor: __sdk::__query_builder::Col<MatchState, u64>,
     pub started_at_us: __sdk::__query_builder::Col<MatchState, u64>,
     pub completed_at_us: __sdk::__query_builder::Col<MatchState, u64>,
 }
@@ -64,6 +70,15 @@ impl __sdk::__query_builder::HasCols for MatchState {
             latest_cluster_policy_revision: __sdk::__query_builder::Col::new(
                 table_name,
                 "latest_cluster_policy_revision",
+            ),
+            ownership_revision: __sdk::__query_builder::Col::new(table_name, "ownership_revision"),
+            policy_topology_revision: __sdk::__query_builder::Col::new(
+                table_name,
+                "policy_topology_revision",
+            ),
+            policy_replan_cursor: __sdk::__query_builder::Col::new(
+                table_name,
+                "policy_replan_cursor",
             ),
             started_at_us: __sdk::__query_builder::Col::new(table_name, "started_at_us"),
             completed_at_us: __sdk::__query_builder::Col::new(table_name, "completed_at_us"),

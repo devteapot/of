@@ -14,6 +14,7 @@ pub struct CellState {
     pub infantry: u64,
     pub military_capacity: u64,
     pub last_changed_step: u64,
+    pub last_policy_changed_step: u64,
 }
 
 impl __sdk::InModule for CellState {
@@ -31,6 +32,7 @@ pub struct CellStateCols {
     pub infantry: __sdk::__query_builder::Col<CellState, u64>,
     pub military_capacity: __sdk::__query_builder::Col<CellState, u64>,
     pub last_changed_step: __sdk::__query_builder::Col<CellState, u64>,
+    pub last_policy_changed_step: __sdk::__query_builder::Col<CellState, u64>,
 }
 
 impl __sdk::__query_builder::HasCols for CellState {
@@ -44,6 +46,10 @@ impl __sdk::__query_builder::HasCols for CellState {
             infantry: __sdk::__query_builder::Col::new(table_name, "infantry"),
             military_capacity: __sdk::__query_builder::Col::new(table_name, "military_capacity"),
             last_changed_step: __sdk::__query_builder::Col::new(table_name, "last_changed_step"),
+            last_policy_changed_step: __sdk::__query_builder::Col::new(
+                table_name,
+                "last_policy_changed_step",
+            ),
         }
     }
 }

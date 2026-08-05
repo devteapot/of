@@ -26,11 +26,6 @@ use crate::schema::{
     transfer_source, transit_packet,
 };
 
-/// Full policy reconciliation rebuilds component topology, target weights,
-/// routes, and a receding-horizon order. Let existing packets advance between
-/// rebuilds instead of paying that global cost on every recruitment pass.
-const POLICY_REPLAN_POPULATION_PASSES: u64 = 4;
-
 /// Transaction-local packet index for one simulation step.
 ///
 /// SpacetimeDB row iteration decodes the complete row, including `route`, on
@@ -223,17 +218,9 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let population_interval = u64::from(config.population_step_interval.max(1));
     if logical_step.is_multiple_of(population_interval) {
         population_step(ctx, logical_step)?;
-        if policy_replan_is_due(logical_step, population_interval) {
-            maintain_cluster_policies(ctx)?;
-        }
     }
+    maintain_cluster_policies(ctx, logical_step)?;
     Ok(state(ctx)?.phase == MatchPhase::Running)
-}
-
-fn policy_replan_is_due(logical_step: u64, population_interval: u64) -> bool {
-    let normalized_interval = population_interval.max(1);
-    let cadence = normalized_interval.saturating_mul(POLICY_REPLAN_POPULATION_PASSES);
-    logical_step.is_multiple_of(cadence)
 }
 
 fn is_expansion_wave_order(kind: OrderKind) -> bool {
@@ -799,6 +786,9 @@ fn population_step(ctx: &ReducerContext, logical_step: u64) -> Result<(), String
         }
         if cell.civilians != previous_civilians || cell.infantry != previous_infantry {
             cell.last_changed_step = logical_step;
+            if cell.infantry != previous_infantry {
+                cell.last_policy_changed_step = logical_step;
+            }
             ctx.db.cell_state().cell_id().update(cell);
         }
     }
@@ -1050,6 +1040,9 @@ fn move_friendly_packets(
             .ok_or_else(|| "movement result omitted a participating cell".to_string())?
             .force();
         let mut row = cell_state(ctx, cell_id)?;
+        if row.infantry != infantry {
+            row.last_policy_changed_step = logical_step;
+        }
         row.infantry = infantry;
         row.last_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(row);
@@ -1325,6 +1318,9 @@ fn resolve_target_combat(
 
     defender.infantry = defender.infantry.saturating_sub(defender_casualties);
     defender.last_changed_step = logical_step;
+    if defender_casualties > 0 {
+        defender.last_policy_changed_step = logical_step;
+    }
     ctx.db.cell_state().cell_id().update(defender.clone());
     trim_packets_at_cell(
         ctx,
@@ -1375,6 +1371,7 @@ fn apply_attacker_casualties(
         let mut source_state = cell_state(ctx, current.current_cell)?;
         source_state.infantry = source_state.infantry.saturating_sub(lost);
         source_state.last_changed_step = logical_step;
+        source_state.last_policy_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(source_state);
         reduce_packet_metadata(ctx, packet_state, current, lost, logical_step, true)?;
         casualties -= lost;
@@ -1409,6 +1406,7 @@ fn occupy_after_combat(
     target.owner_player_id = front.attacker;
     target.infantry = target.infantry.saturating_add(occupancy);
     target.last_changed_step = logical_step;
+    target.last_policy_changed_step = logical_step;
     ctx.db.cell_state().cell_id().update(target.clone());
 
     let mut remaining = occupancy;
@@ -1434,6 +1432,7 @@ fn occupy_after_combat(
         let mut source = cell_state(ctx, packet.current_cell)?;
         source.infantry = source.infantry.saturating_sub(moved);
         source.last_changed_step = logical_step;
+        source.last_policy_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(source);
         advance_packet(
             ctx,
@@ -1514,6 +1513,10 @@ fn record_capture(
     // debt, even when this capture was performed by a different order kind.
     ctx.db.expansion_garrison_debt().cell_id().delete(cell_id);
     let mut match_state = state(ctx)?;
+    match_state.ownership_revision = match_state
+        .ownership_revision
+        .checked_add(1)
+        .ok_or_else(|| "ownership revision overflow".to_string())?;
     match old_owner {
         PLAYER_ONE => {
             match_state.player_one_controlled = match_state.player_one_controlled.saturating_sub(1);
@@ -2241,6 +2244,7 @@ fn complete_retreat_abandonments(
             let old_owner = cell.owner_player_id;
             cell.owner_player_id = NEUTRAL_PLAYER;
             cell.last_changed_step = logical_step;
+            cell.last_policy_changed_step = logical_step;
             ctx.db.cell_state().cell_id().update(cell);
             record_capture(ctx, candidate.cell_id, old_owner, NEUTRAL_PLAYER)?;
         }
@@ -2478,36 +2482,6 @@ mod tests {
         assert_eq!(state.by_order(1).count(), 0);
         assert_eq!(state.by_cell(10).count(), 0);
         assert_eq!(state.iter().count(), 1);
-    }
-
-    #[test]
-    fn policy_replan_cadence_is_every_four_population_passes() {
-        let population_interval = 4;
-        for logical_step in [4, 8, 12, 20, 24, 28] {
-            assert!(!policy_replan_is_due(logical_step, population_interval));
-        }
-        for logical_step in [16, 32, 48, 64] {
-            assert!(policy_replan_is_due(logical_step, population_interval));
-        }
-    }
-
-    #[test]
-    fn policy_replan_cadence_normalizes_zero_and_saturates_overflow() {
-        assert!(!policy_replan_is_due(1, 0));
-        assert!(policy_replan_is_due(4, 0));
-
-        let largest_config_interval = u64::from(u32::MAX);
-        let largest_config_cadence = largest_config_interval * POLICY_REPLAN_POPULATION_PASSES;
-        assert!(policy_replan_is_due(
-            largest_config_cadence,
-            largest_config_interval
-        ));
-        assert!(!policy_replan_is_due(
-            largest_config_interval,
-            largest_config_interval
-        ));
-
-        assert!(policy_replan_is_due(u64::MAX, u64::MAX));
     }
 
     #[test]

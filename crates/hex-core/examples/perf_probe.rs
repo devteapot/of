@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use hex_core::{
     Axial, Cell, DistributionPreset, HexMap, LogisticsConfig, MovementConfig, MovementIntent,
-    redistribution_targets, shortest_path,
+    distribution_weights_dense, redistribution_targets, redistribution_targets_dense,
+    redistribution_targets_dense_with_weights, shortest_path,
 };
 
 /// Builds a solid hex disk of owned cells: a realistic "one big cluster".
@@ -81,8 +82,30 @@ fn bench_redistribution() {
             let result = redistribution_targets(&map, 1, map.coordinates(), total, preset).unwrap();
             let elapsed = t.elapsed();
             assert_eq!(result.assigned, total);
+            let coordinates = map.coordinates().collect::<Vec<_>>();
+            let capacities = coordinates
+                .iter()
+                .map(|coordinate| map.get(*coordinate).unwrap().military_capacity)
+                .collect::<Vec<_>>();
+            let t = Instant::now();
+            let dense =
+                redistribution_targets_dense(&coordinates, &capacities, total, preset).unwrap();
+            let dense_elapsed = t.elapsed();
+            let weights = distribution_weights_dense(&coordinates, preset).unwrap();
+            let t = Instant::now();
+            let cached = redistribution_targets_dense_with_weights(
+                &coordinates,
+                &capacities,
+                total,
+                weights,
+            )
+            .unwrap();
+            let cached_elapsed = t.elapsed();
+            assert_eq!(dense.assigned, result.assigned);
+            assert_eq!(cached.targets, dense.targets);
             println!(
-                "redistribution radius={radius:>3} cells={cells:>6}  {preset:?} => {elapsed:>9.2?}"
+                "redistribution radius={radius:>3} cells={cells:>6}  {preset:?} => \
+                 tree={elapsed:>9.2?} dense={dense_elapsed:>9.2?} cached={cached_elapsed:>9.2?}"
             );
         }
     }

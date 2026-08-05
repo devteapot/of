@@ -146,6 +146,15 @@ pub struct MatchState {
     pub winner_player_id: u8,
     /// Monotonic authority-owned revision for explicit cluster-policy changes.
     pub latest_cluster_policy_revision: u64,
+    /// Monotonic durable ownership/topology revision. Every capture or
+    /// relinquishment advances it transactionally.
+    pub ownership_revision: u64,
+    /// Ownership revision represented by the durable component topology rows.
+    /// A mismatch forces one cold-start-safe global relabeling pass.
+    pub policy_topology_revision: u64,
+    /// Stable key of the last component considered by periodic policy
+    /// maintenance. The next pass resumes after it and wraps deterministically.
+    pub policy_replan_cursor: u64,
     pub started_at_us: u64,
     pub completed_at_us: u64,
 }
@@ -195,6 +204,48 @@ pub struct CellState {
     pub infantry: u64,
     pub military_capacity: u64,
     pub last_changed_step: u64,
+    /// Last step at which ownership, infantry, or capacity changed. Civilian-
+    /// only growth does not dirty military distribution plans.
+    pub last_policy_changed_step: u64,
+}
+
+/// Small durable invalidation record for one derived owned component.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = policy_replan_state)]
+pub struct PolicyReplanState {
+    /// `(owner_player_id << 32) | minimum_cell_id`.
+    #[primary_key]
+    pub component_key: u64,
+    pub shape_hash: u64,
+    pub policy_revision: u64,
+    pub last_plan_step: u64,
+}
+
+/// Durable boundary-weight cache. Large vectors are rewritten only when the
+/// component topology changes, never on ordinary recruitment or movement.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = policy_topology_cache)]
+pub struct PolicyTopologyCache {
+    #[primary_key]
+    pub component_key: u64,
+    pub owner_player_id: u8,
+    pub ownership_revision: u64,
+    pub shape_hash: u64,
+    pub cell_ids: Vec<u32>,
+    /// Static cell data aligned with `cell_ids`. Keeping it beside the durable
+    /// topology turns periodic planning into one owner-indexed state scan
+    /// instead of two direct table probes per component cell.
+    pub q: Vec<i32>,
+    pub r: Vec<i32>,
+    pub terrain: Vec<TerrainClass>,
+    pub elevation: Vec<i16>,
+    pub capturable: Vec<bool>,
+    pub habitable: Vec<bool>,
+    pub civilian_capacity: Vec<u64>,
+    pub military_capacity: Vec<u64>,
+    /// CoreLoad weights aligned with `cell_ids`; PerimeterLoad uses the exact
+    /// complementary weight around the shared 20,000 midpoint sum.
+    pub core_weights: Vec<u32>,
 }
 
 /// Static, direction-aware movement limits for one undirected neighboring
