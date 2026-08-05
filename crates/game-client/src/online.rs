@@ -183,16 +183,20 @@ struct TacticalChanges {
 #[derive(Default)]
 struct TacticalCache {
     packets: BTreeMap<u64, TransitPacket>,
+    packet_ids_by_order: BTreeMap<u64, BTreeSet<u64>>,
+    packet_ids_by_route: BTreeMap<u64, BTreeSet<u64>>,
     routes: BTreeMap<u64, TransitRoute>,
     fronts: BTreeMap<String, CombatFront>,
     orders: BTreeMap<u64, TransferOrder>,
     sources: BTreeMap<u128, TransferSource>,
+    source_keys_by_order: BTreeMap<u64, BTreeSet<u128>>,
     destinations: BTreeMap<u128, TransferDestination>,
+    destination_keys_by_order: BTreeMap<u64, BTreeSet<u128>>,
 }
 
 impl TacticalCache {
     fn capture(connection: &DbConnection) -> Self {
-        Self {
+        let mut cache = Self {
             packets: subscribed_packets(connection)
                 .into_iter()
                 .map(|packet| (packet.packet_key, packet))
@@ -226,16 +230,106 @@ impl TacticalCache {
                 .iter()
                 .map(|destination| (destination.destination_key, destination))
                 .collect(),
-        }
+            ..Default::default()
+        };
+        cache.rebuild_indexes();
+        cache
     }
 
     fn apply(&mut self, changes: TacticalChanges) {
-        apply_changes(&mut self.packets, changes.packets);
+        for (key, value) in changes.packets {
+            if let Some(previous) = self.packets.remove(&key) {
+                remove_index_value(&mut self.packet_ids_by_order, previous.order_id, key);
+                if previous.route_id != 0 {
+                    remove_index_value(&mut self.packet_ids_by_route, previous.route_id, key);
+                }
+            }
+            if let Some(value) = value {
+                self.packet_ids_by_order
+                    .entry(value.order_id)
+                    .or_default()
+                    .insert(key);
+                if value.route_id != 0 {
+                    self.packet_ids_by_route
+                        .entry(value.route_id)
+                        .or_default()
+                        .insert(key);
+                }
+                self.packets.insert(key, value);
+            }
+        }
         apply_changes(&mut self.routes, changes.routes);
         apply_changes(&mut self.fronts, changes.fronts);
         apply_changes(&mut self.orders, changes.orders);
-        apply_changes(&mut self.sources, changes.sources);
-        apply_changes(&mut self.destinations, changes.destinations);
+        for (key, value) in changes.sources {
+            if let Some(previous) = self.sources.remove(&key) {
+                remove_index_value(&mut self.source_keys_by_order, previous.order_id, key);
+            }
+            if let Some(value) = value {
+                self.source_keys_by_order
+                    .entry(value.order_id)
+                    .or_default()
+                    .insert(key);
+                self.sources.insert(key, value);
+            }
+        }
+        for (key, value) in changes.destinations {
+            if let Some(previous) = self.destinations.remove(&key) {
+                remove_index_value(&mut self.destination_keys_by_order, previous.order_id, key);
+            }
+            if let Some(value) = value {
+                self.destination_keys_by_order
+                    .entry(value.order_id)
+                    .or_default()
+                    .insert(key);
+                self.destinations.insert(key, value);
+            }
+        }
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.packet_ids_by_order.clear();
+        self.packet_ids_by_route.clear();
+        self.source_keys_by_order.clear();
+        self.destination_keys_by_order.clear();
+        for packet in self.packets.values() {
+            self.packet_ids_by_order
+                .entry(packet.order_id)
+                .or_default()
+                .insert(packet.packet_key);
+            if packet.route_id != 0 {
+                self.packet_ids_by_route
+                    .entry(packet.route_id)
+                    .or_default()
+                    .insert(packet.packet_key);
+            }
+        }
+        for source in self.sources.values() {
+            self.source_keys_by_order
+                .entry(source.order_id)
+                .or_default()
+                .insert(source.source_key);
+        }
+        for destination in self.destinations.values() {
+            self.destination_keys_by_order
+                .entry(destination.order_id)
+                .or_default()
+                .insert(destination.destination_key);
+        }
+    }
+}
+
+fn remove_index_value<K: Ord + Copy, V: Ord + Copy>(
+    index: &mut BTreeMap<K, BTreeSet<V>>,
+    key: K,
+    value: V,
+) {
+    let remove_entry = index.get_mut(&key).is_some_and(|values| {
+        values.remove(&value);
+        values.is_empty()
+    });
+    if remove_entry {
+        index.remove(&key);
     }
 }
 
@@ -313,6 +407,10 @@ struct OnlineTransport {
     coordinate_to_id: BTreeMap<Axial, u32>,
     id_to_coordinate: BTreeMap<u32, Axial>,
     tactical: TacticalCache,
+    retask_source_counts: BTreeMap<(u64, Axial), u32>,
+    retask_destination_claim_counts: BTreeMap<(u64, Axial), u32>,
+    retask_edge_counts: BTreeMap<((u32, u32), u64), u32>,
+    retask_orders_by_edge: BTreeMap<(u32, u32), BTreeSet<u64>>,
     pending: BTreeMap<u64, PendingCommand>,
     processed_receipts: BTreeSet<u128>,
     terminal_command_ids: BTreeSet<u64>,
@@ -336,6 +434,10 @@ impl OnlineTransport {
             coordinate_to_id: BTreeMap::new(),
             id_to_coordinate: BTreeMap::new(),
             tactical: TacticalCache::default(),
+            retask_source_counts: BTreeMap::new(),
+            retask_destination_claim_counts: BTreeMap::new(),
+            retask_edge_counts: BTreeMap::new(),
+            retask_orders_by_edge: BTreeMap::new(),
             pending: BTreeMap::new(),
             processed_receipts: BTreeSet::new(),
             terminal_command_ids: BTreeSet::new(),
@@ -438,6 +540,14 @@ fn toggle_policy_flow_debug(
         // the toggle is used during a reconnect and no snapshot is available.
         view.active_flows.clear();
     }
+    replace_authoritative_flows(
+        &transport,
+        &mut view,
+        transport.tactical.packets.values(),
+        &transport.tactical.routes,
+        transport.tactical.orders.values(),
+        transport.config.debug_policy_flows,
+    );
     let status = if transport.config.debug_policy_flows {
         "ON · F4 to hide"
     } else {
@@ -1292,12 +1402,121 @@ fn subscribed_routes(connection: &DbConnection) -> Vec<TransitRoute> {
     connection.db.visible_routes().iter().collect()
 }
 
+#[derive(Default)]
+struct ProjectionImpact {
+    flow_packet_ids: BTreeSet<u64>,
+    retask_packet_ids: BTreeSet<u64>,
+    retask_source_keys: BTreeSet<u128>,
+    retask_destination_keys: BTreeSet<u128>,
+    route_ids: BTreeSet<u64>,
+    structural_order_ids: BTreeSet<u64>,
+    fronts_changed: bool,
+}
+
+impl ProjectionImpact {
+    fn before(cache: &TacticalCache, changes: &TacticalChanges) -> Self {
+        let mut impact = Self {
+            flow_packet_ids: changes.packets.keys().copied().collect(),
+            retask_packet_ids: changes.packets.keys().copied().collect(),
+            retask_source_keys: changes.sources.keys().copied().collect(),
+            retask_destination_keys: changes.destinations.keys().copied().collect(),
+            route_ids: changes.routes.keys().copied().collect(),
+            fronts_changed: !changes.fronts.is_empty(),
+            ..Default::default()
+        };
+        for route_id in &impact.route_ids {
+            if let Some(packet_ids) = cache.packet_ids_by_route.get(route_id) {
+                impact.flow_packet_ids.extend(packet_ids);
+                impact.retask_packet_ids.extend(packet_ids);
+            }
+        }
+        for (order_id, next) in &changes.orders {
+            let previous = cache.orders.get(order_id);
+            if flow_order_projection_changed(previous, next.as_ref())
+                && let Some(packet_ids) = cache.packet_ids_by_order.get(order_id)
+            {
+                impact.flow_packet_ids.extend(packet_ids);
+            }
+            if retask_order_projection_changed(previous, next.as_ref()) {
+                impact.structural_order_ids.insert(*order_id);
+                impact.extend_order_rows(cache, *order_id);
+            }
+        }
+        impact
+    }
+
+    fn after(&mut self, cache: &TacticalCache) {
+        for route_id in &self.route_ids {
+            if let Some(packet_ids) = cache.packet_ids_by_route.get(route_id) {
+                self.flow_packet_ids.extend(packet_ids);
+                self.retask_packet_ids.extend(packet_ids);
+            }
+        }
+        for order_id in self.structural_order_ids.clone() {
+            if let Some(packet_ids) = cache.packet_ids_by_order.get(&order_id) {
+                self.flow_packet_ids.extend(packet_ids);
+            }
+            self.extend_order_rows(cache, order_id);
+        }
+    }
+
+    fn extend_order_rows(&mut self, cache: &TacticalCache, order_id: u64) {
+        if let Some(packet_ids) = cache.packet_ids_by_order.get(&order_id) {
+            self.retask_packet_ids.extend(packet_ids);
+        }
+        if let Some(source_keys) = cache.source_keys_by_order.get(&order_id) {
+            self.retask_source_keys.extend(source_keys);
+        }
+        if let Some(destination_keys) = cache.destination_keys_by_order.get(&order_id) {
+            self.retask_destination_keys.extend(destination_keys);
+        }
+    }
+
+    fn retask_changed(&self) -> bool {
+        self.fronts_changed
+            || !self.structural_order_ids.is_empty()
+            || !self.retask_packet_ids.is_empty()
+            || !self.retask_source_keys.is_empty()
+            || !self.retask_destination_keys.is_empty()
+    }
+}
+
+fn flow_order_projection_changed(
+    previous: Option<&TransferOrder>,
+    next: Option<&TransferOrder>,
+) -> bool {
+    match (previous, next) {
+        (Some(previous), Some(next)) => {
+            previous.status != next.status || previous.kind != next.kind
+        }
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+fn retask_order_projection_changed(
+    previous: Option<&TransferOrder>,
+    next: Option<&TransferOrder>,
+) -> bool {
+    match (previous, next) {
+        (Some(previous), Some(next)) => {
+            previous.status != next.status
+                || previous.player_id != next.player_id
+                || previous.kind != next.kind
+                || previous.client_command_id != next.client_command_id
+        }
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 fn synchronize_authoritative_view(
     mut transport: ResMut<OnlineTransport>,
     mut view: ResMut<MatchView>,
     mode: Res<MapViewMode>,
     mut updates: MessageWriter<ServerUpdate>,
 ) {
+    let previous_local_player = view.local_player;
     for event in transport.signals.drain() {
         apply_lifecycle_event(&mut transport, &mut view, &mut updates, event);
     }
@@ -1313,12 +1532,18 @@ fn synchronize_authoritative_view(
         AuthoritySnapshot::capture(connection, dirty, transport.signals.take_cell_changes())
     };
     let tactical_changes = transport.signals.take_tactical_changes();
+    let full_tactical_rebuild = snapshot.tactical.is_some();
+    let mut projection_impact = ProjectionImpact::before(&transport.tactical, &tactical_changes);
+    if !full_tactical_rebuild {
+        apply_retask_row_changes(&mut transport, &mut view, &projection_impact, false);
+    }
     if let Some(tactical) = snapshot.tactical {
         transport.tactical = tactical;
     }
     // Deltas may arrive between the full capture and this drain. Applying
     // them unconditionally closes that race without another table scan.
     transport.tactical.apply(tactical_changes);
+    projection_impact.after(&transport.tactical);
 
     if let Some(terrain) = snapshot.terrain {
         rebuild_cells(
@@ -1350,6 +1575,7 @@ fn synchronize_authoritative_view(
     if let Some(players) = snapshot.players {
         update_players(&mut transport, &mut view, snapshot.identity, &players);
     }
+    let full_retask_rebuild = full_tactical_rebuild || view.local_player != previous_local_player;
     if let Some(policies) = snapshot.cluster_policies {
         update_cluster_policies(&transport, &mut view, &policies);
     }
@@ -1372,7 +1598,7 @@ fn synchronize_authoritative_view(
     if let Some(receipts) = snapshot.receipts {
         process_receipts(&mut transport, &view, receipts, &mut updates);
     }
-    if dirty & (TERRAIN_DIRTY | FLOWS_DIRTY | ORDERS_DIRTY) != 0 {
+    if full_tactical_rebuild {
         replace_authoritative_flows(
             &transport,
             &mut view,
@@ -1381,6 +1607,8 @@ fn synchronize_authoritative_view(
             transport.tactical.orders.values(),
             transport.config.debug_policy_flows,
         );
+    } else if !projection_impact.flow_packet_ids.is_empty() {
+        update_authoritative_flows(&transport, &mut view, &projection_impact.flow_packet_ids);
     }
     if dirty & (TERRAIN_DIRTY | FRONTS_DIRTY) != 0 {
         let (active_fronts, contested_cells) =
@@ -1388,18 +1616,17 @@ fn synchronize_authoritative_view(
         view.active_fronts = active_fronts;
         view.set_contested_cells(contested_cells);
     }
-    if dirty & (TERRAIN_DIRTY | FLOWS_DIRTY | FRONTS_DIRTY | ORDERS_DIRTY) != 0 {
-        let projection = retask_projection_from_authority(
+    if full_retask_rebuild {
+        rebuild_retask_indexes(&mut transport, &mut view);
+    } else if projection_impact.retask_changed() {
+        apply_retask_row_changes(&mut transport, &mut view, &projection_impact, true);
+        refresh_retask_order_kinds(
             &transport,
-            &view,
-            transport.tactical.orders.values(),
-            transport.tactical.packets.values(),
-            &transport.tactical.routes,
-            transport.tactical.fronts.values(),
-            transport.tactical.sources.values(),
-            transport.tactical.destinations.values(),
+            &mut view,
+            !projection_impact.structural_order_ids.is_empty(),
         );
-        view.set_retask_projection(projection);
+        rebuild_retask_handles(&transport, &mut view);
+        view.retask_revision = view.retask_revision.wrapping_add(1);
     }
     if dirty & (TERRAIN_DIRTY | ORDERS_DIRTY) != 0 {
         view.active_orders = transport.tactical.orders.len();
@@ -1846,6 +2073,7 @@ fn process_receipts(
     }
 }
 
+#[cfg(test)]
 fn packets_to_flows<'a>(
     transport: &OnlineTransport,
     view: &MatchView,
@@ -1866,36 +2094,54 @@ fn packets_to_flows<'a>(
     packets
         .into_iter()
         .filter_map(|packet| {
-            let order = orders_by_id.get(&packet.order_id)?;
-            if !order_flow_is_visible(order, show_policy_flows) {
-                return None;
-            }
-            let resolved_route = resolved_packet_route(packet, routes)?;
-            let route_index = packet.route_index as usize;
-            let route = resolved_route
-                .get(route_index..)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|cell_id| transport.id_to_coordinate.get(cell_id).copied())
-                .collect::<Vec<_>>();
-            if route.len() < 2 {
-                return None;
-            }
-            let attacking = transport
-                .id_to_coordinate
-                .get(&packet.destination_cell)
-                .and_then(|coordinate| view.cell(*coordinate))
-                .and_then(|cell| cell.owner)
-                .is_some_and(|owner| owner != u32::from(packet.owner_player_id));
-            Some(ActiveFlow {
-                route,
-                strength: packet.infantry,
-                attacking,
-                age: 0.0,
-                lifetime: 60.0,
-            })
+            packet_to_flow(
+                transport,
+                view,
+                packet,
+                routes,
+                orders_by_id.get(&packet.order_id).copied(),
+                show_policy_flows,
+            )
         })
         .collect()
+}
+
+fn packet_to_flow(
+    transport: &OnlineTransport,
+    view: &MatchView,
+    packet: &TransitPacket,
+    routes: &BTreeMap<u64, TransitRoute>,
+    order: Option<&TransferOrder>,
+    show_policy_flows: bool,
+) -> Option<ActiveFlow> {
+    let order = order?;
+    if !order_flow_is_visible(order, show_policy_flows) {
+        return None;
+    }
+    let resolved_route = resolved_packet_route(packet, routes)?;
+    let route_index = packet.route_index as usize;
+    let route = resolved_route
+        .get(route_index..)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|cell_id| transport.id_to_coordinate.get(cell_id).copied())
+        .collect::<Vec<_>>();
+    if route.len() < 2 {
+        return None;
+    }
+    let attacking = transport
+        .id_to_coordinate
+        .get(&packet.destination_cell)
+        .and_then(|coordinate| view.cell(*coordinate))
+        .and_then(|cell| cell.owner)
+        .is_some_and(|owner| owner != u32::from(packet.owner_player_id));
+    Some(ActiveFlow {
+        route,
+        strength: packet.infantry,
+        attacking,
+        age: 0.0,
+        lifetime: 60.0,
+    })
 }
 
 fn replace_authoritative_flows<'a>(
@@ -1906,8 +2152,52 @@ fn replace_authoritative_flows<'a>(
     orders: impl IntoIterator<Item = &'a TransferOrder>,
     show_policy_flows: bool,
 ) {
-    view.active_flows =
-        packets_to_flows(transport, view, packets, routes, orders, show_policy_flows);
+    let orders_by_id = orders
+        .into_iter()
+        .map(|order| (order.order_id, order))
+        .collect::<BTreeMap<_, _>>();
+    let flows = packets
+        .into_iter()
+        .filter_map(|packet| {
+            packet_to_flow(
+                transport,
+                view,
+                packet,
+                routes,
+                orders_by_id.get(&packet.order_id).copied(),
+                show_policy_flows,
+            )
+            .map(|flow| (packet.packet_key, flow))
+        })
+        .collect::<Vec<_>>();
+    view.clear_authoritative_flows();
+    for (packet_id, flow) in flows {
+        view.set_authoritative_flow(packet_id, Some(flow));
+    }
+}
+
+fn update_authoritative_flows(
+    transport: &OnlineTransport,
+    view: &mut MatchView,
+    packet_ids: &BTreeSet<u64>,
+) {
+    for packet_id in packet_ids {
+        let flow = transport
+            .tactical
+            .packets
+            .get(packet_id)
+            .and_then(|packet| {
+                packet_to_flow(
+                    transport,
+                    view,
+                    packet,
+                    &transport.tactical.routes,
+                    transport.tactical.orders.get(&packet.order_id),
+                    transport.config.debug_policy_flows,
+                )
+            });
+        view.set_authoritative_flow(*packet_id, flow);
+    }
 }
 
 fn resolved_packet_route(
@@ -2032,6 +2322,7 @@ fn fronts_to_overlays<'a>(
     (overlays, contested)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn retask_projection_from_authority<'a, O, P, F, S, D>(
     transport: &OnlineTransport,
@@ -2208,6 +2499,386 @@ where
 
     projection.active_order_ids = projection.order_strength_by_cell.keys().copied().collect();
     projection
+}
+
+fn active_local_order<'a>(
+    transport: &'a OnlineTransport,
+    view: &MatchView,
+    order_id: u64,
+) -> Option<&'a TransferOrder> {
+    transport.tactical.orders.get(&order_id).filter(|order| {
+        order.status == OrderStatus::Active && u32::from(order.player_id) == view.local_player
+    })
+}
+
+fn apply_retask_row_changes(
+    transport: &mut OnlineTransport,
+    view: &mut MatchView,
+    impact: &ProjectionImpact,
+    adding: bool,
+) {
+    let packets = impact
+        .retask_packet_ids
+        .iter()
+        .filter_map(|key| transport.tactical.packets.get(key).cloned())
+        .collect::<Vec<_>>();
+    let sources = impact
+        .retask_source_keys
+        .iter()
+        .filter_map(|key| transport.tactical.sources.get(key).cloned())
+        .collect::<Vec<_>>();
+    let destinations = impact
+        .retask_destination_keys
+        .iter()
+        .filter_map(|key| transport.tactical.destinations.get(key).cloned())
+        .collect::<Vec<_>>();
+    for packet in &packets {
+        adjust_retask_packet(transport, view, packet, adding);
+    }
+    for source in &sources {
+        adjust_retask_source(transport, view, source, adding);
+    }
+    for destination in &destinations {
+        adjust_retask_destination(transport, view, destination, adding);
+    }
+}
+
+fn adjust_retask_packet(
+    transport: &mut OnlineTransport,
+    view: &mut MatchView,
+    packet: &TransitPacket,
+    adding: bool,
+) {
+    if u32::from(packet.owner_player_id) != view.local_player
+        || active_local_order(transport, view, packet.order_id).is_none()
+    {
+        return;
+    }
+    let Some(current) = transport
+        .id_to_coordinate
+        .get(&packet.current_cell)
+        .copied()
+    else {
+        return;
+    };
+    adjust_strength(
+        &mut view.retask_projection.active_strength_by_cell,
+        current,
+        packet.infantry,
+        adding,
+    );
+    adjust_order_strength(
+        &mut view.retask_projection.order_strength_by_cell,
+        packet.order_id,
+        current,
+        packet.infantry,
+        adding,
+    );
+    if let Some(destination) = transport
+        .id_to_coordinate
+        .get(&packet.destination_cell)
+        .copied()
+    {
+        adjust_destination_claim(
+            transport,
+            &mut view.retask_projection,
+            packet.order_id,
+            destination,
+            adding,
+        );
+    }
+    let next_index = packet.route_index as usize + 1;
+    if let Some(next) = resolved_packet_route(packet, &transport.tactical.routes)
+        .and_then(|route| route.get(next_index).copied())
+    {
+        adjust_retask_edge(
+            transport,
+            (packet.current_cell, next),
+            packet.order_id,
+            adding,
+        );
+    }
+}
+
+fn adjust_retask_source(
+    transport: &mut OnlineTransport,
+    view: &mut MatchView,
+    source: &TransferSource,
+    adding: bool,
+) {
+    if active_local_order(transport, view, source.order_id).is_none() {
+        return;
+    }
+    let Some(coordinate) = transport.id_to_coordinate.get(&source.cell_id).copied() else {
+        return;
+    };
+    let key = (source.order_id, coordinate);
+    adjust_counted_set(
+        &mut transport.retask_source_counts,
+        key,
+        &mut view.retask_projection.order_source_cells,
+        source.order_id,
+        coordinate,
+        adding,
+    );
+}
+
+fn adjust_retask_destination(
+    transport: &mut OnlineTransport,
+    view: &mut MatchView,
+    destination: &TransferDestination,
+    adding: bool,
+) {
+    let Some(order) = active_local_order(transport, view, destination.order_id) else {
+        return;
+    };
+    let outstanding = destination
+        .target_infantry
+        .saturating_sub(destination.received_infantry);
+    if outstanding == 0 {
+        return;
+    }
+    let is_internal = matches!(
+        order.kind,
+        match_bindings::OrderKind::Balance
+            | match_bindings::OrderKind::FrontLoad
+            | match_bindings::OrderKind::CoreLoad
+            | match_bindings::OrderKind::PerimeterLoad
+            | match_bindings::OrderKind::Reshape
+    );
+    let Some(coordinate) = transport
+        .id_to_coordinate
+        .get(&destination.cell_id)
+        .copied()
+    else {
+        return;
+    };
+    adjust_destination_claim(
+        transport,
+        &mut view.retask_projection,
+        destination.order_id,
+        coordinate,
+        adding,
+    );
+    if is_internal {
+        adjust_order_strength(
+            &mut view.retask_projection.destination_reservations_by_order,
+            destination.order_id,
+            coordinate,
+            outstanding,
+            adding,
+        );
+    }
+}
+
+fn adjust_strength(
+    strengths: &mut BTreeMap<Axial, u64>,
+    coordinate: Axial,
+    amount: u64,
+    adding: bool,
+) {
+    if adding {
+        let strength = strengths.entry(coordinate).or_default();
+        *strength = strength.saturating_add(amount);
+    } else if let Some(strength) = strengths.get_mut(&coordinate) {
+        *strength = strength.saturating_sub(amount);
+        if *strength == 0 {
+            strengths.remove(&coordinate);
+        }
+    }
+}
+
+fn adjust_order_strength(
+    strengths: &mut BTreeMap<u64, BTreeMap<Axial, u64>>,
+    order_id: u64,
+    coordinate: Axial,
+    amount: u64,
+    adding: bool,
+) {
+    if adding {
+        let strength = strengths
+            .entry(order_id)
+            .or_default()
+            .entry(coordinate)
+            .or_default();
+        *strength = strength.saturating_add(amount);
+        return;
+    }
+    let remove_order = strengths.get_mut(&order_id).is_some_and(|by_cell| {
+        if let Some(strength) = by_cell.get_mut(&coordinate) {
+            *strength = strength.saturating_sub(amount);
+            if *strength == 0 {
+                by_cell.remove(&coordinate);
+            }
+        }
+        by_cell.is_empty()
+    });
+    if remove_order {
+        strengths.remove(&order_id);
+    }
+}
+
+fn adjust_destination_claim(
+    transport: &mut OnlineTransport,
+    projection: &mut RetaskProjection,
+    order_id: u64,
+    coordinate: Axial,
+    adding: bool,
+) {
+    adjust_counted_set(
+        &mut transport.retask_destination_claim_counts,
+        (order_id, coordinate),
+        &mut projection.destination_claims_by_order,
+        order_id,
+        coordinate,
+        adding,
+    );
+}
+
+fn adjust_counted_set(
+    counts: &mut BTreeMap<(u64, Axial), u32>,
+    count_key: (u64, Axial),
+    sets: &mut BTreeMap<u64, BTreeSet<Axial>>,
+    order_id: u64,
+    coordinate: Axial,
+    adding: bool,
+) {
+    if adding {
+        *counts.entry(count_key).or_default() += 1;
+        sets.entry(order_id).or_default().insert(coordinate);
+        return;
+    }
+    let remove_coordinate = counts.get_mut(&count_key).is_some_and(|count| {
+        *count = count.saturating_sub(1);
+        *count == 0
+    });
+    if !remove_coordinate {
+        return;
+    }
+    counts.remove(&count_key);
+    let remove_order = sets.get_mut(&order_id).is_some_and(|coordinates| {
+        coordinates.remove(&coordinate);
+        coordinates.is_empty()
+    });
+    if remove_order {
+        sets.remove(&order_id);
+    }
+}
+
+fn adjust_retask_edge(
+    transport: &mut OnlineTransport,
+    edge: (u32, u32),
+    order_id: u64,
+    adding: bool,
+) {
+    let key = (edge, order_id);
+    if adding {
+        *transport.retask_edge_counts.entry(key).or_default() += 1;
+        transport
+            .retask_orders_by_edge
+            .entry(edge)
+            .or_default()
+            .insert(order_id);
+        return;
+    }
+    let remove_order = transport
+        .retask_edge_counts
+        .get_mut(&key)
+        .is_some_and(|count| {
+            *count = count.saturating_sub(1);
+            *count == 0
+        });
+    if !remove_order {
+        return;
+    }
+    transport.retask_edge_counts.remove(&key);
+    let remove_edge = transport
+        .retask_orders_by_edge
+        .get_mut(&edge)
+        .is_some_and(|orders| {
+            orders.remove(&order_id);
+            orders.is_empty()
+        });
+    if remove_edge {
+        transport.retask_orders_by_edge.remove(&edge);
+    }
+}
+
+fn refresh_retask_order_kinds(
+    transport: &OnlineTransport,
+    view: &mut MatchView,
+    refresh_background_orders: bool,
+) {
+    view.retask_projection.active_order_ids = view
+        .retask_projection
+        .order_strength_by_cell
+        .keys()
+        .copied()
+        .collect();
+    if !refresh_background_orders {
+        return;
+    }
+    view.retask_projection.background_policy_order_ids = transport
+        .tactical
+        .orders
+        .values()
+        .filter(|order| {
+            order.status == OrderStatus::Active
+                && u32::from(order.player_id) == view.local_player
+                && is_policy_maintenance_order(order)
+        })
+        .map(|order| order.order_id)
+        .collect();
+}
+
+fn rebuild_retask_handles(transport: &OnlineTransport, view: &mut MatchView) {
+    view.retask_projection.handle_orders.clear();
+    for front in transport.tactical.fronts.values().filter(|front| {
+        u32::from(front.attacker_player_id) == view.local_player
+            && front
+                .queued_infantry
+                .saturating_add(front.attacker_engaged)
+                .saturating_sub(front.attacker_casualties)
+                > 0
+    }) {
+        let Some(handle) = transport.id_to_coordinate.get(&front.to_cell).copied() else {
+            continue;
+        };
+        if !view.is_local_retask_handle(handle) {
+            continue;
+        }
+        let Some(order_ids) = transport
+            .retask_orders_by_edge
+            .get(&(front.from_cell, front.to_cell))
+        else {
+            continue;
+        };
+        view.retask_projection
+            .handle_orders
+            .entry(handle)
+            .or_default()
+            .extend(order_ids);
+    }
+}
+
+fn rebuild_retask_indexes(transport: &mut OnlineTransport, view: &mut MatchView) {
+    let previous = std::mem::take(&mut view.retask_projection);
+    transport.retask_source_counts.clear();
+    transport.retask_destination_claim_counts.clear();
+    transport.retask_edge_counts.clear();
+    transport.retask_orders_by_edge.clear();
+    let impact = ProjectionImpact {
+        retask_packet_ids: transport.tactical.packets.keys().copied().collect(),
+        retask_source_keys: transport.tactical.sources.keys().copied().collect(),
+        retask_destination_keys: transport.tactical.destinations.keys().copied().collect(),
+        ..Default::default()
+    };
+    apply_retask_row_changes(transport, view, &impact, true);
+    refresh_retask_order_kinds(transport, view, true);
+    rebuild_retask_handles(transport, view);
+    if view.retask_projection != previous {
+        view.retask_revision = view.retask_revision.wrapping_add(1);
+    }
 }
 
 fn reducer_failure(result: Result<Result<(), String>, InternalError>) -> Option<String> {
@@ -2602,13 +3273,16 @@ mod tests {
         transport.id_to_coordinate.insert(10, Axial::ZERO);
         transport.id_to_coordinate.insert(11, Axial::new(1, 0));
         let mut view = MatchView::connecting(1);
-        view.active_flows.push(ActiveFlow {
-            route: vec![Axial::ZERO, Axial::new(1, 0)],
-            strength: 99,
-            attacking: false,
-            age: 8.0,
-            lifetime: 60.0,
-        });
+        view.set_authoritative_flow(
+            99,
+            Some(ActiveFlow {
+                route: vec![Axial::ZERO, Axial::new(1, 0)],
+                strength: 99,
+                attacking: false,
+                age: 8.0,
+                lifetime: 60.0,
+            }),
+        );
         let packet = TransitPacket {
             packet_key: 24,
             order_id: 24,
@@ -2634,7 +3308,120 @@ mod tests {
             &[],
             false,
         );
-        assert!(view.active_flows.is_empty());
+        assert!(view.authoritative_flows.is_empty());
+        assert!(view.authoritative_flows_by_chunk.is_empty());
+    }
+
+    #[test]
+    fn packet_delta_matches_a_full_retask_projection_without_touching_other_packets() {
+        let mut transport = OnlineTransport::new(test_config());
+        transport.id_to_coordinate.insert(10, Axial::ZERO);
+        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
+        transport.id_to_coordinate.insert(12, Axial::new(2, 0));
+        let order = test_order(7, 7, match_bindings::OrderKind::ExpandClusters);
+        let packet = |packet_key, current_cell, destination_cell, infantry| TransitPacket {
+            packet_key,
+            order_id: 7,
+            owner_player_id: 1,
+            origin_cell: 10,
+            current_cell,
+            destination_cell,
+            infantry,
+            pending_source_infantry: 0,
+            route_id: 0,
+            route_index: 0,
+            updated_step: 1,
+        };
+        transport.tactical.apply(TacticalChanges {
+            orders: BTreeMap::from([(7, Some(order))]),
+            packets: BTreeMap::from([
+                (41, Some(packet(41, 10, 11, 20))),
+                (42, Some(packet(42, 11, 12, 30))),
+            ]),
+            ..Default::default()
+        });
+        let mut view = MatchView::connecting(1);
+        rebuild_retask_indexes(&mut transport, &mut view);
+
+        let changes = TacticalChanges {
+            packets: BTreeMap::from([(41, Some(packet(41, 11, 12, 12)))]),
+            ..Default::default()
+        };
+        let mut impact = ProjectionImpact::before(&transport.tactical, &changes);
+        apply_retask_row_changes(&mut transport, &mut view, &impact, false);
+        transport.tactical.apply(changes);
+        impact.after(&transport.tactical);
+        apply_retask_row_changes(&mut transport, &mut view, &impact, true);
+        refresh_retask_order_kinds(&transport, &mut view, false);
+        rebuild_retask_handles(&transport, &mut view);
+
+        let expected = retask_projection_from_authority(
+            &transport,
+            &view,
+            transport.tactical.orders.values(),
+            transport.tactical.packets.values(),
+            &transport.tactical.routes,
+            transport.tactical.fronts.values(),
+            transport.tactical.sources.values(),
+            transport.tactical.destinations.values(),
+        );
+        assert_eq!(view.retask_projection, expected);
+        assert_eq!(
+            view.retask_projection.order_strength_by_cell[&7],
+            BTreeMap::from([(Axial::new(1, 0), 42)])
+        );
+    }
+
+    #[test]
+    fn packet_flow_delta_preserves_unaffected_projection_state() {
+        let mut transport = OnlineTransport::new(test_config());
+        transport.id_to_coordinate.insert(10, Axial::ZERO);
+        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
+        let packet = |packet_key, infantry| TransitPacket {
+            packet_key,
+            order_id: 7,
+            owner_player_id: 1,
+            origin_cell: 10,
+            current_cell: 10,
+            destination_cell: 11,
+            infantry,
+            pending_source_infantry: 0,
+            route_id: 0,
+            route_index: 0,
+            updated_step: 1,
+        };
+        transport.tactical.apply(TacticalChanges {
+            orders: BTreeMap::from([(
+                7,
+                Some(test_order(7, 7, match_bindings::OrderKind::ExpandClusters)),
+            )]),
+            packets: BTreeMap::from([(41, Some(packet(41, 20))), (42, Some(packet(42, 30)))]),
+            ..Default::default()
+        });
+        let mut view = MatchView::connecting(1);
+        replace_authoritative_flows(
+            &transport,
+            &mut view,
+            transport.tactical.packets.values(),
+            &transport.tactical.routes,
+            transport.tactical.orders.values(),
+            false,
+        );
+        view.authoritative_flows.get_mut(&42).unwrap().age = 9.0;
+
+        let changes = TacticalChanges {
+            packets: BTreeMap::from([(41, Some(packet(41, 12)))]),
+            ..Default::default()
+        };
+        let mut impact = ProjectionImpact::before(&transport.tactical, &changes);
+        transport.tactical.apply(changes);
+        impact.after(&transport.tactical);
+        update_authoritative_flows(&transport, &mut view, &impact.flow_packet_ids);
+
+        assert_eq!(view.authoritative_flows[&41].strength, 12);
+        assert_eq!(view.authoritative_flows[&42].strength, 30);
+        assert!((view.authoritative_flows[&42].age - 9.0).abs() < f32::EPSILON);
+        assert_eq!(impact.flow_packet_ids, BTreeSet::from([41]));
     }
 
     #[test]

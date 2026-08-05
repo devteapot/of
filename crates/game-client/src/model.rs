@@ -313,6 +313,12 @@ pub struct MatchView {
     pub active_orders: usize,
     pub queued_infantry: u64,
     pub active_flows: Vec<ActiveFlow>,
+    /// Authoritative packet projections keyed by numeric packet ID. Online
+    /// row deltas update this map in place instead of rebuilding every flow.
+    pub authoritative_flows: BTreeMap<u64, ActiveFlow>,
+    /// Spatial buckets for authoritative flows. Rendering unions only the IDs
+    /// touching visible chunks, so frame work is viewport-bounded.
+    pub authoritative_flows_by_chunk: BTreeMap<ChunkCoord, BTreeSet<u64>>,
     pub active_fronts: Vec<ActiveFront>,
     /// Only cells with an active hostile front are present. Callers replacing
     /// this projection must dirty the chunks containing removed and inserted
@@ -366,6 +372,8 @@ impl MatchView {
             active_orders: 0,
             queued_infantry: 0,
             active_flows: Vec::new(),
+            authoritative_flows: BTreeMap::new(),
+            authoritative_flows_by_chunk: BTreeMap::new(),
             active_fronts: Vec::new(),
             contested_cells: BTreeMap::new(),
             retask_projection: RetaskProjection::default(),
@@ -497,6 +505,8 @@ impl MatchView {
             active_orders: 0,
             queued_infantry: 0,
             active_flows: Vec::new(),
+            authoritative_flows: BTreeMap::new(),
+            authoritative_flows_by_chunk: BTreeMap::new(),
             active_fronts: vec![ActiveFront {
                 friendly: Axial::new(-5, 4),
                 hostile: Axial::new(-4, 4),
@@ -625,6 +635,7 @@ impl MatchView {
                 })
     }
 
+    #[cfg(test)]
     pub fn set_retask_projection(&mut self, projection: RetaskProjection) {
         if self.retask_projection == projection {
             return;
@@ -870,6 +881,53 @@ impl MatchView {
             remaining: 4.5,
         });
     }
+
+    pub fn set_authoritative_flow(&mut self, packet_id: u64, flow: Option<ActiveFlow>) {
+        if let Some(previous) = self.authoritative_flows.remove(&packet_id) {
+            for chunk in previous
+                .route
+                .iter()
+                .copied()
+                .map(chunk_of)
+                .collect::<BTreeSet<_>>()
+            {
+                let remove_bucket =
+                    if let Some(packet_ids) = self.authoritative_flows_by_chunk.get_mut(&chunk) {
+                        packet_ids.remove(&packet_id);
+                        packet_ids.is_empty()
+                    } else {
+                        false
+                    };
+                if remove_bucket {
+                    self.authoritative_flows_by_chunk.remove(&chunk);
+                }
+            }
+        }
+        if let Some(flow) = flow {
+            for chunk in flow
+                .route
+                .iter()
+                .copied()
+                .map(chunk_of)
+                .collect::<BTreeSet<_>>()
+            {
+                self.authoritative_flows_by_chunk
+                    .entry(chunk)
+                    .or_default()
+                    .insert(packet_id);
+            }
+            self.authoritative_flows.insert(packet_id, flow);
+        }
+    }
+
+    pub fn clear_authoritative_flows(&mut self) {
+        self.authoritative_flows.clear();
+        self.authoritative_flows_by_chunk.clear();
+    }
+
+    pub fn flow_count(&self) -> usize {
+        self.active_flows.len() + self.authoritative_flows.len()
+    }
 }
 
 fn index_cells_by_chunk(cells: &BTreeMap<Axial, CellView>) -> BTreeMap<ChunkCoord, Vec<Axial>> {
@@ -889,6 +947,9 @@ pub fn update_transient_state(time: Res<Time>, mut view: ResMut<MatchView>) {
         flow.age += delta;
     }
     view.active_flows.retain(|flow| flow.age < flow.lifetime);
+    for flow in view.authoritative_flows.values_mut() {
+        flow.age += delta;
+    }
 
     for front in &mut view.active_fronts {
         front.age += delta;
@@ -1444,5 +1505,52 @@ mod tests {
         assert!(!view.is_local_owned_passable(enemy));
         assert!(view.is_local_owned_passable(local));
         assert!(!view.is_local_retask_handle(local));
+    }
+
+    #[test]
+    fn authoritative_flow_buckets_follow_route_replacement_and_removal() {
+        let first = Axial::ZERO;
+        let second = Axial::new(20, 0);
+        let mut view = MatchView::connecting(1);
+        view.set_authoritative_flow(
+            7,
+            Some(ActiveFlow {
+                route: vec![first, second],
+                strength: 10,
+                attacking: false,
+                age: 0.0,
+                lifetime: 60.0,
+            }),
+        );
+        assert_eq!(view.flow_count(), 1);
+        assert_eq!(
+            view.authoritative_flows_by_chunk[&chunk_of(first)],
+            BTreeSet::from([7])
+        );
+        assert_eq!(
+            view.authoritative_flows_by_chunk[&chunk_of(second)],
+            BTreeSet::from([7])
+        );
+
+        view.set_authoritative_flow(
+            7,
+            Some(ActiveFlow {
+                route: vec![second, Axial::new(21, 0)],
+                strength: 8,
+                attacking: false,
+                age: 0.0,
+                lifetime: 60.0,
+            }),
+        );
+        assert!(
+            !view
+                .authoritative_flows_by_chunk
+                .contains_key(&chunk_of(first))
+        );
+        assert_eq!(view.authoritative_flows.len(), 1);
+
+        view.set_authoritative_flow(7, None);
+        assert!(view.authoritative_flows.is_empty());
+        assert!(view.authoritative_flows_by_chunk.is_empty());
     }
 }

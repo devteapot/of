@@ -47,9 +47,16 @@ struct PerimeterStyle {
 
 pub struct OverlayPlugin;
 
+#[derive(Resource, Default)]
+struct OverlayScratch {
+    cells: Vec<Axial>,
+    chunks: BTreeSet<ChunkCoord>,
+    flow_ids: BTreeSet<u64>,
+}
+
 impl Plugin for OverlayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.init_resource::<OverlayScratch>().add_systems(
             PostUpdate,
             draw_world_overlays.after(VisibilitySystems::CheckVisibility),
         );
@@ -62,6 +69,7 @@ fn draw_world_overlays(
     interaction: Res<InteractionState>,
     visible: Single<&VisibleEntities, With<GameCamera>>,
     chunks: Query<&TerrainChunk>,
+    mut scratch: ResMut<OverlayScratch>,
     mut gizmos: Gizmos,
 ) {
     let needs_visible_cells = interaction.has_selection()
@@ -73,51 +81,71 @@ fn draw_world_overlays(
         || !interaction.preview.component_routes.is_empty()
         || !interaction.preview.projected_sources.is_empty()
         || !interaction.preview.excluded.is_empty();
-    let visible_cells = if needs_visible_cells {
-        visible_cell_coordinates(&visible, &chunks)
-    } else {
-        Vec::new()
-    };
-    let visible_chunks = if view.active_flows.is_empty()
+    scratch.cells.clear();
+    if needs_visible_cells {
+        append_visible_cell_coordinates(&visible, &chunks, &mut scratch.cells);
+    }
+    scratch.chunks.clear();
+    if !(view.active_flows.is_empty()
+        && view.authoritative_flows.is_empty()
         && view.active_fronts.is_empty()
-        && interaction.preview.front_edges.is_empty()
+        && interaction.preview.front_edges.is_empty())
     {
-        BTreeSet::new()
-    } else {
-        visible_chunk_coordinates(&visible, &chunks)
-    };
+        append_visible_chunk_coordinates(&visible, &chunks, &mut scratch.chunks);
+    }
+    scratch.flow_ids.clear();
+    let OverlayScratch {
+        chunks: visible_chunks,
+        flow_ids: visible_flow_ids,
+        ..
+    } = &mut *scratch;
+    for chunk in visible_chunks.iter() {
+        if let Some(packet_ids) = view.authoritative_flows_by_chunk.get(chunk) {
+            visible_flow_ids.extend(packet_ids);
+        }
+    }
     draw_blocked_cells(&view, &visible, &chunks, &mut gizmos);
-    draw_selection(&view, &interaction, &visible_cells, &mut gizmos);
+    draw_selection(&view, &interaction, &scratch.cells, &mut gizmos);
     draw_preview(
         &view,
         &interaction,
-        &visible_cells,
-        &visible_chunks,
+        &scratch.cells,
+        &scratch.chunks,
         &mut gizmos,
     );
-    draw_committed_orders(&view, time.elapsed_secs(), &visible_chunks, &mut gizmos);
+    draw_committed_orders(
+        &view,
+        time.elapsed_secs(),
+        &scratch.chunks,
+        &scratch.flow_ids,
+        &mut gizmos,
+    );
 }
 
-fn visible_cell_coordinates(
+fn append_visible_cell_coordinates(
     visible: &VisibleEntities,
     chunks: &Query<&TerrainChunk>,
-) -> Vec<Axial> {
-    visible
+    coordinates: &mut Vec<Axial>,
+) {
+    for chunk in visible
         .iter(TypeId::of::<Mesh3d>())
         .filter_map(|entity| chunks.get(*entity).ok())
-        .flat_map(|chunk| chunk.cells.iter().copied())
-        .collect()
+    {
+        coordinates.extend_from_slice(&chunk.cells);
+    }
 }
 
-fn visible_chunk_coordinates(
+fn append_visible_chunk_coordinates(
     visible: &VisibleEntities,
     chunks: &Query<&TerrainChunk>,
-) -> BTreeSet<ChunkCoord> {
-    visible
-        .iter(TypeId::of::<Mesh3d>())
-        .filter_map(|entity| chunks.get(*entity).ok())
-        .map(|chunk| chunk.coordinate)
-        .collect()
+    coordinates: &mut BTreeSet<ChunkCoord>,
+) {
+    coordinates.extend(
+        visible
+            .iter(TypeId::of::<Mesh3d>())
+            .filter_map(|entity| chunks.get(*entity).ok())
+            .map(|chunk| chunk.coordinate),
+    );
 }
 
 fn draw_blocked_cells(
@@ -592,6 +620,7 @@ fn draw_committed_orders(
     view: &MatchView,
     elapsed: f32,
     visible_chunks: &BTreeSet<ChunkCoord>,
+    visible_flow_ids: &BTreeSet<u64>,
     gizmos: &mut Gizmos,
 ) {
     for flow in &view.active_flows {
@@ -603,33 +632,12 @@ fn draw_committed_orders(
         {
             continue;
         }
-        let color = if flow.attacking { HOSTILE } else { FRIENDLY };
-        for pair in flow.route.windows(2).filter(|pair| {
-            visible_chunks.contains(&chunk_of(pair[0]))
-                || visible_chunks.contains(&chunk_of(pair[1]))
-        }) {
-            let (Some(from), Some(to)) = (view.cell(pair[0]), view.cell(pair[1])) else {
-                continue;
-            };
-            gizmos.line(point(from, 0.16), point(to, 0.16), color);
+        draw_flow(view, flow, visible_chunks, gizmos);
+    }
+    for packet_id in visible_flow_ids {
+        if let Some(flow) = view.authoritative_flows.get(packet_id) {
+            draw_flow(view, flow, visible_chunks, gizmos);
         }
-
-        let travel = ((flow.age * 0.68).fract() * (flow.route.len() - 1) as f32)
-            .clamp(0.0, (flow.route.len() - 1) as f32);
-        let index = travel.floor() as usize;
-        let next = (index + 1).min(flow.route.len() - 1);
-        if !visible_chunks.contains(&chunk_of(flow.route[index]))
-            && !visible_chunks.contains(&chunk_of(flow.route[next]))
-        {
-            continue;
-        }
-        let (Some(from), Some(to)) = (view.cell(flow.route[index]), view.cell(flow.route[next]))
-        else {
-            continue;
-        };
-        let moving = point(from, 0.16).lerp(point(to, 0.16), travel.fract()) + Vec3::Y * 0.04;
-        let marker_radius = 0.075 + (flow.strength as f32 / 700.0).clamp(0.0, 0.075);
-        gizmos.sphere(moving, marker_radius, color).resolution(4);
     }
 
     for front in &view.active_fronts {
@@ -660,6 +668,42 @@ fn draw_committed_orders(
                 .with_tip_length(0.16);
         }
     }
+}
+
+fn draw_flow(
+    view: &MatchView,
+    flow: &crate::model::ActiveFlow,
+    visible_chunks: &BTreeSet<ChunkCoord>,
+    gizmos: &mut Gizmos,
+) {
+    if flow.route.len() < 2 {
+        return;
+    }
+    let color = if flow.attacking { HOSTILE } else { FRIENDLY };
+    for pair in flow.route.windows(2).filter(|pair| {
+        visible_chunks.contains(&chunk_of(pair[0])) || visible_chunks.contains(&chunk_of(pair[1]))
+    }) {
+        let (Some(from), Some(to)) = (view.cell(pair[0]), view.cell(pair[1])) else {
+            continue;
+        };
+        gizmos.line(point(from, 0.16), point(to, 0.16), color);
+    }
+
+    let travel = ((flow.age * 0.68).fract() * (flow.route.len() - 1) as f32)
+        .clamp(0.0, (flow.route.len() - 1) as f32);
+    let index = travel.floor() as usize;
+    let next = (index + 1).min(flow.route.len() - 1);
+    if !visible_chunks.contains(&chunk_of(flow.route[index]))
+        && !visible_chunks.contains(&chunk_of(flow.route[next]))
+    {
+        return;
+    }
+    let (Some(from), Some(to)) = (view.cell(flow.route[index]), view.cell(flow.route[next])) else {
+        return;
+    };
+    let moving = point(from, 0.16).lerp(point(to, 0.16), travel.fract()) + Vec3::Y * 0.04;
+    let marker_radius = 0.075 + (flow.strength as f32 / 700.0).clamp(0.0, 0.075);
+    gizmos.sphere(moving, marker_radius, color).resolution(4);
 }
 
 fn point(cell: &CellView, lift: f32) -> Vec3 {

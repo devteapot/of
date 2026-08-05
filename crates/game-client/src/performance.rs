@@ -139,7 +139,7 @@ fn update_performance_overlay(
         map_view.active_labels,
         view.dirty_chunks.len(),
         view.active_orders,
-        view.active_flows.len(),
+        view.flow_count(),
         view.active_fronts.len(),
     );
     if **text != value {
