@@ -1364,10 +1364,7 @@ fn load_policy_component_snapshot(
         topology.civilian_capacity.len(),
         topology.military_capacity.len(),
     ];
-    if aligned_lengths
-        .iter()
-        .any(|length| *length != expected_len)
-    {
+    if aligned_lengths.iter().any(|length| *length != expected_len) {
         return Err(format!(
             "policy topology {} has misaligned static data",
             topology.component_key
@@ -1868,8 +1865,7 @@ pub(crate) fn maintain_cluster_policies(
         return Ok(());
     }
 
-    let topology_was_stale =
-        match_state.policy_topology_revision != match_state.ownership_revision;
+    let topology_was_stale = match_state.policy_topology_revision != match_state.ownership_revision;
     // During an expansion wave ownership may change every tick. Component
     // topology is allowed the same four-second staleness as redistribution;
     // rebuilding once in that window coalesces all captures into one scan.
@@ -3343,11 +3339,11 @@ fn policy_distribution_weights(
         .component_key()
         .find(component.component_key);
     let valid_cached_weights = cached.as_ref().filter(|cache| {
-            cache.shape_hash == component.shape_hash
-                && cache.ownership_revision == component.ownership_revision
-                && cache.cell_ids == component.cell_ids
-                && cache.core_weights.len() == component.cell_ids.len()
-        });
+        cache.shape_hash == component.shape_hash
+            && cache.ownership_revision == component.ownership_revision
+            && cache.cell_ids == component.cell_ids
+            && cache.core_weights.len() == component.cell_ids.len()
+    });
     let core_weights = if let Some(cache) = valid_cached_weights {
         cache.core_weights.clone()
     } else {

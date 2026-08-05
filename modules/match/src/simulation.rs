@@ -1,11 +1,15 @@
-use std::{cmp::Reverse, collections::{BTreeMap, BTreeSet}, rc::Rc};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 use hex_core::{
     AttackFront, Axial, CombatConfig, EdgeLimits, HexMap, LogisticsConfig, MovementConfig,
     MovementIntent, MovementLimit, focus_branch_weight, movement_step, resolve_edge_combat,
     weighted_branch_allocations_rotated,
 };
-use spacetimedb::{ReducerContext, Table};
+use spacetimedb::{ReducerContext, Table, log_stopwatch::LogStopwatch};
 
 use crate::orders::{is_background_policy_order, maintain_cluster_policies};
 use crate::rules::{
@@ -293,11 +297,7 @@ impl PacketTickState {
         Ok(())
     }
 
-    fn decrement_source_queue(
-        &mut self,
-        packet: &TickPacket,
-        amount: u64,
-    ) -> Result<(), String> {
+    fn decrement_source_queue(&mut self, packet: &TickPacket, amount: u64) -> Result<(), String> {
         if amount == 0 {
             return Ok(());
         }
@@ -371,6 +371,7 @@ impl PacketTickState {
 }
 
 pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
+    let _tick_stopwatch = LogStopwatch::new("simulation_tick_total");
     let mut match_state = state(ctx)?;
     if match_state.phase != MatchPhase::Running {
         return Ok(false);
@@ -382,23 +383,45 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let logical_step = match_state.logical_step;
     ctx.db.match_state().singleton_id().update(match_state);
 
-    let mut packets = PacketTickState::load(ctx)?;
-    trim_all_overallocated_packets(ctx, &mut packets, logical_step)?;
-    branch_expand_waves(ctx, &mut packets, logical_step)?;
-    stop_blocked_expand_edges(ctx, &mut packets, logical_step)?;
-    move_friendly_packets(ctx, &mut packets, logical_step)?;
-    stop_blocked_internal_edges(ctx, &mut packets, logical_step)?;
-    resolve_combats(ctx, &mut packets, logical_step)?;
-    clear_stale_combat_fronts(ctx, logical_step);
-    packets.flush_source_queues(ctx);
-    finalize_orders(ctx, &packets, logical_step)?;
+    let mut packets = {
+        let _phase_stopwatch = LogStopwatch::new("simulation_packet_load");
+        PacketTickState::load(ctx)?
+    };
+    {
+        let _phase_stopwatch = LogStopwatch::new("simulation_trim");
+        trim_all_overallocated_packets(ctx, &mut packets, logical_step)?;
+    }
+    {
+        let _phase_stopwatch = LogStopwatch::new("simulation_branch");
+        branch_expand_waves(ctx, &mut packets, logical_step)?;
+        stop_blocked_expand_edges(ctx, &mut packets, logical_step)?;
+    }
+    {
+        let _phase_stopwatch = LogStopwatch::new("simulation_move");
+        move_friendly_packets(ctx, &mut packets, logical_step)?;
+        stop_blocked_internal_edges(ctx, &mut packets, logical_step)?;
+    }
+    {
+        let _phase_stopwatch = LogStopwatch::new("simulation_combat");
+        resolve_combats(ctx, &mut packets, logical_step)?;
+        clear_stale_combat_fronts(ctx, logical_step);
+    }
+    {
+        let _phase_stopwatch = LogStopwatch::new("simulation_finalize");
+        packets.flush_source_queues(ctx);
+        finalize_orders(ctx, &packets, logical_step)?;
+    }
 
     let config = config(ctx)?;
     let population_interval = u64::from(config.population_step_interval.max(1));
     if logical_step.is_multiple_of(population_interval) {
+        let _phase_stopwatch = LogStopwatch::new("simulation_population");
         population_step(ctx, logical_step)?;
     }
-    maintain_cluster_policies(ctx, logical_step)?;
+    {
+        let _phase_stopwatch = LogStopwatch::new("simulation_policy");
+        maintain_cluster_policies(ctx, logical_step)?;
+    }
     Ok(state(ctx)?.phase == MatchPhase::Running)
 }
 
@@ -1219,8 +1242,7 @@ fn move_friendly_packets(
                 direction,
             ));
         } else if should_station_capacity_blocked_packet(&order, &outcome.limits) {
-            capacity_stopped_packets
-                .insert(intent.packet.packet_key, intent.packet.clone());
+            capacity_stopped_packets.insert(intent.packet.packet_key, intent.packet.clone());
         }
     }
 
@@ -2202,9 +2224,7 @@ fn station_packet_allocation(
         .find(current.order_id)
         .ok_or_else(|| "order is missing while stationing infantry".to_string())?;
     let accounting = station_accounting(current.infantry, amount, order.delivered_infantry)?;
-    let source_debit = accounting
-        .stationed
-        .min(current.pending_source_infantry);
+    let source_debit = accounting.stationed.min(current.pending_source_infantry);
     if accounting.packet_remaining == 0 {
         packets.delete(ctx, &current.packet_key);
     } else {
