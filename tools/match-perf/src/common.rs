@@ -216,7 +216,7 @@ pub fn default_run_dir(database: &str, preset: PresetArg, players: u16) -> PathB
         .unwrap_or_default()
         .as_secs();
     PathBuf::from(format!(
-        "match-perf-runs/{}-{}-{}p-{timestamp}",
+        "artifacts/performance/runs/{}-{}-{}p-{timestamp}",
         database,
         preset.label(),
         players
@@ -535,5 +535,11 @@ mod tests {
         let schedule = PhaseSchedule::from_steps(10, 3, 0, 2).expect("schedule");
         assert!(validate_command_spread_for_schedule(4, schedule).is_err());
         assert!(validate_command_spread_for_schedule(2, schedule).is_ok());
+    }
+
+    #[test]
+    fn default_run_directory_is_inside_ignored_artifacts() {
+        let path = default_run_dir("of-match-perf", PresetArg::Playtest, 32);
+        assert!(path.starts_with("artifacts/performance/runs"));
     }
 }

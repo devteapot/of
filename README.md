@@ -275,7 +275,7 @@ cargo run -p match-perf -- run-local --database of-match-perf --preset playtest 
 
 `run-local` spawns one coordinator telemetry observer plus worker process shards.
 `coordinator` and `worker` can also run on different hosts. Outputs land in a new
-`match-perf-runs/…` directory: `timeline.csv`, long-form `players.csv`, per-shard
+`artifacts/performance/runs/…` directory: `timeline.csv`, long-form `players.csv`, per-shard
 `worker-*.jsonl`, `metadata.json`, and `summary.json`. Prefer logical-step phase
 durations for distributed synchronization; wall-second aliases remain available.
 Required expansion commands fail the run if rejected. The `--rebalance-steps`

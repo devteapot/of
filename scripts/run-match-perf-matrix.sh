@@ -27,7 +27,7 @@
 #   OF_PERF_ATTACK_STEPS  Logical attack steps (default: 0)
 #   OF_PERF_REEXPAND_STEPS
 #   OF_PERF_WARMUP_STEPS  Shared warmup steps (default: 120)
-#   OF_PERF_OUT_ROOT      Root for run dirs + matrix.csv (default: match-perf-runs/matrix-<ts>)
+#   OF_PERF_OUT_ROOT      Root for run dirs + matrix.csv (default: artifacts/performance/matrix-<ts>)
 #   OF_PERF_TIMEOUT_SECS  Per-cell run-local timeout (default: 3600)
 #   OF_PERF_BIN           match-perf binary (default: cargo run -p match-perf --)
 #   OF_PERF_VIEWER        1/true/yes/on to launch a Bevy viewer (default: 0)
@@ -84,7 +84,7 @@ reexpand_steps="${OF_PERF_REEXPAND_STEPS:-20}"
 warmup_steps="${OF_PERF_WARMUP_STEPS:-120}"
 timeout_secs="${OF_PERF_TIMEOUT_SECS:-3600}"
 ts="$(date +%Y%m%d-%H%M%S)"
-out_root="${OF_PERF_OUT_ROOT:-match-perf-runs/matrix-${ts}}"
+out_root="${OF_PERF_OUT_ROOT:-artifacts/performance/matrix-${ts}}"
 mkdir -p "${out_root}"
 
 matrix_csv="${out_root}/matrix.csv"

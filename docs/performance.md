@@ -69,7 +69,7 @@ cargo run -p match-perf -- run-local \
 2. enough `worker` subprocesses to cover seats in contiguous `--shard-size`
    ranges.
 
-Artifacts land in a new non-overwriting directory under `match-perf-runs/`
+Artifacts land in a new non-overwriting directory under `artifacts/performance/runs/`
 (or `--output-dir`). Existing paths are refused.
 
 ### Phase duration options
@@ -216,7 +216,7 @@ Useful environment overrides:
 | `OF_PERF_SHARD_SIZE` | `32` | worker shard size |
 | `OF_PERF_EXPAND_STEPS` / `POLICY` / `ATTACK` / `REEXPAND` | short smoke defaults | phase lengths (`POLICY` = front-rebalance phase) |
 | `OF_PERF_WARMUP_STEPS` | `120` | shared warmup before phase progress |
-| `OF_PERF_OUT_ROOT` | `match-perf-runs/matrix-<ts>` | artifact root |
+| `OF_PERF_OUT_ROOT` | `artifacts/performance/matrix-<ts>` | artifact root |
 | `OF_PERF_TIMEOUT_SECS` | `3600` | per-cell timeout |
 | `OF_PERF_HOST` | `http://127.0.0.1:3000` | client SpacetimeDB URI |
 | `OF_PERF_SERVER` | `local` | explicit `spacetime publish --server` target |
@@ -267,8 +267,9 @@ active transfer order IDs (queued sources on active orders with no packet yet).
 - **Step timing is observational.** Pair `summary.json` percentiles with module
   instrumentation (for example simulation phase timings) when diagnosing reducer
   hot paths.
-- **Existing root-level `perf-*.csv` logs are historical samples.** New runs
-  should use `match-perf-runs/` and must not clobber those files.
+- **Ad-hoc `perf-*.csv` logs are local artifacts.** Keep them under the ignored
+  `artifacts/performance/` directory. New structured runs are created beneath
+  `artifacts/performance/runs/` and must not clobber existing outputs.
 
 ## Related docs
 
