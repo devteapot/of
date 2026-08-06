@@ -11,13 +11,13 @@ use match_bindings::{
     CellStateTableAccess, CellTerrainTableAccess, CombatFrontTableAccess,
     CommandReceiptTableAccess, DbConnection, MapPreset, MatchConfig, MatchConfigTableAccess,
     MatchPhase, MatchStateTableAccess, OrderStatus, PlayerSlotTableAccess, PlayerStateTableAccess,
-    ReceiptStatus, TerrainClass, TransferOrderTableAccess, TransitPacketTableAccess,
-    configure_match as _, issue_attack_clusters as _, issue_expand_clusters as _,
-    issue_front_rebalance as _, join_match as _, set_mobilization_target as _,
+    ReceiptStatus, TransferOrderTableAccess, TransitPacketTableAccess, configure_match as _,
+    issue_attack_clusters as _, issue_expand_clusters as _, issue_front_rebalance as _,
+    join_match as _, set_mobilization_target as _,
 };
 use spacetimedb_sdk::{DbContext, Table};
 
-use crate::attack::{AttackFront, FrontCell, axial_distance, find_attack_fronts};
+use crate::attack::{AttackFront, FrontCell, find_attack_fronts};
 use crate::common::SINGLETON_ID;
 use crate::front_rebalance::MapCell;
 
@@ -421,7 +421,16 @@ impl Client {
             .db
             .cell_state()
             .iter()
-            .map(|state| (state.cell_id, state.owner_player_id))
+            .map(|state| {
+                (
+                    state.cell_id,
+                    (
+                        state.owner_player_id,
+                        state.infantry,
+                        state.military_capacity,
+                    ),
+                )
+            })
             .collect::<std::collections::BTreeMap<_, _>>();
         self.conn
             .db
@@ -432,10 +441,12 @@ impl Client {
                     cell_id: terrain.cell_id,
                     q: terrain.q,
                     r: terrain.r,
-                    owner: *states.get(&terrain.cell_id)?,
+                    owner: states.get(&terrain.cell_id)?.0,
                     elevation: terrain.elevation,
                     passable: terrain.passable,
                     capturable: terrain.capturable,
+                    infantry: states.get(&terrain.cell_id)?.1,
+                    military_capacity: states.get(&terrain.cell_id)?.2,
                 })
             })
             .collect()
@@ -474,32 +485,6 @@ impl Client {
             },
             timeout,
         )
-    }
-
-    pub fn neutral_focus(&self, near_cell: u32) -> Option<u32> {
-        let terrain = self.conn.db.cell_terrain().cell_id().find(&near_cell)?;
-        let mut best = None::<(i64, u32)>;
-        for row in self.conn.db.cell_terrain().iter() {
-            if !row.passable || !row.capturable || matches!(row.terrain, TerrainClass::Water) {
-                continue;
-            }
-            let owned = self
-                .conn
-                .db
-                .cell_state()
-                .cell_id()
-                .find(&row.cell_id)
-                .is_some_and(|state| state.owner_player_id != 0);
-            if owned {
-                continue;
-            }
-            let distance = axial_distance(row.q, row.r, terrain.q, terrain.r);
-            let score = i64::try_from(distance).map_or(i64::MIN, |value| -value);
-            if best.is_none_or(|current| (score, row.cell_id) > current) {
-                best = Some((score, row.cell_id));
-            }
-        }
-        best.map(|(_, cell)| cell)
     }
 }
 

@@ -14,6 +14,8 @@ pub struct MapCell {
     pub elevation: i16,
     pub passable: bool,
     pub capturable: bool,
+    pub infantry: u64,
+    pub military_capacity: u64,
 }
 
 /// Exact reducer payload for one seat's front-rebalance command.
@@ -89,11 +91,13 @@ pub fn plan_front_rebalance_for_player(
         return FrontRebalancePlan::Skipped("could not resolve two distinct front seeds");
     }
 
-    let (_, source_front_seed) = resolvable[0];
-    let (_, target_front_seed) = resolvable[1];
-    if source_front_seed == target_front_seed {
-        return FrontRebalancePlan::Skipped("front seeds collapsed to the same cell");
-    }
+    let Some((source_front_seed, target_front_seed)) =
+        select_front_pair(&fronts, &resolvable, &by_coord)
+    else {
+        return FrontRebalancePlan::Skipped(
+            "no front pair has movable troops and destination capacity",
+        );
+    };
 
     let mut component_cells = component.iter().copied().collect::<Vec<_>>();
     component_cells.sort_unstable();
@@ -102,6 +106,45 @@ pub fn plan_front_rebalance_for_player(
         source_front_seed,
         target_front_seed,
     })
+}
+
+/// Selects the first deterministic ordered pair accepted by the authoritative
+/// reducer. Strategic arcs may share corner cells; a source is usable as long
+/// as at least one of its cells is not also part of the target front.
+fn select_front_pair(
+    fronts: &[hex_core::StrategicFront],
+    resolvable: &[(usize, u32)],
+    by_coord: &BTreeMap<Axial, MapCell>,
+) -> Option<(u32, u32)> {
+    for &(source_index, source_seed) in resolvable {
+        let source_cells = fronts.get(source_index)?.source_cells();
+        for &(target_index, target_seed) in resolvable {
+            if source_index == target_index || source_seed == target_seed {
+                continue;
+            }
+            let target_cells = fronts.get(target_index)?.source_cells();
+            let source_has_troops = source_cells
+                .difference(&target_cells)
+                .any(|coord| by_coord.get(coord).is_some_and(|cell| cell.infantry > 0));
+            let target_has_headroom = target_cells.iter().any(|coord| {
+                by_coord
+                    .get(coord)
+                    .is_some_and(|cell| cell.infantry < cell.military_capacity)
+            });
+            if source_has_troops && target_has_headroom {
+                return Some((source_seed, target_seed));
+            }
+        }
+    }
+    None
+}
+
+/// Capacity and allocation can change between the observer snapshot and reducer
+/// execution. These resource-exhaustion receipts are valid accounted skips, not
+/// malformed benchmark commands.
+pub fn is_skippable_resource_rejection(message: &str) -> bool {
+    message.contains("target front cannot accept any of the requested share")
+        || message.contains("source front has no movable troops for the requested share")
 }
 
 fn owned_components(
@@ -225,6 +268,8 @@ mod tests {
             elevation,
             passable,
             capturable,
+            infantry: 10,
+            military_capacity: 100,
         }
     }
 
@@ -295,6 +340,130 @@ mod tests {
         assert_ne!(command.source_front_seed, command.target_front_seed);
         assert!(command.component_cells.contains(&command.source_front_seed));
         assert!(command.component_cells.contains(&command.target_front_seed));
+    }
+
+    #[test]
+    fn pair_selection_reverses_fully_overlapped_source_arc() {
+        let a = Axial::new(0, 0);
+        let b = Axial::new(1, 0);
+        let outside = Axial::new(0, 1);
+        let fronts = vec![
+            hex_core::StrategicFront {
+                opponent: Some(2),
+                edges: vec![hex_core::DirectedFrontEdge {
+                    source: a,
+                    target: outside,
+                }],
+            },
+            hex_core::StrategicFront {
+                opponent: None,
+                edges: vec![
+                    hex_core::DirectedFrontEdge {
+                        source: a,
+                        target: Axial::new(-1, 1),
+                    },
+                    hex_core::DirectedFrontEdge {
+                        source: b,
+                        target: Axial::new(2, 0),
+                    },
+                ],
+            },
+        ];
+        assert_eq!(
+            select_front_pair(
+                &fronts,
+                &[(0, 10), (1, 11)],
+                &BTreeMap::from([
+                    (a, cell(10, a.q, a.r, 1, 0, true, true)),
+                    (b, cell(11, b.q, b.r, 1, 0, true, true)),
+                ]),
+            ),
+            Some((11, 10))
+        );
+    }
+
+    #[test]
+    fn pair_selection_skips_identical_source_cell_sets() {
+        let source = Axial::new(0, 0);
+        let fronts = vec![
+            hex_core::StrategicFront {
+                opponent: Some(2),
+                edges: vec![hex_core::DirectedFrontEdge {
+                    source,
+                    target: Axial::new(1, 0),
+                }],
+            },
+            hex_core::StrategicFront {
+                opponent: None,
+                edges: vec![hex_core::DirectedFrontEdge {
+                    source,
+                    target: Axial::new(0, 1),
+                }],
+            },
+        ];
+        assert_eq!(
+            select_front_pair(
+                &fronts,
+                &[(0, 10), (1, 11)],
+                &BTreeMap::from([(source, cell(10, 0, 0, 1, 0, true, true))]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pair_selection_avoids_a_saturated_target_front() {
+        let a = Axial::new(0, 0);
+        let b = Axial::new(1, 0);
+        let c = Axial::new(2, 0);
+        let fronts = vec![
+            hex_core::StrategicFront {
+                opponent: Some(2),
+                edges: vec![hex_core::DirectedFrontEdge {
+                    source: a,
+                    target: Axial::new(0, -1),
+                }],
+            },
+            hex_core::StrategicFront {
+                opponent: Some(3),
+                edges: vec![hex_core::DirectedFrontEdge {
+                    source: b,
+                    target: Axial::new(1, -1),
+                }],
+            },
+            hex_core::StrategicFront {
+                opponent: None,
+                edges: vec![hex_core::DirectedFrontEdge {
+                    source: c,
+                    target: Axial::new(3, 0),
+                }],
+            },
+        ];
+        let mut saturated = cell(11, b.q, b.r, 1, 0, true, true);
+        saturated.infantry = saturated.military_capacity;
+        let by_coord = BTreeMap::from([
+            (a, cell(10, a.q, a.r, 1, 0, true, true)),
+            (b, saturated),
+            (c, cell(12, c.q, c.r, 1, 0, true, true)),
+        ]);
+
+        assert_eq!(
+            select_front_pair(&fronts, &[(0, 10), (1, 11), (2, 12)], &by_coord),
+            Some((10, 12))
+        );
+    }
+
+    #[test]
+    fn classifies_only_dynamic_resource_exhaustion_as_skippable() {
+        assert!(is_skippable_resource_rejection(
+            "target front cannot accept any of the requested share"
+        ));
+        assert!(is_skippable_resource_rejection(
+            "source front has no movable troops for the requested share"
+        ));
+        assert!(!is_skippable_resource_rejection(
+            "front rebalance seeds must lie in the selected component"
+        ));
     }
 
     #[test]

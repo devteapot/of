@@ -59,12 +59,6 @@ pub fn find_attack_fronts(
     Ok(fronts)
 }
 
-pub fn axial_distance(first_q: i32, first_r: i32, second_q: i32, second_r: i32) -> u64 {
-    let dq = i64::from(first_q) - i64::from(second_q);
-    let dr = i64::from(first_r) - i64::from(second_r);
-    (dq.unsigned_abs() + dr.unsigned_abs() + (dq + dr).unsigned_abs()) / 2
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

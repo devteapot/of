@@ -18,7 +18,7 @@ The coordinator samples the authoritative `logical_step` counter and records:
 | --- | --- |
 | `timeline.csv` | elapsed time, logical step/delta, client-observed gap and ms/step, phase, packet/order/front counts, controlled-cell min/p50/p95/max/sum |
 | `players.csv` | long-form `(logical_step, player_id, controlled_cells)` snapshots |
-| `worker-<first>-<last>.jsonl` | per-shard join/command receipt status and latency, including front-rebalance attempted/accepted/skipped counts |
+| `worker-<first>-<last>.jsonl` | per-shard join/command receipt status and latency, including expansion attempted/accepted/retried/skipped and front-rebalance attempted/accepted/skipped counts |
 | `metadata.json` | full scenario, host/db, map size/hash, shard layout, git HEAD + dirty flag, timing caveat |
 | `summary.json` | observed steps (`sum(step_delta)`), weighted p50/p95/p99/max ms/step, max packets/orders/fronts, failures, early completion |
 
@@ -149,11 +149,16 @@ Worker connections:
   `command-only` keeps receipt-only queries for a lighter command path.
 
 Command IDs are deterministic and spread by player ID so concurrent workers never
-collide. `--command-spread` must not exceed the relevant expand-wave /
+collide. Expansion is derived from each player's current owned component and
+neutral traversable perimeter. When a concurrent scheduled tick invalidates
+that snapshot, the worker retries with a fresh command ID; players with no
+remaining frontier are explicitly skipped. `--command-spread` must not exceed
+the relevant expand-wave /
 rebalance / attack duration; workers keep pending player sets and dispatch due
-residues across subsequent logical steps so every seat executes **exactly once**
-per expansion wave and once for rebalance/attack (default spread 1 = concurrent
-fanout of the full due batch). Phase progress uses one shared absolute epoch:
+residues across subsequent logical steps so every seat is **accepted or
+explicitly skipped** once per expansion wave and once for rebalance/attack
+(default spread 1 = concurrent fanout of the full due batch). Phase progress
+uses one shared absolute epoch:
 `phase_progress = logical_step - warmup_steps` (default warmup 120). Workers fan
 out per-seat reducer submissions before awaiting callbacks so shard load is
 concurrent. When the run directory is shared, workers emit atomic
@@ -169,10 +174,14 @@ The `--rebalance-steps` phase drives **front rebalance**. Each worker observer d
 possible, one complete owned traversable component and two distinct strategic
 front seeds (`hex_core::strategic_fronts`), then seats issue
 `issue_front_rebalance` with the configured `--command-share-bps` and an empty
-supersede list. Component cell IDs are exact and deterministic. Players whose
-current topology lacks two usable fronts are **skipped and reported** (worker
-JSONL + console summary counts: attempted/accepted/skipped) rather than sent an
-invalid command. Issued commands still fail the run if rejected.
+supersede list. Component cell IDs are exact and deterministic, the source must
+have movable troops outside the target arc, and the target must have physical
+military headroom. Players whose current topology or resources lack a usable
+pair are **skipped and reported** (worker JSONL + console summary counts:
+attempted/accepted/skipped) rather than sent an invalid command. If troop supply
+or target capacity changes between the observer snapshot and receipt, that
+narrow resource-exhaustion result is also an accounted skip; every other issued
+command rejection still fails the run.
 
 Attack commands are optional. When enabled, each seat must have a real
 traversable adjacent owned→enemy front; otherwise the worker fails closed.
@@ -188,8 +197,9 @@ by default:
 It requires an explicit destructive confirmation flag, publishes a **unique**
 fresh database per cell with `--delete-data`, runs `run-local`, traps/cleans
 child processes, preserves non-overwriting run directories, and appends
-`matrix.csv` from each `summary.json`. Matrix rows also aggregate
-`front_rebalance_attempted`, `front_rebalance_accepted`, and
+`matrix.csv` from each `summary.json`. Matrix rows also aggregate expansion
+attempted/accepted/retried/skipped counts plus `front_rebalance_attempted`,
+`front_rebalance_accepted`, and
 `front_rebalance_skipped` from worker logs so a fast run cannot hide a topology
 that exercised no rebalance commands.
 

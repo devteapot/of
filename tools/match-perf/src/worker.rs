@@ -19,6 +19,7 @@ use crate::common::{
     due_players_from_pending, validate_command_spread_for_schedule, worker_status_path,
     write_worker_status,
 };
+use crate::expansion::{ExpansionPlan, is_retryable_topology_rejection};
 use crate::front_rebalance::FrontRebalancePlan;
 use crate::output::WorkerLog;
 use crate::queries::{subscription_mode_detail, worker_command_queries, worker_observer_queries};
@@ -461,7 +462,11 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     let mut front_rebalance_attempted = 0_u64;
     let mut front_rebalance_accepted = 0_u64;
     let mut front_rebalance_skipped = 0_u64;
-    let mut expand_seq = 1_u32;
+    let mut expand_attempt_sequences = BTreeMap::<u16, u32>::new();
+    let mut expansion_attempted = 0_u64;
+    let mut expansion_accepted = 0_u64;
+    let mut expansion_retried = 0_u64;
+    let mut expansion_skipped = 0_u64;
     let started = Instant::now();
     let budget = Duration::from_millis(
         args.warmup_steps
@@ -507,40 +512,77 @@ pub fn run(args: WorkerArgs) -> Result<()> {
         if phase == ScenarioPhase::Expand {
             let wave = progress / schedule.reexpand_steps;
             if wave != last_expand_wave {
-                // Prior wave must have drained every seat exactly once.
+                // A heavily loaded callback batch may cross the wave boundary.
+                // Account for every unhandled seat explicitly instead of
+                // turning exhausted topology into a harness failure.
                 if last_expand_wave != u64::MAX && !pending_expand.is_empty() {
-                    return fail(
-                        &args,
-                        range,
-                        anyhow::anyhow!(
-                            "expand wave {last_expand_wave} ended with pending players {pending_expand:?}"
-                        ),
-                    );
+                    for player_id in std::mem::take(&mut pending_expand) {
+                        expansion_skipped = expansion_skipped.saturating_add(1);
+                        let _ = log.write_event(&serde_json::json!({
+                            "event": "expand",
+                            "player_id": player_id,
+                            "ok": true,
+                            "skipped": true,
+                            "reason": format!("expand wave {last_expand_wave} ended before a stable command could be accepted"),
+                        }));
+                    }
                 }
                 last_expand_wave = wave;
                 pending_expand = range.iter().collect();
-                expand_seq = expand_seq.saturating_add(1);
             }
             let players = due_players_from_pending(&pending_expand, step, args.command_spread);
             if !players.is_empty() {
-                let seq = expand_seq;
+                // Derive every due command from one coherent observer snapshot.
+                // Invalidated snapshots are retried below with fresh command IDs.
+                let map_cells = observer.map_cells();
+                let mut ready = Vec::new();
+                for player_id in players {
+                    let spawn = *spawns.get(&player_id).context("spawn missing")?;
+                    let opposing_index = (u32::from(player_id) - 1
+                        + u32::from(args.match_players) / 2)
+                        % u32::from(args.match_players)
+                        + 1;
+                    let opposing_spawn = observer
+                        .spawn_cell(u16::try_from(opposing_index).context("opposing id")?)
+                        .unwrap_or(spawn);
+                    match crate::expansion::plan_expansion_for_player(
+                        &map_cells,
+                        player_id,
+                        spawn,
+                        opposing_spawn,
+                        config.max_elevation_step,
+                    ) {
+                        ExpansionPlan::Skipped(reason) => {
+                            pending_expand.remove(&player_id);
+                            expansion_skipped = expansion_skipped.saturating_add(1);
+                            let _ = log.write_event(&serde_json::json!({
+                                "event": "expand",
+                                "player_id": player_id,
+                                "ok": true,
+                                "skipped": true,
+                                "reason": reason,
+                            }));
+                        }
+                        ExpansionPlan::Ready(plan) => {
+                            let sequence = expand_attempt_sequences.entry(player_id).or_default();
+                            *sequence = sequence.saturating_add(1);
+                            let command =
+                                deterministic_command_id(player_id, CommandKind::Expand, *sequence);
+                            ready.push((player_id, command, plan));
+                        }
+                    }
+                }
+                if ready.is_empty() {
+                    std::thread::sleep(Duration::from_millis(15));
+                    continue;
+                }
                 let batch_timeout = command_timeout
-                    .saturating_mul(u32::try_from(players.len().max(1)).unwrap_or(u32::MAX));
+                    .saturating_mul(u32::try_from(ready.len().max(1)).unwrap_or(u32::MAX));
+                expansion_attempted = expansion_attempted
+                    .saturating_add(u64::try_from(ready.len()).unwrap_or(u64::MAX));
                 let pending = match fanout_then_await(
-                    players.clone(),
-                    |player_id, tx| {
-                        let command = deterministic_command_id(player_id, CommandKind::Expand, seq);
-                        let spawn = *spawns.get(&player_id).context("spawn missing")?;
-                        let opposing_index = (u32::from(player_id) - 1
-                            + u32::from(args.match_players) / 2)
-                            % u32::from(args.match_players)
-                            + 1;
-                        let opposing_spawn = observer
-                            .spawn_cell(u16::try_from(opposing_index).context("opposing id")?)
-                            .unwrap_or(spawn);
-                        let focus = observer.neutral_focus(opposing_spawn).with_context(|| {
-                            format!("player {player_id} has no neutral expansion focus")
-                        })?;
+                    ready,
+                    |(player_id, command, plan), tx| {
                         let client = commanders.get(&player_id).context("commander")?;
                         let started = Instant::now();
                         client
@@ -548,8 +590,8 @@ pub fn run(args: WorkerArgs) -> Result<()> {
                             .reducers
                             .issue_expand_clusters_then(
                                 command,
-                                vec![spawn],
-                                focus,
+                                vec![plan.source_seed],
+                                plan.focus,
                                 args.command_share_bps,
                                 move |_, result| {
                                     let mapped = result
@@ -593,9 +635,23 @@ pub fn run(args: WorkerArgs) -> Result<()> {
                         item.receipt_name,
                         command_timeout,
                     ) {
+                        if is_retryable_topology_rejection(&error.to_string()) {
+                            expansion_retried = expansion_retried.saturating_add(1);
+                            let _ = log.write_event(&serde_json::json!({
+                                "event": "expand",
+                                "player_id": item.player_id,
+                                "command_id": item.command_id,
+                                "ok": false,
+                                "retrying": true,
+                                "reason": error.to_string(),
+                                "rtt_ms": item.rtt.as_secs_f64() * 1_000.0,
+                            }));
+                            continue;
+                        }
                         return fail(&args, range, error);
                     }
                     pending_expand.remove(&item.player_id);
+                    expansion_accepted = expansion_accepted.saturating_add(1);
                     let _ = log.write_event(&serde_json::json!({
                         "event": "expand",
                         "player_id": item.player_id,
@@ -715,6 +771,29 @@ pub fn run(args: WorkerArgs) -> Result<()> {
                                 item.receipt_name,
                                 command_timeout,
                             ) {
+                                if crate::front_rebalance::is_skippable_resource_rejection(
+                                    &error.to_string(),
+                                ) {
+                                    pending_set.remove(&item.player_id);
+                                    front_rebalance_skipped =
+                                        front_rebalance_skipped.saturating_add(1);
+                                    let _ = log.write_event(&serde_json::json!({
+                                        "event": "front_rebalance",
+                                        "player_id": item.player_id,
+                                        "command_id": item.command_id,
+                                        "ok": true,
+                                        "skipped": true,
+                                        "reason": error.to_string(),
+                                        "rtt_ms": item.rtt.as_secs_f64() * 1_000.0,
+                                    }));
+                                    println!(
+                                        "worker {}-{}: skip front_rebalance player {} after receipt: {error}",
+                                        range.first_player,
+                                        range.last_player(),
+                                        item.player_id
+                                    );
+                                    continue;
+                                }
                                 return fail(&args, range, error);
                             }
                             pending_set.remove(&item.player_id);
@@ -821,12 +900,15 @@ pub fn run(args: WorkerArgs) -> Result<()> {
         std::thread::sleep(Duration::from_millis(15));
     }
 
-    if !pending_expand.is_empty() {
-        return fail(
-            &args,
-            range,
-            anyhow::anyhow!("expand wave left pending players {pending_expand:?}"),
-        );
+    for player_id in std::mem::take(&mut pending_expand) {
+        expansion_skipped = expansion_skipped.saturating_add(1);
+        let _ = log.write_event(&serde_json::json!({
+            "event": "expand",
+            "player_id": player_id,
+            "ok": true,
+            "skipped": true,
+            "reason": "expansion phase ended before a stable command could be accepted",
+        }));
     }
     if pending_rebalance
         .as_ref()
@@ -850,6 +932,25 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     }
 
     let _ = log.write_event(&serde_json::json!({
+        "event": "expansion_summary",
+        "first_player": range.first_player,
+        "last_player": range.last_player(),
+        "attempted": expansion_attempted,
+        "accepted": expansion_accepted,
+        "retried": expansion_retried,
+        "skipped": expansion_skipped,
+    }));
+    println!(
+        "worker {}-{} expansion attempted={} accepted={} retried={} skipped={}",
+        range.first_player,
+        range.last_player(),
+        expansion_attempted,
+        expansion_accepted,
+        expansion_retried,
+        expansion_skipped
+    );
+
+    let _ = log.write_event(&serde_json::json!({
         "event": "front_rebalance_summary",
         "first_player": range.first_player,
         "last_player": range.last_player(),
@@ -871,6 +972,10 @@ pub fn run(args: WorkerArgs) -> Result<()> {
         "first_player": range.first_player,
         "last_player": range.last_player(),
         "ok": true,
+        "expansion_attempted": expansion_attempted,
+        "expansion_accepted": expansion_accepted,
+        "expansion_retried": expansion_retried,
+        "expansion_skipped": expansion_skipped,
         "front_rebalance_attempted": front_rebalance_attempted,
         "front_rebalance_accepted": front_rebalance_accepted,
         "front_rebalance_skipped": front_rebalance_skipped,

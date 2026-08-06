@@ -89,7 +89,7 @@ mkdir -p "${out_root}"
 
 matrix_csv="${out_root}/matrix.csv"
 if [[ ! -f "${matrix_csv}" ]]; then
-  echo "timestamp,database,preset,players,shard_size,run_dir,status,observed_steps,p50_ms,p95_ms,p99_ms,max_ms,max_packets,max_orders,max_fronts,front_rebalance_attempted,front_rebalance_accepted,front_rebalance_skipped,failures,early_completion" \
+  echo "timestamp,database,preset,players,shard_size,run_dir,status,observed_steps,p50_ms,p95_ms,p99_ms,max_ms,max_packets,max_orders,max_fronts,expansion_attempted,expansion_accepted,expansion_retried,expansion_skipped,front_rebalance_attempted,front_rebalance_accepted,front_rebalance_skipped,failures,early_completion" \
     > "${matrix_csv}"
 fi
 
@@ -172,7 +172,7 @@ for preset in "${presets[@]}"; do
       "${db}"; then
       cell_status="publish_failed"
       overall_status=1
-      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),${db},${preset},${player_count},${shard_size},${run_dir},${cell_status},,,,,,,,,,,,,," \
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),${db},${preset},${player_count},${shard_size},${run_dir},${cell_status},,,,,,,,,,,,,,,,,," \
         >> "${matrix_csv}"
       continue
     fi
@@ -261,21 +261,26 @@ path, db, preset, players, shard, run_dir, status = sys.argv[1:8]
 try:
     s = json.load(open(path))
 except Exception:
-    print(f"{datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')},{db},{preset},{players},{shard},{run_dir},{status},,,,,,,,,,,,,")
+    now = datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+    print(",".join([now, db, preset, players, shard, run_dir, status] + [""] * 17))
     raise SystemExit(0)
+expansion = {"attempted": 0, "accepted": 0, "retried": 0, "skipped": 0}
 front = {"attempted": 0, "accepted": 0, "skipped": 0}
 for worker_path in glob.glob(os.path.join(run_dir, "worker-*.jsonl")):
     try:
         with open(worker_path) as worker:
             for line in worker:
                 event = json.loads(line)
+                if event.get("event") == "expansion_summary":
+                    for key in expansion:
+                        expansion[key] += int(event.get(key, 0))
                 if event.get("event") == "front_rebalance_summary":
                     for key in front:
                         front[key] += int(event.get(key, 0))
     except Exception:
         pass
 print(
-    f"{datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')},"
+    f"{datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')},"
     f"{db},{preset},{players},{shard},{run_dir},{status},"
     f"{s.get('observed_steps','')},"
     f"{s.get('observed_ms_per_step_p50','')},"
@@ -285,6 +290,10 @@ print(
     f"{s.get('max_packets','')},"
     f"{s.get('max_active_orders','')},"
     f"{s.get('max_fronts','')},"
+    f"{expansion['attempted']},"
+    f"{expansion['accepted']},"
+    f"{expansion['retried']},"
+    f"{expansion['skipped']},"
     f"{front['attempted']},"
     f"{front['accepted']},"
     f"{front['skipped']},"
@@ -295,7 +304,7 @@ PY
       )"
       echo "${row}" >> "${matrix_csv}"
     else
-      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),${db},${preset},${player_count},${shard_size},${run_dir},${cell_status},,,,,,,,,,,,,," \
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),${db},${preset},${player_count},${shard_size},${run_dir},${cell_status},,,,,,,,,,,,,,,,,," \
         >> "${matrix_csv}"
     fi
   done

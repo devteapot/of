@@ -15,6 +15,7 @@ mod attack;
 mod client;
 mod common;
 mod coordinator;
+mod expansion;
 mod front_rebalance;
 mod output;
 mod queries;
