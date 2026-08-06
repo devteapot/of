@@ -10,6 +10,8 @@ use hex_core::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
+pub mod v2;
+
 pub const NEUTRAL_PLAYER: u32 = 0;
 pub const PLAYER_ONE: u32 = 1;
 pub const PLAYER_TWO: u32 = 2;

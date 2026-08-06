@@ -174,6 +174,13 @@ round-trips without non-string map keys. V1 has no per-edge map overrides;
 roads, rivers, bridges, and crossings require an explicit versioned edge array
 later.
 
+The offline [`worldgen` V2 pipeline](./worldgen-v2.md) now provides that
+separate layered contract, including hydrology overlays, sparse edge features,
+custom dimensions, chunk extraction, and large-map validation. It is not yet an
+authoritative match preset: V1 hashes and bindings stay pinned until the
+runtime adopts immutable terrain chunks and the remaining simulation/client
+scale work described in that document.
+
 ## Client structure
 
 The native client renders combined chunk meshes rather than one entity per hex.

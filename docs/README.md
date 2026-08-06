@@ -11,6 +11,9 @@ current interaction or simulation contract.
 - [V1 game design](./v1-game-design.md) — player experience, rules, interaction experiments, provisional tuning, and acceptance criteria.
 - [Technical architecture](./technical-architecture.md) — Bevy and SpacetimeDB boundaries, simulation and data flow, scalability, testing, and the implementation sequence.
 - [V1 implementation guide](./implementation.md) — executable components, runtime topology, operational flow, evidence, and known limits.
+- [Layered world generator V2](./worldgen-v2.md) — composable terrain layers,
+  deterministic passes, hydrology, chunk export, validation, and the runtime
+  integration boundary for much larger maps.
 - [Graybox UI direction](./v1-ui-direction.md) — implemented interaction states, controls, HUD hierarchy, overlays, and playtest risks.
 - [Graybox UI brief](./v1-ui-brief.md) — concise requirements for visual and
   interaction exploration within the canonical control contract.

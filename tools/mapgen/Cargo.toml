@@ -9,6 +9,8 @@ description = "Offline generator and validator for curated RTS maps"
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+hex-core.workspace = true
 worldgen = { path = "../../crates/worldgen" }
 
 [lints]

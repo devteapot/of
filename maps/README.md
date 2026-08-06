@@ -10,3 +10,20 @@ cargo run -p mapgen -- --preset dev --players 2 \
 ```
 
 The larger playtest and validation maps are generated on demand so tens of thousands of derived cell rows do not need to be committed. `--players` accepts 2 through 500 (default 2); manifests record `player_count` (`u16`, legacy JSON defaults to 2) and a deterministic ordered spawn-cell vector. Counts `2..=8` keep multi-cell ring footprints; counts above eight use deterministic farthest-point one-cell starts. Custom two-player generation requires dimensions of at least 24 by 24, while custom maps with more than two players require at least 32 by 32; the Rust API panics when these dimension or player-count preconditions are violated. Generator-version-1 JSON written before `player_count` existed remains readable as a two-player manifest, and the existing two-player terrain/spawn output is unchanged.
+
+## Layered V2 maps
+
+Generator V2 is available for offline generation and inspection while V1 stays
+the authoritative match format. It composes independent elevation, surface,
+landform, hydrology, biome, edge, and gameplay layers and supports custom large
+dimensions:
+
+```bash
+cargo run -p mapgen --release -- \
+  --generator v2 --width 1024 --height 1024 --players 500 --seed 42
+```
+
+Use `--inspect-layer rivers --inspect-output rivers.pgm` for layer diagnostics,
+or `--chunks-dir <directory>` to write a manifest and zero-based terrain chunks.
+See [the V2 generator design](../docs/worldgen-v2.md) for the layer merge rules,
+pass sequence, validation, tuning flags, and runtime integration boundary.
