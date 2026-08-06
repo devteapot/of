@@ -25,9 +25,9 @@ the command:
 
 - Clicking unclaimed capturable ground dispatches **Expand Clusters**. Every
   selected source cluster with a reachable neutral perimeter expands on all of
-  its perimeter. The clicked hex is a focus, not a destination: branches which
-  move closer to it receive weight 3, equal-distance branches weight 2, and
-  branches moving away weight 1. The allocator gives every branch a positive
+  its perimeter using troops already stationed there; inland troops remain
+  still. The clicked hex is a focus, not a destination: closer/equal/farther
+  branches receive mild 11/10/9 weights. The allocator gives every branch a positive
   baseline when the committed integer strength makes that possible.
 - Clicking an enemy hex dispatches **Attack Clusters** against that complete
   enemy traversable cluster. Every shared passable front between the selected
@@ -42,14 +42,14 @@ cells expose the next cells in that mask, so the wave can turn around a corner,
 split, and merge as the front changes. It never enters a cell outside the
 accepted mask. Terrain, elevation, edge throughput, destination capacity,
 garrison cost, and enemy infantry are rechecked during execution.
+Only troops already stationed on the shared hostile fronts participate.
 
 ## Force Share
 
 One persisted Share percentage applies to Expand Clusters, Attack Clusters,
-and Front Rebalance. Each participating source cell contributes that percentage of its
-action-available infantry exactly once: stationary free strength plus
-yieldable background-policy strength physically inside the source, excluding
-troops committed to another explicit action. A selected source cluster with no
+and Front Rebalance. Each participating perimeter/front cell contributes that percentage of its
+stationary action-available infantry exactly once, excluding troops committed
+to another explicit action. Interior cells and a selected source cluster with no
 eligible shared front contributes nothing. Strength is then conserved through
 branching and merging; selecting several targets never reapplies Share to the
 same source.

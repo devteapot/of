@@ -860,7 +860,6 @@ pub(crate) enum ExpandWaveError {
 #[derive(Clone, Debug, Default)]
 struct ExpandWaveTopology {
     initial_edges: Vec<DirectedFrontEdge>,
-    selected_depth: BTreeMap<Axial, u16>,
     outside_depth: BTreeMap<Axial, u16>,
     outgoing: BTreeMap<Axial, Vec<Axial>>,
     parents: BTreeMap<Axial, Vec<Axial>>,
@@ -872,10 +871,8 @@ struct ExpandWaveTopology {
 pub(crate) struct ExpandWaveForecast {
     pub initial_edges: Vec<DirectedFrontEdge>,
     pub reached_depth: BTreeMap<Axial, u16>,
-    pub max_internal_depth: u16,
     pub strength_upper_bound: u64,
     pub first_ring_capacity: u64,
-    pub active_sources: BTreeSet<Axial>,
     pub truncated: bool,
 }
 
@@ -886,34 +883,11 @@ fn build_expand_wave_topology(
     max_rings: Option<u16>,
 ) -> Result<ExpandWaveTopology, ExpandWaveError> {
     let initial_edges = expand_all_front_edges(view, sources).map_err(ExpandWaveError::Front)?;
-    let boundary = initial_edges
-        .iter()
-        .map(|edge| edge.source)
-        .collect::<BTreeSet<_>>();
-    let selected_depth = selected_depths_to_boundary(view, sources, &boundary);
-
     let mut topology = ExpandWaveTopology {
         initial_edges: initial_edges.clone(),
-        selected_depth,
         focus,
         ..Default::default()
     };
-
-    // Inside the selected seed, strength moves down every shortest local
-    // depth. A central pool can therefore branch, and equal-depth routes merge
-    // naturally before reaching the outside perimeter.
-    for (&source, &depth) in &topology.selected_depth {
-        if depth == 0 {
-            continue;
-        }
-        for neighbor in source.neighbors() {
-            if topology.selected_depth.get(&neighbor) == Some(&(depth - 1))
-                && wave_edge_is_traversable(view, source, neighbor)
-            {
-                topology.outgoing.entry(source).or_default().push(neighbor);
-            }
-        }
-    }
 
     let mut first_ring = BTreeSet::new();
     for edge in initial_edges {
@@ -967,32 +941,6 @@ fn build_expand_wave_topology(
     Ok(topology)
 }
 
-fn selected_depths_to_boundary(
-    view: &MatchView,
-    sources: &BTreeSet<Axial>,
-    boundary: &BTreeSet<Axial>,
-) -> BTreeMap<Axial, u16> {
-    let mut depths = BTreeMap::new();
-    let mut pending = VecDeque::new();
-    for &coordinate in boundary {
-        depths.insert(coordinate, 0_u16);
-        pending.push_back(coordinate);
-    }
-    while let Some(current) = pending.pop_front() {
-        let next_depth = depths[&current].saturating_add(1);
-        for neighbor in current.neighbors() {
-            if sources.contains(&neighbor)
-                && !depths.contains_key(&neighbor)
-                && wave_edge_is_traversable(view, current, neighbor)
-            {
-                depths.insert(neighbor, next_depth);
-                pending.push_back(neighbor);
-            }
-        }
-    }
-    depths
-}
-
 fn next_wave_ring(
     view: &MatchView,
     sources: &BTreeSet<Axial>,
@@ -1035,50 +983,29 @@ fn wave_continuation_target_is_eligible(view: &MatchView, from: Axial, target: A
             .is_some_and(|cell| cell.owner.is_none() || cell.owner == Some(view.local_player))
 }
 
-fn boundary_strength_pools(
-    sources: &BTreeSet<Axial>,
+fn perimeter_strength_pools(
     commitment_percent: u8,
     topology: &ExpandWaveTopology,
     source_strength_by_cell: &BTreeMap<Axial, u64>,
 ) -> (u64, BTreeMap<Axial, u64>, BTreeMap<Axial, u64>) {
     let percentage = u64::from(commitment_percent.clamp(10, 100));
-    let requested_by_source = sources
+    let perimeter_sources = topology
+        .initial_edges
         .iter()
-        .filter(|coordinate| topology.selected_depth.contains_key(coordinate))
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    let requested_by_source = perimeter_sources
+        .into_iter()
         .map(|coordinate| {
             let strength = source_strength_by_cell
-                .get(coordinate)
+                .get(&coordinate)
                 .copied()
                 .unwrap_or(0);
-            (*coordinate, strength.saturating_mul(percentage) / 100)
+            (coordinate, strength.saturating_mul(percentage) / 100)
         })
         .collect::<BTreeMap<_, _>>();
     let requested = requested_by_source.values().copied().sum();
-    let mut pools = requested_by_source.clone();
-    let max_depth = topology.selected_depth.values().copied().max().unwrap_or(0);
-    for depth in (1..=max_depth).rev() {
-        let layer = topology
-            .selected_depth
-            .iter()
-            .filter_map(|(&coordinate, &coordinate_depth)| {
-                (coordinate_depth == depth).then_some(coordinate)
-            })
-            .collect::<Vec<_>>();
-        for coordinate in layer {
-            let amount = pools.remove(&coordinate).unwrap_or(0);
-            distribute_wave_strength(
-                amount,
-                coordinate,
-                topology
-                    .outgoing
-                    .get(&coordinate)
-                    .map_or(&[][..], Vec::as_slice),
-                topology.focus,
-                &mut pools,
-            );
-        }
-    }
-    (requested, requested_by_source, pools)
+    (requested, requested_by_source.clone(), requested_by_source)
 }
 
 fn distribute_wave_strength(
@@ -1129,12 +1056,8 @@ pub(crate) fn forecast_expand_wave_toward(
     max_rings: u16,
 ) -> Result<ExpandWaveForecast, ExpandWaveError> {
     let topology = build_expand_wave_topology(view, sources, focus, Some(max_rings))?;
-    let (strength_upper_bound, _, boundary_pools) = boundary_strength_pools(
-        sources,
-        commitment_percent,
-        &topology,
-        source_strength_by_cell,
-    );
+    let (strength_upper_bound, _, boundary_pools) =
+        perimeter_strength_pools(commitment_percent, &topology, source_strength_by_cell);
     let mut incoming = BTreeMap::new();
     for (boundary, amount) in boundary_pools {
         distribute_wave_strength(
@@ -1204,10 +1127,8 @@ pub(crate) fn forecast_expand_wave_toward(
     Ok(ExpandWaveForecast {
         initial_edges: topology.initial_edges,
         reached_depth,
-        max_internal_depth: topology.selected_depth.values().copied().max().unwrap_or(0),
         strength_upper_bound,
         first_ring_capacity,
-        active_sources: topology.selected_depth.keys().copied().collect(),
         truncated: forecast_truncated,
     })
 }
@@ -1328,8 +1249,8 @@ fn validate_attack_target_union(
 }
 
 /// Builds one deterministic target-mask DAG from all currently shared fronts.
-/// Source strength moves down its inward distance, then target strength moves
-/// up its minimum distance from any shared edge. A target with several parents
+/// Perimeter strength enters the target at every shared edge, then moves up its
+/// minimum distance from any shared edge. A target with several parents
 /// merges their strength before combat, while no edge can leave `targets`.
 fn build_attack_wave_topology(
     view: &MatchView,
@@ -1354,29 +1275,10 @@ fn build_attack_wave_topology(
             attack_wave_error("Attack cluster boundary is invalid", None)
         }
     })?;
-    let boundary = initial_edges
-        .iter()
-        .map(|edge| edge.source)
-        .collect::<BTreeSet<_>>();
-    let selected_depth = selected_depths_to_boundary(view, sources, &boundary);
     let mut topology = ExpandWaveTopology {
         initial_edges: initial_edges.clone(),
-        selected_depth,
         ..Default::default()
     };
-
-    for (&source, &depth) in &topology.selected_depth {
-        if depth == 0 {
-            continue;
-        }
-        for neighbor in source.neighbors() {
-            if topology.selected_depth.get(&neighbor) == Some(&(depth - 1))
-                && wave_edge_is_traversable(view, source, neighbor)
-            {
-                topology.outgoing.entry(source).or_default().push(neighbor);
-            }
-        }
-    }
 
     let mut frontier = BTreeSet::new();
     for edge in initial_edges {
@@ -1458,10 +1360,15 @@ pub(crate) fn forecast_attack_wave(
 ) -> Result<AttackWaveForecast, &'static str> {
     let topology =
         build_attack_wave_topology(view, sources, targets).map_err(|error| error.reason)?;
+    let participating_sources = topology
+        .initial_edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect();
     Ok(AttackWaveForecast {
         initial_edges: topology.initial_edges,
         reached_depth: topology.outside_depth,
-        participating_sources: topology.selected_depth.into_keys().collect(),
+        participating_sources,
     })
 }
 
@@ -1493,15 +1400,14 @@ pub(crate) fn resolve_attack_clusters(
         Ok(topology) => topology,
         Err(error) => return rejection(error.reason, error.relevant_cell),
     };
-    let (committed, requested_by_source, boundary_pools) = boundary_strength_pools(
-        &projection.cells,
+    let (committed, requested_by_source, boundary_pools) = perimeter_strength_pools(
         commitment_percent,
         &topology,
         &projection.affected_strength_by_cell,
     );
     if committed == 0 {
         return rejection(
-            "Participating source clusters have no infantry to commit",
+            "Shared hostile fronts have no infantry to commit",
             projection.cells.first().copied(),
         );
     }
@@ -1655,15 +1561,14 @@ fn resolve_projected_expand_all(
             return rejection(expand_error_message(error), sources.first().copied());
         }
     };
-    let (committed, requested_by_source, boundary_pools) = boundary_strength_pools(
-        sources,
+    let (committed, requested_by_source, boundary_pools) = perimeter_strength_pools(
         commitment_percent,
         &topology,
         &projection.affected_strength_by_cell,
     );
     if committed == 0 {
         return rejection(
-            "Selected sources have no infantry to dispatch",
+            "Eligible perimeter cells have no infantry to dispatch",
             sources.first().copied(),
         );
     }
@@ -3013,6 +2918,39 @@ mod tests {
     }
 
     #[test]
+    fn offline_cluster_attack_does_not_pull_interior_strength_to_the_front() {
+        let interior = Axial::ZERO;
+        let front = Axial::new(1, 0);
+        let target = Axial::new(2, 0);
+        let sources = BTreeSet::from([interior, front]);
+        let mut view = MatchView::connecting(1);
+        view.cells.insert(interior, cell(interior, 100));
+        view.cells.insert(front, cell(front, 20));
+        view.cells.insert(target, hostile_cell(target, 0));
+        view.rebuild_chunk_index();
+
+        let ServerUpdate::Accepted {
+            summary, patches, ..
+        } = resolve_attack_clusters(&view, &sources, &BTreeSet::from([target]), 100)
+        else {
+            panic!("troops already stationed on the hostile front should attack");
+        };
+
+        assert!(summary.contains("20 committed"));
+        assert!(
+            patches.iter().all(|patch| patch.coordinate != interior),
+            "interior troops must require explicit redistribution"
+        );
+        assert_eq!(
+            patches
+                .iter()
+                .find(|patch| patch.coordinate == target)
+                .map(|patch| patch.infantry),
+            Some(20)
+        );
+    }
+
+    #[test]
     fn offline_cluster_attack_turns_through_its_target_mask_and_never_leaves_it() {
         let source = Axial::ZERO;
         let first = Axial::new(1, 0);
@@ -3409,7 +3347,7 @@ mod tests {
         };
 
         assert_eq!(patch(focus).owner, Some(1));
-        assert_eq!(patch(focus).infantry, 54);
+        assert_eq!(patch(focus).infantry, 30);
         assert!(outer_ring.iter().all(|coordinate| {
             let outer = patch(*coordinate);
             outer.owner == Some(1) && outer.infantry > 0 && outer.infantry < patch(focus).infantry
@@ -3418,7 +3356,7 @@ mod tests {
     }
 
     #[test]
-    fn central_strength_branches_through_the_selected_seed_and_merges_on_ring_one() {
+    fn interior_strength_does_not_feed_the_selected_perimeter() {
         let selected = hex_disk(1).into_iter().collect::<BTreeSet<_>>();
         let mut view = MatchView::connecting(1);
         for &coordinate in &selected {
@@ -3433,24 +3371,12 @@ mod tests {
         }
         view.rebuild_chunk_index();
 
-        let ServerUpdate::Accepted {
-            summary, patches, ..
-        } = resolve_expand_all(&view, &selected, 100)
+        let ServerUpdate::Rejected { reason, .. } = resolve_expand_all(&view, &selected, 100)
         else {
-            panic!("central strength should reach every selected boundary branch");
+            panic!("interior strength must require explicit redistribution");
         };
 
-        assert!(summary.contains("12 neutral cells captured"));
-        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 60);
-        assert!(
-            hex_disk(2)
-                .into_iter()
-                .filter(|coordinate| coordinate.distance(Axial::ZERO) == 2)
-                .all(|coordinate| patches
-                    .iter()
-                    .find(|patch| patch.coordinate == coordinate)
-                    .is_some_and(|patch| patch.owner == Some(1) && patch.infantry > 0))
-        );
+        assert!(reason.contains("perimeter cells have no infantry"));
     }
 
     #[test]

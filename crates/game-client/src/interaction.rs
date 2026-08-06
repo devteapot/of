@@ -2187,16 +2187,13 @@ fn build_projected_expand_all_preview(
             return;
         }
     };
-    preview
-        .excluded
-        .extend(sources.difference(&forecast.active_sources).copied());
-
     preview.front_edges = forecast.initial_edges;
     preview.wave_depth = forecast.reached_depth;
     preview.wave_truncated = forecast.truncated;
     preview.strength_upper_bound = forecast.strength_upper_bound;
     if preview.strength_upper_bound == 0 {
-        preview.invalid_reason = Some("Selected sources have no visible infantry to request");
+        preview.invalid_reason =
+            Some("Eligible perimeter cells have no visible infantry to request");
         return;
     }
     preview.destination_capacity = forecast.first_ring_capacity;
@@ -2205,9 +2202,8 @@ fn build_projected_expand_all_preview(
         return;
     }
     let outside_depth = preview.wave_depth.values().copied().max().unwrap_or(0);
-    let traversed_edges =
-        u64::from(forecast.max_internal_depth).saturating_add(u64::from(outside_depth));
-    preview.eta_seconds = u32::try_from(traversed_edges.saturating_mul(2)).unwrap_or(u32::MAX);
+    preview.eta_seconds =
+        u32::try_from(u64::from(outside_depth).saturating_mul(2)).unwrap_or(u32::MAX);
 }
 
 fn selected_reachability_to_front(
@@ -4573,7 +4569,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_all_preview_eta_includes_travel_through_a_deep_seed() {
+    fn expand_all_preview_does_not_pull_strength_from_a_deep_seed() {
         let selected = hex_disk(2).into_iter().collect::<BTreeSet<_>>();
         let mut view = MatchView::connecting(1);
         for coordinate in hex_disk(3) {
@@ -4587,12 +4583,12 @@ mod tests {
         let mut preview = OrderPreview::default();
         build_expand_all_preview(&view, &selected, 100, &mut preview);
 
-        assert_eq!(preview.invalid_reason, None);
-        assert_eq!(preview.wave_depth.values().copied().max(), Some(1));
         assert_eq!(
-            preview.eta_seconds, 6,
-            "two selected-region edges plus one outside ring at two seconds each"
+            preview.invalid_reason,
+            Some("Eligible perimeter cells have no visible infantry to request")
         );
+        assert!(preview.wave_depth.is_empty());
+        assert_eq!(preview.eta_seconds, 0);
     }
 
     #[test]

@@ -14,7 +14,7 @@ This document records the architecture commitments for the first playable versio
 - V1 starts with one manually provisioned development match database. A lobby database and external match orchestrator are added when concurrent public matches are needed.
 - One visible terrain hex is one authoritative gameplay cell. Terrain is static during a V1 match and is stored and rendered in chunks.
 - Troops are conserved aggregate strength, not individual infantry entities.
-  Cluster waves, policy redistribution, Reshape, and combat operate on active
+  Cluster waves, explicit front redistribution, Reshape, and combat operate on active
   orders and active front edges rather than per-soldier entities.
 - Authoritative calculations use integers or explicit fixed-point values with stable iteration order. Floating point is reserved for client presentation.
 - Generated SpacetimeDB bindings define the client/server wire contract. Files
@@ -263,14 +263,14 @@ not the authority boundary.
 
 Expand Clusters computes every eligible neutral exit around every accepted
 source component. Sources without a reachable neutral perimeter remain
-stationary and do not invalidate other components. Each participating source
-cell contributes its Share of action-available infantry once: stationary free
-strength plus yieldable background-policy strength physically inside the
-source, excluding every other explicit allocation.
+stationary and do not invalidate other components. Only owned cells directly
+touching an eligible neutral exit participate. Each contributes its Share of
+stationary action-available infantry once, excluding every explicit allocation.
+Interior strength remains stationary and no support corridor is constructed.
 
-The private expansion wave stores a deterministic acyclic topology and the
-clicked focus cell. At each branch, progress toward the focus has weight 3,
-equal-distance progress weight 2, and movement away weight 1. The shared integer
+The private expansion wave stores a deterministic acyclic outward topology and
+the clicked focus cell. At each branch, closer/equal/farther progress receives
+a mild 11/10/9 weight. The shared integer
 allocator gives eligible branches a positive baseline when sufficient strength
 exists, conserves the exact total, merges contributions before later splits, and
 rotates remainder priority to avoid permanent branch bias.
@@ -285,12 +285,13 @@ into an implicit attack.
 Attack Clusters expands every target seed to its complete same-owner enemy
 component and snapshots the sorted union as an immutable target mask. The
 authority starts from every passable edge shared by accepted source and target
-clusters, not one global direction or one chosen arc.
+clusters, not one global direction or one chosen arc. Only infantry already on
+the owned cells of those edges is eligible; the attack never pulls inland troops.
 
 The target mask is represented as a deterministic acyclic progression from all
 initial shared fronts. Captures reveal the next masked neighbors; local
 progression can turn with the boundary, split at several successors, and merge
-where fronts meet. Each participating source contributes Share once even when it
+where fronts meet. Each participating front cell contributes Share once even when it
 touches several fronts or targets. A branch cannot enter a cell outside the
 accepted mask, so later adjacent territory is never attacked accidentally.
 
@@ -347,8 +348,7 @@ target remains unchanged.
 The generic `cancel_orders` reducer receives exact active explicit-order IDs
 captured by the Stop preview. It revalidates ownership and liveness, then
 releases only that snapshot at current cells. Normal selection sends no supersede set, while an
-accepted contextual command automatically yields only intersecting background
-policy work as described above.
+accepted contextual command leaves every unrelated explicit order intact.
 
 Legacy Push Front, unfocused Expand Perimeter, one-shot Formation/Bias, and
 retask planning remain compatibility code paths rather than the cluster-first
@@ -438,7 +438,7 @@ separable from terrain rendering:
 - hovered cell and complete selected-cluster perimeters;
 - staged complete enemy target-cluster perimeters;
 - focused neutral expansion and current active wave/front edges;
-- policy and Reshape density targets;
+- front-rebalance and Reshape targets;
 - complete Reshape brush footprint, including unavailable and out-of-world
   cells;
 - active packet queues, combat pressure, congestion, and blocked movement.
@@ -458,14 +458,13 @@ ownership.
 
 With sources selected, idle left-click dispatches from map ownership: neutral
 means focused whole-perimeter expansion and enemy means complete-cluster attack.
-Target staging stores complete enemy components. Policy keys submit metadata
-immediately. The Reshape brush exists only in single-cluster Reshape mode; idle
+Target staging stores complete enemy components. The Reshape brush exists only in single-cluster Reshape mode; idle
 left-drag is not a source-paint operation. Stop is the only state that snapshots
-explicit dispatch order IDs; policy-maintenance orders are not Stop targets.
+explicit dispatch order IDs.
 
 The contextual HUD is a compact text strip, not a command-button grid. It shows
-Share only for expansion/attack, selected policy or mixed state, and the exact
-keys for target staging, policy facing, Reshape, Stop, cancellation, or
+Share for expansion, attack, and Front Rebalance, and the exact keys for target
+staging, front selection, Reshape, Stop, cancellation, or
 submission. `?` toggles the full field manual.
 
 All command payloads are revalidated by the authority. The 32,768-cell
@@ -479,7 +478,7 @@ Whole-cluster interaction must not multiply pathfinding by the number of
 possible fronts. Focused expansion derives its reachable perimeter and shared
 branch weights once. Cluster attack enumerates all shared fronts once and uses
 one immutable target-mask topology. Previews cache by selection, cell-state,
-active-order, and policy revisions.
+active-order, and retask revisions.
 
 Rendering work remains viewport-bounded: dirty visible chunks update first,
 selection and target outlines inspect visible render chunks, and hidden chunks
@@ -537,11 +536,11 @@ High-value invariants include:
 ### Module and client integration
 
 The headless two-identity smoke covers join, match start, subscription,
-idempotent receipts, cluster expansion/attack and policy reducers, conserved
+idempotent receipts, cluster expansion/attack and front-rebalance reducers, conserved
 movement, exact selected-order cancellation, and token-based reconnect.
 Deterministic module and client cases pin complete-component authority,
 focused all-side allocation, immutable attack masks, multi-front progression,
-Share-once accounting, policy inheritance and live-packet exclusion,
+perimeter-local Share accounting and live-packet exclusion,
 best-effort Reshape, shared-child merging, and asynchronous split fairness.
 Command rejection, simultaneous hostile orders, full Conquest
 completion, schedule fault injection, and completed-match immutability remain
@@ -592,14 +591,14 @@ If Grok is unavailable, unreliable, or out of credits, use `gpt-5.6-sol` subagen
    owned clusters with multi-select and Select All.
 5. **Troop-flow slice:** add cell capacity, focused neutral expansion,
    target-masked enemy-cluster attack, complete-component authority,
-   Share-once branching waves, persistent cluster policies, best-effort
+   perimeter-local Share branching waves, explicit Front Rebalance, best-effort
    single-cluster Reshape, terrain-scaled garrisons, congestion, density
    shading, front/target previews, and ETA feedback.
 6. **Conflict slice:** add hostile edges, combat frontage, capture, elevation modifiers, disconnected components, and the Conquest win condition at 80% of capturable land.
 7. **Reliability slice:** add command idempotency, reconnect/reclaim, snapshot rebuild, scheduler recovery, deterministic replay fixtures, and completed-match handling.
 8. **Scale slice:** validate the 128 and 192 presets; retain 256, high-order-count traces, profiling, and soak gates as post-slice performance work.
 9. **Playable V1 pass:** curate several generated maps, improve contextual
-   cluster-action and policy legibility, add match setup/result screens, and use
+   cluster-action and front-rebalance legibility, add match setup/result screens, and use
    the asset workflow only where graybox presentation blocks evaluation.
 
 Each stage should leave a playable or executable end-to-end path. Do not build the lobby/orchestrator, production art pipeline, or speculative unit systems before the two-client troop-flow slice is measurable and understandable.

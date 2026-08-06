@@ -783,9 +783,6 @@ fn expansion_children(
     wave: &ExpansionWave,
     cell_id: u32,
 ) -> Result<Vec<u32>, String> {
-    if wave.selected_cells.len() != wave.seed_depths.len() {
-        return Err("expand topology has mismatched seed vectors".into());
-    }
     let parent_depth = wave_node_depth(wave, cell_id)
         .ok_or_else(|| format!("expand resting cell {cell_id} is outside its topology"))?;
 
@@ -838,17 +835,13 @@ fn focus_weights_for_coordinates(parent: Axial, children: &[Axial], focus: Axial
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaveNodeDepth {
-    Seed(u16),
+    Source,
     Outside(u16),
 }
 
 fn wave_node_depth(wave: &ExpansionWave, cell_id: u32) -> Option<WaveNodeDepth> {
-    if let Ok(index) = wave.selected_cells.binary_search(&cell_id) {
-        return wave
-            .seed_depths
-            .get(index)
-            .copied()
-            .map(WaveNodeDepth::Seed);
+    if wave.selected_cells.binary_search(&cell_id).is_ok() {
+        return Some(WaveNodeDepth::Source);
     }
     wave.outside_depths
         .get(cell_id as usize)
@@ -859,10 +852,7 @@ fn wave_node_depth(wave: &ExpansionWave, cell_id: u32) -> Option<WaveNodeDepth> 
 
 fn wave_depth_allows_child(parent: WaveNodeDepth, child: WaveNodeDepth) -> bool {
     match (parent, child) {
-        (WaveNodeDepth::Seed(parent), WaveNodeDepth::Seed(child)) => {
-            parent > 0 && child.checked_add(1) == Some(parent)
-        }
-        (WaveNodeDepth::Seed(0), WaveNodeDepth::Outside(1)) => true,
+        (WaveNodeDepth::Source, WaveNodeDepth::Outside(1)) => true,
         (WaveNodeDepth::Outside(parent), WaveNodeDepth::Outside(child)) => {
             parent.checked_add(1) == Some(child)
         }
@@ -2562,7 +2552,7 @@ mod tests {
         infantry: u64,
     }
 
-    fn run_policy_pipeline(
+    fn run_internal_pipeline(
         mut map: HexMap,
         mut packets: Vec<FunnelPacket>,
         station_blocked_remainders: bool,
@@ -2591,7 +2581,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let step = movement_step(&mut map, &intents, &movement, &logistics)
-                .expect("capacity-safe friendly policy pipeline");
+                .expect("capacity-safe friendly internal pipeline");
             let mut next_packets = Vec::new();
             for (index, packet) in packets.into_iter().enumerate() {
                 let outcome = &step.outcomes[&(index as u64 + 1)];
@@ -2614,7 +2604,10 @@ mod tests {
             }
             packets = next_packets;
         }
-        assert!(packets.is_empty(), "the queued policy pipeline must drain");
+        assert!(
+            packets.is_empty(),
+            "the queued internal pipeline must drain"
+        );
         (map, saw_capacity_backpressure, passes)
     }
 
@@ -2645,7 +2638,7 @@ mod tests {
         // 57 everywhere with the deterministic remainder at source C. Every
         // source-to-destination route crosses the already-full center, which
         // reproduces the large-cluster funnel that used to strand most of a
-        // policy order at intermediate capacity stops.
+        // internal order at intermediate capacity stops.
         let packets = vec![
             FunnelPacket {
                 route: vec![center, destination_a],
@@ -2678,7 +2671,7 @@ mod tests {
                 infantry: 42,
             },
         ];
-        run_policy_pipeline(map, packets, station_blocked_remainders, 16)
+        run_internal_pipeline(map, packets, station_blocked_remainders, 16)
     }
 
     fn test_order(kind: OrderKind, status: OrderStatus) -> TransferOrder {
@@ -2784,13 +2777,9 @@ mod tests {
     }
 
     #[test]
-    fn wave_depth_transitions_are_monotonic_and_cannot_form_cycles_or_rays() {
+    fn wave_depth_transitions_start_at_the_perimeter_and_cannot_form_cycles_or_rays() {
         assert!(wave_depth_allows_child(
-            WaveNodeDepth::Seed(2),
-            WaveNodeDepth::Seed(1)
-        ));
-        assert!(wave_depth_allows_child(
-            WaveNodeDepth::Seed(0),
+            WaveNodeDepth::Source,
             WaveNodeDepth::Outside(1)
         ));
         assert!(wave_depth_allows_child(
@@ -2798,8 +2787,8 @@ mod tests {
             WaveNodeDepth::Outside(4)
         ));
         assert!(!wave_depth_allows_child(
-            WaveNodeDepth::Seed(1),
-            WaveNodeDepth::Seed(1)
+            WaveNodeDepth::Source,
+            WaveNodeDepth::Source
         ));
         assert!(!wave_depth_allows_child(
             WaveNodeDepth::Outside(3),
@@ -2813,14 +2802,13 @@ mod tests {
         let wave = ExpansionWave {
             order_id: 1,
             selected_cells: vec![2, 4],
-            seed_depths: vec![1, 0],
             outside_depths: vec![u16::MAX, 1, u16::MAX, 2, u16::MAX],
             split_cursors: vec![0; 5],
             focus_cell_id: None,
             target_cells: Vec::new(),
         };
-        assert_eq!(wave_node_depth(&wave, 2), Some(WaveNodeDepth::Seed(1)));
-        assert_eq!(wave_node_depth(&wave, 4), Some(WaveNodeDepth::Seed(0)));
+        assert_eq!(wave_node_depth(&wave, 2), Some(WaveNodeDepth::Source));
+        assert_eq!(wave_node_depth(&wave, 4), Some(WaveNodeDepth::Source));
         assert_eq!(wave_node_depth(&wave, 1), Some(WaveNodeDepth::Outside(1)));
         assert_eq!(wave_node_depth(&wave, 0), None);
     }
@@ -2836,9 +2824,9 @@ mod tests {
         let parent = Axial::ZERO;
         let children = [Axial::new(1, 0), Axial::new(1, -1), Axial::new(-1, 0)];
         let weights = focus_weights_for_coordinates(parent, &children, Axial::new(3, 0));
-        assert_eq!(weights, vec![3, 2, 1]);
+        assert_eq!(weights, vec![11, 10, 9]);
 
-        let split = weighted_branch_allocations_rotated(&[12], &weights, 0).unwrap();
+        let split = weighted_branch_allocations_rotated(&[33], &weights, 0).unwrap();
         let by_child = split.allocations.into_iter().fold(
             vec![0_u64; children.len()],
             |mut totals, allocation| {
@@ -2846,7 +2834,7 @@ mod tests {
                 totals
             },
         );
-        assert_eq!(by_child, vec![6, 4, 2]);
+        assert_eq!(by_child, vec![12, 11, 10]);
         assert!(by_child[2] > 0, "the rear perimeter must remain active");
     }
 
@@ -2861,8 +2849,8 @@ mod tests {
         let west_weights = focus_weights_for_coordinates(west_parent, &west_children, focus);
         let east_weights = focus_weights_for_coordinates(east_parent, &east_children, focus);
 
-        assert_eq!(west_weights, vec![3, 1]);
-        assert_eq!(east_weights, vec![3, 1]);
+        assert_eq!(west_weights, vec![11, 9]);
+        assert_eq!(east_weights, vec![11, 9]);
 
         let split_totals = |weights: &[u8]| {
             weighted_branch_allocations_rotated(&[20], weights, 0)
@@ -2877,8 +2865,8 @@ mod tests {
         let west_split = split_totals(&west_weights);
         let east_split = split_totals(&east_weights);
 
-        assert_eq!(west_split, vec![15, 5]);
-        assert_eq!(east_split, vec![15, 5]);
+        assert_eq!(west_split, vec![11, 9]);
+        assert_eq!(east_split, vec![11, 9]);
         assert_eq!(west_split.iter().chain(&east_split).sum::<u64>(), 40);
         assert!(west_split[1] > 0 && east_split[1] > 0);
     }
@@ -3114,7 +3102,7 @@ mod tests {
             [Axial::new(1, 0), Axial::new(0, 1), Axial::new(1, -1)]
                 .into_iter()
                 .any(|coordinate| stationed.get(coordinate).unwrap().force() < 57),
-            "old stop-in-place behavior must leave declared policy demand undelivered"
+            "old stop-in-place behavior must leave declared internal demand undelivered"
         );
         assert!(
             [

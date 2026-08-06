@@ -13,8 +13,8 @@ The defining mechanic is **spatially conserved troop flow**:
 Army strength cannot be reassigned instantly from one border to another. Troops have a location, routes take time, destinations have finite capacity, and terrain creates bottlenecks. This should preserve high-level RTS control while making geography and logistics matter.
 
 V1 exists to answer one question: is selecting complete territorial clusters,
-contextually expanding or attacking with them, choosing persistent density
-policies, and fighting over a height-aware hex map understandable and fun?
+contextually expanding or attacking from their deployed fronts, explicitly
+rebalancing those fronts, and fighting over a height-aware hex map understandable and fun?
 
 ## Locked V1 Scope
 
@@ -131,8 +131,8 @@ sub-region. This keeps the primary decision strategic: choose which territorial
 forces participate, which territory to pressure, and how much free infantry to
 commit. Direct sub-cluster front surgery remains outside the V1 interaction.
 
-The HUD is keybind-first. A compact strip reports selection, current policy,
-Share when relevant, staged targets, preview validity, and submission state.
+The HUD is keybind-first. A compact strip reports selection, Share when relevant,
+staged targets, preview validity, and submission state.
 It does not repeat every command as a button grid. `?` opens the complete field
 manual.
 
@@ -159,9 +159,10 @@ action from the clicked cell's owner.
 
 Clicking unclaimed capturable ground issues **Expand Clusters**. Every selected
 source cluster with a reachable neutral perimeter participates across all of
-that perimeter. The click is a focus, not a destination. Branches that reduce
-distance to it receive weight 3, equal-distance branches weight 2, and branches
-moving away weight 1. When the committed integer strength is sufficient, each
+that perimeter using only troops already stationed on eligible boundary cells.
+Interior troops never feed the action automatically. The click is a focus, not
+a destination. Branches that reduce, preserve, or increase distance to it
+receive mild 11/10/9 weights. When the committed integer strength is sufficient, each
 eligible branch receives a positive baseline before the weighted remainder.
 Terrain, capacity, throughput, elevation, and terrain-scaled occupation
 garrisons can make the resulting outline bulge or stall. Expansion never enters
@@ -180,6 +181,9 @@ vector and no assumption that one direction fits every front arc. A branch never
 leaves the accepted target mask or silently attacks a newly adjacent cluster.
 Enemy infantry, frontage, terrain, elevation, throughput, capacity, and
 garrisons are evaluated authoritatively during progress.
+Only troops already stationed on cells sharing an accepted hostile front are
+committed. Reshape deploys inland reserves; Front Rebalance shifts strength
+between existing fronts.
 
 ### Force Share and live allocations
 
@@ -187,10 +191,10 @@ One persisted **Share** percentage applies to Expand Clusters, Attack Clusters,
 and Front Rebalance. `[` and `]` adjust it. It is independent of the mobilization
 target, which controls future civilian conversion.
 
-On acceptance, each participating source cell contributes Share of its
+On acceptance, each participating perimeter/front cell contributes Share of its
 action-available infantry exactly once: stationary free strength, excluding troops
-committed to another explicit action. A source with no eligible neutral route
-or shared enemy front contributes nothing. Multiple exits, shared fronts, or
+committed to another explicit action. Interior cells and sources with no eligible
+neutral edge or shared enemy front contribute nothing. Multiple exits, shared fronts, or
 staged target clusters never multiply the source base. Strength remains
 conserved as contributions split and merge.
 
@@ -287,7 +291,7 @@ V1 uses intentionally simple graybox graphics:
 - clear borders and selection highlights;
 - selected-cluster and enemy-target perimeters, exact active front edges,
   queues, and ETA;
-- policy and Reshape target-density heatmaps;
+- front-rebalance and Reshape target heatmaps;
 - a 52-pixel, text-only contextual key-hint strip showing the current mode,
   projection, invalid/submitting state, and exact next keys, plus a complete
   `?` field manual and compact side inspector/order summary;
@@ -318,8 +322,8 @@ Later, the Bevy client may render a small deterministic sample of representative
 - Tanks, discrete multi-hex vehicles, artillery, naval combat, or air combat.
 - Technology trees.
 - Full economic resources, production chains, trade, migration, jobs, happiness, training, evacuation, or demobilization.
-- Per-cell target-density scripting, policy priorities, conditional automation,
-  or automatic enemy-target selection beyond the four cluster policies.
+- Per-cell target-density scripting, conditional automation, or automatic
+  enemy-target selection.
 - Browser delivery, matchmaking, progression, or production operations.
 - Production art, asset generation, or a settled fiction/theme.
 
@@ -371,20 +375,18 @@ are true:
    adopting or cancelling active orders.
 6. Clicking neutral ground expands every reachable selected perimeter with a
    mild focus bias and positive all-side participation when strength permits.
+   Only troops already on eligible perimeter cells participate; no internal
+   support movement is created.
    The conserved wave respects terrain, capacity, throughput, garrisons, and
    hostile exclusion.
 7. Clicking one or more complete enemy clusters attacks every shared front.
    Fronts can turn, split, and merge as captures expose the immutable target
-   mask, but cannot escape it or duplicate source commitments.
+   mask, but cannot escape it, pull inland troops, or duplicate source commitments.
 8. One persisted Share applies exactly once per participating free source cell
-   and only to expansion and attack. Mobilization, policy, and Reshape remain
+   for expansion, attack, and Front Rebalance. Mobilization and Reshape remain
    independent of it.
-9. Balanced, Perimeter, Center, and Directional persist on clusters and adapt to
-   geometry. Policy targets exclude live action troops while reserving their
-   occupied capacity. Maintenance yields atomically to intersecting accepted
-   commands, queues at capacity bottlenecks, and replans relay movement from
-   current positions; explicit allocations and split, capture, and
-   newest-revision merge inheritance remain preserved.
+9. Front Rebalance moves one explicit Share from one strategic front to another;
+   topology changes never trigger automatic redistribution.
 10. One selected cluster can best-effort Reshape into a smaller or larger owned,
     passable troop footprint using its whole available pool. Exact fits drain
     movable strength outside; undersized shapes saturate and conserve overflow;
@@ -398,7 +400,7 @@ are true:
     and casualties, including attacks from several edges without double-counting
     defenders.
 14. Graybox overlays make source clusters, staged enemy targets, focused
-    expansion, policy/Reshape targets, active flows, blocked orders, and
+    expansion, front-rebalance/Reshape targets, active flows, blocked orders, and
     contested pressure understandable without production assets.
 15. Core tuning values are configurable so playtests can adjust the model
     without changing its data or interaction foundations.
@@ -411,12 +413,10 @@ are true:
   clearly enough, or does it need stronger branch-allocation preview?
 - Does attacking complete enemy clusters from every shared front produce
   understandable momentum as the masked fronts turn, split, and merge?
-- Is one Share value sufficient for both contextual actions, and is it always
-  clear that policies and Reshape ignore it?
-- Do persistent Balanced, Perimeter, Center, and Directional policies reduce
-  repetitive housekeeping without creating surprising troop motion?
-- Is excluding live action troops from policy targets intuitive once their
-  occupied capacity is still visible and reserved?
+- Is one Share value sufficient for expansion, attack, and Front Rebalance, and
+  is it clear that Reshape ignores it?
+- Does explicit Front Rebalance provide enough strategic control without
+  surprising automatic troop motion?
 - Does the one-cluster Reshape brush make contraction, enlargement, saturation,
   and conserved overflow legible?
 - Is exact Stop discoverable and precise enough without normal selection ever

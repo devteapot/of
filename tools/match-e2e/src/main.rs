@@ -407,7 +407,7 @@ struct ExpandAllCandidate {
     commitment_bps: u32,
     expected_requested: u64,
     expected_source_commitments: HashMap<u32, u64>,
-    seed_depths: HashMap<u32, u16>,
+    perimeter_sources: BTreeSet<u32>,
     outside_depths: HashMap<u32, u16>,
     children: HashMap<u32, Vec<u32>>,
     first_ring: HashSet<u32>,
@@ -418,6 +418,7 @@ struct ExpandAllCandidate {
 struct FocusedClusterExpandCandidate {
     source_seed: u32,
     source_component: BTreeSet<u32>,
+    approach_source: u32,
     focus_cell: u32,
     focus_distance: u32,
     expected_source_commitments: HashMap<u32, u64>,
@@ -520,7 +521,7 @@ fn main() -> Result<()> {
 
     println!("[3/10] verifying idempotent mobilization and its receipt");
     let mobilization_id = unused_command_id(&player_one.conn, PLAYER_ONE, COMMAND_ID_FLOOR)?;
-    // Keep recruitment stopped after proving the policy command. That makes
+    // Keep recruitment stopped after proving the mobilization command. That makes
     // the exact percentage snapshots below stable across simulation ticks.
     let target_bps = 0;
     player_one.set_mobilization_target(mobilization_id, target_bps, timeout)?;
@@ -1503,7 +1504,7 @@ fn exercise_cluster_first_controls(
             )?;
             ensure!(
                 order.status == OrderStatus::Active && order.in_transit_infantry > 0,
-                "focused cluster expansion exhausted before its policy-isolation check"
+                "focused cluster expansion exhausted before its front-local accounting check"
             );
             Ok(Some(order))
         },
@@ -1621,7 +1622,7 @@ fn exercise_cluster_first_controls(
         expand_id
     };
 
-    let contact_setup_command_id = establish_cluster_contact_with_expansions(
+    let mut contact_setup_command_id = establish_cluster_contact_with_expansions(
         client,
         PLAYER_TWO,
         PLAYER_ONE,
@@ -1630,6 +1631,62 @@ fn exercise_cluster_first_controls(
         poll,
     )?;
 
+    let setup_attack_candidate = select_cluster_attack_candidate(
+        &client.conn,
+        PLAYER_TWO,
+        PLAYER_ONE,
+        CLUSTER_ACTION_COMMITMENT_BPS,
+    )?;
+    if component_target_needs_reshape(
+        &client.conn,
+        &setup_attack_candidate.source_component,
+        setup_attack_candidate.source_seed,
+    )? {
+        let reshape_id = unused_command_id(
+            &client.conn,
+            PLAYER_TWO,
+            contact_setup_command_id
+                .checked_add(1)
+                .context("attack-front Reshape command ID overflow")?,
+        )?;
+        client.issue_reshape(
+            reshape_id,
+            &[setup_attack_candidate.source_seed],
+            &[setup_attack_candidate.source_seed],
+            &[],
+            timeout,
+        )?;
+        let receipt = wait_for_receipt(
+            client,
+            PLAYER_TWO,
+            reshape_id,
+            "issue_reshape",
+            timeout,
+            poll,
+        )?;
+        wait_until(
+            "explicit attack-front Reshape completion",
+            timeout,
+            poll,
+            || {
+                let Some(order) = client
+                    .conn
+                    .db
+                    .transfer_order()
+                    .order_id()
+                    .find(&receipt.order_id)
+                else {
+                    return Ok(None);
+                };
+                assert_order_conservation(&order)?;
+                Ok(
+                    (order.status == OrderStatus::Completed && order.in_transit_infantry == 0)
+                        .then_some(()),
+                )
+            },
+        )?;
+        contact_setup_command_id = reshape_id;
+    }
     let attack_candidate = select_cluster_attack_candidate(
         &client.conn,
         PLAYER_TWO,
@@ -1825,8 +1882,9 @@ fn establish_cluster_contact_with_expansions(
         CONTACT_EXPAND_COMMITMENT_BPS,
     )?
     .focus_distance;
-    let max_contact_expansion_attempts = usize::try_from(initial_contact_distance)
-        .context("neutral contact distance does not fit this platform")?;
+    let max_contact_expansion_attempts =
+        usize::try_from(initial_contact_distance.saturating_add(8))
+            .context("neutral contact attempt bound does not fit this platform")?;
     ensure!(
         max_contact_expansion_attempts > 0,
         "non-contacting clusters produced a zero neutral contact distance"
@@ -1838,6 +1896,61 @@ fn establish_cluster_contact_with_expansions(
             return Ok(last_command_id);
         }
 
+        let setup_candidate = select_contact_cluster_expand_candidate(
+            &client.conn,
+            player_id,
+            enemy_player_id,
+            CONTACT_EXPAND_COMMITMENT_BPS,
+        )?;
+        if contact_approach_needs_reshape(&client.conn, &setup_candidate)? {
+            let reshape_id = unused_command_id(
+                &client.conn,
+                player_id,
+                last_command_id
+                    .checked_add(1)
+                    .context("contact-setup Reshape command ID overflow")?,
+            )?;
+            client.issue_reshape(
+                reshape_id,
+                &[setup_candidate.source_seed],
+                &[setup_candidate.approach_source],
+                &[],
+                timeout,
+            )?;
+            let reshape_receipt = wait_for_receipt(
+                client,
+                player_id,
+                reshape_id,
+                "issue_reshape",
+                timeout,
+                poll,
+            )?;
+            wait_until(
+                "explicit contact-front Reshape completion",
+                timeout,
+                poll,
+                || {
+                    let Some(order) = client
+                        .conn
+                        .db
+                        .transfer_order()
+                        .order_id()
+                        .find(&reshape_receipt.order_id)
+                    else {
+                        return Ok(None);
+                    };
+                    assert_order_conservation(&order)?;
+                    Ok(
+                        (order.status == OrderStatus::Completed && order.in_transit_infantry == 0)
+                            .then_some(()),
+                    )
+                },
+            )?;
+            last_command_id = reshape_id;
+        }
+
+        // Re-read after the explicit distribution command. Expansion itself
+        // may commit only the infantry now present on its eligible perimeter.
         let candidate = select_contact_cluster_expand_candidate(
             &client.conn,
             player_id,
@@ -2023,8 +2136,40 @@ fn establish_cluster_contact_with_expansions(
     }
 
     bail!(
-        "failed to establish enemy contact after {max_contact_expansion_attempts} full-share cluster expansions across an initial {initial_contact_distance}-cell neutral contact path"
+        "failed to establish enemy contact after {max_contact_expansion_attempts} explicitly supplied front-local cluster expansions across an initial {initial_contact_distance}-cell neutral contact path"
     )
+}
+
+fn contact_approach_needs_reshape(
+    conn: &DbConnection,
+    candidate: &FocusedClusterExpandCandidate,
+) -> Result<bool> {
+    component_target_needs_reshape(conn, &candidate.source_component, candidate.approach_source)
+}
+
+fn component_target_needs_reshape(
+    conn: &DbConnection,
+    source_component: &BTreeSet<u32>,
+    target_cell: u32,
+) -> Result<bool> {
+    let target = conn
+        .db
+        .cell_state()
+        .cell_id()
+        .find(&target_cell)
+        .context("explicit distribution target disappeared")?;
+    if target.infantry >= target.military_capacity {
+        return Ok(false);
+    }
+    Ok(source_component.iter().any(|cell_id| {
+        *cell_id != target_cell
+            && conn
+                .db
+                .cell_state()
+                .cell_id()
+                .find(cell_id)
+                .is_some_and(|cell| cell.infantry > 0)
+    }))
 }
 
 fn assert_expansion_claimed_only_neutral(
@@ -3088,23 +3233,6 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u16) -> Result<Ex
             .map(|coordinate| cell_by_coordinate[coordinate])
             .collect::<Vec<_>>();
         let selected_ids = selected_cells.iter().copied().collect::<BTreeSet<_>>();
-        let mut expected_source_commitments = HashMap::new();
-        let mut expected_requested = 0_u64;
-        for &cell_id in &selected_cells {
-            let state = &cell_by_id[&cell_id];
-            let available = state
-                .infantry
-                .saturating_sub(allocated_by_cell.get(&cell_id).copied().unwrap_or(0));
-            let committed = basis_point_share(available, EXPAND_COMMITMENT_BPS);
-            expected_source_commitments.insert(cell_id, committed);
-            expected_requested = expected_requested
-                .checked_add(committed)
-                .context("all-front candidate commitment overflow")?;
-        }
-        if expected_requested == 0 {
-            continue;
-        }
-
         let mut boundary = BTreeSet::new();
         let mut first_ring = BTreeSet::new();
         for &source_coordinate in &component {
@@ -3132,13 +3260,21 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u16) -> Result<Ex
             continue;
         }
 
-        let seed_depths = wave_seed_depths(
-            &selected_ids,
+        let expected_source_commitments = expected_component_shares(
             &boundary,
-            &terrain_by_id,
-            &cell_by_coordinate,
-        );
-        if seed_depths.len() != selected_cells.len() {
+            &cell_by_id,
+            &allocated_by_cell,
+            EXPAND_COMMITMENT_BPS,
+        )?;
+        let expected_requested =
+            expected_source_commitments
+                .values()
+                .try_fold(0_u64, |total, &committed| {
+                    total
+                        .checked_add(committed)
+                        .context("all-front candidate commitment overflow")
+                })?;
+        if expected_requested == 0 {
             continue;
         }
         let outside_depths = wave_outside_depths(
@@ -3150,7 +3286,7 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u16) -> Result<Ex
             &cell_by_coordinate,
         );
         let children = wave_children(
-            &seed_depths,
+            &boundary,
             &outside_depths,
             &terrain_by_id,
             &cell_by_coordinate,
@@ -3160,10 +3296,10 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u16) -> Result<Ex
         }
 
         let turning_second_ring =
-            turning_second_ring_cells(&seed_depths, &outside_depths, &children, &terrain_by_id);
+            turning_second_ring_cells(&boundary, &outside_depths, &children, &terrain_by_id);
         let reached = forecast_wave_reach(
             &expected_source_commitments,
-            &seed_depths,
+            &boundary,
             &outside_depths,
             &children,
             &terrain_by_id,
@@ -3184,7 +3320,7 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u16) -> Result<Ex
             commitment_bps: EXPAND_COMMITMENT_BPS,
             expected_requested,
             expected_source_commitments,
-            seed_depths,
+            perimeter_sources: boundary,
             outside_depths,
             children,
             first_ring: first_ring.into_iter().collect(),
@@ -3230,6 +3366,8 @@ fn select_focused_cluster_expand_candidate(
     let mut candidates = Vec::new();
     for source_component in owned_traversable_components(conn, player_id)? {
         let mut first_ring = BTreeSet::new();
+        let mut approach_by_target = BTreeMap::new();
+        let mut perimeter_sources = BTreeSet::new();
         for &source_cell in &source_component {
             let source_terrain = &terrain_by_id[&source_cell];
             for coordinate in Axial::new(source_terrain.q, source_terrain.r).neighbors() {
@@ -3248,15 +3386,18 @@ fn select_focused_cluster_expand_candidate(
                         max_elevation_step,
                     )
                 {
+                    perimeter_sources.insert(source_cell);
                     first_ring.insert(target_cell);
+                    approach_by_target.entry(target_cell).or_insert(source_cell);
                 }
             }
         }
         let Some(&focus_cell) = first_ring.first() else {
             continue;
         };
+        let approach_source = approach_by_target[&focus_cell];
         let expected_source_commitments = expected_component_shares(
-            &source_component,
+            &perimeter_sources,
             &cell_by_id,
             &allocated_by_cell,
             commitment_bps,
@@ -3277,6 +3418,7 @@ fn select_focused_cluster_expand_candidate(
                 .first()
                 .context("owned component unexpectedly empty")?,
             source_component,
+            approach_source,
             focus_cell,
             focus_distance: 1,
             expected_source_commitments,
@@ -3322,7 +3464,7 @@ fn select_contact_cluster_expand_candidate(
     let allocated_by_cell = allocated_infantry_by_cell(conn, player_id)?;
     let mut candidates = Vec::new();
     for source_component in owned_traversable_components(conn, player_id)? {
-        let Some((distance, focus_cell)) = nearest_neutral_focus_toward_enemy(
+        let Some((distance, focus_cell, approach_source)) = nearest_neutral_focus_toward_enemy(
             &source_component,
             enemy_player_id,
             &terrain_by_id,
@@ -3332,8 +3474,15 @@ fn select_contact_cluster_expand_candidate(
         ) else {
             continue;
         };
-        let expected_source_commitments = expected_component_shares(
+        let perimeter_sources = neutral_perimeter_sources(
             &source_component,
+            &terrain_by_id,
+            &cell_by_id,
+            &cell_by_coordinate,
+            max_elevation_step,
+        );
+        let expected_source_commitments = expected_component_shares(
+            &perimeter_sources,
             &cell_by_id,
             &allocated_by_cell,
             commitment_bps,
@@ -3357,6 +3506,7 @@ fn select_contact_cluster_expand_candidate(
             FocusedClusterExpandCandidate {
                 source_seed,
                 source_component,
+                approach_source,
                 focus_cell,
                 focus_distance: distance,
                 expected_source_commitments,
@@ -3389,7 +3539,7 @@ fn nearest_neutral_focus_toward_enemy(
     cell_by_id: &HashMap<u32, CellState>,
     cell_by_coordinate: &HashMap<Axial, u32>,
     max_elevation_step: u16,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32, u32)> {
     let mut reached = BTreeSet::new();
     let mut pending = VecDeque::new();
     for &source_cell in source_component {
@@ -3415,12 +3565,12 @@ fn nearest_neutral_focus_toward_enemy(
                 )
                 && reached.insert(neighbor)
             {
-                pending.push_back((neighbor, 1_u32));
+                pending.push_back((neighbor, 1_u32, source_cell));
             }
         }
     }
 
-    while let Some((current, distance)) = pending.pop_front() {
+    while let Some((current, distance, approach_source)) = pending.pop_front() {
         let terrain = terrain_by_id.get(&current)?;
         let neighbors = Axial::new(terrain.q, terrain.r)
             .neighbors()
@@ -3438,7 +3588,7 @@ fn nearest_neutral_focus_toward_enemy(
                     max_elevation_step,
                 )
         }) {
-            return Some((distance, current));
+            return Some((distance, current, approach_source));
         }
         for neighbor in neighbors {
             let Some(state) = cell_by_id.get(&neighbor) else {
@@ -3458,7 +3608,7 @@ fn nearest_neutral_focus_toward_enemy(
                 )
                 && reached.insert(neighbor)
             {
-                pending.push_back((neighbor, distance.saturating_add(1)));
+                pending.push_back((neighbor, distance.saturating_add(1), approach_source));
             }
         }
     }
@@ -3505,20 +3655,6 @@ fn select_cluster_attack_candidate(
     let mut pairs_with_outside_guard = 0_usize;
     let mut candidates = Vec::new();
     for source_component in &source_components {
-        let expected_source_commitments = expected_component_shares(
-            source_component,
-            &cell_by_id,
-            &allocated_by_cell,
-            commitment_bps,
-        )?;
-        let expected_requested =
-            expected_source_commitments
-                .values()
-                .try_fold(0_u64, |total, &commitment| {
-                    total
-                        .checked_add(commitment)
-                        .context("enemy-cluster attack commitment overflow")
-                })?;
         for target_component in &target_components {
             let mut shared_front_sources = BTreeSet::new();
             let mut shared_front_targets = BTreeSet::new();
@@ -3545,6 +3681,20 @@ fn select_cluster_attack_candidate(
                 continue;
             }
             shared_component_pairs += 1;
+            let expected_source_commitments = expected_component_shares(
+                &shared_front_sources,
+                &cell_by_id,
+                &allocated_by_cell,
+                commitment_bps,
+            )?;
+            let expected_requested =
+                expected_source_commitments
+                    .values()
+                    .try_fold(0_u64, |total, &commitment| {
+                        total
+                            .checked_add(commitment)
+                            .context("enemy-cluster attack commitment overflow")
+                    })?;
             if expected_requested == 0 {
                 continue;
             }
@@ -3591,7 +3741,7 @@ fn select_cluster_attack_candidate(
                 target_component: target_component.clone(),
                 shared_front_targets,
                 outside_guard_cells,
-                expected_source_commitments: expected_source_commitments.clone(),
+                expected_source_commitments,
                 expected_requested,
             });
         }
@@ -3767,6 +3917,41 @@ fn expected_component_shares(
         .collect()
 }
 
+fn neutral_perimeter_sources(
+    component: &BTreeSet<u32>,
+    terrain_by_id: &HashMap<u32, CellTerrain>,
+    cell_by_id: &HashMap<u32, CellState>,
+    cell_by_coordinate: &HashMap<Axial, u32>,
+    max_elevation_step: u16,
+) -> BTreeSet<u32> {
+    component
+        .iter()
+        .copied()
+        .filter(|source_cell| {
+            let source = &terrain_by_id[source_cell];
+            Axial::new(source.q, source.r)
+                .neighbors()
+                .into_iter()
+                .any(|coordinate| {
+                    let Some(&target_cell) = cell_by_coordinate.get(&coordinate) else {
+                        return false;
+                    };
+                    let target_state = &cell_by_id[&target_cell];
+                    let target_terrain = &terrain_by_id[&target_cell];
+                    target_state.owner_player_id == 0
+                        && target_terrain.passable
+                        && target_terrain.capturable
+                        && terrain_edge_is_traversable_with_limit(
+                            terrain_by_id,
+                            *source_cell,
+                            target_cell,
+                            max_elevation_step,
+                        )
+                })
+        })
+        .collect()
+}
+
 fn terrain_edge_is_traversable_with_limit(
     terrain_by_id: &HashMap<u32, CellTerrain>,
     from_cell: u32,
@@ -3794,38 +3979,6 @@ fn terrain_edge_is_traversable(
         .is_some_and(|(from, to)| {
             from.passable && to.passable && from.elevation.abs_diff(to.elevation) <= 1
         })
-}
-
-fn wave_seed_depths(
-    selected: &BTreeSet<u32>,
-    boundary: &BTreeSet<u32>,
-    terrain_by_id: &HashMap<u32, CellTerrain>,
-    cell_by_coordinate: &HashMap<Axial, u32>,
-) -> HashMap<u32, u16> {
-    let mut depths = HashMap::new();
-    let mut pending = VecDeque::new();
-    for &cell_id in boundary {
-        depths.insert(cell_id, 0_u16);
-        pending.push_back(cell_id);
-    }
-    while let Some(current_id) = pending.pop_front() {
-        let depth = depths[&current_id];
-        let current = &terrain_by_id[&current_id];
-        for neighbor in Axial::new(current.q, current.r).neighbors() {
-            let Some(&neighbor_id) = cell_by_coordinate.get(&neighbor) else {
-                continue;
-            };
-            if !selected.contains(&neighbor_id)
-                || depths.contains_key(&neighbor_id)
-                || !terrain_edge_is_traversable(terrain_by_id, current_id, neighbor_id)
-            {
-                continue;
-            }
-            depths.insert(neighbor_id, depth.saturating_add(1));
-            pending.push_back(neighbor_id);
-        }
-    }
-    depths
 }
 
 fn wave_outside_depths(
@@ -3868,26 +4021,20 @@ fn wave_outside_depths(
 }
 
 fn wave_children(
-    seed_depths: &HashMap<u32, u16>,
+    perimeter_sources: &BTreeSet<u32>,
     outside_depths: &HashMap<u32, u16>,
     terrain_by_id: &HashMap<u32, CellTerrain>,
     cell_by_coordinate: &HashMap<Axial, u32>,
 ) -> HashMap<u32, Vec<u32>> {
     let mut result = HashMap::new();
-    for (&cell_id, &depth) in seed_depths {
-        let wanted_seed = depth.checked_sub(1);
+    for &cell_id in perimeter_sources {
         let current = &terrain_by_id[&cell_id];
         let mut targets = Axial::new(current.q, current.r)
             .neighbors()
             .into_iter()
             .filter_map(|coordinate| cell_by_coordinate.get(&coordinate).copied())
             .filter(|target| terrain_edge_is_traversable(terrain_by_id, cell_id, *target))
-            .filter(|target| {
-                wanted_seed.map_or_else(
-                    || outside_depths.get(target) == Some(&1),
-                    |wanted| seed_depths.get(target) == Some(&wanted),
-                )
-            })
+            .filter(|target| outside_depths.get(target) == Some(&1))
             .collect::<Vec<_>>();
         targets.sort_unstable();
         targets.dedup();
@@ -3910,7 +4057,7 @@ fn wave_children(
 }
 
 fn turning_second_ring_cells(
-    seed_depths: &HashMap<u32, u16>,
+    perimeter_sources: &BTreeSet<u32>,
     outside_depths: &HashMap<u32, u16>,
     children: &HashMap<u32, Vec<u32>>,
     terrain_by_id: &HashMap<u32, CellTerrain>,
@@ -3929,7 +4076,7 @@ fn turning_second_ring_cells(
                     let parent_coordinate = axial_for_cell(terrain_by_id, parent);
                     let outward = target_coordinate - parent_coordinate;
                     children.iter().any(|(&boundary, targets)| {
-                        seed_depths.get(&boundary) == Some(&0)
+                        perimeter_sources.contains(&boundary)
                             && targets.contains(&parent)
                             && parent_coordinate - axial_for_cell(terrain_by_id, boundary)
                                 != outward
@@ -3942,32 +4089,16 @@ fn turning_second_ring_cells(
 #[allow(clippy::too_many_arguments)]
 fn forecast_wave_reach(
     commitments: &HashMap<u32, u64>,
-    seed_depths: &HashMap<u32, u16>,
+    perimeter_sources: &BTreeSet<u32>,
     outside_depths: &HashMap<u32, u16>,
     children: &HashMap<u32, Vec<u32>>,
     terrain_by_id: &HashMap<u32, CellTerrain>,
     cell_by_id: &HashMap<u32, CellState>,
     max_depth: u16,
 ) -> HashSet<u32> {
-    let mut pools = commitments.clone();
-    let max_seed_depth = seed_depths.values().copied().max().unwrap_or(0);
-    for depth in (1..=max_seed_depth).rev() {
-        let cells = seed_depths
-            .iter()
-            .filter_map(|(&cell_id, &candidate)| (candidate == depth).then_some(cell_id))
-            .collect::<Vec<_>>();
-        for cell_id in cells {
-            let amount = pools.remove(&cell_id).unwrap_or(0);
-            distribute_wave_pool(amount, children.get(&cell_id), &mut pools);
-        }
-    }
-    let boundary = seed_depths
-        .iter()
-        .filter_map(|(&cell_id, &depth)| (depth == 0).then_some(cell_id))
-        .collect::<Vec<_>>();
     let mut incoming = HashMap::new();
-    for cell_id in boundary {
-        let amount = pools.remove(&cell_id).unwrap_or(0);
+    for &cell_id in perimeter_sources {
+        let amount = commitments.get(&cell_id).copied().unwrap_or(0);
         distribute_wave_pool(amount, children.get(&cell_id), &mut incoming);
     }
 
@@ -4337,9 +4468,9 @@ fn assert_expand_persistence(
             "all-front packet must be one resting node or one monotonic wave edge"
         );
         ensure!(
-            candidate.seed_depths.contains_key(&packet.current_cell)
+            candidate.perimeter_sources.contains(&packet.current_cell)
                 || candidate.outside_depths.contains_key(&packet.current_cell),
-            "all-front packet rests outside its accepted seed/wave topology"
+            "all-front packet rests outside its accepted perimeter/wave topology"
         );
         ensure!(
             packet.origin_cell == EXPANSION_AGGREGATE_ORIGIN,
@@ -4432,7 +4563,7 @@ fn assert_cluster_action_order(
     command_id: u64,
     kind: OrderKind,
     expected_requested: u64,
-    expected_source_cells: &BTreeSet<u32>,
+    expected_source_component: &BTreeSet<u32>,
     expected_source_commitments: &HashMap<u32, u64>,
     require_exact_source_snapshot: bool,
 ) -> Result<()> {
@@ -4501,16 +4632,17 @@ fn assert_cluster_action_order(
                     .context("pre-command cluster source commitment overflow")
             })?;
     ensure!(
-        expected_snapshot_cells == *expected_source_cells
+        expected_snapshot_cells.is_subset(expected_source_component)
             && expected_snapshot_total == expected_requested,
-        "cluster action test fixture has inconsistent source cells or commitment total"
+        "cluster action test fixture has sources outside its component or an inconsistent commitment total"
     );
     ensure!(
-        actual_source_cells == *expected_source_cells,
-        "authority did not expand the one-cell seed to exactly one complete owned component for order {}: expected {} cells {:?}, got {} cells {:?}",
+        actual_source_cells == expected_snapshot_cells,
+        "authority did not restrict order {} to its participating perimeter/front: expected {} cells {:?} inside component {:?}, got {} cells {:?}",
         order.order_id,
-        expected_source_cells.len(),
-        expected_source_cells,
+        expected_snapshot_cells.len(),
+        expected_snapshot_cells,
+        expected_source_component,
         actual_source_cells.len(),
         actual_source_cells,
     );

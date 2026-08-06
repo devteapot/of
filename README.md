@@ -21,9 +21,10 @@ The exact control contract lives in
 - Per-hex civilians, infantry, civilian capacity, and military capacity.
 - A global mobilization target that converts population locally over time.
 - Contextual neutral expansion from every selected perimeter, mildly weighted
-  toward the clicked focus while preserving all-side pressure.
+  toward the clicked focus and powered only by troops already on that perimeter.
 - Target-mask enemy attacks from every shared front. Branches dynamically turn
-  through the selected enemy clusters and never escape into an unselected one.
+  through the selected enemy clusters and never escape into an unselected one;
+  only troops already stationed on a shared hostile front participate.
 - One persisted Force Share setting for expansion, attack, and explicit
   front-to-front rebalancing, independent of mobilization and applied once per
   participating free source cell.
@@ -182,13 +183,17 @@ are absorbed, while both surviving children of a split remain selected.
 
 Expansion, attack, and Front Rebalance use Share. Each participating source
 cell contributes that percentage of its action-available infantry once:
-stationary free strength, but never troops committed to another explicit action. This
-happens once regardless of how many fronts or target clusters are involved.
+stationary free strength, but never troops committed to another explicit action.
+For expansion and attack, participating sources are only the perimeter cells
+that already touch an eligible neutral edge or accepted hostile target. Interior
+troops do not move automatically; use Reshape to deploy inland reserves, while
+Front Rebalance shifts strength between existing fronts. This
+happens once regardless of how many edges or target clusters are involved.
 Repeating the exact same contextual click while it is in flight immediately
 queues another independent order against the remaining action-available pool;
 two 10% clicks on an unchanged pool of 100 therefore commit 10 and then 9.
 Expansion allocates a positive all-side baseline when integer strength permits
-and weights branches that approach the clicked focus more strongly. Attack
+and applies a small 11/10/9 closer/equal/farther focus weight. Attack
 snapshots the accepted enemy-cluster mask and advances through it from all shared fronts;
 local branches may turn, split, merge, stall, or be defeated as terrain,
 capacity, throughput, garrisons, and defenders are re-evaluated. An attack

@@ -9,7 +9,6 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct ExpansionWave {
     pub order_id: u64,
     pub selected_cells: Vec<u32>,
-    pub seed_depths: Vec<u16>,
     pub outside_depths: Vec<u16>,
     pub split_cursors: Vec<u8>,
     pub focus_cell_id: Option<u32>,
@@ -26,7 +25,6 @@ impl __sdk::InModule for ExpansionWave {
 pub struct ExpansionWaveCols {
     pub order_id: __sdk::__query_builder::Col<ExpansionWave, u64>,
     pub selected_cells: __sdk::__query_builder::Col<ExpansionWave, Vec<u32>>,
-    pub seed_depths: __sdk::__query_builder::Col<ExpansionWave, Vec<u16>>,
     pub outside_depths: __sdk::__query_builder::Col<ExpansionWave, Vec<u16>>,
     pub split_cursors: __sdk::__query_builder::Col<ExpansionWave, Vec<u8>>,
     pub focus_cell_id: __sdk::__query_builder::Col<ExpansionWave, Option<u32>>,
@@ -39,7 +37,6 @@ impl __sdk::__query_builder::HasCols for ExpansionWave {
         ExpansionWaveCols {
             order_id: __sdk::__query_builder::Col::new(table_name, "order_id"),
             selected_cells: __sdk::__query_builder::Col::new(table_name, "selected_cells"),
-            seed_depths: __sdk::__query_builder::Col::new(table_name, "seed_depths"),
             outside_depths: __sdk::__query_builder::Col::new(table_name, "outside_depths"),
             split_cursors: __sdk::__query_builder::Col::new(table_name, "split_cursors"),
             focus_cell_id: __sdk::__query_builder::Col::new(table_name, "focus_cell_id"),

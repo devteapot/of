@@ -177,7 +177,7 @@ Larger maps, long-running worlds, or multiple linked theaters could amplify logi
 **Depends on:** benchmarks at several map sizes, chunked storage and rendering, interest management, hierarchical routing, regional aggregation, persistence/versioning, and a game loop that remains active while distant forces travel. Scale should grow because it improves decisions, not because the renderer can display more hexes.
 
 Before increasing the V1 32,768-cell current-world command cap, measure the
-private cluster-wave topology, policy redistribution routes, packet counts, and
+private cluster-wave topology, explicit redistribution routes, packet counts, and
 subscription churn. Coalesce shared topology where those measurements justify
 it. Track active packet count through the F3 `FLOWS` metric while profiling
 representative wide fronts.

@@ -91,7 +91,8 @@ Public state is split by read/update pattern:
 - `combat_front` exposes the current contested edges and casualties.
 
 `simulation_schedule`, `expansion_wave`, and `expansion_garrison_debt` are
-private. A wave stores its deterministic inward/outward topology, optional
+private. A wave stores its deterministic outward topology, participating
+perimeter cells, optional
 neutral focus, immutable enemy target mask, and rotating fair-split cursors.
 Sparse cell-keyed garrison debt ensures partial asynchronous arrivals finish the
 full occupation cost before later strength branches, even when another wave
@@ -110,11 +111,12 @@ The cluster-first client uses these gameplay reducers:
   points.
 - `issue_expand_clusters` — expand every complete owned cluster touched by the
   source seeds across its full reachable neutral perimeter. The clicked neutral
-  cell is a focus: deterministic 3/2/1 branch weights favor progress toward it
-  without suppressing the rest of the perimeter.
+  cell is a focus: mild deterministic 11/10/9 branch weights favor progress
+  toward it without suppressing the rest of the perimeter. Only troops already
+  on eligible neutral-facing perimeter cells participate.
 - `issue_attack_clusters` — expand source and target seeds to complete owned
   and enemy clusters, snapshot the enemy target union, and start from every
-  shared passable front. Captures reveal the next masked cells, so local branches
+  shared passable front using only troops stationed on that front. Captures reveal the next masked cells, so local branches
   can turn, split, and merge but can never leave the accepted targets.
 - `issue_front_rebalance` — move one Share of movable troops from a selected
   strategic front to another front of the same complete owned cluster.
@@ -129,7 +131,8 @@ Cluster reducers accept sparse seed IDs and expand them authoritatively. The
 client therefore cannot create a hidden sub-cluster action by omitting cells.
 Share is a basis-point field on expansion, attack, and Front Rebalance; it is
 applied once to stationary action-available infantry in each participating
-source. Existing explicit allocations remain fixed and reserve their physical
+perimeter/front source. Inland cells contribute nothing until explicitly
+rebalanced. Existing explicit allocations remain fixed and reserve their physical
 capacity.
 
 Front Rebalance derives current strategic arcs from authoritative ownership and

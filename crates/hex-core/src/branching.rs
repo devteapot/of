@@ -8,13 +8,14 @@ use crate::Axial;
 /// like a scalar potential, not one global heading copied onto every front.
 /// Consequently, opposed edges around an enclosed focus point in opposed
 /// directions. Every branch remains eligible: moving toward the focus receives
-/// weight 3, moving along an equal-distance contour receives weight 2, and
-/// moving away receives weight 1.
+/// weight 11, moving along an equal-distance contour receives weight 10, and
+/// moving away receives weight 9. The narrow spread keeps the click directional
+/// without overriding the existing troop distribution along the perimeter.
 pub fn focus_branch_weight(parent: Axial, child: Axial, focus: Axial) -> u8 {
     match child.distance(focus).cmp(&parent.distance(focus)) {
-        Ordering::Less => 3,
-        Ordering::Equal => 2,
-        Ordering::Greater => 1,
+        Ordering::Less => 11,
+        Ordering::Equal => 10,
+        Ordering::Greater => 9,
     }
 }
 
@@ -204,19 +205,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn focus_weights_are_three_two_one_by_hex_distance() {
+    fn focus_weights_are_mildly_biased_by_hex_distance() {
         let parent = Axial::ZERO;
         let focus = Axial::new(3, 0);
 
-        assert_eq!(focus_branch_weight(parent, Axial::new(1, 0), focus), 3);
-        assert_eq!(focus_branch_weight(parent, Axial::new(1, -1), focus), 2);
-        assert_eq!(focus_branch_weight(parent, Axial::new(-1, 0), focus), 1);
+        assert_eq!(focus_branch_weight(parent, Axial::new(1, 0), focus), 11);
+        assert_eq!(focus_branch_weight(parent, Axial::new(1, -1), focus), 10);
+        assert_eq!(focus_branch_weight(parent, Axial::new(-1, 0), focus), 9);
     }
 
     #[test]
     fn focus_on_the_parent_keeps_every_outward_weight_positive() {
         for child in Axial::ZERO.neighbors() {
-            assert_eq!(focus_branch_weight(Axial::ZERO, child, Axial::ZERO), 1);
+            assert_eq!(focus_branch_weight(Axial::ZERO, child, Axial::ZERO), 9);
         }
     }
 
@@ -229,8 +230,8 @@ mod tests {
             let inward = focus;
             let outward = parent + direction;
 
-            assert_eq!(focus_branch_weight(parent, inward, focus), 3);
-            assert_eq!(focus_branch_weight(parent, outward, focus), 1);
+            assert_eq!(focus_branch_weight(parent, inward, focus), 11);
+            assert_eq!(focus_branch_weight(parent, outward, focus), 9);
 
             let split = weighted_branch_quotas_rotated(
                 20,
@@ -241,7 +242,7 @@ mod tests {
                 0,
             )
             .unwrap();
-            assert_eq!(split.by_child, vec![15, 5]);
+            assert_eq!(split.by_child, vec![11, 9]);
             assert_eq!(split.by_child.iter().sum::<u64>(), 20);
             assert!(split.by_child[1] > 0, "the opposite perimeter stays active");
         }

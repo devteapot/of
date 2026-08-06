@@ -58,7 +58,6 @@ struct PreparedOrderPersistence {
 struct PlannedExpansion {
     kind: OrderKind,
     selected_cells: Vec<u32>,
-    seed_depths: Vec<u16>,
     outside_depths: Vec<u16>,
     focus_cell_id: Option<u32>,
     target_cells: Vec<u32>,
@@ -240,8 +239,9 @@ pub fn issue_push_front(
     )
 }
 
-/// Commits one fixed share of every selected cell's currently unallocated
-/// infantry to a branching perimeter wave around the selected region.
+/// Commits one fixed share of currently unallocated infantry already stationed
+/// on each eligible neutral-facing perimeter cell. Interior troops remain in
+/// place until the player explicitly rebalances them to a front.
 #[spacetimedb::reducer]
 pub fn issue_expand_all(
     ctx: &ReducerContext,
@@ -1314,7 +1314,6 @@ fn plan_neutral_expansion(
 
     let selected_ids = &selection.source_cells;
     let mut coordinate_to_id = BTreeMap::new();
-    let mut commitments = BTreeMap::new();
     for cell_id in selected_ids.iter().copied() {
         let terrain_row = terrain(ctx, cell_id)?;
         let cell = core_cell(ctx, cell_id)?;
@@ -1324,14 +1323,6 @@ fn plan_neutral_expansion(
             ));
         }
         coordinate_to_id.insert(cell.coordinate, cell_id);
-        let allocated = allocated_infantry_at_cell(ctx, player_id, cell_id);
-        let available = available_after_retask_release(
-            cell.force(),
-            allocated,
-            selection.released_at(cell_id),
-        )?;
-        let commitment = basis_point_share(available, commitment_bps);
-        commitments.insert(cell_id, commitment);
     }
     let selected_coordinates = coordinate_to_id.keys().copied().collect::<BTreeSet<_>>();
     let match_config = config(ctx)?;
@@ -1373,8 +1364,6 @@ fn plan_neutral_expansion(
         .iter()
         .map(|edge| eligible_targets[&(edge.source, edge.target)])
         .collect::<BTreeSet<_>>();
-    let seed_depth_by_id = seed_inward_depths(ctx, &coordinate_to_id, &boundary_cells)?;
-
     let cell_count = usize::from(match_config.map_width)
         .checked_mul(usize::from(match_config.map_height))
         .ok_or_else(|| "map cell count overflow".to_string())?;
@@ -1387,24 +1376,20 @@ fn plan_neutral_expansion(
         cell_count,
     )?;
 
-    let selected_cells = seed_depth_by_id.keys().copied().collect::<Vec<_>>();
-    commitments.retain(|cell_id, _| seed_depth_by_id.contains_key(cell_id));
+    let selected_cells = boundary_cells.iter().copied().collect::<Vec<_>>();
+    let commitments =
+        perimeter_commitments(ctx, player_id, selection, &boundary_cells, commitment_bps)?;
     let requested = commitments.values().try_fold(0_u64, |total, commitment| {
         total
             .checked_add(*commitment)
             .ok_or_else(|| "expand requested infantry overflow".to_string())
     })?;
     if requested == 0 {
-        return Err("the active expand regions have no uncommitted infantry".into());
+        return Err("the eligible neutral perimeters have no uncommitted infantry".into());
     }
-    let seed_depths = selected_cells
-        .iter()
-        .map(|cell_id| seed_depth_by_id[cell_id])
-        .collect();
     Ok(PlannedExpansion {
         kind,
         selected_cells,
-        seed_depths,
         outside_depths,
         focus_cell_id,
         target_cells: Vec::new(),
@@ -1427,7 +1412,6 @@ fn plan_attack_clusters(
 
     let selected_ids = &selection.source_cells;
     let mut coordinate_to_id = BTreeMap::new();
-    let mut commitments = BTreeMap::new();
     for cell_id in selected_ids.iter().copied() {
         let terrain_row = terrain(ctx, cell_id)?;
         let cell = core_cell(ctx, cell_id)?;
@@ -1437,13 +1421,6 @@ fn plan_attack_clusters(
             ));
         }
         coordinate_to_id.insert(cell.coordinate, cell_id);
-        let allocated = allocated_infantry_at_cell(ctx, player_id, cell_id);
-        let available = available_after_retask_release(
-            cell.force(),
-            allocated,
-            selection.released_at(cell_id),
-        )?;
-        commitments.insert(cell_id, basis_point_share(available, commitment_bps));
     }
     let selected_coordinates = coordinate_to_id.keys().copied().collect::<BTreeSet<_>>();
     let match_config = config(ctx)?;
@@ -1482,16 +1459,15 @@ fn plan_attack_clusters(
         .iter()
         .map(|edge| eligible_targets[&(edge.source, edge.target)])
         .collect::<BTreeSet<_>>();
-    let seed_depth_by_id = seed_inward_depths(ctx, &coordinate_to_id, &boundary_cells)?;
-
     let cell_count = usize::from(match_config.map_width)
         .checked_mul(usize::from(match_config.map_height))
         .ok_or_else(|| "map cell count overflow".to_string())?;
     let outside_depths =
         masked_wave_depths(ctx, &match_config, target_cells, &first_ring, cell_count)?;
 
-    let selected_cells = seed_depth_by_id.keys().copied().collect::<Vec<_>>();
-    commitments.retain(|cell_id, _| seed_depth_by_id.contains_key(cell_id));
+    let selected_cells = boundary_cells.iter().copied().collect::<Vec<_>>();
+    let commitments =
+        perimeter_commitments(ctx, player_id, selection, &boundary_cells, commitment_bps)?;
     let requested = commitments.values().try_fold(0_u64, |total, commitment| {
         total
             .checked_add(*commitment)
@@ -1500,14 +1476,9 @@ fn plan_attack_clusters(
     if requested == 0 {
         return Err("the shared attack fronts have no uncommitted infantry".into());
     }
-    let seed_depths = selected_cells
-        .iter()
-        .map(|cell_id| seed_depth_by_id[cell_id])
-        .collect();
     Ok(PlannedExpansion {
         kind: OrderKind::AttackClusters,
         selected_cells,
-        seed_depths,
         outside_depths,
         focus_cell_id: None,
         target_cells: target_cells.iter().copied().collect(),
@@ -1516,39 +1487,27 @@ fn plan_attack_clusters(
     })
 }
 
-fn seed_inward_depths(
+fn perimeter_commitments(
     ctx: &ReducerContext,
-    coordinate_to_id: &BTreeMap<Axial, u32>,
-    boundary_cells: &BTreeSet<u32>,
-) -> Result<BTreeMap<u32, u16>, String> {
-    let mut depths = BTreeMap::new();
-    let mut pending = VecDeque::new();
-    for &cell_id in boundary_cells {
-        depths.insert(cell_id, 0_u16);
-        pending.push_back(cell_id);
-    }
-    while let Some(current_id) = pending.pop_front() {
-        let current_depth = depths[&current_id];
-        let current_coordinate = coordinate_for_cell(ctx, current_id)?;
-        let mut neighbors = current_coordinate.neighbors();
-        neighbors.sort_unstable();
-        for neighbor_coordinate in neighbors {
-            let Some(&neighbor_id) = coordinate_to_id.get(&neighbor_coordinate) else {
-                continue;
-            };
-            if depths.contains_key(&neighbor_id)
-                || edge_runtime_limits(ctx, neighbor_id, current_id)?.is_none()
-            {
-                continue;
-            }
-            let depth = current_depth
-                .checked_add(1)
-                .ok_or_else(|| "expand seed depth overflow".to_string())?;
-            depths.insert(neighbor_id, depth);
-            pending.push_back(neighbor_id);
-        }
-    }
-    Ok(depths)
+    player_id: u16,
+    selection: &RetaskSelection,
+    perimeter_cells: &BTreeSet<u32>,
+    commitment_bps: u32,
+) -> Result<BTreeMap<u32, u64>, String> {
+    perimeter_cells
+        .iter()
+        .copied()
+        .map(|cell_id| {
+            let cell = core_cell(ctx, cell_id)?;
+            let allocated = allocated_infantry_at_cell(ctx, player_id, cell_id);
+            let available = available_after_retask_release(
+                cell.force(),
+                allocated,
+                selection.released_at(cell_id),
+            )?;
+            Ok((cell_id, basis_point_share(available, commitment_bps)))
+        })
+        .collect()
 }
 
 fn outside_wave_depths(
@@ -2740,9 +2699,6 @@ fn persist_expand_order(
     ) {
         return Err("expand topology received an invalid order kind".into());
     }
-    if plan.selected_cells.len() != plan.seed_depths.len() {
-        return Err("expand topology has mismatched seed vectors".into());
-    }
     if plan.selected_cells.contains(&EXPANSION_AGGREGATE_ORIGIN) {
         return Err("map cell id collides with the expansion aggregate sentinel".into());
     }
@@ -2795,7 +2751,6 @@ fn persist_expand_order(
     ctx.db.expansion_wave().insert(ExpansionWave {
         order_id: order.order_id,
         selected_cells: plan.selected_cells,
-        seed_depths: plan.seed_depths,
         split_cursors: vec![0; plan.outside_depths.len()],
         outside_depths: plan.outside_depths,
         focus_cell_id: plan.focus_cell_id,

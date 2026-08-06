@@ -402,8 +402,9 @@ pub struct TransitPacket {
 
 /// Compact private topology for one branching neutral or cluster-attack wave.
 ///
-/// `selected_cells` and `seed_depths` are parallel sorted vectors. A seed
-/// depth of zero marks the selected perimeter; larger values flow toward zero.
+/// `selected_cells` is the sorted set of owned perimeter cells that committed
+/// troops when the order was accepted. Expansion starts directly at those
+/// cells; it never creates an internal support corridor through owned ground.
 /// `outside_depths[cell_id]` is the static multi-source BFS distance from the
 /// first destination ring, starting at one, or `u16::MAX` when unreachable.
 #[derive(Clone)]
@@ -412,12 +413,11 @@ pub struct ExpansionWave {
     #[primary_key]
     pub order_id: u64,
     pub selected_cells: Vec<u32>,
-    pub seed_depths: Vec<u16>,
     pub outside_depths: Vec<u16>,
     /// Per-cell rotating remainder cursor for unbiased asynchronous splits.
     pub split_cursors: Vec<u8>,
-    /// Optional neutral click objective. Branch weights are 3/2/1 according
-    /// to whether a child moves closer/equally/farther from this cell.
+    /// Optional neutral click objective. Branch weights mildly favor children
+    /// that move closer to this cell.
     pub focus_cell_id: Option<u32>,
     /// Immutable sorted enemy footprint for `AttackClusters`. Empty for both
     /// neutral expansion variants. Attack branches may never leave this mask.

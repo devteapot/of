@@ -59,8 +59,7 @@ arrives. Merges absorb the newly connected owned cells. If ownership splits a
 selected component, each surviving selected child keeps its outline.
 
 The HUD selection summary reports cluster count, selected hex count, free
-infantry, action-committed infantry, and common policy. Different selected
-policies display as **Mixed**, not a guessed winner.
+infantry, and action-committed infantry.
 
 ### Neutral expansion feedback
 
@@ -140,7 +139,7 @@ The compact command strip switches between these states:
    `X`, and selection keys.
 2. **Attack targets staged** — target count, all shared fronts, LMB/Enter submit,
    Shift toggle, Control remove, Escape back.
-3. **Directional policy gesture** — exact facing vector and release-to-apply.
+3. **Front Rebalance gesture** — source/target strategic fronts and release-to-preview.
 4. **Reshape drawing** — brush dimensions, available pool, capacity, and drawing
    controls.
 5. **Reshape ready** — projected fit/overflow and LMB/Enter confirmation.
@@ -160,14 +159,12 @@ The right panel remains inspection-level:
 - active map view;
 - hovered cell coordinate, terrain, elevation, owner, capacity, and occupants;
 - selected cluster/source summary;
-- common or Mixed policy;
 - active order/front counts and latest receipt.
 
 The bottom contextual strip is action-level. It shows the current state and only
-the relevant keys. Share appears only for neutral expansion and enemy attack.
-Policy and Reshape instead show free/available strength and reserved active
-occupancy. `?` contains explanations rather than forcing long copy into the
-map view.
+the relevant keys. Share appears for neutral expansion, enemy attack, and Front
+Rebalance. Reshape instead shows free/available strength and reserved active
+occupancy. `?` contains explanations rather than forcing long copy into the map view.
 
 ## Map encodings
 
@@ -178,7 +175,7 @@ Use a small, composable overlay vocabulary:
 - staged enemy cluster: solid hostile perimeter with shared fronts emphasized;
 - expansion focus: target marker plus weighted all-perimeter branches;
 - active wave: current packet/front segments, congestion, and blocked edges;
-- policy/Reshape: target-density heatmap;
+- front-rebalance/Reshape: target heatmap;
 - unavailable brush: distinct warning tint;
 - out-of-world brush: translucent third tint that preserves intended geometry;
 - contested cell: controller/attacker pressure blend while ownership stays
