@@ -40,20 +40,50 @@ use overlays::OverlayPlugin;
 use performance::PerformanceOverlayPlugin;
 use population_outline::PopulationOutlinePlugin;
 use terrain::{spawn_terrain, sync_terrain_chunks};
+use worldgen::v2::{WorldSpec, generate as generate_v2};
 
 fn main() {
     let config = ClientConfig::from_process();
-    let match_view = if config.offline {
+    let match_view = if let Some(options) = &config.layered_world {
+        eprintln!(
+            "Generating layered V2 viewer map {}x{} · {} players · seed {}…",
+            options.width, options.height, options.players, options.seed
+        );
+        let mut spec = WorldSpec::new(
+            format!("viewer-v2-{}x{}", options.width, options.height),
+            options.width,
+            options.height,
+            options.seed,
+        );
+        spec.player_count = options.players;
+        let world = generate_v2(&spec).unwrap_or_else(|error| {
+            eprintln!("failed to generate layered V2 viewer map: {error}");
+            std::process::exit(2);
+        });
+        eprintln!(
+            "Generated {:016x} · {} land · {} lake · {} river cells",
+            world.manifest.content_hash,
+            world.manifest.land_cells,
+            world.manifest.lake_cells,
+            world.manifest.river_cells,
+        );
+        MatchView::offline_layered_world(&world, config.preferred_player)
+    } else if config.offline {
         MatchView::offline_fixture()
     } else {
         MatchView::connecting(config.preferred_player)
+    };
+    let window_title = if config.layered_world.is_some() {
+        "Hex RTS · Layered V2 Viewer".to_owned()
+    } else {
+        format!("Hex RTS · V1 {}", config.mode_label())
     };
     let mut app = App::new();
     app.insert_resource(config.clone())
         .insert_resource(match_view)
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: format!("Hex RTS · V1 {}", config.mode_label()),
+                title: window_title,
                 resolution: WindowResolution::new(1440, 900),
                 resizable: true,
                 canvas: Some("#game-canvas".to_owned()),

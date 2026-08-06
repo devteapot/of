@@ -2991,6 +2991,7 @@ dependencies = [
  "spacetimedb-sdk",
  "wasm-bindgen-futures",
  "web-sys",
+ "worldgen",
 ]
 
 [[package]]

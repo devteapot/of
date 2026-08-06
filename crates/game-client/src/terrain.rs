@@ -558,7 +558,11 @@ fn recolor_chunk_mesh(
 
 fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapViewMode) -> [f32; 4] {
     let base = if cell.is_water() {
-        Color::srgb(0.055, 0.16, 0.21)
+        if cell.lake {
+            Color::srgb(0.075, 0.27, 0.31)
+        } else {
+            Color::srgb(0.055, 0.16, 0.21)
+        }
     } else {
         match cell.owner {
             Some(player) => player_color(player).unwrap_or_else(|| terrain_color(cell.terrain)),
@@ -577,6 +581,13 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
             )
         },
     );
+    if cell.river && cell.is_land() {
+        linear = mix_linear_rgba(
+            linear,
+            LinearRgba::from(Color::srgb(0.055, 0.34, 0.43)),
+            0.46,
+        );
+    }
     let intensity = match mode {
         MapViewMode::Overview => 0.42,
         MapViewMode::Soldiers => normalized_soldier_strength(
@@ -660,14 +671,20 @@ fn normalized_share(share: f32) -> f32 {
 }
 
 fn mix_linear_colors(controller: Color, attacker: Color, attacker_share: f32) -> LinearRgba {
-    let controller = LinearRgba::from(controller);
-    let attacker = LinearRgba::from(attacker);
-    let controller_share = 1.0 - attacker_share;
+    mix_linear_rgba(
+        LinearRgba::from(controller),
+        LinearRgba::from(attacker),
+        attacker_share,
+    )
+}
+
+fn mix_linear_rgba(first: LinearRgba, second: LinearRgba, second_share: f32) -> LinearRgba {
+    let first_share = 1.0 - second_share;
     LinearRgba::new(
-        controller.red * controller_share + attacker.red * attacker_share,
-        controller.green * controller_share + attacker.green * attacker_share,
-        controller.blue * controller_share + attacker.blue * attacker_share,
-        controller.alpha * controller_share + attacker.alpha * attacker_share,
+        first.red * first_share + second.red * second_share,
+        first.green * first_share + second.green * second_share,
+        first.blue * first_share + second.blue * second_share,
+        first.alpha * first_share + second.alpha * second_share,
     )
 }
 
@@ -723,6 +740,8 @@ mod tests {
         CellView {
             coordinate: Axial::ZERO,
             terrain: TerrainKind::Plains,
+            river: false,
+            lake: false,
             elevation: 1,
             owner: Some(PLAYER_ONE),
             civilians,
@@ -747,6 +766,39 @@ mod tests {
         // Curated first-eight palette stays pinned.
         assert_eq!(player_color(1), Some(Color::srgb(0.06, 0.48, 0.58)));
         assert_eq!(player_color(2), Some(Color::srgb(0.76, 0.24, 0.16)));
+    }
+
+    #[test]
+    fn layered_hydrology_has_distinct_viewer_colors() {
+        let ordinary = test_cell(0, 0, 100);
+        let river = CellView {
+            river: true,
+            ..ordinary.clone()
+        };
+        let lake = CellView {
+            terrain: TerrainKind::Water,
+            lake: true,
+            ..ordinary.clone()
+        };
+        let ocean = CellView {
+            terrain: TerrainKind::Water,
+            ..ordinary.clone()
+        };
+
+        let visibly_distinct = |first: [f32; 4], second: [f32; 4]| {
+            first
+                .into_iter()
+                .zip(second)
+                .any(|(first, second)| (first - second).abs() > 1.0e-6)
+        };
+        assert!(visibly_distinct(
+            cell_color(&river, None, MapViewMode::Overview),
+            cell_color(&ordinary, None, MapViewMode::Overview)
+        ));
+        assert!(visibly_distinct(
+            cell_color(&lake, None, MapViewMode::Overview),
+            cell_color(&ocean, None, MapViewMode::Overview)
+        ));
     }
 
     #[test]

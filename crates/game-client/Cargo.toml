@@ -14,6 +14,7 @@ bevy = { workspace = true, features = ["3d", "ui"] }
 hex-core = { workspace = true }
 match-bindings = { path = "../match-bindings" }
 spacetimedb-sdk.workspace = true
+worldgen = { path = "../worldgen" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy = { workspace = true, features = ["x11"] }

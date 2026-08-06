@@ -1,7 +1,8 @@
 # Layered world generator V2
 
-Status: implemented offline generator contract; authoritative match integration
-is deliberately separate from the pinned V1 map format.
+Status: implemented offline generator contract and native client viewer;
+authoritative match integration is deliberately separate from the pinned V1
+map format.
 
 ## Purpose
 
@@ -62,6 +63,28 @@ The default remains V1:
 cargo run -p mapgen -- --preset validation
 ```
 
+### Native client viewer
+
+Generate V2 in-process and open it in the existing offline Bevy viewer:
+
+```bash
+./scripts/run-client.sh --offline --worldgen-v2 \
+  --map-width 512 --map-height 512 \
+  --map-players 32 --map-seed 42
+```
+
+With no map options, `--worldgen-v2` defaults to a 256 x 256 map, two players,
+and seed 42. The ordinary `--offline` command still loads the small hand-built
+fixture. V2 oceans and lakes use separate water tones, and river-bearing land
+cells receive a blue-green overlay while retaining their plain, hill, plateau,
+valley, or mountain geometry. Generated spawn neighborhoods are assigned to
+their players so the normal ownership and interaction overlays remain usable.
+
+The current renderer builds 8 x 8 render chunks with bounded per-frame work,
+but eventually retains every chunk. A 256 or 512 square map is the practical
+viewer starting point; million-cell runtime play still needs resident-set
+terrain streaming as described below.
+
 Generate and validate a custom layered map:
 
 ```bash
@@ -120,10 +143,11 @@ SpacetimeDB schema and Bevy client still materialize full per-cell/per-edge
 state and must not switch to V2 at that size without runtime terrain streaming,
 sparse wave topology, and map-size-based subscription/simulation policies.
 
-## Runtime integration boundary
+## Authoritative runtime integration boundary
 
-V2 is intentionally not selected by the match reducer yet. Safe integration
-requires a versioned terrain adapter and generated bindings, followed by:
+The offline client can project V2 into its viewer model, but V2 is intentionally
+not selected by the match reducer yet. Safe authoritative integration requires
+versioned generated bindings, followed by:
 
 - packed immutable chunk storage or deterministic client-side regeneration;
 - spatial terrain interest and a resident-set renderer;

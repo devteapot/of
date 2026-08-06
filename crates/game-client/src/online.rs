@@ -2191,6 +2191,8 @@ fn cell_view_from_rows(
             match_bindings::TerrainClass::Hills => TerrainKind::Hills,
             match_bindings::TerrainClass::Mountain => TerrainKind::Mountain,
         },
+        river: false,
+        lake: false,
         elevation: terrain.elevation,
         owner: state.and_then(|state| owner(state.owner_player_id)),
         civilians: state.map_or(0, |state| state.civilians),

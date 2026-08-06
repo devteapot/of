@@ -341,6 +341,8 @@ mod tests {
         CellView {
             coordinate,
             terrain: TerrainKind::Plains,
+            river: false,
+            lake: false,
             elevation: 1,
             owner,
             civilians: 20,
