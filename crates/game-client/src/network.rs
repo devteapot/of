@@ -8,28 +8,18 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bevy::prelude::*;
 use hex_core::{
-    Axial, BALANCE_WEIGHT, Cell, DirectedFrontEdge, DistributionError,
-    DistributionPreset as CoreDistributionPreset, ForceComposition, FrontSelectionError, HexMap,
-    LocalFrontRoute, LogisticsConfig, MovementConfig, MovementIntent, focus_branch_weight,
-    ground_traversal, movement_step, redistribution_targets_with_commitment,
+    Axial, Cell, DirectedFrontEdge, DistributionError, ForceComposition, FrontSelectionError,
+    HexMap, LocalFrontRoute, LogisticsConfig, MovementConfig, MovementIntent,
+    UNIFORM_ALLOCATION_WEIGHT, focus_branch_weight, ground_traversal, movement_step,
     redistribution_targets_with_fallback_constraints, selected_all_front_edges,
     selected_directional_routes, selected_front_edges, selected_local_front_routes,
     weighted_branch_quotas_rotated,
 };
 
-pub use crate::model::ClusterPolicy;
 use crate::model::{
-    ActiveFlow, ActiveFront, ClusterPolicyView, MatchPhase, MatchView,
-    OrderSelectionProjectionError, ProjectedOrderSelection, ToastKind,
+    ActiveFlow, ActiveFront, MatchPhase, MatchView, OrderSelectionProjectionError,
+    ProjectedOrderSelection, ToastKind,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RedistributionPreset {
-    Balance,
-    FrontLoad,
-    CoreLoad,
-    PerimeterLoad,
-}
 
 #[derive(Message, Clone, Debug)]
 pub enum ClientIntent {
@@ -50,18 +40,20 @@ pub enum ClientIntent {
         commitment_percent: u8,
     },
     /// Changes metadata for every complete owned cluster touched by `sources`.
-    /// This never retasks active action packets; the background policy solves
-    /// only their currently free strength in residual capacity.
-    SetClusterPolicy {
-        sources: BTreeSet<Axial>,
-        policy: ClusterPolicy,
-        direction: Option<Axial>,
-    },
     PushFront {
         sources: BTreeSet<Axial>,
         supersede_order_ids: BTreeSet<u64>,
         direction: Axial,
         commitment_percent: u8,
+    },
+    /// One-shot movement of Share from one strategic perimeter arc to another
+    /// on exactly one complete owned component.
+    FrontRebalance {
+        source_component_cells: BTreeSet<Axial>,
+        source_front_seed: Axial,
+        target_front_seed: Axial,
+        commitment_percent: u8,
+        supersede_order_ids: BTreeSet<u64>,
     },
     ExpandAll {
         sources: BTreeSet<Axial>,
@@ -75,14 +67,6 @@ pub enum ClientIntent {
     },
     CancelOrders {
         order_ids: BTreeSet<u64>,
-    },
-    Redistribute {
-        cells: BTreeSet<Axial>,
-        supersede_order_ids: BTreeSet<u64>,
-        preset: RedistributionPreset,
-        /// Exact fixed-point axial orientation for directional Bias. This is
-        /// intentionally not restricted to the six neighboring Push axes.
-        direction: Option<Axial>,
     },
     SetMobilization {
         target: f32,
@@ -149,7 +133,7 @@ impl Plugin for OfflineTransportPlugin {
 
 pub fn resolve_offline_intents(
     mut intents: MessageReader<ClientIntent>,
-    mut view: ResMut<MatchView>,
+    view: Res<MatchView>,
     mut updates: MessageWriter<ServerUpdate>,
 ) {
     for intent in intents.read() {
@@ -164,17 +148,6 @@ pub fn resolve_offline_intents(
                 targets,
                 commitment_percent,
             } => resolve_attack_clusters(&view, sources, targets, *commitment_percent),
-            ClientIntent::SetClusterPolicy {
-                sources,
-                policy,
-                direction,
-            } => {
-                let update = resolve_cluster_policy(&view, sources, *policy, *direction);
-                if matches!(update, ServerUpdate::Accepted { .. }) {
-                    persist_offline_cluster_policy(&mut view, sources, *policy, *direction);
-                }
-                update
-            }
             ClientIntent::PushFront {
                 sources,
                 supersede_order_ids,
@@ -187,6 +160,11 @@ pub fn resolve_offline_intents(
                 *direction,
                 *commitment_percent,
             ),
+            ClientIntent::FrontRebalance { .. } => ServerUpdate::Rejected {
+                command_id: None,
+                reason: "Front Rebalance requires an authoritative online match".to_owned(),
+                relevant_cell: None,
+            },
             ClientIntent::ExpandAll {
                 sources,
                 supersede_order_ids,
@@ -207,18 +185,6 @@ pub fn resolve_offline_intents(
                 reason: "Stopping exact orders requires an authoritative online match".to_owned(),
                 relevant_cell: None,
             },
-            ClientIntent::Redistribute {
-                cells,
-                supersede_order_ids,
-                preset,
-                direction,
-            } => resolve_redistribution_with_retask(
-                &view,
-                cells,
-                supersede_order_ids,
-                *preset,
-                *direction,
-            ),
             ClientIntent::SetMobilization { target } => ServerUpdate::MobilizationChanged {
                 command_id: None,
                 target: target.clamp(0.0, 1.0),
@@ -228,311 +194,7 @@ pub fn resolve_offline_intents(
     }
 }
 
-fn resolve_cluster_policy(
-    view: &MatchView,
-    sources: &BTreeSet<Axial>,
-    policy: ClusterPolicy,
-    direction: Option<Axial>,
-) -> ServerUpdate {
-    if sources.is_empty() {
-        return rejection("Cluster policy needs at least one selected cluster", None);
-    }
-    if let Some(invalid) = sources
-        .iter()
-        .find(|coordinate| !view.is_local_owned_passable(**coordinate))
-    {
-        return rejection(
-            "Cluster policy sources must be owned passable ground",
-            Some(*invalid),
-        );
-    }
-    if policy == ClusterPolicy::Directional
-        && direction.is_none_or(|orientation| orientation == Axial::ZERO)
-    {
-        return rejection(
-            "Directional cluster policy needs a visible orientation",
-            sources.first().copied(),
-        );
-    }
-    if policy != ClusterPolicy::Directional && direction.is_some() {
-        return rejection(
-            "Only the directional cluster policy accepts an orientation",
-            sources.first().copied(),
-        );
-    }
-    let complete_sources = offline_local_clusters(view)
-        .into_iter()
-        .filter(|cluster| !cluster.is_disjoint(sources))
-        .flatten()
-        .collect::<BTreeSet<_>>();
-    let assignment = ClusterPolicyView {
-        kind: policy,
-        orientation: direction.unwrap_or(Axial::ZERO),
-        revision: 0,
-    };
-    // Setting metadata is authoritative; its first redistribution is only a
-    // best-effort convenience. In particular, an active action reservation
-    // must not make the persistent policy edit itself fail.
-    let patches = offline_policy_maintenance_targets(view, &complete_sources, assignment)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(coordinate, infantry)| CellPatch {
-            coordinate,
-            owner: Some(view.local_player),
-            infantry,
-        })
-        .collect();
-    ServerUpdate::Accepted {
-        command_id: None,
-        summary: format!(
-            "Cluster policy set to {} · free troops redistributed · active dispatches remain committed",
-            policy.label()
-        ),
-        patches,
-        flow: None,
-        front: None,
-    }
-}
-
-fn persist_offline_cluster_policy(
-    view: &mut MatchView,
-    seeds: &BTreeSet<Axial>,
-    policy: ClusterPolicy,
-    direction: Option<Axial>,
-) {
-    let revision = view
-        .cluster_policies
-        .values()
-        .map(|assignment| assignment.revision)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    let orientation = direction.unwrap_or(Axial::ZERO);
-    let selected = offline_local_clusters(view)
-        .into_iter()
-        .filter(|cluster| !cluster.is_disjoint(seeds))
-        .flatten()
-        .collect::<BTreeSet<_>>();
-    for coordinate in selected {
-        view.cluster_policies.insert(
-            coordinate,
-            ClusterPolicyView {
-                kind: policy,
-                orientation,
-                revision,
-            },
-        );
-    }
-}
-
-fn offline_local_clusters(view: &MatchView) -> Vec<BTreeSet<Axial>> {
-    let mut remaining = view
-        .cells
-        .keys()
-        .filter(|coordinate| view.is_local_owned_passable(**coordinate))
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut clusters = Vec::new();
-    while let Some(seed) = remaining.pop_first() {
-        let mut cluster = BTreeSet::from([seed]);
-        let mut pending = VecDeque::from([seed]);
-        while let Some(current) = pending.pop_front() {
-            for neighbor in current.neighbors() {
-                if remaining.contains(&neighbor)
-                    && view.is_local_traversable_edge(current, neighbor)
-                    && remaining.remove(&neighbor)
-                {
-                    cluster.insert(neighbor);
-                    pending.push_back(neighbor);
-                }
-            }
-        }
-        clusters.push(cluster);
-    }
-    clusters
-}
-
-fn reconcile_offline_cluster_policies(view: &mut MatchView) {
-    let existing = view.cluster_policies.clone();
-    let mut reconciled = BTreeMap::new();
-    for cluster in offline_local_clusters(view) {
-        let winner = cluster
-            .iter()
-            .filter_map(|coordinate| {
-                existing
-                    .get(coordinate)
-                    .copied()
-                    .map(|policy| (*coordinate, policy))
-            })
-            .max_by_key(|(coordinate, policy)| (policy.revision, *coordinate))
-            .map_or(ClusterPolicyView::BALANCED_DEFAULT, |(_, policy)| policy);
-        reconciled.extend(cluster.into_iter().map(|coordinate| (coordinate, winner)));
-    }
-    view.cluster_policies = reconciled;
-}
-
-/// Re-applies every surviving offline cluster policy after a local action has
-/// changed strength or ownership. The real authority persists background
-/// redistribution orders and retries them over time; the offline fixture has
-/// no simulation clock for those orders, so it performs one deterministic
-/// best-effort transfer immediately.
-///
-/// Live action strength remains fixed at its current cell and reduces that
-/// cell's usable capacity. Outstanding inbound reservations also reduce the
-/// amount moved into a destination. A malformed projection or temporarily
-/// impossible distribution simply leaves that component alone: maintenance
-/// must never turn an already accepted action into a rejection.
-fn maintain_offline_cluster_policies(view: &mut MatchView) {
-    for cluster in offline_local_clusters(view) {
-        let Some(policy) = cluster
-            .first()
-            .and_then(|coordinate| view.cluster_policy_at(*coordinate))
-        else {
-            continue;
-        };
-        let Ok(targets) = offline_policy_maintenance_targets(view, &cluster, policy) else {
-            continue;
-        };
-        for (coordinate, infantry) in targets {
-            let Some(cell) = view.cell_mut(coordinate) else {
-                continue;
-            };
-            cell.infantry = infantry.min(cell.military_capacity);
-        }
-    }
-}
-
-fn offline_policy_maintenance_targets(
-    view: &MatchView,
-    cluster: &BTreeSet<Axial>,
-    policy: ClusterPolicyView,
-) -> Result<BTreeMap<Axial, u64>, &'static str> {
-    let preset = match policy.kind {
-        ClusterPolicy::Balanced => CoreDistributionPreset::Balance,
-        ClusterPolicy::Center => CoreDistributionPreset::CoreLoad,
-        ClusterPolicy::Perimeter => CoreDistributionPreset::PerimeterLoad,
-        ClusterPolicy::Directional if policy.orientation != Axial::ZERO => {
-            CoreDistributionPreset::front_load(policy.orientation)
-        }
-        ClusterPolicy::Directional => return Err("directional policy has no orientation"),
-    };
-    let projection = view
-        .project_order_selection(cluster, &BTreeSet::new())
-        .map_err(|_| "cluster policy projection is stale")?;
-
-    let mut map = HexMap::new();
-    let mut free_strength = 0_u64;
-    for &coordinate in cluster {
-        let cell = view
-            .cell(coordinate)
-            .ok_or("cluster policy cell is missing")?;
-        let affected = projection
-            .affected_strength_by_cell
-            .get(&coordinate)
-            .copied()
-            .unwrap_or(0);
-        let fixed = projection
-            .unaffected_strength_by_cell
-            .get(&coordinate)
-            .copied()
-            .unwrap_or(0);
-        free_strength = free_strength
-            .checked_add(affected)
-            .ok_or("cluster policy strength overflow")?;
-        map.insert(projected_cell(cell, affected, fixed));
-    }
-    let distribution = redistribution_targets_with_commitment(
-        &map,
-        view.local_player,
-        cluster.iter().copied(),
-        free_strength,
-        preset,
-        10_000,
-    )
-    .map_err(|_| "cluster policy distribution is temporarily unavailable")?;
-
-    // Authority subtracts unrelated inbound reservations from each desired
-    // increase before planning transfer legs. Reproduce that behavior instead
-    // of applying the ideal heatmap outright: source surplus with no currently
-    // safe destination simply stays where it is until the next maintenance.
-    let mut desired = BTreeMap::new();
-    let mut demands = BTreeMap::new();
-    let mut requested = 0_u64;
-    for (&coordinate, &affected_target) in &distribution.targets {
-        let current = view
-            .cell(coordinate)
-            .ok_or("cluster policy cell disappeared")?
-            .infantry;
-        let fixed = projection
-            .unaffected_strength_by_cell
-            .get(&coordinate)
-            .copied()
-            .unwrap_or(0);
-        let target = fixed
-            .checked_add(affected_target)
-            .ok_or("cluster policy target overflow")?;
-        desired.insert(coordinate, target);
-        if target > current {
-            let reserved = projection
-                .unrelated_destination_reservations_by_cell
-                .get(&coordinate)
-                .copied()
-                .unwrap_or(0);
-            let demand = (target - current).saturating_sub(reserved);
-            if demand > 0 {
-                demands.insert(coordinate, demand);
-                requested = requested
-                    .checked_add(demand)
-                    .ok_or("cluster policy demand overflow")?;
-            }
-        }
-    }
-    if requested == 0 {
-        return Ok(BTreeMap::new());
-    }
-
-    let mut result = cluster
-        .iter()
-        .map(|&coordinate| {
-            view.cell(coordinate)
-                .map(|cell| (coordinate, cell.infantry))
-                .ok_or("cluster policy cell disappeared")
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let mut remaining = requested;
-    for &coordinate in cluster {
-        if remaining == 0 {
-            break;
-        }
-        let current = result[&coordinate];
-        let target = desired[&coordinate];
-        let moved = current.saturating_sub(target).min(remaining);
-        if moved > 0 {
-            result.insert(coordinate, current - moved);
-            remaining -= moved;
-        }
-    }
-    if remaining != 0 {
-        return Err("cluster policy demand exceeds movable strength");
-    }
-    for (coordinate, demand) in demands {
-        let current = result[&coordinate];
-        result.insert(
-            coordinate,
-            current
-                .checked_add(demand)
-                .ok_or("cluster policy result overflow")?,
-        );
-    }
-    result.retain(|coordinate, infantry| {
-        view.cell(*coordinate)
-            .is_some_and(|cell| cell.infantry != *infantry)
-    });
-    Ok(result)
-}
-
 pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: ResMut<MatchView>) {
-    let mut offline_cells_changed = false;
     let mut offline_ownership_changed = false;
     for update in updates.read() {
         match update {
@@ -544,7 +206,6 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
                 front,
                 ..
             } => {
-                offline_cells_changed |= !patches.is_empty();
                 for patch in patches {
                     if let Some(cell) = view.cell_mut(patch.coordinate) {
                         offline_ownership_changed |= cell.owner != patch.owner;
@@ -586,11 +247,6 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
 
     if offline_ownership_changed {
         view.mark_ownership_changed();
-    }
-
-    if offline_cells_changed && matches!(view.authority, crate::model::AuthorityState::Offline) {
-        reconcile_offline_cluster_policies(&mut view);
-        maintain_offline_cluster_policies(&mut view);
     }
 
     if view.authoritative_control.is_none() {
@@ -2277,83 +1933,6 @@ fn expand_error_message(error: FrontSelectionError) -> &'static str {
     }
 }
 
-#[cfg(test)]
-fn resolve_redistribution(
-    view: &MatchView,
-    cells: &BTreeSet<Axial>,
-    preset: RedistributionPreset,
-    direction: Option<Axial>,
-) -> ServerUpdate {
-    resolve_redistribution_with_retask(view, cells, &BTreeSet::new(), preset, direction)
-}
-
-fn resolve_redistribution_with_retask(
-    view: &MatchView,
-    cells: &BTreeSet<Axial>,
-    supersede_order_ids: &BTreeSet<u64>,
-    preset: RedistributionPreset,
-    direction: Option<Axial>,
-) -> ServerUpdate {
-    let projection = match view.project_order_selection(cells, supersede_order_ids) {
-        Ok(projection) => projection,
-        Err(error) => return projection_rejection(error),
-    };
-    resolve_projected_redistribution(view, &projection, preset, direction)
-}
-
-fn resolve_projected_redistribution(
-    view: &MatchView,
-    projection: &ProjectedOrderSelection,
-    preset: RedistributionPreset,
-    direction: Option<Axial>,
-) -> ServerUpdate {
-    let core_preset = match preset {
-        RedistributionPreset::Balance => CoreDistributionPreset::Balance,
-        RedistributionPreset::FrontLoad => {
-            let Some(direction) = direction.filter(|direction| *direction != Axial::ZERO) else {
-                return rejection(
-                    "Directional Bias direction is too short",
-                    projection.cells.first().copied(),
-                );
-            };
-            CoreDistributionPreset::front_load(direction)
-        }
-        RedistributionPreset::CoreLoad => CoreDistributionPreset::CoreLoad,
-        RedistributionPreset::PerimeterLoad => CoreDistributionPreset::PerimeterLoad,
-    };
-
-    let plan = match projected_redistribution_distribution(view, projection, core_preset) {
-        Ok(plan) => plan,
-        Err(reason) => return rejection(reason, projection.cells.first().copied()),
-    };
-    let patches = plan
-        .final_strength_by_cell
-        .into_iter()
-        .map(|(coordinate, infantry)| CellPatch {
-            coordinate,
-            owner: Some(view.local_player),
-            infantry,
-        })
-        .collect();
-
-    let label = match preset {
-        RedistributionPreset::Balance => "Formation · Balanced",
-        RedistributionPreset::FrontLoad => "Directional Bias",
-        RedistributionPreset::CoreLoad => "Formation · Center",
-        RedistributionPreset::PerimeterLoad => "Formation · Perimeter",
-    };
-    ServerUpdate::Accepted {
-        command_id: None,
-
-        summary: format!(
-            "{label} accepted · {} available infantry redistributed",
-            plan.participating_strength,
-        ),
-        patches,
-        flow: None,
-        front: None,
-    }
-}
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProjectedDistribution {
     pub final_strength_by_cell: BTreeMap<Axial, u64>,
@@ -2362,93 +1941,6 @@ pub(crate) struct ProjectedDistribution {
     pub destination_capacity: u64,
     pub destination_strength: u64,
     pub outside_strength: u64,
-}
-
-pub(crate) fn projected_redistribution_distribution(
-    view: &MatchView,
-    projection: &ProjectedOrderSelection,
-    preset: CoreDistributionPreset,
-) -> Result<ProjectedDistribution, &'static str> {
-    if projection.cells.is_empty() {
-        return Err("Formation or Directional Bias needs selected troops");
-    }
-    validate_projected_cells(view, &projection.cells)?;
-    if projection.cells.iter().any(|coordinate| {
-        projection
-            .unrelated_destination_reservations_by_cell
-            .contains_key(coordinate)
-    }) {
-        return Err("A selected cell is reserved by another active order");
-    }
-    let mut plan = ProjectedDistribution::default();
-    for component in owned_relevant_components(view, &projection.cells) {
-        let mut map = HexMap::new();
-        let mut total = 0_u64;
-        for &coordinate in &component {
-            let cell = view.cell(coordinate).expect("projected cell was validated");
-            let affected = projection
-                .affected_strength_by_cell
-                .get(&coordinate)
-                .copied()
-                .unwrap_or(0);
-            let unaffected = projection
-                .unaffected_strength_by_cell
-                .get(&coordinate)
-                .copied()
-                .unwrap_or(0);
-            total = total.saturating_add(affected);
-            map.insert(projected_cell(cell, affected, unaffected));
-        }
-        let distribution = redistribution_targets_with_commitment(
-            &map,
-            view.local_player,
-            component.iter().copied(),
-            total,
-            preset,
-            10_000,
-        )
-        .map_err(|_| "This Formation or Directional Bias cannot be resolved")?;
-        let final_strength = distribution
-            .targets
-            .into_iter()
-            .map(|(coordinate, target)| {
-                let unaffected = projection
-                    .unaffected_strength_by_cell
-                    .get(&coordinate)
-                    .copied()
-                    .unwrap_or(0);
-                (coordinate, unaffected.saturating_add(target))
-            })
-            .collect::<BTreeMap<_, _>>();
-        if final_strength.iter().all(|(coordinate, target)| {
-            view.cell(*coordinate)
-                .is_some_and(|cell| cell.infantry == *target)
-        }) {
-            plan.excluded.extend(component);
-            continue;
-        }
-        plan.participating_strength = plan.participating_strength.saturating_add(
-            component
-                .iter()
-                .map(|coordinate| {
-                    projection
-                        .affected_strength_by_cell
-                        .get(coordinate)
-                        .copied()
-                        .unwrap_or(0)
-                })
-                .sum::<u64>(),
-        );
-        plan.destination_capacity = plan.destination_capacity.saturating_add(
-            component
-                .iter()
-                .filter_map(|coordinate| view.cell(*coordinate))
-                .map(|cell| cell.military_capacity)
-                .sum::<u64>(),
-        );
-        plan.final_strength_by_cell.extend(final_strength);
-    }
-    Ok(plan)
 }
 
 pub(crate) fn projected_shape_distribution(
@@ -2547,7 +2039,7 @@ pub(crate) fn projected_shape_distribution(
             weights.insert(
                 coordinate,
                 if component_targets.contains(&coordinate) {
-                    BALANCE_WEIGHT
+                    UNIFORM_ALLOCATION_WEIGHT
                 } else {
                     0
                 },
@@ -2737,7 +2229,7 @@ fn projection_rejection(error: OrderSelectionProjectionError) -> ServerUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AuthorityState, CellView, RetaskProjection};
+    use crate::model::{CellView, RetaskProjection};
     use hex_core::TerrainKind;
 
     fn cell(coordinate: Axial, infantry: u64) -> CellView {
@@ -4018,408 +3510,6 @@ mod tests {
     }
 
     #[test]
-    fn offline_balance_uses_all_available_selected_troops() {
-        let left = Axial::ZERO;
-        let right = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(left, cell(left, 100));
-        view.cells.insert(right, cell(right, 0));
-        view.rebuild_chunk_index();
-
-        let update = resolve_redistribution(
-            &view,
-            &BTreeSet::from([left, right]),
-            RedistributionPreset::Balance,
-            None,
-        );
-        let ServerUpdate::Accepted { patches, .. } = update else {
-            panic!("full-selection balance should be accepted");
-        };
-        let target = |coordinate| {
-            patches
-                .iter()
-                .find(|patch| patch.coordinate == coordinate)
-                .map(|patch| patch.infantry)
-        };
-        assert_eq!(target(left), Some(50));
-        assert_eq!(target(right), Some(50));
-    }
-
-    #[test]
-    fn offline_cluster_policy_persists_for_the_complete_cluster_and_moves_only_free_troops() {
-        let left = Axial::ZERO;
-        let right = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(left, cell(left, 100));
-        view.cells.insert(right, cell(right, 0));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7]),
-            order_strength_by_cell: BTreeMap::from([(7, BTreeMap::from([(left, 40)]))]),
-            active_strength_by_cell: BTreeMap::from([(left, 40)]),
-            ..Default::default()
-        });
-        view.rebuild_chunk_index();
-
-        let selected = BTreeSet::from([left, right]);
-        let ServerUpdate::Accepted {
-            summary,
-            patches,
-            flow,
-            front,
-            ..
-        } = resolve_cluster_policy(&view, &selected, ClusterPolicy::Balanced, None)
-        else {
-            panic!("a valid persistent policy should resolve offline");
-        };
-        assert!(summary.contains("free troops redistributed"));
-        assert!(
-            flow.is_none(),
-            "offline policy movement stays background-only"
-        );
-        assert!(
-            front.is_none(),
-            "friendly policy movement cannot create combat UI"
-        );
-        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 100);
-        assert!(
-            patches
-                .iter()
-                .find(|patch| patch.coordinate == left)
-                .is_some_and(|patch| patch.infantry >= 40),
-            "the 40 active infantry must remain physically reserved at their cell"
-        );
-
-        // Sparse metadata seeds still close over the complete current cluster,
-        // matching the online reducer's authority expansion.
-        persist_offline_cluster_policy(
-            &mut view,
-            &BTreeSet::from([left]),
-            ClusterPolicy::Perimeter,
-            None,
-        );
-        for coordinate in [left, right] {
-            assert_eq!(
-                view.cluster_policy_at(coordinate)
-                    .expect("owned cell policy")
-                    .kind,
-                ClusterPolicy::Perimeter
-            );
-        }
-        let first_revision = view.cluster_policy_at(left).unwrap().revision;
-        persist_offline_cluster_policy(
-            &mut view,
-            &BTreeSet::from([right]),
-            ClusterPolicy::Center,
-            None,
-        );
-        assert!(view.cluster_policy_at(left).unwrap().revision > first_revision);
-        assert_eq!(
-            view.cluster_policy_at(right).unwrap().kind,
-            ClusterPolicy::Center
-        );
-    }
-
-    #[test]
-    fn offline_policy_lineage_follows_growth_and_uses_the_newest_policy_on_merge() {
-        let left = Axial::ZERO;
-        let middle = Axial::new(1, 0);
-        let bridge = Axial::new(2, 0);
-        let remote = Axial::new(3, 0);
-        let mut view = MatchView::connecting(1);
-        for coordinate in [left, middle, remote] {
-            view.cells.insert(coordinate, cell(coordinate, 0));
-        }
-        view.rebuild_chunk_index();
-        persist_offline_cluster_policy(
-            &mut view,
-            &BTreeSet::from([left]),
-            ClusterPolicy::Perimeter,
-            None,
-        );
-        persist_offline_cluster_policy(
-            &mut view,
-            &BTreeSet::from([remote]),
-            ClusterPolicy::Directional,
-            Some(Axial::new(800, -200)),
-        );
-
-        // Capturing the bridge merges the clusters. Offline lineage mirrors
-        // authority: the newest explicit policy wins the complete component.
-        view.cells.insert(bridge, cell(bridge, 0));
-        view.rebuild_chunk_index();
-        reconcile_offline_cluster_policies(&mut view);
-
-        for coordinate in [left, middle, bridge, remote] {
-            let policy = view.cluster_policy_at(coordinate).unwrap();
-            assert_eq!(policy.kind, ClusterPolicy::Directional);
-            assert_eq!(policy.orientation, Axial::new(800, -200));
-        }
-    }
-
-    #[test]
-    fn accepted_offline_growth_inherits_policy_and_immediately_maintains_the_new_cluster() {
-        let left = Axial::ZERO;
-        let middle = Axial::new(1, 0);
-        let captured = Axial::new(2, 0);
-        let mut view = MatchView::connecting(1);
-        view.authority = AuthorityState::Offline;
-        view.cells.insert(left, cell(left, 90));
-        view.cells.insert(middle, cell(middle, 0));
-        view.cells.insert(captured, neutral_cell(captured));
-        view.rebuild_chunk_index();
-        persist_offline_cluster_policy(
-            &mut view,
-            &BTreeSet::from([left]),
-            ClusterPolicy::Balanced,
-            None,
-        );
-        let inherited_revision = view.cluster_policy_at(left).unwrap().revision;
-        let ownership_revision = view.ownership_revision;
-
-        let mut app = App::new();
-        app.add_message::<ServerUpdate>()
-            .insert_resource(view)
-            .add_systems(Update, apply_server_updates);
-        app.world_mut().write_message(ServerUpdate::Accepted {
-            command_id: None,
-            summary: "Expansion accepted".to_owned(),
-            patches: vec![
-                CellPatch {
-                    coordinate: left,
-                    owner: Some(1),
-                    infantry: 60,
-                },
-                CellPatch {
-                    coordinate: captured,
-                    owner: Some(1),
-                    infantry: 30,
-                },
-            ],
-            flow: None,
-            front: None,
-        });
-        app.update();
-
-        let view = app.world().resource::<MatchView>();
-        assert_eq!(view.latest_result, "Expansion accepted");
-        assert_eq!(view.ownership_revision, ownership_revision.wrapping_add(1));
-        assert_eq!(
-            [left, middle, captured].map(|coordinate| view.cell(coordinate).unwrap().infantry),
-            [30, 30, 30]
-        );
-        assert_eq!(
-            view.cluster_policy_at(captured).unwrap(),
-            ClusterPolicyView {
-                kind: ClusterPolicy::Balanced,
-                orientation: Axial::ZERO,
-                revision: inherited_revision,
-            }
-        );
-    }
-
-    #[test]
-    fn offline_policy_maintenance_freezes_actions_and_reserves_inbound_capacity() {
-        let left = Axial::ZERO;
-        let right = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.authority = AuthorityState::Offline;
-        view.cells.insert(left, cell(left, 100));
-        view.cells.insert(right, cell(right, 0));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7]),
-            order_strength_by_cell: BTreeMap::from([(7, BTreeMap::from([(left, 40)]))]),
-            active_strength_by_cell: BTreeMap::from([(left, 40)]),
-            destination_reservations_by_order: BTreeMap::from([(7, BTreeMap::from([(right, 20)]))]),
-            ..Default::default()
-        });
-        view.rebuild_chunk_index();
-        assert!(matches!(
-            resolve_cluster_policy(
-                &view,
-                &BTreeSet::from([left]),
-                ClusterPolicy::Balanced,
-                None,
-            ),
-            ServerUpdate::Accepted { .. }
-        ));
-        persist_offline_cluster_policy(
-            &mut view,
-            &BTreeSet::from([left]),
-            ClusterPolicy::Balanced,
-            None,
-        );
-
-        let mut app = App::new();
-        app.add_message::<ServerUpdate>()
-            .insert_resource(view)
-            .add_systems(Update, apply_server_updates);
-        app.world_mut().write_message(ServerUpdate::Accepted {
-            command_id: None,
-            summary: "Action accepted".to_owned(),
-            // Any accepted local action patch schedules policy maintenance;
-            // the unchanged value keeps this test focused on allocation math.
-            patches: vec![CellPatch {
-                coordinate: left,
-                owner: Some(1),
-                infantry: 100,
-            }],
-            flow: None,
-            front: None,
-        });
-        app.update();
-
-        let view = app.world().resource::<MatchView>();
-        assert_eq!(view.cell(left).unwrap().infantry, 83);
-        assert_eq!(view.cell(right).unwrap().infantry, 17);
-        assert_eq!(
-            view.cell(left).unwrap().infantry + view.cell(right).unwrap().infantry,
-            100
-        );
-        assert!(view.cell(left).unwrap().infantry >= 40);
-        assert_eq!(
-            view.cell(right).unwrap().infantry + 20,
-            37,
-            "the inbound action reservation completes, rather than competes with, the policy target"
-        );
-    }
-
-    #[test]
-    fn unavailable_offline_policy_maintenance_never_rejects_an_accepted_action() {
-        let coordinate = Axial::ZERO;
-        let mut view = MatchView::connecting(1);
-        view.authority = AuthorityState::Offline;
-        view.cells.insert(coordinate, cell(coordinate, 10));
-        view.cluster_policies.insert(
-            coordinate,
-            ClusterPolicyView {
-                kind: ClusterPolicy::Directional,
-                orientation: Axial::ZERO,
-                revision: 4,
-            },
-        );
-        view.rebuild_chunk_index();
-
-        let mut app = App::new();
-        app.add_message::<ServerUpdate>()
-            .insert_resource(view)
-            .add_systems(Update, apply_server_updates);
-        app.world_mut().write_message(ServerUpdate::Accepted {
-            command_id: None,
-            summary: "Action remains accepted".to_owned(),
-            patches: vec![CellPatch {
-                coordinate,
-                owner: Some(1),
-                infantry: 75,
-            }],
-            flow: None,
-            front: None,
-        });
-        app.update();
-
-        let view = app.world().resource::<MatchView>();
-        assert_eq!(view.cell(coordinate).unwrap().infantry, 75);
-        assert_eq!(view.latest_result, "Action remains accepted");
-        assert_eq!(view.toast.as_ref().unwrap().kind, ToastKind::Success);
-    }
-
-    #[test]
-    fn formation_rejects_unrelated_inbound_reservations_and_allows_superseded_ones() {
-        let left = Axial::ZERO;
-        let right = Axial::new(1, 0);
-        let selected = BTreeSet::from([left, right]);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(left, cell(left, 80));
-        view.cells.insert(right, cell(right, 0));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7]),
-            order_strength_by_cell: BTreeMap::from([(7, BTreeMap::from([(left, 10)]))]),
-            active_strength_by_cell: BTreeMap::from([(left, 10)]),
-            destination_reservations_by_order: BTreeMap::from([(7, BTreeMap::from([(right, 20)]))]),
-            ..Default::default()
-        });
-
-        let unrelated = view
-            .project_order_selection(&selected, &BTreeSet::new())
-            .expect("owned selection");
-        assert_eq!(
-            projected_redistribution_distribution(
-                &view,
-                &unrelated,
-                CoreDistributionPreset::Balance,
-            )
-            .expect_err("unrelated inbound reservation must block redistribution"),
-            "A selected cell is reserved by another active order"
-        );
-
-        let superseded = view
-            .project_order_selection(&selected, &BTreeSet::from([7]))
-            .expect("active order may be superseded");
-        assert!(
-            superseded
-                .unrelated_destination_reservations_by_cell
-                .is_empty()
-        );
-        projected_redistribution_distribution(&view, &superseded, CoreDistributionPreset::Balance)
-            .expect("superseding the reserving order removes the overlap");
-    }
-
-    #[test]
-    fn formation_balances_each_owned_component_independently() {
-        let coordinates = [
-            Axial::new(0, 0),
-            Axial::new(1, 0),
-            Axial::new(5, 0),
-            Axial::new(6, 0),
-        ];
-        let mut view = MatchView::connecting(1);
-        for (coordinate, infantry) in coordinates.into_iter().zip([80, 0, 20, 0]) {
-            view.cells.insert(coordinate, cell(coordinate, infantry));
-        }
-        let selected = coordinates.into_iter().collect::<BTreeSet<_>>();
-        let projection = view
-            .project_order_selection(&selected, &BTreeSet::new())
-            .expect("owned sources");
-
-        let plan = projected_redistribution_distribution(
-            &view,
-            &projection,
-            CoreDistributionPreset::Balance,
-        )
-        .expect("component-local balance");
-
-        assert_eq!(plan.final_strength_by_cell[&Axial::new(0, 0)], 40);
-        assert_eq!(plan.final_strength_by_cell[&Axial::new(1, 0)], 40);
-        assert_eq!(plan.final_strength_by_cell[&Axial::new(5, 0)], 10);
-        assert_eq!(plan.final_strength_by_cell[&Axial::new(6, 0)], 10);
-    }
-
-    #[test]
-    fn formation_connects_selected_cells_through_an_unselected_owned_corridor() {
-        let left = Axial::new(0, 0);
-        let corridor = Axial::new(1, 0);
-        let right = Axial::new(2, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(left, cell(left, 80));
-        view.cells.insert(corridor, cell(corridor, 0));
-        view.cells.insert(right, cell(right, 0));
-        let selected = BTreeSet::from([left, right]);
-        let projection = view
-            .project_order_selection(&selected, &BTreeSet::new())
-            .expect("owned endpoints");
-
-        let plan = projected_redistribution_distribution(
-            &view,
-            &projection,
-            CoreDistributionPreset::Balance,
-        )
-        .expect("corridor joins endpoints");
-
-        assert_eq!(plan.final_strength_by_cell[&left], 40);
-        assert_eq!(plan.final_strength_by_cell[&right], 40);
-        assert!(!plan.final_strength_by_cell.contains_key(&corridor));
-    }
-
-    #[test]
     fn offline_reshape_moves_all_available_troops_into_the_drawn_shape() {
         let source = Axial::ZERO;
         let target = Axial::new(1, 0);
@@ -4779,66 +3869,6 @@ mod tests {
                 .expect_err("no-op reshape must reject"),
             "Destination shape does not move any selected troops"
         );
-    }
-
-    #[test]
-    fn offline_retask_redistributes_selected_packets_and_preserves_unrelated_strength() {
-        let left = Axial::ZERO;
-        let right = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(left, cell(left, 100));
-        view.cells.insert(right, cell(right, 20));
-        view.set_retask_projection(RetaskProjection {
-            handle_orders: BTreeMap::new(),
-            active_order_ids: BTreeSet::from([7, 8]),
-            background_policy_order_ids: BTreeSet::new(),
-            order_source_cells: BTreeMap::new(),
-            order_strength_by_cell: BTreeMap::from([
-                (7, BTreeMap::from([(left, 30), (right, 10)])),
-                (8, BTreeMap::from([(left, 20)])),
-            ]),
-            active_strength_by_cell: BTreeMap::from([(left, 50), (right, 10)]),
-            destination_reservations_by_order: BTreeMap::new(),
-            destination_claims_by_order: BTreeMap::new(),
-        });
-        view.rebuild_chunk_index();
-
-        let projected = view
-            .project_order_selection(&BTreeSet::new(), &BTreeSet::from([7]))
-            .expect("selected active order projects");
-        assert_eq!(projected.unaffected_strength_by_cell[&left], 20);
-        assert_eq!(projected.affected_strength_by_cell[&left], 80);
-
-        let update = resolve_redistribution_with_retask(
-            &view,
-            &BTreeSet::new(),
-            &BTreeSet::from([7]),
-            RedistributionPreset::Balance,
-            None,
-        );
-        let ServerUpdate::Accepted { patches, .. } = update else {
-            panic!("handle-only redistribution should be accepted");
-        };
-        let target = |coordinate| {
-            patches
-                .iter()
-                .find(|patch| patch.coordinate == coordinate)
-                .map(|patch| patch.infantry)
-        };
-        assert_eq!(target(left), Some(64));
-        assert_eq!(target(right), Some(56));
-        assert_eq!(patches.iter().map(|patch| patch.infantry).sum::<u64>(), 120);
-
-        assert!(matches!(
-            resolve_redistribution_with_retask(
-                &view,
-                &BTreeSet::new(),
-                &BTreeSet::from([9]),
-                RedistributionPreset::Balance,
-                None,
-            ),
-            ServerUpdate::Rejected { reason, .. } if reason.contains("no longer active")
-        ));
     }
 
     #[test]

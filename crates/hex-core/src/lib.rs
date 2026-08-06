@@ -29,9 +29,10 @@ pub use connectivity::{connected_components, owned_components};
 pub use conquest::{ConquestError, ConquestProgress, ConquestRule};
 pub use coord::{Axial, ChunkAddress, ChunkCoord, Cube, HexDirection, HexEdge};
 pub use front::{
-    DirectedFrontEdge, FrontSelectionError, LocalFrontRoute, selected_all_front_edges,
-    selected_directional_routes, selected_front_edges, selected_local_front_routes,
-    unique_target_front_edges,
+    DirectedFrontEdge, FrontSelectionError, LocalFrontRoute, StrategicExterior, StrategicFront,
+    StrategicFrontError, selected_all_front_edges, selected_directional_routes,
+    selected_front_edges, selected_local_front_routes, strategic_front_index_for_seed,
+    strategic_fronts, unique_target_front_edges,
 };
 pub use map::{
     Cell, EdgeLimits, ForceComposition, HexMap, LogisticsConfig, MovementConfig, PlayerId,
@@ -43,9 +44,6 @@ pub use movement::{
 };
 pub use pathfinding::{Path, shortest_path};
 pub use redistribution::{
-    BALANCE_WEIGHT, DenseTargetDistribution, DistributionError, DistributionPreset,
-    TargetDistribution, distribution_weights, distribution_weights_dense, redistribution_targets,
-    redistribution_targets_dense, redistribution_targets_dense_with_weights,
-    redistribution_targets_with_commitment, redistribution_targets_with_constraints,
-    redistribution_targets_with_fallback_constraints,
+    DenseTargetDistribution, DistributionError, TargetDistribution, UNIFORM_ALLOCATION_WEIGHT,
+    redistribution_targets_dense_with_weights, redistribution_targets_with_fallback_constraints,
 };

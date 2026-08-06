@@ -2,21 +2,18 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bevy::{picking::pointer::PointerInteraction, prelude::*};
 use hex_core::{
-    Axial, DirectedFrontEdge, DistributionPreset as CoreDistributionPreset, FrontSelectionError,
-    selected_directional_routes, selected_front_edges,
+    Axial, DirectedFrontEdge, FrontSelectionError, StrategicExterior, selected_directional_routes,
+    selected_front_edges, strategic_front_index_for_seed, strategic_fronts,
 };
 
 use crate::{
     camera::GameCamera,
-    geometry::{HEX_RADIUS, axial_to_plane},
-    model::{
-        ClusterPolicy, MatchView, OrderSelectionProjectionError, ProjectedOrderSelection, ToastKind,
-    },
+    geometry::axial_to_plane,
+    model::{MatchView, OrderSelectionProjectionError, ProjectedOrderSelection, ToastKind},
     network::{
-        ClientIntent, ExpandWaveError, MAX_WAVE_PREVIEW_RINGS, NetworkSet, RedistributionPreset,
-        ServerUpdate, arc_push_routes, forecast_attack_wave, forecast_expand_wave,
-        projected_redistribution_distribution, projected_shape_distribution, push_edge_is_eligible,
-        resolve_projected_push_front,
+        ClientIntent, ExpandWaveError, MAX_WAVE_PREVIEW_RINGS, NetworkSet, ServerUpdate,
+        arc_push_routes, forecast_attack_wave, forecast_expand_wave, projected_shape_distribution,
+        push_edge_is_eligible, resolve_projected_push_front,
     },
     terrain::TerrainChunk,
 };
@@ -64,19 +61,28 @@ pub struct OrderPreview {
 pub enum OrderMode {
     Idle,
     AttackClustersPreview,
-    PushFrontOrient { start: Vec3, current: Vec3 },
-    PushFrontPreview { direction: Axial },
+    PushFrontOrient {
+        start: Vec3,
+        current: Vec3,
+    },
+    PushFrontPreview {
+        direction: Axial,
+    },
     PushFrontArcPreview,
+    FrontRebalanceSelectSource,
+    FrontRebalanceDrag {
+        source_front_seed: Axial,
+        target_front_seed: Option<Axial>,
+    },
     ExpandAllPreview,
-    BalancePreview,
-    FrontLoadOrient { start: Vec3, current: Vec3 },
-    FrontLoadPreview { orientation: Axial },
-    CoreLoadPreview,
-    PerimeterLoadPreview,
     ReshapeDrawing,
     ReshapePreview,
-    StopPreview { order_ids: BTreeSet<u64> },
-    Submitting { _label: &'static str },
+    StopPreview {
+        order_ids: BTreeSet<u64>,
+    },
+    Submitting {
+        _label: &'static str,
+    },
 }
 
 impl OrderMode {
@@ -87,12 +93,9 @@ impl OrderMode {
             Self::PushFrontOrient { .. } => "PUSH FRONT / ORIENT",
             Self::PushFrontPreview { .. } => "PUSH FRONT / READY",
             Self::PushFrontArcPreview => "CONTACT FRONTS / READY",
+            Self::FrontRebalanceSelectSource => "FRONT REBALANCE / PICK SOURCE",
+            Self::FrontRebalanceDrag { .. } => "FRONT REBALANCE / PICK TARGET",
             Self::ExpandAllPreview => "EXPAND PERIMETER / READY",
-            Self::BalancePreview => "POLICY / BALANCED",
-            Self::FrontLoadOrient { .. } => "POLICY / CHOOSE FACING",
-            Self::FrontLoadPreview { .. } => "POLICY / DIRECTIONAL",
-            Self::CoreLoadPreview => "POLICY / CENTER",
-            Self::PerimeterLoadPreview => "POLICY / PERIMETER",
             Self::ReshapeDrawing => "RESHAPE / DRAW DESTINATION",
             Self::ReshapePreview => "RESHAPE / READY",
             Self::StopPreview { .. } => "STOP ORDERS / READY",
@@ -248,12 +251,14 @@ enum SelectionCombine {
 enum PreviewModeKey {
     Idle,
     AttackClusters,
-    PushFront { direction: Option<Axial> },
+    PushFront {
+        direction: Option<Axial>,
+    },
+    FrontRebalance {
+        source_front_seed: Option<Axial>,
+        target_front_seed: Option<Axial>,
+    },
     ExpandAll,
-    Balance,
-    FrontLoad { orientation: Option<(i32, i32)> },
-    CoreLoad,
-    PerimeterLoad,
     Reshape,
     Stop,
 }
@@ -384,21 +389,6 @@ fn visible_push_drag(start: Option<Vec2>, current: Option<Vec2>) -> bool {
         .is_some_and(|(start, current)| start.distance(current) >= PUSH_DRAG_THRESHOLD_PIXELS)
 }
 
-/// Converts a world-space Bias gesture into a deterministic fixed-point axial
-/// orientation. Unlike Push Front this deliberately preserves continuous
-/// headings; the same integer pair is used by the preview, offline authority,
-/// and online reducer call.
-fn bias_orientation_from_world(direction: Vec2) -> Option<Axial> {
-    if direction.length_squared() < 0.01 {
-        return None;
-    }
-    let q = direction.x / (1.5 * HEX_RADIUS);
-    let r = direction.y / (3.0_f32.sqrt() * HEX_RADIUS) - q * 0.5;
-    let scale = 1_024.0 / q.abs().max(r.abs()).max((q + r).abs()).max(0.000_1);
-    let orientation = Axial::new((q * scale).round() as i32, (r * scale).round() as i32);
-    (orientation != Axial::ZERO).then_some(orientation)
-}
-
 #[derive(Resource, Debug)]
 pub struct InteractionState {
     pub hovered: Option<Axial>,
@@ -432,9 +422,6 @@ pub struct InteractionState {
     contextual_submissions: Option<ContextualSubmissionGroup>,
     preview_key: Option<OrderPreviewKey>,
     push_start_screen: Option<Vec2>,
-    /// Deterministic target used only when a multi-cluster selection currently
-    /// reports mixed authoritative policies.
-    mixed_policy_cycle: u8,
 }
 
 impl Default for InteractionState {
@@ -462,7 +449,6 @@ impl Default for InteractionState {
             contextual_submissions: None,
             preview_key: None,
             push_start_screen: None,
-            mixed_policy_cycle: 0,
         }
     }
 }
@@ -505,35 +491,14 @@ impl InteractionState {
             _ => None,
         }
     }
-
-    pub fn frontload_orientation(&self) -> Option<Axial> {
-        match self.mode {
-            OrderMode::FrontLoadOrient { start, current } => {
-                let value = Vec2::new(current.x - start.x, current.z - start.z);
-                bias_orientation_from_world(value)
-            }
-            OrderMode::FrontLoadPreview { orientation } => Some(orientation),
-            _ => None,
-        }
-    }
-
-    pub fn frontload_direction(&self) -> Option<Vec2> {
-        self.frontload_orientation()
-            .map(axial_to_plane)
-            .filter(|direction| direction.length_squared() > 0.0)
-            .map(Vec2::normalize)
-    }
 }
 
 #[derive(Message, Clone, Copy, Debug)]
 #[allow(dead_code)] // Legacy UI messages remain accepted while the HUD exposes cluster-first controls.
 pub enum UiAction {
     PushFront,
+    FrontRebalance,
     ExpandAll,
-    Formation,
-    FormationIn,
-    FormationOut,
-    FrontLoad,
     Reshape,
     StopOrders,
     Confirm,
@@ -667,11 +632,11 @@ fn process_order_input(
     }
 
     let mut requested_actions = Vec::new();
-    if keyboard.just_pressed(KeyCode::KeyR) {
-        requested_actions.push(UiAction::Formation);
-    }
     if keyboard.just_pressed(KeyCode::KeyT) {
         requested_actions.push(UiAction::Reshape);
+    }
+    if keyboard.just_pressed(KeyCode::KeyB) {
+        requested_actions.push(UiAction::FrontRebalance);
     }
     if keyboard.just_pressed(KeyCode::KeyX) {
         requested_actions.push(UiAction::StopOrders);
@@ -691,10 +656,6 @@ fn process_order_input(
     }
     requested_actions.extend(actions.read().copied());
 
-    if keyboard.just_pressed(KeyCode::KeyF) {
-        requested_actions.push(UiAction::FrontLoad);
-    }
-
     let mode_before_actions = interaction.mode.clone();
     let click_confirms_preview = mouse.just_pressed(MouseButton::Left)
         && pointer_is_preview(&mode_before_actions)
@@ -706,6 +667,7 @@ fn process_order_input(
     }
     let contextual_click_consumed =
         handle_contextual_map_click(&keyboard, &mouse, &mut interaction, &mut view, &mut intents);
+    handle_front_rebalance_drag(&keyboard, &mouse, &mut interaction, &mut view, &mut intents);
     if !contextual_click_consumed
         && click_confirms_preview
         && same_preview_mode(&mode_before_actions, &interaction.mode)
@@ -716,70 +678,29 @@ fn process_order_input(
     let cursor_world = interaction.cursor_world;
     let cursor_screen = interaction.cursor_screen;
     let push_start_screen = interaction.push_start_screen;
-    let mut directional_policy = None;
-    match &mut interaction.mode {
-        OrderMode::PushFrontOrient { start, current } => {
-            if let Some(cursor) = cursor_world {
-                *current = cursor;
-            }
-            if keyboard.just_released(KeyCode::KeyP) {
-                let direction = Vec2::new(current.x - start.x, current.z - start.z);
-                if !interaction.shape_targets.is_empty() {
-                    interaction.shape_targets.clear();
-                    interaction.shape_revision = interaction.shape_revision.wrapping_add(1);
-                }
-                if visible_push_drag(push_start_screen, cursor_screen)
-                    && let Some(direction) = quantize_world_direction(direction)
-                {
-                    interaction.mode = OrderMode::PushFrontPreview { direction };
-                } else {
-                    interaction.mode = OrderMode::PushFrontArcPreview;
-                    view.show_toast(
-                        "Contact fronts use local normals · drag P for one global direction",
-                        ToastKind::Info,
-                    );
-                }
-                interaction.push_start_screen = None;
-            }
+    if let OrderMode::PushFrontOrient { start, current } = &mut interaction.mode {
+        if let Some(cursor) = cursor_world {
+            *current = cursor;
         }
-        OrderMode::FrontLoadOrient { start, current } => {
-            if let Some(cursor) = cursor_world {
-                *current = cursor;
+        if keyboard.just_released(KeyCode::KeyP) {
+            let direction = Vec2::new(current.x - start.x, current.z - start.z);
+            if !interaction.shape_targets.is_empty() {
+                interaction.shape_targets.clear();
+                interaction.shape_revision = interaction.shape_revision.wrapping_add(1);
             }
-            if keyboard.just_released(KeyCode::KeyF) {
-                let direction = Vec2::new(current.x - start.x, current.z - start.z);
-                if direction.length() < 0.35 {
-                    interaction.mode = OrderMode::Idle;
-                    view.show_toast(
-                        "Directional bias needs a visible drag direction",
-                        ToastKind::Rejection,
-                    );
-                } else if let Some(orientation) = bias_orientation_from_world(direction) {
-                    directional_policy = Some(orientation);
-                } else {
-                    interaction.mode = OrderMode::Idle;
-                    view.show_toast(
-                        "Directional bias could not resolve its orientation",
-                        ToastKind::Rejection,
-                    );
-                }
+            if visible_push_drag(push_start_screen, cursor_screen)
+                && let Some(direction) = quantize_world_direction(direction)
+            {
+                interaction.mode = OrderMode::PushFrontPreview { direction };
+            } else {
+                interaction.mode = OrderMode::PushFrontArcPreview;
+                view.show_toast(
+                    "Contact fronts use local normals · drag P for one global direction",
+                    ToastKind::Info,
+                );
             }
+            interaction.push_start_screen = None;
         }
-        _ => {}
-    }
-    if let Some(direction) = directional_policy {
-        let sources = interaction.sources.clone();
-        begin_submission(
-            &mut interaction,
-            &mut intents,
-            ClientIntent::SetClusterPolicy {
-                sources,
-                policy: ClusterPolicy::Directional,
-                direction: Some(direction),
-            },
-            "POLICY / DIRECTIONAL",
-            OrderMode::Idle,
-        );
     }
 }
 
@@ -796,10 +717,6 @@ fn pointer_is_preview(mode: &OrderMode) -> bool {
             | OrderMode::PushFrontPreview { .. }
             | OrderMode::PushFrontArcPreview
             | OrderMode::ExpandAllPreview
-            | OrderMode::BalancePreview
-            | OrderMode::FrontLoadPreview { .. }
-            | OrderMode::CoreLoadPreview
-            | OrderMode::PerimeterLoadPreview
             | OrderMode::ReshapePreview
             | OrderMode::StopPreview { .. }
     )
@@ -957,6 +874,168 @@ fn handle_contextual_map_click(
         interaction.preview_key = None;
     }
     true
+}
+
+fn handle_front_rebalance_drag(
+    keyboard: &ButtonInput<KeyCode>,
+    mouse: &ButtonInput<MouseButton>,
+    interaction: &mut InteractionState,
+    view: &mut MatchView,
+    intents: &mut MessageWriter<ClientIntent>,
+) {
+    if keyboard.pressed(KeyCode::Space) {
+        return;
+    }
+    if matches!(interaction.mode, OrderMode::FrontRebalanceSelectSource)
+        && mouse.just_pressed(MouseButton::Left)
+    {
+        let Some(seed) = interaction.hovered else {
+            view.show_toast(
+                "Point at an owned strategic-front boundary cell",
+                ToastKind::Rejection,
+            );
+            return;
+        };
+        let Some(component) = selected_complete_component(view, interaction) else {
+            view.show_toast(
+                "Front Rebalance selection is no longer one complete component",
+                ToastKind::Rejection,
+            );
+            interaction.mode = OrderMode::Idle;
+            return;
+        };
+        if let Err(reason) = front_rebalance_seed_error(view, &component, seed, None) {
+            view.show_toast(reason, ToastKind::Rejection);
+            return;
+        }
+        interaction.mode = OrderMode::FrontRebalanceDrag {
+            source_front_seed: seed,
+            target_front_seed: None,
+        };
+        interaction.preview_key = None;
+    }
+
+    if let OrderMode::FrontRebalanceDrag {
+        target_front_seed, ..
+    } = &mut interaction.mode
+        && mouse.pressed(MouseButton::Left)
+    {
+        *target_front_seed = interaction.hovered;
+        interaction.preview_key = None;
+    }
+
+    if !mouse.just_released(MouseButton::Left) {
+        return;
+    }
+    let (source_front_seed, target_front_seed) = match &interaction.mode {
+        OrderMode::FrontRebalanceDrag {
+            source_front_seed,
+            target_front_seed: Some(target_front_seed),
+        } => (*source_front_seed, *target_front_seed),
+        _ => return,
+    };
+    let Some(component) = selected_complete_component(view, interaction) else {
+        view.show_toast(
+            "Front Rebalance selection is no longer one complete component",
+            ToastKind::Rejection,
+        );
+        interaction.mode = OrderMode::Idle;
+        return;
+    };
+    if let Err(reason) =
+        front_rebalance_seed_error(view, &component, source_front_seed, Some(target_front_seed))
+    {
+        view.show_toast(reason, ToastKind::Rejection);
+        return;
+    }
+    begin_submission(
+        interaction,
+        intents,
+        ClientIntent::FrontRebalance {
+            source_component_cells: component,
+            source_front_seed,
+            target_front_seed,
+            commitment_percent: interaction.amount_percent,
+            supersede_order_ids: interaction.supersede_order_ids(),
+        },
+        "FRONT REBALANCE",
+        OrderMode::FrontRebalanceDrag {
+            source_front_seed,
+            target_front_seed: Some(target_front_seed),
+        },
+    );
+}
+
+fn selected_complete_component(
+    view: &MatchView,
+    interaction: &InteractionState,
+) -> Option<BTreeSet<Axial>> {
+    let seed = *interaction.sources.first()?;
+    let component = local_owned_cluster(view, seed);
+    (component == interaction.sources).then_some(component)
+}
+
+fn front_rebalance_component_error(
+    view: &MatchView,
+    component: &BTreeSet<Axial>,
+) -> Result<(), &'static str> {
+    if component.len() > MAX_COMMAND_SELECTION_CELLS {
+        return Err("Front Rebalance component exceeds the 32,768-cell command limit");
+    }
+    let fronts = strategic_fronts(component.iter().copied(), |_, target| {
+        strategic_exterior_for_view(view, target)
+    })
+    .map_err(|_| "Front Rebalance component has no boundary")?;
+    if fronts.len() < 2 {
+        return Err("Front Rebalance needs at least two strategic fronts");
+    }
+    Ok(())
+}
+
+fn strategic_exterior_for_view(view: &MatchView, target: Axial) -> StrategicExterior {
+    let Some(cell) = view.cell(target) else {
+        return StrategicExterior::Ignored;
+    };
+    if !cell.is_land() || cell.blocked {
+        return StrategicExterior::Ignored;
+    }
+    match cell.owner {
+        None => StrategicExterior::Neutral,
+        Some(owner) if owner == view.local_player => StrategicExterior::Ignored,
+        Some(owner) => StrategicExterior::Opponent(owner),
+    }
+}
+
+fn front_rebalance_seed_error(
+    view: &MatchView,
+    component: &BTreeSet<Axial>,
+    source_front_seed: Axial,
+    target_front_seed: Option<Axial>,
+) -> Result<(), &'static str> {
+    front_rebalance_component_error(view, component)?;
+    if !component.contains(&source_front_seed) {
+        return Err("Source seed must be an owned boundary cell in the selected component");
+    }
+    let fronts = strategic_fronts(component.iter().copied(), |_, target| {
+        strategic_exterior_for_view(view, target)
+    })
+    .map_err(|_| "Front Rebalance component has no boundary")?;
+    let source_index = strategic_front_index_for_seed(&fronts, source_front_seed)
+        .ok_or("Source seed is not on a strategic-front boundary")?;
+    let Some(target_front_seed) = target_front_seed else {
+        return Ok(());
+    };
+    if !component.contains(&target_front_seed) {
+        return Err("Target seed must be an owned boundary cell in the selected component");
+    }
+    let target_index = strategic_front_index_for_seed(&fronts, target_front_seed)
+        .ok_or("Target seed is not on a strategic-front boundary")?;
+    if source_index == target_index {
+        return Err("Source and target must be on different strategic fronts");
+    }
+    // Corner cells may expose edges on both fronts. Authority keeps such cells
+    // stationary and routes only from the source-only part of the arc.
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1232,67 +1311,6 @@ fn selected_owned_cluster_count(view: &MatchView, sources: &BTreeSet<Axial>) -> 
     count
 }
 
-fn next_cluster_policy(view: &MatchView, interaction: &mut InteractionState) -> ClusterPolicy {
-    let mut policies = interaction.sources.iter().filter_map(|coordinate| {
-        view.cluster_policy_at(*coordinate)
-            .map(|policy| policy.kind)
-    });
-    let authoritative = policies
-        .next()
-        .filter(|first| policies.all(|policy| policy == *first));
-    let target = authoritative.map_or_else(
-        || policy_for_cycle_index(interaction.mixed_policy_cycle),
-        next_non_directional_policy,
-    );
-    interaction.mixed_policy_cycle = policy_cycle_index(target).wrapping_add(1) % 3;
-    target
-}
-
-const fn next_non_directional_policy(current: ClusterPolicy) -> ClusterPolicy {
-    match current {
-        ClusterPolicy::Balanced => ClusterPolicy::Perimeter,
-        ClusterPolicy::Perimeter => ClusterPolicy::Center,
-        ClusterPolicy::Center | ClusterPolicy::Directional => ClusterPolicy::Balanced,
-    }
-}
-
-const fn policy_for_cycle_index(index: u8) -> ClusterPolicy {
-    match index % 3 {
-        0 => ClusterPolicy::Balanced,
-        1 => ClusterPolicy::Perimeter,
-        _ => ClusterPolicy::Center,
-    }
-}
-
-const fn policy_cycle_index(policy: ClusterPolicy) -> u8 {
-    match policy {
-        ClusterPolicy::Balanced | ClusterPolicy::Directional => 0,
-        ClusterPolicy::Perimeter => 1,
-        ClusterPolicy::Center => 2,
-    }
-}
-
-fn submit_explicit_cluster_policy(
-    interaction: &mut InteractionState,
-    intents: &mut MessageWriter<ClientIntent>,
-    policy: ClusterPolicy,
-    direction: Option<Axial>,
-) {
-    let sources = interaction.sources.clone();
-    interaction.mixed_policy_cycle = policy_cycle_index(policy).wrapping_add(1) % 3;
-    begin_submission(
-        interaction,
-        intents,
-        ClientIntent::SetClusterPolicy {
-            sources,
-            policy,
-            direction,
-        },
-        "SET CLUSTER POLICY",
-        OrderMode::Idle,
-    );
-}
-
 fn handle_action(
     action: UiAction,
     interaction: &mut InteractionState,
@@ -1337,6 +1355,25 @@ fn handle_action(
                 }
             }
         }
+        UiAction::FrontRebalance => {
+            let Some(component) = selected_complete_component(view, interaction) else {
+                view.show_toast(
+                    "Front Rebalance needs exactly one complete owned component",
+                    ToastKind::Rejection,
+                );
+                return;
+            };
+            if let Err(reason) = front_rebalance_component_error(view, &component) {
+                view.show_toast(reason, ToastKind::Rejection);
+            } else if matches!(interaction.mode, OrderMode::Idle) {
+                interaction.mode = OrderMode::FrontRebalanceSelectSource;
+                interaction.preview_key = None;
+                view.show_toast(
+                    "Drag from one owned strategic-front boundary cell to another",
+                    ToastKind::Info,
+                );
+            }
+        }
         UiAction::ExpandAll => {
             if !interaction.has_selection() {
                 view.show_toast(
@@ -1349,68 +1386,6 @@ fn handle_action(
                     "Expand Perimeter previews every selected region · click map to dispatch",
                     ToastKind::Info,
                 );
-            }
-        }
-        UiAction::Formation => {
-            if interaction.sources.is_empty() {
-                view.show_toast("Policy needs selected clusters", ToastKind::Rejection);
-            } else if matches!(interaction.mode, OrderMode::Idle) {
-                let policy = next_cluster_policy(view, interaction);
-                let sources = interaction.sources.clone();
-                begin_submission(
-                    interaction,
-                    intents,
-                    ClientIntent::SetClusterPolicy {
-                        sources,
-                        policy,
-                        direction: None,
-                    },
-                    "SET CLUSTER POLICY",
-                    OrderMode::Idle,
-                );
-            }
-        }
-        UiAction::FormationIn => {
-            if interaction.sources.is_empty() {
-                view.show_toast("Policy needs selected clusters", ToastKind::Rejection);
-            } else if matches!(interaction.mode, OrderMode::Idle) {
-                submit_explicit_cluster_policy(interaction, intents, ClusterPolicy::Center, None);
-            }
-        }
-        UiAction::FormationOut => {
-            if interaction.sources.is_empty() {
-                view.show_toast("Policy needs selected clusters", ToastKind::Rejection);
-            } else if matches!(interaction.mode, OrderMode::Idle) {
-                submit_explicit_cluster_policy(
-                    interaction,
-                    intents,
-                    ClusterPolicy::Perimeter,
-                    None,
-                );
-            }
-        }
-        UiAction::FrontLoad => {
-            if interaction.sources.is_empty() {
-                view.show_toast(
-                    "Directional policy needs selected clusters",
-                    ToastKind::Rejection,
-                );
-            } else if matches!(interaction.mode, OrderMode::Idle) {
-                if let Some(start) = interaction.cursor_world {
-                    interaction.mode = OrderMode::FrontLoadOrient {
-                        start,
-                        current: start,
-                    };
-                    view.show_toast(
-                        "Hold F and drag to orient the cluster policy",
-                        ToastKind::Info,
-                    );
-                } else {
-                    view.show_toast(
-                        "Point at the map before orienting the cluster policy",
-                        ToastKind::Rejection,
-                    );
-                }
             }
         }
         UiAction::Reshape => {
@@ -1477,18 +1452,14 @@ fn is_percentage_preview(mode: &OrderMode) -> bool {
             | OrderMode::PushFrontOrient { .. }
             | OrderMode::PushFrontPreview { .. }
             | OrderMode::PushFrontArcPreview
+            | OrderMode::FrontRebalanceSelectSource
+            | OrderMode::FrontRebalanceDrag { .. }
             | OrderMode::ExpandAllPreview
     )
 }
 
 fn stop_order_ids(view: &MatchView, interaction: &InteractionState) -> BTreeSet<u64> {
-    let is_stoppable = |order_id: &u64| {
-        view.retask_projection.active_order_ids.contains(order_id)
-            && !view
-                .retask_projection
-                .background_policy_order_ids
-                .contains(order_id)
-    };
+    let is_stoppable = |order_id: &u64| view.retask_projection.active_order_ids.contains(order_id);
     let mut order_ids = interaction
         .supersede_order_ids()
         .into_iter()
@@ -1679,6 +1650,20 @@ fn submission_request(
                 OrderMode::PushFrontArcPreview,
             ))
         }
+        OrderMode::FrontRebalanceDrag {
+            source_front_seed,
+            target_front_seed: Some(target_front_seed),
+        } if interaction.preview.invalid_reason.is_none() => Some((
+            ClientIntent::FrontRebalance {
+                source_component_cells: interaction.sources.clone(),
+                source_front_seed: *source_front_seed,
+                target_front_seed: *target_front_seed,
+                commitment_percent: interaction.amount_percent,
+                supersede_order_ids,
+            },
+            "FRONT REBALANCE",
+            interaction.mode.clone(),
+        )),
         OrderMode::ExpandAllPreview
             if !interaction.preview.front_edges.is_empty()
                 && interaction.preview.invalid_reason.is_none() =>
@@ -1693,52 +1678,6 @@ fn submission_request(
                 OrderMode::ExpandAllPreview,
             ))
         }
-        OrderMode::BalancePreview if interaction.preview.invalid_reason.is_none() => Some((
-            ClientIntent::Redistribute {
-                cells: interaction.sources.clone(),
-                supersede_order_ids: supersede_order_ids.clone(),
-                preset: RedistributionPreset::Balance,
-                direction: None,
-            },
-            "FORMATION / BALANCED",
-            OrderMode::BalancePreview,
-        )),
-        OrderMode::FrontLoadPreview { orientation }
-            if interaction.preview.invalid_reason.is_none() =>
-        {
-            Some((
-                ClientIntent::Redistribute {
-                    cells: interaction.sources.clone(),
-                    supersede_order_ids: supersede_order_ids.clone(),
-                    preset: RedistributionPreset::FrontLoad,
-                    direction: Some(*orientation),
-                },
-                "DIRECTIONAL BIAS",
-                OrderMode::FrontLoadPreview {
-                    orientation: *orientation,
-                },
-            ))
-        }
-        OrderMode::CoreLoadPreview if interaction.preview.invalid_reason.is_none() => Some((
-            ClientIntent::Redistribute {
-                cells: interaction.sources.clone(),
-                supersede_order_ids: supersede_order_ids.clone(),
-                preset: RedistributionPreset::CoreLoad,
-                direction: None,
-            },
-            "FORMATION / CENTER",
-            OrderMode::CoreLoadPreview,
-        )),
-        OrderMode::PerimeterLoadPreview if interaction.preview.invalid_reason.is_none() => Some((
-            ClientIntent::Redistribute {
-                cells: interaction.sources.clone(),
-                supersede_order_ids,
-                preset: RedistributionPreset::PerimeterLoad,
-                direction: None,
-            },
-            "FORMATION / PERIMETER",
-            OrderMode::PerimeterLoadPreview,
-        )),
         OrderMode::ReshapePreview
             if !interaction.shape_targets.is_empty()
                 && interaction.preview.invalid_reason.is_none() =>
@@ -1850,17 +1789,18 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
         OrderMode::PushFrontArcPreview => PreviewModeKey::PushFront {
             direction: Some(Axial::ZERO),
         },
+        OrderMode::FrontRebalanceSelectSource => PreviewModeKey::FrontRebalance {
+            source_front_seed: None,
+            target_front_seed: None,
+        },
+        OrderMode::FrontRebalanceDrag {
+            source_front_seed,
+            target_front_seed,
+        } => PreviewModeKey::FrontRebalance {
+            source_front_seed: Some(*source_front_seed),
+            target_front_seed: *target_front_seed,
+        },
         OrderMode::ExpandAllPreview => PreviewModeKey::ExpandAll,
-        OrderMode::BalancePreview => PreviewModeKey::Balance,
-        OrderMode::FrontLoadOrient { .. } | OrderMode::FrontLoadPreview { .. } => {
-            PreviewModeKey::FrontLoad {
-                orientation: interaction
-                    .frontload_orientation()
-                    .map(|value| (value.q, value.r)),
-            }
-        }
-        OrderMode::CoreLoadPreview => PreviewModeKey::CoreLoad,
-        OrderMode::PerimeterLoadPreview => PreviewModeKey::PerimeterLoad,
         OrderMode::ReshapeDrawing | OrderMode::ReshapePreview => PreviewModeKey::Reshape,
         OrderMode::StopPreview { .. } => PreviewModeKey::Stop,
         OrderMode::Submitting { .. } => return None,
@@ -2423,21 +2363,8 @@ fn rebuild_order_preview(view: &MatchView, interaction: &mut InteractionState) {
         interaction.preview_key = Some(key);
         return;
     }
-    let action_releases_policy = matches!(
-        interaction.mode,
-        OrderMode::AttackClustersPreview
-            | OrderMode::PushFrontOrient { .. }
-            | OrderMode::PushFrontPreview { .. }
-            | OrderMode::PushFrontArcPreview
-            | OrderMode::ExpandAllPreview
-            | OrderMode::ReshapeDrawing
-            | OrderMode::ReshapePreview
-    );
-    let projection_result = if action_releases_policy {
-        view.project_cluster_action_selection(&interaction.sources, &supersede_order_ids)
-    } else {
-        view.project_order_selection(&interaction.sources, &supersede_order_ids)
-    };
+    let projection_result =
+        view.project_order_selection(&interaction.sources, &supersede_order_ids);
     let projection = match projection_result {
         Ok(projection) => projection,
         Err(error) => {
@@ -2502,40 +2429,24 @@ fn rebuild_order_preview(view: &MatchView, interaction: &mut InteractionState) {
             interaction.amount_percent,
             &mut preview,
         ),
+        OrderMode::FrontRebalanceSelectSource => {
+            preview.projected_sources.clone_from(&projection.cells);
+        }
+        OrderMode::FrontRebalanceDrag {
+            source_front_seed,
+            target_front_seed,
+        } => build_front_rebalance_preview(
+            view,
+            &projection.cells,
+            *source_front_seed,
+            *target_front_seed,
+            interaction.amount_percent,
+            &mut preview,
+        ),
         OrderMode::ExpandAllPreview => build_projected_expand_all_preview(
             view,
             &projection,
             interaction.amount_percent,
-            &mut preview,
-        ),
-        OrderMode::BalancePreview => build_projected_redistribution_preview(
-            view,
-            &projection,
-            CoreDistributionPreset::Balance,
-            &mut preview,
-        ),
-        OrderMode::FrontLoadOrient { .. } | OrderMode::FrontLoadPreview { .. } => {
-            if let Some(orientation) = interaction.frontload_orientation() {
-                build_projected_redistribution_preview(
-                    view,
-                    &projection,
-                    CoreDistributionPreset::front_load(orientation),
-                    &mut preview,
-                );
-            } else {
-                preview.invalid_reason = Some("Directional Bias direction is too short");
-            }
-        }
-        OrderMode::CoreLoadPreview => build_projected_redistribution_preview(
-            view,
-            &projection,
-            CoreDistributionPreset::CoreLoad,
-            &mut preview,
-        ),
-        OrderMode::PerimeterLoadPreview => build_projected_redistribution_preview(
-            view,
-            &projection,
-            CoreDistributionPreset::PerimeterLoad,
             &mut preview,
         ),
         OrderMode::ReshapeDrawing | OrderMode::ReshapePreview => {
@@ -2588,6 +2499,46 @@ fn build_attack_clusters_preview(
         .fold(0_u64, u64::saturating_add);
 }
 
+fn build_front_rebalance_preview(
+    view: &MatchView,
+    component: &BTreeSet<Axial>,
+    source_front_seed: Axial,
+    target_front_seed: Option<Axial>,
+    commitment_percent: u8,
+    preview: &mut OrderPreview,
+) {
+    preview.projected_sources.clone_from(component);
+    preview.strength_upper_bound = component
+        .iter()
+        .filter_map(|coordinate| view.cell(*coordinate))
+        .map(|cell| cell.infantry)
+        .sum::<u64>()
+        .saturating_mul(u64::from(commitment_percent.clamp(10, 100)))
+        / 100;
+    preview.eta_seconds = component.len() as u32 / 3 + 2;
+    if let Ok(fronts) = strategic_fronts(component.iter().copied(), |_, target| {
+        strategic_exterior_for_view(view, target)
+    }) {
+        if let Some(source_index) = strategic_front_index_for_seed(&fronts, source_front_seed) {
+            for cell in fronts[source_index].source_cells() {
+                preview.heatmap.insert(cell, 0.15);
+            }
+        }
+        if let Some(target_front_seed) = target_front_seed
+            && let Some(target_index) = strategic_front_index_for_seed(&fronts, target_front_seed)
+        {
+            for cell in fronts[target_index].source_cells() {
+                preview.heatmap.insert(cell, 1.0);
+            }
+        }
+    }
+    if let Err(reason) =
+        front_rebalance_seed_error(view, component, source_front_seed, target_front_seed)
+    {
+        preview.invalid_reason = Some(reason);
+    }
+}
+
 fn build_stop_preview(view: &MatchView, order_ids: &BTreeSet<u64>, preview: &mut OrderPreview) {
     preview.stop_order_ids.clone_from(order_ids);
     preview.projected_sources.clear();
@@ -2614,28 +2565,6 @@ const fn projection_error_text(error: OrderSelectionProjectionError) -> &'static
             "A retasked order references an unknown map cell"
         }
     }
-}
-
-fn build_projected_redistribution_preview(
-    view: &MatchView,
-    projection: &ProjectedOrderSelection,
-    preset: CoreDistributionPreset,
-    preview: &mut OrderPreview,
-) {
-    let plan = match projected_redistribution_distribution(view, projection, preset) {
-        Ok(plan) => plan,
-        Err(reason) => {
-            preview.invalid_reason = Some(reason);
-            return;
-        }
-    };
-    preview.excluded.extend(plan.excluded);
-    preview.strength_upper_bound = plan.participating_strength;
-    preview.destination_capacity = plan.destination_capacity;
-    for (coordinate, target) in plan.final_strength_by_cell {
-        record_projected_strength(view, preview, coordinate, target);
-    }
-    preview.eta_seconds = projection.cells.len() as u32 / 3 + 3;
 }
 
 fn build_projected_shape_preview(
@@ -2788,7 +2717,7 @@ fn submission_matches(interaction: &InteractionState, command_id: Option<u64>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CellView, ClusterPolicyView, ContestedCellView, RetaskProjection};
+    use crate::model::{CellView, ContestedCellView, RetaskProjection};
     use hex_core::TerrainKind;
 
     fn preview_cell(
@@ -2847,7 +2776,6 @@ mod tests {
         view.set_retask_projection(RetaskProjection {
             handle_orders: BTreeMap::from([(handle, BTreeSet::from([7]))]),
             active_order_ids: BTreeSet::from([7, 8]),
-            background_policy_order_ids: BTreeSet::new(),
             order_source_cells: BTreeMap::new(),
             order_strength_by_cell: BTreeMap::from([
                 (7, BTreeMap::from([(rear, 30), (front, 20)])),
@@ -3237,71 +3165,6 @@ mod tests {
     }
 
     #[test]
-    fn submitting_mode_ignores_keyboard_and_hud_formation_actions() {
-        let source = Axial::ZERO;
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 20, 0));
-        view.rebuild_chunk_index();
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source]),
-            mode: OrderMode::Submitting {
-                _label: "PUSH FRONT",
-            },
-            return_after_rejection: Some(OrderMode::PushFrontPreview {
-                direction: Axial::new(1, 0),
-            }),
-            submitting_command_id: Some(41),
-            ..Default::default()
-        };
-        let mut app = order_input_app(view, interaction);
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::KeyR);
-        app.world_mut().write_message(UiAction::FormationOut);
-
-        app.update();
-
-        let interaction = app.world().resource::<InteractionState>();
-        assert!(matches!(interaction.mode, OrderMode::Submitting { .. }));
-        assert_eq!(interaction.submitting_command_id, Some(41));
-        assert!(matches!(
-            interaction.return_after_rejection,
-            Some(OrderMode::PushFrontPreview { .. })
-        ));
-    }
-
-    #[test]
-    fn durable_pending_marker_blocks_actions_even_if_visible_mode_is_corrupted() {
-        let source = Axial::ZERO;
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 20, 0));
-        view.rebuild_chunk_index();
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source]),
-            mode: OrderMode::BalancePreview,
-            return_after_rejection: Some(OrderMode::PushFrontPreview {
-                direction: Axial::new(1, 0),
-            }),
-            submitting_command_id: Some(41),
-            ..Default::default()
-        };
-        let mut app = order_input_app(view, interaction);
-        app.world_mut().write_message(UiAction::FormationOut);
-
-        app.update();
-
-        let interaction = app.world().resource::<InteractionState>();
-        assert!(matches!(interaction.mode, OrderMode::BalancePreview));
-        assert_eq!(interaction.submitting_command_id, Some(41));
-        assert!(matches!(
-            interaction.return_after_rejection,
-            Some(OrderMode::PushFrontPreview { .. })
-        ));
-    }
-
-    #[test]
     fn reconciliation_prunes_finished_retask_handles_without_rebinding_them() {
         let (mut view, _rear, _front, handle) = retask_preview_view();
         let mut sources = BTreeSet::new();
@@ -3640,51 +3503,6 @@ mod tests {
             Some(Axial::new(1, 0)),
             "a visible pixel drag resolves even when zoom makes its world delta small"
         );
-    }
-
-    #[test]
-    fn directional_policy_preserves_a_continuous_fixed_point_heading_end_to_end() {
-        let source = Axial::ZERO;
-        let direction = Vec2::new(1.0, 1.0);
-        let orientation = bias_orientation_from_world(direction).expect("visible policy drag");
-        assert_ne!(orientation.q, 0);
-        assert_ne!(orientation.r, 0);
-        assert_ne!(orientation.q + orientation.r, 0);
-
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 40, 0));
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source]),
-            cursor_world: Some(Vec3::new(direction.x, 0.0, direction.y)),
-            mode: OrderMode::FrontLoadOrient {
-                start: Vec3::ZERO,
-                current: Vec3::ZERO,
-            },
-            ..Default::default()
-        };
-        let mut app = order_input_app(view, interaction);
-        app.init_resource::<CapturedIntents>()
-            .add_systems(Update, capture_intents.after(process_order_input));
-        let keyboard = &mut *app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        keyboard.press(KeyCode::KeyF);
-        keyboard.clear_just_pressed(KeyCode::KeyF);
-        keyboard.release(KeyCode::KeyF);
-
-        app.update();
-
-        assert!(matches!(
-            app.world().resource::<InteractionState>().mode,
-            OrderMode::Submitting { .. }
-        ));
-        assert!(matches!(
-            app.world().resource::<CapturedIntents>().0.as_slice(),
-            [ClientIntent::SetClusterPolicy {
-                sources,
-                policy: ClusterPolicy::Directional,
-                direction: Some(serialized),
-            }] if sources == &BTreeSet::from([source]) && *serialized == orientation
-        ));
     }
 
     #[test]
@@ -4228,48 +4046,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_cycle_uses_authoritative_kind_and_dispatches_immediately() {
-        let source = Axial::ZERO;
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 40, 0));
-        view.cluster_policies.insert(
-            source,
-            ClusterPolicyView {
-                kind: ClusterPolicy::Balanced,
-                orientation: Axial::ZERO,
-                revision: 7,
-            },
-        );
-        let mut app = order_input_app(
-            view,
-            InteractionState {
-                sources: BTreeSet::from([source]),
-                ..Default::default()
-            },
-        );
-        app.init_resource::<CapturedIntents>()
-            .add_systems(Update, capture_intents.after(process_order_input));
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::KeyR);
-        app.update();
-
-        assert!(matches!(
-            app.world().resource::<CapturedIntents>().0.as_slice(),
-            [ClientIntent::SetClusterPolicy {
-                sources,
-                policy: ClusterPolicy::Perimeter,
-                direction: None,
-            }] if sources == &BTreeSet::from([source])
-        ));
-        assert!(matches!(
-            app.world().resource::<InteractionState>().mode,
-            OrderMode::Submitting { .. }
-        ));
-    }
-
-    #[test]
     fn arc_push_submission_uses_the_zero_direction_sentinel() {
         let source = Axial::ZERO;
         let target = Axial::new(1, 0);
@@ -4293,72 +4069,6 @@ mod tests {
     }
 
     #[test]
-    fn preview_cache_key_tracks_revisions_share_mode_and_direction() {
-        let mut view = MatchView::connecting(1);
-        let mut interaction = InteractionState {
-            mode: OrderMode::PushFrontPreview {
-                direction: Axial::new(1, 0),
-            },
-            ..Default::default()
-        };
-        let mut prior = order_preview_key(&view, &interaction).expect("push key");
-
-        interaction.source_revision = interaction.source_revision.wrapping_add(1);
-        let current = order_preview_key(&view, &interaction).expect("source key");
-        assert_ne!(current, prior);
-        prior = current;
-
-        interaction.amount_percent = 70;
-        let current = order_preview_key(&view, &interaction).expect("share key");
-        assert_ne!(current, prior);
-        prior = current;
-
-        interaction.mode = OrderMode::PushFrontPreview {
-            direction: Axial::new(0, 1),
-        };
-        let current = order_preview_key(&view, &interaction).expect("direction key");
-        assert_ne!(current, prior);
-        prior = current;
-
-        interaction.mode = OrderMode::FrontLoadPreview {
-            orientation: Axial::new(1_024, 375),
-        };
-        let current = order_preview_key(&view, &interaction).expect("mode key");
-        assert_ne!(current, prior);
-        prior = current;
-
-        interaction.amount_percent = 90;
-        let current = order_preview_key(&view, &interaction).expect("internal full-scope key");
-        assert_eq!(
-            current, prior,
-            "Share changes must not invalidate an internal-command preview"
-        );
-
-        view.cell_state_revision = view.cell_state_revision.wrapping_add(1);
-        let current = order_preview_key(&view, &interaction).expect("presentation-only key");
-        assert_eq!(
-            current, prior,
-            "Presentation-only cell changes must not invalidate a command preview"
-        );
-
-        view.planning_revision = view.planning_revision.wrapping_add(1);
-        let current = order_preview_key(&view, &interaction).expect("planning key");
-        assert_ne!(current, prior);
-        prior = current;
-
-        view.chunk_index_revision = view.chunk_index_revision.wrapping_add(1);
-        let current = order_preview_key(&view, &interaction).expect("topology key");
-        assert_ne!(current, prior);
-        prior = current;
-
-        view.retask_revision = view.retask_revision.wrapping_add(1);
-        assert_ne!(
-            order_preview_key(&view, &interaction).expect("retask key"),
-            prior
-        );
-    }
-
-    #[test]
     fn idle_preview_and_selection_reconcile_ignore_infantry_only_changes() {
         let mut view = MatchView::connecting(1);
         let interaction = InteractionState::default();
@@ -4379,131 +4089,6 @@ mod tests {
             idle_key
         );
         assert!(!reconcile_cache.is_current(&view, &interaction));
-    }
-
-    #[test]
-    fn handle_only_preview_expands_to_current_packet_cells() {
-        let (view, rear, front, handle) = retask_preview_view();
-        let interaction = InteractionState {
-            retask_handles: BTreeMap::from([(handle, BTreeSet::from([7]))]),
-            mode: OrderMode::BalancePreview,
-            amount_percent: 50,
-            source_revision: 1,
-            ..Default::default()
-        };
-        let mut app = App::new();
-        app.insert_resource(view)
-            .insert_resource(interaction)
-            .add_systems(Update, update_order_preview);
-        app.update();
-
-        let preview = &app.world().resource::<InteractionState>().preview;
-        assert_eq!(preview.invalid_reason, None);
-        assert_eq!(preview.projected_sources, BTreeSet::from([rear, front]));
-        assert_eq!(preview.projected_source_count, 2);
-        assert_eq!(preview.retask_handle_count, 1);
-        assert_eq!(preview.retask_order_count, 1);
-        assert_eq!(preview.retask_strength, 50);
-        assert_eq!(preview.projected_strength, 160);
-        assert!(!preview.heatmap.is_empty());
-    }
-
-    #[test]
-    fn attack_preview_releases_intersecting_policy_but_keeps_explicit_action_fixed() {
-        let source = Axial::ZERO;
-        let target = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 100, 0));
-        view.cells
-            .insert(target, preview_cell(target, Some(2), 20, 0));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7, 9]),
-            background_policy_order_ids: BTreeSet::from([7]),
-            order_source_cells: BTreeMap::from([
-                (7, BTreeSet::from([source])),
-                (9, BTreeSet::from([source])),
-            ]),
-            order_strength_by_cell: BTreeMap::from([
-                (7, BTreeMap::from([(source, 40)])),
-                (9, BTreeMap::from([(source, 30)])),
-            ]),
-            active_strength_by_cell: BTreeMap::from([(source, 70)]),
-            ..Default::default()
-        });
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source]),
-            attack_targets: BTreeSet::from([target]),
-            mode: OrderMode::AttackClustersPreview,
-            amount_percent: 50,
-            ..Default::default()
-        };
-        let mut app = App::new();
-        app.insert_resource(view)
-            .insert_resource(interaction)
-            .add_systems(Update, update_order_preview);
-
-        app.update();
-
-        let preview = &app.world().resource::<InteractionState>().preview;
-        assert_eq!(preview.invalid_reason, None);
-        assert_eq!(preview.projected_sources, BTreeSet::from([source]));
-        assert_eq!(preview.projected_strength, 70);
-        assert_eq!(preview.strength_upper_bound, 35);
-        assert_eq!(preview.retask_order_count, 0);
-    }
-
-    #[test]
-    fn reshape_preview_uses_yielded_policy_strength_without_sending_its_order_id() {
-        let source = Axial::ZERO;
-        let target = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 100, 0));
-        view.cells
-            .insert(target, preview_cell(target, Some(1), 0, 0));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7, 9]),
-            background_policy_order_ids: BTreeSet::from([7]),
-            order_source_cells: BTreeMap::from([
-                (7, BTreeSet::from([source])),
-                (9, BTreeSet::from([source])),
-            ]),
-            order_strength_by_cell: BTreeMap::from([
-                (7, BTreeMap::from([(source, 40)])),
-                (9, BTreeMap::from([(source, 30)])),
-            ]),
-            active_strength_by_cell: BTreeMap::from([(source, 70)]),
-            ..Default::default()
-        });
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source, target]),
-            shape_targets: BTreeSet::from([target]),
-            mode: OrderMode::ReshapePreview,
-            ..Default::default()
-        };
-        let mut app = App::new();
-        app.insert_resource(view)
-            .insert_resource(interaction)
-            .add_systems(Update, update_order_preview);
-
-        app.update();
-
-        let interaction = app.world().resource::<InteractionState>();
-        assert_eq!(interaction.preview.invalid_reason, None);
-        assert_eq!(interaction.preview.projected_strength, 70);
-        assert_eq!(interaction.preview.reshape_destination_strength, 70);
-        assert!(matches!(
-            submission_request(interaction),
-            Some((
-                ClientIntent::Reshape {
-                    supersede_order_ids,
-                    ..
-                },
-                _,
-                _
-            )) if supersede_order_ids.is_empty()
-        ));
     }
 
     #[test]
@@ -5033,381 +4618,6 @@ mod tests {
     }
 
     #[test]
-    fn every_order_preview_rejects_an_oversized_selection_before_building() {
-        let sources = (0..=MAX_COMMAND_SELECTION_CELLS)
-            .map(|index| Axial::new(i32::try_from(index).expect("test index fits i32"), 0))
-            .collect();
-        let interaction = InteractionState {
-            sources,
-            mode: OrderMode::BalancePreview,
-            source_revision: 1,
-            ..Default::default()
-        };
-        let mut app = App::new();
-        app.insert_resource(MatchView::connecting(1))
-            .insert_resource(interaction)
-            .add_systems(Update, update_order_preview);
-        app.update();
-
-        let preview = &app.world().resource::<InteractionState>().preview;
-        assert_eq!(
-            preview.invalid_reason,
-            Some("Selection exceeds the 32,768-cell command limit")
-        );
-        assert!(preview.heatmap.is_empty());
-    }
-
-    #[test]
-    fn every_order_preview_rejects_too_many_superseded_orders_before_projection() {
-        let handle = Axial::new(1, 0);
-        let interaction = InteractionState {
-            retask_handles: BTreeMap::from([(
-                handle,
-                (0..=u64::try_from(MAX_COMMAND_SUPERSEDE_ORDERS).expect("limit fits u64"))
-                    .collect(),
-            )]),
-            mode: OrderMode::BalancePreview,
-            source_revision: 1,
-            ..Default::default()
-        };
-        let mut app = App::new();
-        app.insert_resource(MatchView::connecting(1))
-            .insert_resource(interaction)
-            .add_systems(Update, update_order_preview);
-        app.update();
-
-        let preview = &app.world().resource::<InteractionState>().preview;
-        assert_eq!(
-            preview.invalid_reason,
-            Some("Retask selection exceeds the 32,768-order command limit")
-        );
-        assert!(preview.heatmap.is_empty());
-    }
-
-    #[test]
-    fn every_issue_intent_carries_the_exact_snapshotted_order_ids() {
-        let source = Axial::ZERO;
-        let handle = Axial::new(2, 0);
-        let ids = BTreeSet::from([7, 9]);
-        let mut interaction = InteractionState {
-            sources: BTreeSet::from([source]),
-            retask_handles: BTreeMap::from([(handle, ids.clone())]),
-            amount_percent: 70,
-            preview: OrderPreview {
-                front_edges: vec![DirectedFrontEdge {
-                    source,
-                    target: Axial::new(1, 0),
-                }],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        interaction.mode = OrderMode::PushFrontPreview {
-            direction: Axial::new(1, 0),
-        };
-        let (push, _, _) = submission_request(&interaction).expect("push request");
-        let ClientIntent::PushFront {
-            sources,
-            supersede_order_ids,
-            commitment_percent,
-            ..
-        } = push
-        else {
-            panic!("expected Push Front intent");
-        };
-        assert_eq!(sources, BTreeSet::from([source]));
-        assert_eq!(supersede_order_ids, ids);
-        assert_eq!(commitment_percent, 70);
-
-        interaction.mode = OrderMode::ExpandAllPreview;
-        let (expand, _, _) = submission_request(&interaction).expect("expand request");
-        let ClientIntent::ExpandAll {
-            sources,
-            supersede_order_ids,
-            commitment_percent,
-        } = expand
-        else {
-            panic!("expected Expand Perimeter intent");
-        };
-        assert_eq!(sources, BTreeSet::from([source]));
-        assert_eq!(supersede_order_ids, BTreeSet::from([7, 9]));
-        assert_eq!(commitment_percent, 70);
-
-        for (mode, expected_preset) in [
-            (OrderMode::BalancePreview, RedistributionPreset::Balance),
-            (
-                OrderMode::FrontLoadPreview {
-                    orientation: Axial::new(1_024, 227),
-                },
-                RedistributionPreset::FrontLoad,
-            ),
-            (OrderMode::CoreLoadPreview, RedistributionPreset::CoreLoad),
-            (
-                OrderMode::PerimeterLoadPreview,
-                RedistributionPreset::PerimeterLoad,
-            ),
-        ] {
-            interaction.mode = mode;
-            let (redistribute, _, _) =
-                submission_request(&interaction).expect("redistribution request");
-            let ClientIntent::Redistribute {
-                cells,
-                supersede_order_ids,
-                preset,
-                ..
-            } = redistribute
-            else {
-                panic!("expected redistribution intent");
-            };
-            assert_eq!(cells, BTreeSet::from([source]));
-            assert_eq!(supersede_order_ids, BTreeSet::from([7, 9]));
-            assert_eq!(preset, expected_preset);
-        }
-
-        let target = Axial::new(1, 0);
-        interaction.mode = OrderMode::ReshapePreview;
-        interaction.shape_targets = BTreeSet::from([target]);
-        let (reshape, _, _) = submission_request(&interaction).expect("reshape request");
-        let ClientIntent::Reshape {
-            sources,
-            targets,
-            supersede_order_ids,
-        } = reshape
-        else {
-            panic!("expected Reshape intent");
-        };
-        assert_eq!(sources, BTreeSet::from([source]));
-        assert_eq!(targets, BTreeSet::from([target]));
-        assert_eq!(supersede_order_ids, BTreeSet::from([7, 9]));
-    }
-
-    #[test]
-    fn formation_and_reshape_previews_use_all_available_selected_troops() {
-        let cells = hex_disk(1).into_iter().collect::<BTreeSet<_>>();
-        for (preset, occupied) in [
-            (CoreDistributionPreset::Balance, Axial::ZERO),
-            (CoreDistributionPreset::CoreLoad, Axial::new(1, 0)),
-            (CoreDistributionPreset::PerimeterLoad, Axial::ZERO),
-        ] {
-            let mut view = MatchView::connecting(1);
-            for &coordinate in &cells {
-                view.cells.insert(
-                    coordinate,
-                    preview_cell(
-                        coordinate,
-                        Some(1),
-                        u64::from(coordinate == occupied) * 100,
-                        0,
-                    ),
-                );
-            }
-            let projection = view
-                .project_order_selection(&cells, &BTreeSet::new())
-                .expect("owned formation cells");
-            let mut preview = OrderPreview::default();
-            build_projected_redistribution_preview(&view, &projection, preset, &mut preview);
-
-            assert_eq!(preview.invalid_reason, None, "full selection {preset:?}");
-            assert_eq!(
-                preview.strength_upper_bound, 100,
-                "full selection {preset:?}"
-            );
-            assert!(
-                !preview.delta_by_cell.is_empty(),
-                "full selection {preset:?}"
-            );
-        }
-
-        let source = Axial::ZERO;
-        let target = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 100, 0));
-        view.cells
-            .insert(target, preview_cell(target, Some(1), 0, 0));
-        let projection = view
-            .project_order_selection(&BTreeSet::from([source]), &BTreeSet::new())
-            .expect("owned reshape source");
-        let mut preview = OrderPreview::default();
-        let targets = BTreeSet::from([target]);
-        build_projected_shape_preview(&view, &projection, &targets, &mut preview);
-
-        assert_eq!(preview.invalid_reason, None);
-        assert_eq!(preview.strength_upper_bound, 100);
-        assert!((preview.heatmap[&target] - 1.0).abs() < f32::EPSILON);
-        assert_eq!(
-            preview.delta_by_cell,
-            BTreeMap::from([(source, -100), (target, 100)])
-        );
-    }
-
-    #[test]
-    fn force_share_is_available_only_for_contextual_movement_and_legacy_push_previews() {
-        for mode in [
-            OrderMode::Idle,
-            OrderMode::AttackClustersPreview,
-            OrderMode::PushFrontOrient {
-                start: Vec3::ZERO,
-                current: Vec3::X,
-            },
-            OrderMode::PushFrontPreview {
-                direction: Axial::new(1, 0),
-            },
-            OrderMode::PushFrontArcPreview,
-            OrderMode::ExpandAllPreview,
-        ] {
-            assert!(is_percentage_preview(&mode), "missing Share: {mode:?}");
-        }
-        for mode in [
-            OrderMode::BalancePreview,
-            OrderMode::CoreLoadPreview,
-            OrderMode::PerimeterLoadPreview,
-            OrderMode::FrontLoadOrient {
-                start: Vec3::ZERO,
-                current: Vec3::X,
-            },
-            OrderMode::FrontLoadPreview {
-                orientation: Axial::new(1_024, 0),
-            },
-            OrderMode::ReshapeDrawing,
-            OrderMode::ReshapePreview,
-            OrderMode::StopPreview {
-                order_ids: BTreeSet::from([7]),
-            },
-        ] {
-            assert!(!is_percentage_preview(&mode), "unexpected Share: {mode:?}");
-        }
-    }
-
-    #[test]
-    fn invalid_formation_and_reshape_previews_cannot_submit() {
-        let source = Axial::ZERO;
-        let target = Axial::new(1, 0);
-        let invalid_preview = OrderPreview {
-            invalid_reason: Some("blocked for test"),
-            ..Default::default()
-        };
-        for mode in [
-            OrderMode::BalancePreview,
-            OrderMode::FrontLoadPreview {
-                orientation: Axial::new(1_024, 0),
-            },
-            OrderMode::CoreLoadPreview,
-            OrderMode::PerimeterLoadPreview,
-        ] {
-            let interaction = InteractionState {
-                sources: BTreeSet::from([source]),
-                mode,
-                preview: invalid_preview.clone(),
-                ..Default::default()
-            };
-            assert!(submission_request(&interaction).is_none());
-        }
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source]),
-            shape_targets: BTreeSet::from([target]),
-            mode: OrderMode::ReshapePreview,
-            preview: invalid_preview,
-            ..Default::default()
-        };
-        assert!(submission_request(&interaction).is_none());
-    }
-
-    #[test]
-    fn invalid_previews_stay_open_after_click_or_enter_confirmation() {
-        let source = Axial::ZERO;
-        let target = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 50, 0));
-        view.cells
-            .insert(target, preview_cell(target, Some(1), 0, 0));
-        let invalid = OrderPreview {
-            invalid_reason: Some("blocked for test"),
-            ..Default::default()
-        };
-
-        let mut click_app = order_input_app(
-            view,
-            InteractionState {
-                hovered: Some(source),
-                sources: BTreeSet::from([source]),
-                mode: OrderMode::BalancePreview,
-                preview: invalid.clone(),
-                ..Default::default()
-            },
-        );
-        click_app
-            .world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .press(MouseButton::Left);
-        click_app.update();
-        assert!(matches!(
-            click_app.world().resource::<InteractionState>().mode,
-            OrderMode::BalancePreview
-        ));
-
-        let mut enter_app = order_input_app(
-            MatchView::connecting(1),
-            InteractionState {
-                sources: BTreeSet::from([source]),
-                shape_targets: BTreeSet::from([target]),
-                mode: OrderMode::ReshapePreview,
-                preview: invalid,
-                ..Default::default()
-            },
-        );
-        enter_app
-            .world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::Enter);
-        enter_app.update();
-        assert!(matches!(
-            enter_app.world().resource::<InteractionState>().mode,
-            OrderMode::ReshapePreview
-        ));
-    }
-
-    #[test]
-    fn policy_key_dispatches_without_waiting_for_a_one_shot_preview() {
-        let source = Axial::ZERO;
-        let neighbor = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 100, 0));
-        view.cells
-            .insert(neighbor, preview_cell(neighbor, Some(1), 0, 0));
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source, neighbor]),
-            ..Default::default()
-        };
-        let mut app = order_input_app(view, interaction);
-        app.init_resource::<CapturedIntents>()
-            .add_systems(Update, update_order_preview.after(process_order_input))
-            .add_systems(Update, capture_intents.after(process_order_input));
-        let keyboard = &mut *app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        keyboard.press(KeyCode::KeyR);
-        keyboard.press(KeyCode::Enter);
-
-        app.update();
-
-        assert!(matches!(
-            app.world().resource::<InteractionState>().mode,
-            OrderMode::Submitting { .. }
-        ));
-        assert_eq!(app.world().resource::<CapturedIntents>().0.len(), 1);
-        assert!(matches!(
-            app.world().resource::<CapturedIntents>().0.as_slice(),
-            [ClientIntent::SetClusterPolicy {
-                policy: ClusterPolicy::Perimeter,
-                direction: None,
-                ..
-            }]
-        ));
-    }
-
-    #[test]
     fn map_click_waits_when_share_changes_after_the_displayed_preview() {
         let source = Axial::ZERO;
         let target = Axial::new(1, 0);
@@ -5469,74 +4679,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn valid_map_click_confirms_once_while_hud_clicks_do_not_map_confirm() {
-        let source = Axial::ZERO;
-        let ready_view = || {
-            let mut view = MatchView::connecting(1);
-            view.cells
-                .insert(source, preview_cell(source, Some(1), 50, 0));
-            view
-        };
-        let map_view = ready_view();
-        let mut ready = InteractionState {
-            hovered: Some(source),
-            sources: BTreeSet::from([source]),
-            mode: OrderMode::BalancePreview,
-            ..Default::default()
-        };
-        mark_preview_current(&map_view, &mut ready);
-        let mut map_click = order_input_app(map_view, ready);
-        map_click
-            .init_resource::<CapturedIntents>()
-            .add_systems(Update, capture_intents.after(process_order_input));
-        map_click
-            .world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .press(MouseButton::Left);
-
-        map_click.update();
-
-        assert!(matches!(
-            map_click.world().resource::<InteractionState>().mode,
-            OrderMode::Submitting { .. }
-        ));
-        let captured = &map_click.world().resource::<CapturedIntents>().0;
-        assert_eq!(captured.len(), 1);
-        assert!(matches!(
-            &captured[0],
-            ClientIntent::Redistribute {
-                preset: RedistributionPreset::Balance,
-                ..
-            }
-        ));
-
-        let hud_view = ready_view();
-        let mut hud_ready = InteractionState {
-            hovered: None,
-            sources: BTreeSet::from([source]),
-            mode: OrderMode::BalancePreview,
-            ..Default::default()
-        };
-        mark_preview_current(&hud_view, &mut hud_ready);
-        let mut hud_click = order_input_app(hud_view, hud_ready);
-        hud_click
-            .init_resource::<CapturedIntents>()
-            .add_systems(Update, capture_intents.after(process_order_input));
-        hud_click.world_mut().write_message(UiAction::AmountUp);
-        hud_click
-            .world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .press(MouseButton::Left);
-
-        hud_click.update();
-
-        let interaction = hud_click.world().resource::<InteractionState>();
-        assert!(matches!(interaction.mode, OrderMode::BalancePreview));
-        assert_eq!(interaction.amount_percent, 50);
-        assert!(hud_click.world().resource::<CapturedIntents>().0.is_empty());
     }
 
     #[test]
@@ -5738,34 +4880,6 @@ mod tests {
     }
 
     #[test]
-    fn stop_ignores_persistent_policy_maintenance_orders() {
-        let source = Axial::ZERO;
-        let mut view = MatchView::connecting(1);
-        view.cells
-            .insert(source, preview_cell(source, Some(1), 50, 0));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7, 9]),
-            background_policy_order_ids: BTreeSet::from([7]),
-            order_source_cells: BTreeMap::from([
-                (7, BTreeSet::from([source])),
-                (9, BTreeSet::from([source])),
-            ]),
-            order_strength_by_cell: BTreeMap::from([
-                (7, BTreeMap::from([(source, 20)])),
-                (9, BTreeMap::from([(source, 10)])),
-            ]),
-            active_strength_by_cell: BTreeMap::from([(source, 30)]),
-            ..Default::default()
-        });
-        let interaction = InteractionState {
-            sources: BTreeSet::from([source]),
-            ..Default::default()
-        };
-
-        assert_eq!(stop_order_ids(&view, &interaction), BTreeSet::from([9]));
-    }
-
-    #[test]
     fn rejected_commands_restore_expand_and_arc_previews() {
         let interaction = InteractionState {
             mode: OrderMode::Submitting {
@@ -5811,38 +4925,6 @@ mod tests {
 
         let interaction = app.world().resource::<InteractionState>();
         assert!(matches!(interaction.mode, OrderMode::PushFrontArcPreview));
-        assert_eq!(interaction.submitting_command_id, None);
-    }
-
-    #[test]
-    fn matching_submission_response_is_not_orphaned_if_presentation_mode_changes() {
-        let interaction = InteractionState {
-            // Simulate a presentation-system regression that replaced the
-            // visible mode while the durable pending marker remains intact.
-            mode: OrderMode::BalancePreview,
-            return_after_rejection: Some(OrderMode::PushFrontPreview {
-                direction: Axial::new(1, 0),
-            }),
-            submitting_command_id: Some(41),
-            ..Default::default()
-        };
-        let mut app = App::new();
-        app.add_message::<ServerUpdate>()
-            .insert_resource(interaction)
-            .add_systems(Update, finish_submission);
-        app.world_mut().write_message(ServerUpdate::Accepted {
-            command_id: Some(41),
-            summary: "accepted".to_owned(),
-            patches: Vec::new(),
-            flow: None,
-            front: None,
-        });
-
-        app.update();
-
-        let interaction = app.world().resource::<InteractionState>();
-        assert!(matches!(interaction.mode, OrderMode::Idle));
-        assert!(interaction.return_after_rejection.is_none());
         assert_eq!(interaction.submitting_command_id, None);
     }
 }

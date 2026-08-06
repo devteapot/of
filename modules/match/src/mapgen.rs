@@ -4,13 +4,11 @@ use worldgen::{generate_for_players, validate};
 
 use crate::rules::{calculate_edge_runtime_limits, edge_key};
 use crate::schema::{
-    CellState, CellTerrain, ClusterPolicyAssignment, ClusterPolicyKind, MapPreset, MatchConfig,
-    MatchPhase, MatchState, NEUTRAL_PLAYER, PlayerState, SINGLETON_ID, StaticEdgeLimit,
-    TerrainClass,
+    CellState, CellTerrain, MapPreset, MatchConfig, MatchPhase, MatchState, NEUTRAL_PLAYER,
+    PlayerState, SINGLETON_ID, StaticEdgeLimit, TerrainClass,
 };
 use crate::schema::{
-    cell_state, cell_terrain, cluster_policy_assignment, match_config, match_state, player_state,
-    policy_replan_state, policy_topology_cache, static_edge_limit,
+    cell_state, cell_terrain, match_config, match_state, player_state, static_edge_limit,
 };
 
 pub fn default_config() -> MatchConfig {
@@ -124,20 +122,7 @@ pub fn regenerate_map(
             chunk_q,
             chunk_r,
             last_changed_step: 0,
-            last_policy_changed_step: 0,
         });
-        if owner != NEUTRAL_PLAYER && owner <= player_count {
-            ctx.db
-                .cluster_policy_assignment()
-                .insert(ClusterPolicyAssignment {
-                    cell_id,
-                    owner_player_id: owner,
-                    kind: ClusterPolicyKind::Balanced,
-                    orientation_q: 0,
-                    orientation_r: 0,
-                    revision: 0,
-                });
-        }
     }
 
     let mut config = default_config();
@@ -208,10 +193,7 @@ pub fn regenerate_map(
         required_control: rule.required_control(),
         winner_player_id: NEUTRAL_PLAYER,
         claimed_players: 0,
-        latest_cluster_policy_revision: 0,
         ownership_revision: 1,
-        policy_topology_revision: 0,
-        policy_replan_cursor: 0,
         started_at_us: 0,
         completed_at_us: 0,
     });
@@ -227,30 +209,6 @@ fn clear_map(ctx: &ReducerContext) {
         .collect::<Vec<_>>();
     for player_id in player_ids {
         ctx.db.player_state().player_id().delete(player_id);
-    }
-    let replan_keys = ctx
-        .db
-        .policy_replan_state()
-        .iter()
-        .map(|row| row.component_key)
-        .collect::<Vec<_>>();
-    for component_key in replan_keys {
-        ctx.db
-            .policy_replan_state()
-            .component_key()
-            .delete(component_key);
-    }
-    let topology_keys = ctx
-        .db
-        .policy_topology_cache()
-        .iter()
-        .map(|row| row.component_key)
-        .collect::<Vec<_>>();
-    for component_key in topology_keys {
-        ctx.db
-            .policy_topology_cache()
-            .component_key()
-            .delete(component_key);
     }
     let edge_keys = ctx
         .db
@@ -273,15 +231,6 @@ fn clear_map(ctx: &ReducerContext) {
     let state_ids: Vec<_> = ctx.db.cell_state().iter().map(|row| row.cell_id).collect();
     for cell_id in state_ids {
         ctx.db.cell_state().cell_id().delete(cell_id);
-    }
-    let policy_cell_ids: Vec<_> = ctx
-        .db
-        .cluster_policy_assignment()
-        .iter()
-        .map(|row| row.cell_id)
-        .collect();
-    for cell_id in policy_cell_ids {
-        ctx.db.cluster_policy_assignment().cell_id().delete(cell_id);
     }
     ctx.db.match_config().singleton_id().delete(SINGLETON_ID);
     ctx.db.match_state().singleton_id().delete(SINGLETON_ID);

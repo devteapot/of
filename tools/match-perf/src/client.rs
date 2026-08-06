@@ -8,17 +8,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use match_bindings::{
-    CellStateTableAccess, CellTerrainTableAccess, ClusterPolicyKind, CombatFrontTableAccess,
+    CellStateTableAccess, CellTerrainTableAccess, CombatFrontTableAccess,
     CommandReceiptTableAccess, DbConnection, MapPreset, MatchConfig, MatchConfigTableAccess,
     MatchPhase, MatchStateTableAccess, OrderStatus, PlayerSlotTableAccess, PlayerStateTableAccess,
     ReceiptStatus, TerrainClass, TransferOrderTableAccess, TransitPacketTableAccess,
-    configure_match as _, issue_attack_clusters as _, issue_expand_clusters as _, join_match as _,
-    set_cluster_policy as _, set_mobilization_target as _,
+    configure_match as _, issue_attack_clusters as _, issue_expand_clusters as _,
+    issue_front_rebalance as _, join_match as _, set_mobilization_target as _,
 };
 use spacetimedb_sdk::{DbContext, Table};
 
 use crate::attack::{AttackFront, FrontCell, axial_distance, find_attack_fronts};
 use crate::common::SINGLETON_ID;
+use crate::front_rebalance::MapCell;
 
 pub enum LifecycleEvent {
     Connected { token: String },
@@ -214,31 +215,6 @@ impl Client {
     }
 
     #[allow(dead_code)] // retained for sequential/debug command paths
-    pub fn policy(
-        &self,
-        command: u64,
-        seeds: Vec<u32>,
-        kind: ClusterPolicyKind,
-        timeout: Duration,
-    ) -> Result<(Duration, Result<(), String>)> {
-        Self::call(
-            |tx| {
-                self.conn
-                    .reducers
-                    .set_cluster_policy_then(command, seeds, kind, 0, 0, move |_, result| {
-                        let _ = tx.send(
-                            result
-                                .map_err(|error| error.to_string())
-                                .and_then(|inner| inner.map_err(|error| error.clone())),
-                        );
-                    })
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))
-            },
-            timeout,
-        )
-    }
-
-    #[allow(dead_code)] // retained for sequential/debug command paths
     pub fn attack(
         &self,
         command: u64,
@@ -418,6 +394,28 @@ impl Client {
         player_count: u16,
         max_elevation_step: u8,
     ) -> Result<Vec<AttackFront>> {
+        let cells = self.map_cells();
+        let fronts = cells
+            .iter()
+            .map(|cell| FrontCell {
+                cell_id: cell.cell_id,
+                q: cell.q,
+                r: cell.r,
+                owner: cell.owner,
+                elevation: cell.elevation,
+                passable: cell.passable,
+                capturable: cell.capturable,
+            })
+            .collect::<Vec<_>>();
+        find_attack_fronts(&fronts, player_count, max_elevation_step).map_err(|player| {
+            anyhow::anyhow!(
+                "attack phase requested, but player {player} has no adjacent owned/enemy front"
+            )
+        })
+    }
+
+    /// Snapshot terrain + ownership for pure scenario derivation helpers.
+    pub fn map_cells(&self) -> Vec<MapCell> {
         let states = self
             .conn
             .db
@@ -425,13 +423,12 @@ impl Client {
             .iter()
             .map(|state| (state.cell_id, state.owner_player_id))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let cells = self
-            .conn
+        self.conn
             .db
             .cell_terrain()
             .iter()
             .filter_map(|terrain| {
-                Some(FrontCell {
+                Some(MapCell {
                     cell_id: terrain.cell_id,
                     q: terrain.q,
                     r: terrain.r,
@@ -441,12 +438,42 @@ impl Client {
                     capturable: terrain.capturable,
                 })
             })
-            .collect::<Vec<_>>();
-        find_attack_fronts(&cells, player_count, max_elevation_step).map_err(|player| {
-            anyhow::anyhow!(
-                "attack phase requested, but player {player} has no adjacent owned/enemy front"
-            )
-        })
+            .collect()
+    }
+
+    #[allow(dead_code)] // retained for sequential/debug command paths
+    pub fn front_rebalance(
+        &self,
+        command: u64,
+        component_cells: Vec<u32>,
+        source_front_seed: u32,
+        target_front_seed: u32,
+        commitment_bps: u32,
+        timeout: Duration,
+    ) -> Result<(Duration, Result<(), String>)> {
+        Self::call(
+            |tx| {
+                self.conn
+                    .reducers
+                    .issue_front_rebalance_then(
+                        command,
+                        component_cells,
+                        source_front_seed,
+                        target_front_seed,
+                        commitment_bps,
+                        Vec::new(),
+                        move |_, result| {
+                            let _ = tx.send(
+                                result
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|inner| inner.map_err(|error| error.clone())),
+                            );
+                        },
+                    )
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+            },
+            timeout,
+        )
     }
 
     pub fn neutral_focus(&self, near_cell: u32) -> Option<u32> {

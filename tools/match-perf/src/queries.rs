@@ -2,17 +2,8 @@
 
 use crate::common::SubscriptionMode;
 
-/// Debug builds mirror the game-client raw packet/route stream; release uses the
-/// server-maintained tactical views so background rebalancing never crosses the
-/// network — same cfg split as `crates/game-client/src/online.rs`.
-#[cfg(debug_assertions)]
 const PACKET_TABLE: &str = "transit_packet";
-#[cfg(not(debug_assertions))]
-const PACKET_TABLE: &str = "visible_packets";
-#[cfg(debug_assertions)]
 const ROUTE_TABLE: &str = "transit_route";
-#[cfg(not(debug_assertions))]
-const ROUTE_TABLE: &str = "visible_routes";
 
 const HIGH_SCALE_PLAYER_THRESHOLD: u16 = 8;
 
@@ -122,7 +113,6 @@ pub fn worker_command_queries(
                 "SELECT * FROM player_state".to_owned(),
                 "SELECT * FROM cell_state".to_owned(),
                 "SELECT * FROM combat_front".to_owned(),
-                "SELECT * FROM cluster_policy_assignment".to_owned(),
                 format!("SELECT * FROM command_receipt WHERE player_id = {player_id}"),
                 "SELECT * FROM mobilization_policy".to_owned(),
                 "SELECT * FROM transfer_destination".to_owned(),
@@ -148,9 +138,6 @@ pub fn worker_command_queries(
                     ),
                     format!("SELECT * FROM combat_front WHERE attacker_player_id = {player_id}"),
                     format!("SELECT * FROM combat_front WHERE defender_player_id = {player_id}"),
-                    format!(
-                        "SELECT * FROM cluster_policy_assignment WHERE owner_player_id = {player_id}"
-                    ),
                     format!("SELECT * FROM command_receipt WHERE player_id = {player_id}"),
                     format!("SELECT * FROM mobilization_policy WHERE player_id = {player_id}"),
                     format!("SELECT * FROM transfer_destination WHERE player_id = {player_id}"),
@@ -226,19 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn packet_and_route_tables_follow_cfg_like_game_client() {
-        #[cfg(debug_assertions)]
-        {
-            assert!(packet_query(None).contains("transit_packet"));
-            assert!(route_query(Some(9)).contains("transit_route"));
-            assert!(!packet_query(None).contains("visible_packets"));
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            assert!(packet_query(None).contains("visible_packets"));
-            assert!(route_query(Some(9)).contains("visible_routes"));
-            assert!(!packet_query(None).contains("transit_packet"));
-        }
+    fn packet_and_route_queries_use_explicit_order_tables() {
+        assert!(packet_query(None).contains("transit_packet"));
+        assert!(route_query(Some(9)).contains("transit_route"));
     }
 
     #[test]

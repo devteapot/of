@@ -13,22 +13,17 @@ use std::{
 use bevy::prelude::*;
 use hex_core::{Axial, TerrainKind};
 use match_bindings::{
-    CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, ClusterPolicyAssignment,
-    ClusterPolicyAssignmentTableAccess, ClusterPolicyKind as RemoteClusterPolicyKind, CombatFront,
+    CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, CombatFront,
     CombatFrontTableAccess, CommandReceipt, CommandReceiptTableAccess, DbConnection, MatchConfig,
     MatchConfigTableAccess, MatchPhase as RemoteMatchPhase, MatchState, MatchStateTableAccess,
     MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
     PlayerSlotTableAccess, PlayerState, PlayerStateTableAccess, ReceiptStatus, SubscriptionHandle,
     TransferDestination, TransferDestinationTableAccess, TransferOrder, TransferOrderTableAccess,
     TransferSource, TransferSourceTableAccess, TransitPacket, TransitRoute, cancel_orders,
-    issue_attack_clusters, issue_balance, issue_core_load, issue_expand_all, issue_expand_clusters,
-    issue_front_load, issue_perimeter_load, issue_push_front, issue_reshape, join_match,
-    set_cluster_policy, set_mobilization_target,
+    issue_attack_clusters, issue_expand_all, issue_expand_clusters, issue_front_rebalance,
+    issue_push_front, issue_reshape, join_match, set_mobilization_target,
 };
-#[cfg(debug_assertions)]
 use match_bindings::{TransitPacketTableAccess, TransitRouteTableAccess};
-#[cfg(not(debug_assertions))]
-use match_bindings::{VisiblePacketsTableAccess, VisibleRoutesTableAccess};
 use spacetimedb_sdk::__codegen::InternalError;
 use spacetimedb_sdk::{DbContext, SubscriptionHandle as _, Table, TableWithPrimaryKey};
 
@@ -38,10 +33,10 @@ use crate::{
     geometry::{axial_to_plane, chunk_of, plane_to_axial},
     map_view::MapViewMode,
     model::{
-        ActiveFlow, ActiveFront, AuthorityState, CellView, ClusterPolicyView, ConnectionState,
-        ContestedCellView, MatchPhase, MatchView, RetaskProjection, ToastKind,
+        ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, ContestedCellView,
+        MatchPhase, MatchView, RetaskProjection, ToastKind,
     },
-    network::{ClientIntent, ClusterPolicy, NetworkSet, RedistributionPreset, ServerUpdate},
+    network::{ClientIntent, NetworkSet, ServerUpdate},
 };
 
 const TERRAIN_DIRTY: u32 = 1 << 0;
@@ -53,20 +48,10 @@ const RECEIPTS_DIRTY: u32 = 1 << 5;
 const FLOWS_DIRTY: u32 = 1 << 6;
 const FRONTS_DIRTY: u32 = 1 << 7;
 const ORDERS_DIRTY: u32 = 1 << 8;
-const POLICIES_DIRTY: u32 = 1 << 9;
-const ALL_DIRTY: u32 = (1 << 10) - 1;
+const ALL_DIRTY: u32 = (1 << 9) - 1;
 
-/// Debug builds retain the raw packet/route stream for the F4 policy-route
-/// diagnostic. Release builds use the server-maintained tactical views, so
-/// background rebalancing packets never cross the network.
-#[cfg(debug_assertions)]
 const PACKET_TABLE: &str = "transit_packet";
-#[cfg(not(debug_assertions))]
-const PACKET_TABLE: &str = "visible_packets";
-#[cfg(debug_assertions)]
 const ROUTE_TABLE: &str = "transit_route";
-#[cfg(not(debug_assertions))]
-const ROUTE_TABLE: &str = "visible_routes";
 
 /// Immutable terrain + match/player metadata only. Bootstrap must not flood the
 /// client with `cell_state` / combat / tactical rows before the local seat is known.
@@ -136,7 +121,6 @@ fn tactical_subscription_queries(player_count: u16, local_player: u16) -> Vec<St
         return vec![
             "SELECT * FROM cell_state".to_owned(),
             "SELECT * FROM combat_front".to_owned(),
-            "SELECT * FROM cluster_policy_assignment".to_owned(),
             "SELECT * FROM command_receipt".to_owned(),
             "SELECT * FROM mobilization_policy".to_owned(),
             "SELECT * FROM transfer_destination".to_owned(),
@@ -150,7 +134,6 @@ fn tactical_subscription_queries(player_count: u16, local_player: u16) -> Vec<St
         format!("SELECT * FROM cell_state WHERE owner_player_id = {local_player}"),
         format!("SELECT * FROM combat_front WHERE attacker_player_id = {local_player}"),
         format!("SELECT * FROM combat_front WHERE defender_player_id = {local_player}"),
-        format!("SELECT * FROM cluster_policy_assignment WHERE owner_player_id = {local_player}"),
         format!("SELECT * FROM command_receipt WHERE player_id = {local_player}"),
         format!("SELECT * FROM mobilization_policy WHERE player_id = {local_player}"),
         format!("SELECT * FROM transfer_destination WHERE player_id = {local_player}"),
@@ -171,29 +154,6 @@ fn spatial_cell_state_queries(interest: SpatialInterest) -> Vec<String> {
     vec![format!(
         "SELECT * FROM cell_state WHERE chunk_q >= {qmin} AND chunk_q <= {qmax} AND chunk_r >= {rmin} AND chunk_r <= {rmax}"
     )]
-}
-
-/// Full query set a bound client ends up with (bootstrap + tactical + optional
-/// spatial cell interest). Unbound observers keep bootstrap only.
-#[cfg(test)]
-fn client_subscription_queries(
-    player_count: u16,
-    local_player: Option<u16>,
-    interest: Option<SpatialInterest>,
-) -> Vec<String> {
-    let mut queries = bootstrap_subscription_queries();
-    if let Some(local_player) = local_player {
-        queries.extend(tactical_subscription_queries(player_count, local_player));
-        if player_count > HIGH_SCALE_PLAYER_THRESHOLD {
-            let interest = interest.unwrap_or(SpatialInterest {
-                focus_chunk_q: 0,
-                focus_chunk_r: 0,
-                radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
-            });
-            queries.extend(spatial_cell_state_queries(interest));
-        }
-    }
-    queries
 }
 
 fn chunk_coords_for_cell_id(cell_id: u32, map_width: u16, chunk_size: u16) -> (i16, i16) {
@@ -263,9 +223,6 @@ impl SubscriptionLifecycle {
         }
     }
 }
-
-#[cfg(debug_assertions)]
-const POLICY_FLOW_DEBUG_KEY: KeyCode = KeyCode::F4;
 
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OnlineSyncSet;
@@ -585,15 +542,11 @@ fn apply_changes<K: Ord, V>(rows: &mut BTreeMap<K, V>, changes: BTreeMap<K, Opti
 enum PendingCommand {
     ExpandClusters,
     AttackClusters,
-    ClusterPolicy(ClusterPolicy),
     PushFront,
+    FrontRebalance,
     ExpandAll,
     Reshape,
     CancelOrders,
-    Balance,
-    FrontLoad,
-    CoreLoad,
-    PerimeterLoad,
     Mobilization { target: f32 },
 }
 
@@ -602,15 +555,11 @@ impl PendingCommand {
         match self {
             Self::ExpandClusters => "Expand Clusters",
             Self::AttackClusters => "Attack Clusters",
-            Self::ClusterPolicy(policy) => policy.label(),
             Self::PushFront => "Push Front",
+            Self::FrontRebalance => "Front Rebalance",
             Self::ExpandAll => "Expand Perimeter",
             Self::Reshape => "Reshape",
             Self::CancelOrders => "Stop Orders",
-            Self::Balance => "Formation · Balanced",
-            Self::FrontLoad => "Directional Bias",
-            Self::CoreLoad => "Formation · Center",
-            Self::PerimeterLoad => "Formation · Perimeter",
             Self::Mobilization { .. } => "Mobilization",
         }
     }
@@ -619,15 +568,11 @@ impl PendingCommand {
         match self {
             Self::ExpandClusters => "issue_expand_clusters",
             Self::AttackClusters => "issue_attack_clusters",
-            Self::ClusterPolicy(_) => "set_cluster_policy",
             Self::PushFront => "issue_push_front",
+            Self::FrontRebalance => "issue_front_rebalance",
             Self::ExpandAll => "issue_expand_all",
             Self::Reshape => "issue_reshape",
             Self::CancelOrders => "cancel_orders",
-            Self::Balance => "issue_balance",
-            Self::FrontLoad => "issue_front_load",
-            Self::CoreLoad => "issue_core_load",
-            Self::PerimeterLoad => "issue_perimeter_load",
             Self::Mobilization { .. } => "set_mobilization_target",
         }
     }
@@ -783,52 +728,7 @@ impl Plugin for OnlineTransportPlugin {
                     .in_set(NetworkSet::Apply)
                     .in_set(OnlineSyncSet),
             );
-
-        #[cfg(debug_assertions)]
-        app.add_systems(
-            Update,
-            toggle_policy_flow_debug.in_set(NetworkSet::Transport),
-        );
     }
-}
-
-/// Development-only presentation switch for background policy logistics.
-///
-/// Packet visibility depends on both packet and order provenance. Force both
-/// caches through the authoritative projection so enabling is immediate and
-/// disabling cannot leave a previously rendered route behind.
-#[cfg(debug_assertions)]
-fn toggle_policy_flow_debug(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut transport: ResMut<OnlineTransport>,
-    mut view: ResMut<MatchView>,
-) {
-    if !keyboard.just_pressed(POLICY_FLOW_DEBUG_KEY) {
-        return;
-    }
-
-    transport.config.debug_policy_flows = !transport.config.debug_policy_flows;
-    transport.signals.mark(FLOWS_DIRTY | ORDERS_DIRTY);
-    if !transport.config.debug_policy_flows {
-        // A connected client restores explicit routes from authority later in
-        // this frame. Clear first so stale policy trails also disappear when
-        // the toggle is used during a reconnect and no snapshot is available.
-        view.active_flows.clear();
-    }
-    replace_authoritative_flows(
-        &transport,
-        &mut view,
-        transport.tactical.packets.values(),
-        &transport.tactical.routes,
-        transport.tactical.orders.values(),
-        transport.config.debug_policy_flows,
-    );
-    let status = if transport.config.debug_policy_flows {
-        "ON · F4 to hide"
-    } else {
-        "OFF · F4 to show"
-    };
-    view.show_toast(format!("DEBUG · policy routes {status}"), ToastKind::Info);
 }
 
 fn maintain_connection(
@@ -1029,14 +929,12 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         // remote state cannot linger when the spatial handle moves.
         cell_delete_signals.record_cell_absence(row.cell_id);
     });
-    watch_table!(connection.db.cluster_policy_assignment(), POLICIES_DIRTY);
     watch_table!(connection.db.match_config(), MATCH_DIRTY);
     watch_table!(connection.db.match_state(), MATCH_DIRTY);
     watch_table!(connection.db.player_slot(), PLAYERS_DIRTY);
     watch_table!(connection.db.player_state(), MATCH_DIRTY);
     watch_table!(connection.db.mobilization_policy(), MOBILIZATION_DIRTY);
     watch_table!(connection.db.command_receipt(), RECEIPTS_DIRTY);
-    #[cfg(debug_assertions)]
     {
         let packet_insert_signals = Arc::clone(signals);
         connection
@@ -1071,42 +969,6 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
                 packet_update_signals.mark(FLOWS_DIRTY);
             });
     }
-    #[cfg(not(debug_assertions))]
-    {
-        let packet_insert_signals = Arc::clone(signals);
-        connection
-            .db
-            .visible_packets()
-            .on_insert(move |_context, row| {
-                record_change(
-                    &packet_insert_signals.packet_changes,
-                    row.packet_key,
-                    Some(row.clone()),
-                );
-                packet_insert_signals.mark(FLOWS_DIRTY);
-            });
-        let packet_delete_signals = Arc::clone(signals);
-        connection
-            .db
-            .visible_packets()
-            .on_delete(move |_context, row| {
-                record_change(&packet_delete_signals.packet_changes, row.packet_key, None);
-                packet_delete_signals.mark(FLOWS_DIRTY);
-            });
-        let packet_update_signals = Arc::clone(signals);
-        connection
-            .db
-            .visible_packets()
-            .on_update(move |_context, _old, new| {
-                record_change(
-                    &packet_update_signals.packet_changes,
-                    new.packet_key,
-                    Some(new.clone()),
-                );
-                packet_update_signals.mark(FLOWS_DIRTY);
-            });
-    }
-    #[cfg(debug_assertions)]
     {
         let route_insert_signals = Arc::clone(signals);
         connection
@@ -1132,41 +994,6 @@ fn register_table_watchers(connection: &DbConnection, signals: &Arc<SharedSignal
         connection
             .db
             .transit_route()
-            .on_update(move |_context, _old, new| {
-                record_change(
-                    &route_update_signals.route_changes,
-                    new.route_id,
-                    Some(new.clone()),
-                );
-                route_update_signals.mark(FLOWS_DIRTY);
-            });
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let route_insert_signals = Arc::clone(signals);
-        connection
-            .db
-            .visible_routes()
-            .on_insert(move |_context, row| {
-                record_change(
-                    &route_insert_signals.route_changes,
-                    row.route_id,
-                    Some(row.clone()),
-                );
-                route_insert_signals.mark(FLOWS_DIRTY);
-            });
-        let route_delete_signals = Arc::clone(signals);
-        connection
-            .db
-            .visible_routes()
-            .on_delete(move |_context, row| {
-                record_change(&route_delete_signals.route_changes, row.route_id, None);
-                route_delete_signals.mark(FLOWS_DIRTY);
-            });
-        let route_update_signals = Arc::clone(signals);
-        connection
-            .db
-            .visible_routes()
             .on_update(move |_context, _old, new| {
                 record_change(
                     &route_update_signals.route_changes,
@@ -1419,25 +1246,6 @@ fn invoke_intent(
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::AttackClusters)
         }
-        ClientIntent::SetClusterPolicy {
-            sources,
-            policy,
-            direction,
-        } => {
-            let (kind, orientation) = remote_cluster_policy(*policy, *direction)?;
-            connection
-                .reducers
-                .set_cluster_policy_then(
-                    command_id,
-                    ids_for_selection(transport, sources)?,
-                    kind,
-                    orientation.q,
-                    orientation.r,
-                    callback,
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::ClusterPolicy(*policy))
-        }
         ClientIntent::PushFront {
             sources,
             supersede_order_ids,
@@ -1457,6 +1265,27 @@ fn invoke_intent(
                 )
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::PushFront)
+        }
+        ClientIntent::FrontRebalance {
+            source_component_cells,
+            source_front_seed,
+            target_front_seed,
+            commitment_percent,
+            supersede_order_ids,
+        } => {
+            connection
+                .reducers
+                .issue_front_rebalance_then(
+                    command_id,
+                    ids_for_selection(transport, source_component_cells)?,
+                    id_for_coordinate(transport, *source_front_seed)?,
+                    id_for_coordinate(transport, *target_front_seed)?,
+                    u32::from((*commitment_percent).clamp(1, 100)) * 100,
+                    supersede_order_ids.iter().copied().collect(),
+                    callback,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(PendingCommand::FrontRebalance)
         }
         ClientIntent::ExpandAll {
             sources,
@@ -1499,78 +1328,6 @@ fn invoke_intent(
                 .map_err(|error| error.to_string())?;
             Ok(PendingCommand::CancelOrders)
         }
-        ClientIntent::Redistribute {
-            cells,
-            supersede_order_ids,
-            preset: RedistributionPreset::Balance,
-            ..
-        } => {
-            connection
-                .reducers
-                .issue_balance_then(
-                    command_id,
-                    ids_for_selection(transport, cells)?,
-                    supersede_order_ids.iter().copied().collect(),
-                    callback,
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::Balance)
-        }
-        ClientIntent::Redistribute {
-            cells,
-            supersede_order_ids,
-            preset: RedistributionPreset::FrontLoad,
-            direction,
-        } => {
-            let orientation = validated_front_load_orientation(*direction)
-                .ok_or_else(|| "Directional Bias direction is too short".to_owned())?;
-            connection
-                .reducers
-                .issue_front_load_then(
-                    command_id,
-                    ids_for_selection(transport, cells)?,
-                    orientation.q,
-                    orientation.r,
-                    supersede_order_ids.iter().copied().collect(),
-                    callback,
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::FrontLoad)
-        }
-        ClientIntent::Redistribute {
-            cells,
-            supersede_order_ids,
-            preset: RedistributionPreset::CoreLoad,
-            ..
-        } => {
-            connection
-                .reducers
-                .issue_core_load_then(
-                    command_id,
-                    ids_for_selection(transport, cells)?,
-                    supersede_order_ids.iter().copied().collect(),
-                    callback,
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::CoreLoad)
-        }
-        ClientIntent::Redistribute {
-            cells,
-            supersede_order_ids,
-            preset: RedistributionPreset::PerimeterLoad,
-            ..
-        } => {
-            connection
-                .reducers
-                .issue_perimeter_load_then(
-                    command_id,
-                    ids_for_selection(transport, cells)?,
-                    supersede_order_ids.iter().copied().collect(),
-                    callback,
-                )
-                .map_err(|error| error.to_string())?;
-            Ok(PendingCommand::PerimeterLoad)
-        }
         ClientIntent::SetMobilization { target } => {
             let target = target.clamp(0.0, 1.0);
             let target_bps = (target * 10_000.0).round() as u32;
@@ -1581,33 +1338,6 @@ fn invoke_intent(
             Ok(PendingCommand::Mobilization { target })
         }
     }
-}
-
-fn remote_cluster_policy(
-    policy: ClusterPolicy,
-    direction: Option<Axial>,
-) -> Result<(RemoteClusterPolicyKind, Axial), String> {
-    let (kind, orientation) = match policy {
-        ClusterPolicy::Balanced => (RemoteClusterPolicyKind::Balanced, Axial::ZERO),
-        ClusterPolicy::Center => (RemoteClusterPolicyKind::Center, Axial::ZERO),
-        ClusterPolicy::Perimeter => (RemoteClusterPolicyKind::Perimeter, Axial::ZERO),
-        ClusterPolicy::Directional => (
-            RemoteClusterPolicyKind::Directional,
-            direction
-                .filter(|orientation| *orientation != Axial::ZERO)
-                .ok_or_else(|| {
-                    "Directional cluster policy needs a visible orientation".to_owned()
-                })?,
-        ),
-    };
-    if policy != ClusterPolicy::Directional && direction.is_some() {
-        return Err("Only the directional cluster policy accepts an orientation".to_owned());
-    }
-    Ok((kind, orientation))
-}
-
-fn validated_front_load_orientation(direction: Option<Axial>) -> Option<Axial> {
-    direction.filter(|orientation| *orientation != Axial::ZERO)
 }
 
 fn ids_for_selection(
@@ -1648,7 +1378,6 @@ struct AuthoritySnapshot {
     identity: Option<spacetimedb_sdk::Identity>,
     terrain: Option<Vec<CellTerrain>>,
     cells: Option<Vec<CellState>>,
-    cluster_policies: Option<Vec<ClusterPolicyAssignment>>,
     config: Option<MatchConfig>,
     match_state: Option<MatchState>,
     player_states: Option<Vec<PlayerState>>,
@@ -1669,8 +1398,6 @@ impl AuthoritySnapshot {
             } else {
                 (dirty & CELLS_DIRTY != 0).then_some(changed_cells)
             },
-            cluster_policies: (dirty & POLICIES_DIRTY != 0)
-                .then(|| connection.db.cluster_policy_assignment().iter().collect()),
             config: (dirty & MATCH_DIRTY != 0)
                 .then(|| connection.db.match_config().iter().next())
                 .flatten(),
@@ -1692,24 +1419,12 @@ impl AuthoritySnapshot {
     }
 }
 
-#[cfg(debug_assertions)]
 fn subscribed_packets(connection: &DbConnection) -> Vec<TransitPacket> {
     connection.db.transit_packet().iter().collect()
 }
 
-#[cfg(not(debug_assertions))]
-fn subscribed_packets(connection: &DbConnection) -> Vec<TransitPacket> {
-    connection.db.visible_packets().iter().collect()
-}
-
-#[cfg(debug_assertions)]
 fn subscribed_routes(connection: &DbConnection) -> Vec<TransitRoute> {
     connection.db.transit_route().iter().collect()
-}
-
-#[cfg(not(debug_assertions))]
-fn subscribed_routes(connection: &DbConnection) -> Vec<TransitRoute> {
-    connection.db.visible_routes().iter().collect()
 }
 
 #[derive(Default)]
@@ -1907,9 +1622,6 @@ fn synchronize_authoritative_view(
         update_players(&mut transport, &mut view, snapshot.identity, &players);
     }
     let full_retask_rebuild = full_tactical_rebuild || view.local_player != previous_local_player;
-    if let Some(policies) = snapshot.cluster_policies {
-        update_cluster_policies(&transport, &mut view, &policies);
-    }
     if let Some(policies) = snapshot.mobilization
         && let Some(policy) = policies
             .iter()
@@ -1936,7 +1648,6 @@ fn synchronize_authoritative_view(
             transport.tactical.packets.values(),
             &transport.tactical.routes,
             transport.tactical.orders.values(),
-            transport.config.debug_policy_flows,
         );
     } else if !projection_impact.flow_packet_ids.is_empty() {
         update_authoritative_flows(&transport, &mut view, &projection_impact.flow_packet_ids);
@@ -1951,11 +1662,7 @@ fn synchronize_authoritative_view(
         rebuild_retask_indexes(&mut transport, &mut view);
     } else if projection_impact.retask_changed() {
         apply_retask_row_changes(&mut transport, &mut view, &projection_impact, true);
-        refresh_retask_order_kinds(
-            &transport,
-            &mut view,
-            !projection_impact.structural_order_ids.is_empty(),
-        );
+        refresh_retask_order_kinds(&transport, &mut view);
         rebuild_retask_handles(&transport, &mut view);
         view.retask_revision = view.retask_revision.wrapping_add(1);
     }
@@ -2488,7 +2195,6 @@ fn clear_tactical_presentation(view: &mut MatchView) {
         view.retask_projection = RetaskProjection::default();
         view.retask_revision = view.retask_revision.wrapping_add(1);
     }
-    view.cluster_policies.clear();
 }
 
 fn neutralize_absent_cells(
@@ -2530,36 +2236,6 @@ fn neutralize_absent_cells(
     }
     if !absences.is_empty() {
         view.mark_cell_state_changed();
-    }
-}
-
-fn update_cluster_policies(
-    transport: &OnlineTransport,
-    view: &mut MatchView,
-    assignments: &[ClusterPolicyAssignment],
-) {
-    view.cluster_policies.clear();
-    for assignment in assignments
-        .iter()
-        .filter(|assignment| u32::from(assignment.owner_player_id) == view.local_player)
-    {
-        let Some(&coordinate) = transport.id_to_coordinate.get(&assignment.cell_id) else {
-            continue;
-        };
-        let kind = match assignment.kind {
-            RemoteClusterPolicyKind::Balanced => ClusterPolicy::Balanced,
-            RemoteClusterPolicyKind::Center => ClusterPolicy::Center,
-            RemoteClusterPolicyKind::Perimeter => ClusterPolicy::Perimeter,
-            RemoteClusterPolicyKind::Directional => ClusterPolicy::Directional,
-        };
-        view.cluster_policies.insert(
-            coordinate,
-            ClusterPolicyView {
-                kind,
-                orientation: Axial::new(assignment.orientation_q, assignment.orientation_r),
-                revision: assignment.revision,
-            },
-        );
     }
 }
 
@@ -2668,51 +2344,14 @@ fn process_receipts(
     }
 }
 
-#[cfg(test)]
-fn packets_to_flows<'a>(
-    transport: &OnlineTransport,
-    view: &MatchView,
-    packets: impl IntoIterator<Item = &'a TransitPacket>,
-    routes: &BTreeMap<u64, TransitRoute>,
-    orders: impl IntoIterator<Item = &'a TransferOrder>,
-    show_policy_flows: bool,
-) -> Vec<ActiveFlow> {
-    // Packet and order callbacks are independent. On a busy policy tick the
-    // packet can therefore be visible in the SDK cache one frame before its
-    // order row. Unknown packets must fail closed: otherwise every newly
-    // spawned background redistribution flashes as a cyan action route before
-    // the next order-table callback supplies the information needed to hide it.
-    let orders_by_id = orders
-        .into_iter()
-        .map(|order| (order.order_id, order))
-        .collect::<BTreeMap<_, _>>();
-    packets
-        .into_iter()
-        .filter_map(|packet| {
-            packet_to_flow(
-                transport,
-                view,
-                packet,
-                routes,
-                orders_by_id.get(&packet.order_id).copied(),
-                show_policy_flows,
-            )
-        })
-        .collect()
-}
-
 fn packet_to_flow(
     transport: &OnlineTransport,
     view: &MatchView,
     packet: &TransitPacket,
     routes: &BTreeMap<u64, TransitRoute>,
     order: Option<&TransferOrder>,
-    show_policy_flows: bool,
 ) -> Option<ActiveFlow> {
-    let order = order?;
-    if !order_flow_is_visible(order, show_policy_flows) {
-        return None;
-    }
+    let _order = order?;
     let resolved_route = resolved_packet_route(packet, routes)?;
     let route_index = packet.route_index as usize;
     let route = resolved_route
@@ -2745,7 +2384,6 @@ fn replace_authoritative_flows<'a>(
     packets: impl IntoIterator<Item = &'a TransitPacket>,
     routes: &BTreeMap<u64, TransitRoute>,
     orders: impl IntoIterator<Item = &'a TransferOrder>,
-    show_policy_flows: bool,
 ) {
     let orders_by_id = orders
         .into_iter()
@@ -2760,7 +2398,6 @@ fn replace_authoritative_flows<'a>(
                 packet,
                 routes,
                 orders_by_id.get(&packet.order_id).copied(),
-                show_policy_flows,
             )
             .map(|flow| (packet.packet_key, flow))
         })
@@ -2788,7 +2425,6 @@ fn update_authoritative_flows(
                     packet,
                     &transport.tactical.routes,
                     transport.tactical.orders.get(&packet.order_id),
-                    transport.config.debug_policy_flows,
                 )
             });
         view.set_authoritative_flow(*packet_id, flow);
@@ -2809,34 +2445,6 @@ fn resolved_packet_route(
     routes
         .get(&packet.route_id)
         .map(|route| route.cells.clone())
-}
-
-const fn order_flow_is_visible(order: &TransferOrder, show_policy_flows: bool) -> bool {
-    match order.kind {
-        match_bindings::OrderKind::Balance
-        | match_bindings::OrderKind::FrontLoad
-        | match_bindings::OrderKind::CoreLoad
-        | match_bindings::OrderKind::PerimeterLoad => show_policy_flows,
-        match_bindings::OrderKind::Reshape
-        | match_bindings::OrderKind::PushFront
-        | match_bindings::OrderKind::ExpandAll
-        | match_bindings::OrderKind::ExpandClusters
-        | match_bindings::OrderKind::AttackClusters => true,
-    }
-}
-
-fn is_internal_distribution_order(order: &TransferOrder) -> bool {
-    matches!(
-        order.kind,
-        match_bindings::OrderKind::Balance
-            | match_bindings::OrderKind::FrontLoad
-            | match_bindings::OrderKind::CoreLoad
-            | match_bindings::OrderKind::PerimeterLoad
-    )
-}
-
-fn is_policy_maintenance_order(order: &TransferOrder) -> bool {
-    order.client_command_id == 0 && is_internal_distribution_order(order)
 }
 
 fn fronts_to_overlays<'a>(
@@ -2915,185 +2523,6 @@ fn fronts_to_overlays<'a>(
         })
         .collect();
     (overlays, contested)
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn retask_projection_from_authority<'a, O, P, F, S, D>(
-    transport: &OnlineTransport,
-    view: &MatchView,
-    orders: O,
-    packets: P,
-    routes: &BTreeMap<u64, TransitRoute>,
-    fronts: F,
-    sources: S,
-    destinations: D,
-) -> RetaskProjection
-where
-    O: Clone + IntoIterator<Item = &'a TransferOrder>,
-    P: IntoIterator<Item = &'a TransitPacket>,
-    F: IntoIterator<Item = &'a CombatFront>,
-    S: IntoIterator<Item = &'a TransferSource>,
-    D: IntoIterator<Item = &'a TransferDestination>,
-{
-    let active_local_orders = orders
-        .clone()
-        .into_iter()
-        .filter(|order| {
-            order.status == OrderStatus::Active && u32::from(order.player_id) == view.local_player
-        })
-        .map(|order| order.order_id)
-        .collect::<BTreeSet<_>>();
-    let mut projection = RetaskProjection {
-        background_policy_order_ids: orders
-            .clone()
-            .into_iter()
-            .filter(|order| {
-                order.status == OrderStatus::Active
-                    && u32::from(order.player_id) == view.local_player
-                    && is_policy_maintenance_order(order)
-            })
-            .map(|order| order.order_id)
-            .collect(),
-        ..Default::default()
-    };
-    let mut orders_by_edge = BTreeMap::<(u32, u32), BTreeSet<u64>>::new();
-
-    for source in sources
-        .into_iter()
-        .filter(|source| active_local_orders.contains(&source.order_id))
-    {
-        let Some(coordinate) = transport.id_to_coordinate.get(&source.cell_id).copied() else {
-            continue;
-        };
-        projection
-            .order_source_cells
-            .entry(source.order_id)
-            .or_default()
-            .insert(coordinate);
-    }
-
-    for packet in packets.into_iter().filter(|packet| {
-        u32::from(packet.owner_player_id) == view.local_player
-            && active_local_orders.contains(&packet.order_id)
-    }) {
-        let Some(current) = transport
-            .id_to_coordinate
-            .get(&packet.current_cell)
-            .copied()
-        else {
-            continue;
-        };
-        let active_cell = projection
-            .active_strength_by_cell
-            .entry(current)
-            .or_default();
-        *active_cell = active_cell.saturating_add(packet.infantry);
-        let order_cell = projection
-            .order_strength_by_cell
-            .entry(packet.order_id)
-            .or_default()
-            .entry(current)
-            .or_default();
-        *order_cell = order_cell.saturating_add(packet.infantry);
-
-        if let Some(destination) = transport
-            .id_to_coordinate
-            .get(&packet.destination_cell)
-            .copied()
-        {
-            projection
-                .destination_claims_by_order
-                .entry(packet.order_id)
-                .or_default()
-                .insert(destination);
-        }
-
-        let next_index = packet.route_index as usize + 1;
-        if let Some(next) =
-            resolved_packet_route(packet, routes).and_then(|route| route.get(next_index).copied())
-        {
-            orders_by_edge
-                .entry((packet.current_cell, next))
-                .or_default()
-                .insert(packet.order_id);
-        }
-    }
-
-    let active_local_internal_orders = orders
-        .into_iter()
-        .filter(|order| {
-            order.status == OrderStatus::Active
-                && u32::from(order.player_id) == view.local_player
-                && matches!(
-                    order.kind,
-                    match_bindings::OrderKind::Balance
-                        | match_bindings::OrderKind::FrontLoad
-                        | match_bindings::OrderKind::CoreLoad
-                        | match_bindings::OrderKind::PerimeterLoad
-                        | match_bindings::OrderKind::Reshape
-                )
-        })
-        .map(|order| order.order_id)
-        .collect::<BTreeSet<_>>();
-    for destination in destinations.into_iter().filter(|destination| {
-        active_local_orders.contains(&destination.order_id)
-            && destination.target_infantry > destination.received_infantry
-    }) {
-        let Some(coordinate) = transport
-            .id_to_coordinate
-            .get(&destination.cell_id)
-            .copied()
-        else {
-            continue;
-        };
-        projection
-            .destination_claims_by_order
-            .entry(destination.order_id)
-            .or_default()
-            .insert(coordinate);
-        if !active_local_internal_orders.contains(&destination.order_id) {
-            continue;
-        }
-        let reserved = projection
-            .destination_reservations_by_order
-            .entry(destination.order_id)
-            .or_default()
-            .entry(coordinate)
-            .or_default();
-        *reserved = reserved.saturating_add(
-            destination
-                .target_infantry
-                .saturating_sub(destination.received_infantry),
-        );
-    }
-
-    for front in fronts.into_iter().filter(|front| {
-        u32::from(front.attacker_player_id) == view.local_player
-            && front
-                .queued_infantry
-                .saturating_add(front.attacker_engaged)
-                .saturating_sub(front.attacker_casualties)
-                > 0
-    }) {
-        let Some(handle) = transport.id_to_coordinate.get(&front.to_cell).copied() else {
-            continue;
-        };
-        if !view.is_local_retask_handle(handle) {
-            continue;
-        }
-        let Some(order_ids) = orders_by_edge.get(&(front.from_cell, front.to_cell)) else {
-            continue;
-        };
-        projection
-            .handle_orders
-            .entry(handle)
-            .or_default()
-            .extend(order_ids);
-    }
-
-    projection.active_order_ids = projection.order_strength_by_cell.keys().copied().collect();
-    projection
 }
 
 fn active_local_order<'a>(
@@ -3235,11 +2664,7 @@ fn adjust_retask_destination(
     }
     let is_internal = matches!(
         order.kind,
-        match_bindings::OrderKind::Balance
-            | match_bindings::OrderKind::FrontLoad
-            | match_bindings::OrderKind::CoreLoad
-            | match_bindings::OrderKind::PerimeterLoad
-            | match_bindings::OrderKind::Reshape
+        match_bindings::OrderKind::Reshape | match_bindings::OrderKind::FrontRebalance
     );
     let Some(coordinate) = transport
         .id_to_coordinate
@@ -3399,30 +2824,12 @@ fn adjust_retask_edge(
     }
 }
 
-fn refresh_retask_order_kinds(
-    transport: &OnlineTransport,
-    view: &mut MatchView,
-    refresh_background_orders: bool,
-) {
+fn refresh_retask_order_kinds(_transport: &OnlineTransport, view: &mut MatchView) {
     view.retask_projection.active_order_ids = view
         .retask_projection
         .order_strength_by_cell
         .keys()
         .copied()
-        .collect();
-    if !refresh_background_orders {
-        return;
-    }
-    view.retask_projection.background_policy_order_ids = transport
-        .tactical
-        .orders
-        .values()
-        .filter(|order| {
-            order.status == OrderStatus::Active
-                && u32::from(order.player_id) == view.local_player
-                && is_policy_maintenance_order(order)
-        })
-        .map(|order| order.order_id)
         .collect();
 }
 
@@ -3469,7 +2876,7 @@ fn rebuild_retask_indexes(transport: &mut OnlineTransport, view: &mut MatchView)
         ..Default::default()
     };
     apply_retask_row_changes(transport, view, &impact, true);
-    refresh_retask_order_kinds(transport, view, true);
+    refresh_retask_order_kinds(transport, view);
     rebuild_retask_handles(transport, view);
     if view.retask_projection != previous {
         view.retask_revision = view.retask_revision.wrapping_add(1);
@@ -3539,1526 +2946,4 @@ fn save_token(path: &Path, token: &str) -> io::Result<()> {
     #[cfg(not(unix))]
     fs::write(path, token)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_config() -> ClientConfig {
-        ClientConfig {
-            offline: false,
-            host: "http://127.0.0.1:3000".to_owned(),
-            database: "test".to_owned(),
-            preferred_player: 1,
-            display_name: "Test".to_owned(),
-            profile: "test".to_owned(),
-            debug_policy_flows: false,
-        }
-    }
-
-    fn test_order(
-        order_id: u64,
-        client_command_id: u64,
-        kind: match_bindings::OrderKind,
-    ) -> TransferOrder {
-        TransferOrder {
-            order_id,
-            player_id: 1,
-            client_command_id,
-            kind,
-            status: OrderStatus::Active,
-            requested_infantry: 20,
-            committed_infantry: 20,
-            in_transit_infantry: 20,
-            delivered_infantry: 0,
-            casualty_infantry: 0,
-            orientation_q: 0,
-            orientation_r: 0,
-            created_step: 1,
-            updated_step: 1,
-        }
-    }
-
-    #[test]
-    fn tactical_row_changes_coalesce_by_primary_key() {
-        let signals = SharedSignals::default();
-        let mut cache = TacticalCache::default();
-        let mut packet = TransitPacket {
-            packet_key: 7,
-            order_id: 7,
-            owner_player_id: 1,
-            origin_cell: 10,
-            current_cell: 10,
-            destination_cell: 11,
-            infantry: 20,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-        record_change(
-            &signals.packet_changes,
-            packet.packet_key,
-            Some(packet.clone()),
-        );
-        packet.infantry = 12;
-        record_change(
-            &signals.packet_changes,
-            packet.packet_key,
-            Some(packet.clone()),
-        );
-
-        cache.apply(signals.take_tactical_changes());
-        assert_eq!(cache.packets.len(), 1);
-        assert_eq!(cache.packets[&packet.packet_key].infantry, 12);
-
-        record_change(&signals.packet_changes, packet.packet_key, None);
-        cache.apply(signals.take_tactical_changes());
-        assert!(cache.packets.is_empty());
-    }
-
-    #[test]
-    fn front_load_transport_preserves_exact_fixed_point_orientation() {
-        let continuous_heading = Axial::new(1_024, 375);
-        assert_eq!(
-            validated_front_load_orientation(Some(continuous_heading)),
-            Some(continuous_heading)
-        );
-    }
-
-    #[test]
-    fn empty_front_load_direction_is_rejected() {
-        assert_eq!(validated_front_load_orientation(Some(Axial::ZERO)), None);
-        assert_eq!(validated_front_load_orientation(None), None);
-    }
-
-    #[test]
-    fn expand_wave_edge_packets_project_while_resting_packets_are_omitted() {
-        let mut transport = OnlineTransport::new(test_config());
-        transport.id_to_coordinate.insert(10, Axial::ZERO);
-        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
-        transport.id_to_coordinate.insert(12, Axial::new(0, 1));
-
-        let mut view = MatchView::connecting(1);
-        for (coordinate, owner) in [(Axial::new(1, 0), None), (Axial::new(0, 1), Some(2))] {
-            view.cells.insert(
-                coordinate,
-                CellView {
-                    coordinate,
-                    terrain: TerrainKind::Plains,
-                    elevation: 0,
-                    owner,
-                    civilians: 0,
-                    infantry: 0,
-                    military_capacity: 100,
-                    blocked: false,
-                },
-            );
-        }
-
-        let edge = TransitPacket {
-            packet_key: 7,
-            order_id: 7,
-            owner_player_id: 1,
-            origin_cell: u32::MAX,
-            current_cell: 10,
-            destination_cell: 11,
-            infantry: 7,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-        let hostile_edge = TransitPacket {
-            packet_key: 8,
-            order_id: 8,
-            owner_player_id: 1,
-            origin_cell: 10,
-            current_cell: 10,
-            destination_cell: 12,
-            infantry: 9,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-        let resting = TransitPacket {
-            packet_key: 9,
-            order_id: 7,
-            owner_player_id: 1,
-            origin_cell: u32::MAX,
-            current_cell: 11,
-            destination_cell: 11,
-            infantry: 8,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-
-        let orders = [
-            test_order(7, 7, match_bindings::OrderKind::ExpandClusters),
-            test_order(8, 8, match_bindings::OrderKind::AttackClusters),
-        ];
-        let flows = packets_to_flows(
-            &transport,
-            &view,
-            &[edge, hostile_edge, resting],
-            &BTreeMap::new(),
-            &orders,
-            false,
-        );
-        assert_eq!(flows.len(), 2);
-        assert_eq!(flows[0].route, vec![Axial::ZERO, Axial::new(1, 0)]);
-        assert!(!flows[0].attacking, "neutral expansion is not hostile");
-        assert!(flows[1].attacking, "enemy-targeted movement stays hostile");
-    }
-
-    #[test]
-    fn internal_distribution_flows_are_debug_only_regardless_of_command_origin() {
-        let mut transport = OnlineTransport::new(test_config());
-        transport.id_to_coordinate.insert(10, Axial::ZERO);
-        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
-        let view = MatchView::connecting(1);
-        let packet = |order_id, infantry| TransitPacket {
-            packet_key: order_id,
-            order_id,
-            owner_player_id: 1,
-            origin_cell: 10,
-            current_cell: 10,
-            destination_cell: 11,
-            infantry,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-        let packets = [
-            packet(20, 20),
-            packet(21, 21),
-            packet(22, 22),
-            // Packet callbacks can precede their order callback on a busy
-            // frame. Unknown packet provenance is never player-visible.
-            packet(23, 23),
-        ];
-        let orders = [
-            test_order(20, 0, match_bindings::OrderKind::PerimeterLoad),
-            // A receipt-bearing legacy redistribution still represents the
-            // same noisy internal logistics and stays behind the diagnostic.
-            test_order(21, 21, match_bindings::OrderKind::PerimeterLoad),
-            test_order(22, 22, match_bindings::OrderKind::ExpandClusters),
-        ];
-
-        let normal = packets_to_flows(
-            &transport,
-            &view,
-            &packets,
-            &BTreeMap::new(),
-            &orders,
-            false,
-        );
-        assert_eq!(
-            normal.iter().map(|flow| flow.strength).collect::<Vec<_>>(),
-            vec![22]
-        );
-
-        let debug = packets_to_flows(&transport, &view, &packets, &BTreeMap::new(), &orders, true);
-        assert_eq!(
-            debug.iter().map(|flow| flow.strength).collect::<Vec<_>>(),
-            vec![20, 21, 22]
-        );
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn f4_toggles_policy_routes_and_requests_an_immediate_reprojection() {
-        let transport = OnlineTransport::new(test_config());
-        let signals = Arc::clone(&transport.signals);
-        let mut app = App::new();
-        app.insert_resource(ButtonInput::<KeyCode>::default())
-            .insert_resource(transport)
-            .insert_resource(MatchView::connecting(1))
-            .add_systems(Update, toggle_policy_flow_debug);
-
-        assert!(
-            !app.world()
-                .resource::<OnlineTransport>()
-                .config
-                .debug_policy_flows,
-            "policy routes must start hidden"
-        );
-        assert_eq!(signals.take_dirty(), 0);
-
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(POLICY_FLOW_DEBUG_KEY);
-        app.update();
-
-        assert!(
-            app.world()
-                .resource::<OnlineTransport>()
-                .config
-                .debug_policy_flows
-        );
-        assert_eq!(signals.take_dirty(), FLOWS_DIRTY | ORDERS_DIRTY);
-        assert_eq!(
-            app.world()
-                .resource::<MatchView>()
-                .toast
-                .as_ref()
-                .map(|toast| toast.text.as_str()),
-            Some("DEBUG · policy routes ON · F4 to hide")
-        );
-
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .clear_just_pressed(POLICY_FLOW_DEBUG_KEY);
-        app.update();
-        assert!(
-            app.world()
-                .resource::<OnlineTransport>()
-                .config
-                .debug_policy_flows,
-            "holding F4 must not retrigger the toggle"
-        );
-        assert_eq!(signals.take_dirty(), 0);
-
-        app.world_mut()
-            .resource_mut::<MatchView>()
-            .active_flows
-            .push(ActiveFlow {
-                route: vec![Axial::ZERO, Axial::new(1, 0)],
-                strength: 20,
-                attacking: false,
-                age: 0.0,
-                lifetime: 60.0,
-            });
-        {
-            let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-            keyboard.reset(POLICY_FLOW_DEBUG_KEY);
-            keyboard.press(POLICY_FLOW_DEBUG_KEY);
-        }
-        app.update();
-
-        assert!(
-            !app.world()
-                .resource::<OnlineTransport>()
-                .config
-                .debug_policy_flows
-        );
-        assert!(
-            app.world().resource::<MatchView>().active_flows.is_empty(),
-            "turning the diagnostic off must clear stale trails without authority"
-        );
-        assert_eq!(signals.take_dirty(), FLOWS_DIRTY | ORDERS_DIRTY);
-        assert_eq!(
-            app.world()
-                .resource::<MatchView>()
-                .toast
-                .as_ref()
-                .map(|toast| toast.text.as_str()),
-            Some("DEBUG · policy routes OFF · F4 to show")
-        );
-    }
-
-    #[test]
-    fn authoritative_flow_sync_clears_stale_and_unknown_policy_routes() {
-        let mut transport = OnlineTransport::new(test_config());
-        transport.id_to_coordinate.insert(10, Axial::ZERO);
-        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
-        let mut view = MatchView::connecting(1);
-        view.set_authoritative_flow(
-            99,
-            Some(ActiveFlow {
-                route: vec![Axial::ZERO, Axial::new(1, 0)],
-                strength: 99,
-                attacking: false,
-                age: 8.0,
-                lifetime: 60.0,
-            }),
-        );
-        let packet = TransitPacket {
-            packet_key: 24,
-            order_id: 24,
-            owner_player_id: 1,
-            origin_cell: 10,
-            current_cell: 10,
-            destination_cell: 11,
-            infantry: 24,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-
-        // This models the packet-first callback window: replacement must
-        // clear the old projection rather than retaining or exposing either
-        // route while the matching order row is unavailable.
-        replace_authoritative_flows(
-            &transport,
-            &mut view,
-            &[packet],
-            &BTreeMap::new(),
-            &[],
-            false,
-        );
-        assert!(view.authoritative_flows.is_empty());
-        assert!(view.authoritative_flows_by_chunk.is_empty());
-    }
-
-    #[test]
-    fn packet_delta_matches_a_full_retask_projection_without_touching_other_packets() {
-        let mut transport = OnlineTransport::new(test_config());
-        transport.id_to_coordinate.insert(10, Axial::ZERO);
-        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
-        transport.id_to_coordinate.insert(12, Axial::new(2, 0));
-        let order = test_order(7, 7, match_bindings::OrderKind::ExpandClusters);
-        let packet = |packet_key, current_cell, destination_cell, infantry| TransitPacket {
-            packet_key,
-            order_id: 7,
-            owner_player_id: 1,
-            origin_cell: 10,
-            current_cell,
-            destination_cell,
-            infantry,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-        transport.tactical.apply(TacticalChanges {
-            orders: BTreeMap::from([(7, Some(order))]),
-            packets: BTreeMap::from([
-                (41, Some(packet(41, 10, 11, 20))),
-                (42, Some(packet(42, 11, 12, 30))),
-            ]),
-            ..Default::default()
-        });
-        let mut view = MatchView::connecting(1);
-        rebuild_retask_indexes(&mut transport, &mut view);
-
-        let changes = TacticalChanges {
-            packets: BTreeMap::from([(41, Some(packet(41, 11, 12, 12)))]),
-            ..Default::default()
-        };
-        let mut impact = ProjectionImpact::before(&transport.tactical, &changes);
-        apply_retask_row_changes(&mut transport, &mut view, &impact, false);
-        transport.tactical.apply(changes);
-        impact.after(&transport.tactical);
-        apply_retask_row_changes(&mut transport, &mut view, &impact, true);
-        refresh_retask_order_kinds(&transport, &mut view, false);
-        rebuild_retask_handles(&transport, &mut view);
-
-        let expected = retask_projection_from_authority(
-            &transport,
-            &view,
-            transport.tactical.orders.values(),
-            transport.tactical.packets.values(),
-            &transport.tactical.routes,
-            transport.tactical.fronts.values(),
-            transport.tactical.sources.values(),
-            transport.tactical.destinations.values(),
-        );
-        assert_eq!(view.retask_projection, expected);
-        assert_eq!(
-            view.retask_projection.order_strength_by_cell[&7],
-            BTreeMap::from([(Axial::new(1, 0), 42)])
-        );
-    }
-
-    #[test]
-    fn packet_flow_delta_preserves_unaffected_projection_state() {
-        let mut transport = OnlineTransport::new(test_config());
-        transport.id_to_coordinate.insert(10, Axial::ZERO);
-        transport.id_to_coordinate.insert(11, Axial::new(1, 0));
-        let packet = |packet_key, infantry| TransitPacket {
-            packet_key,
-            order_id: 7,
-            owner_player_id: 1,
-            origin_cell: 10,
-            current_cell: 10,
-            destination_cell: 11,
-            infantry,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 1,
-        };
-        transport.tactical.apply(TacticalChanges {
-            orders: BTreeMap::from([(
-                7,
-                Some(test_order(7, 7, match_bindings::OrderKind::ExpandClusters)),
-            )]),
-            packets: BTreeMap::from([(41, Some(packet(41, 20))), (42, Some(packet(42, 30)))]),
-            ..Default::default()
-        });
-        let mut view = MatchView::connecting(1);
-        replace_authoritative_flows(
-            &transport,
-            &mut view,
-            transport.tactical.packets.values(),
-            &transport.tactical.routes,
-            transport.tactical.orders.values(),
-            false,
-        );
-        view.authoritative_flows.get_mut(&42).unwrap().age = 9.0;
-
-        let changes = TacticalChanges {
-            packets: BTreeMap::from([(41, Some(packet(41, 12)))]),
-            ..Default::default()
-        };
-        let mut impact = ProjectionImpact::before(&transport.tactical, &changes);
-        transport.tactical.apply(changes);
-        impact.after(&transport.tactical);
-        update_authoritative_flows(&transport, &mut view, &impact.flow_packet_ids);
-
-        assert_eq!(view.authoritative_flows[&41].strength, 12);
-        assert_eq!(view.authoritative_flows[&42].strength, 30);
-        assert!((view.authoritative_flows[&42].age - 9.0).abs() < f32::EPSILON);
-        assert_eq!(impact.flow_packet_ids, BTreeSet::from([41]));
-    }
-
-    #[test]
-    fn combat_fronts_project_a_percentage_contested_cell() {
-        let mut transport = OnlineTransport::new(test_config());
-        let from = Axial::ZERO;
-        let to = Axial::new(1, 0);
-        transport.id_to_coordinate.insert(10, from);
-        transport.id_to_coordinate.insert(12, Axial::new(0, 1));
-        transport.id_to_coordinate.insert(11, to);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(
-            to,
-            CellView {
-                coordinate: to,
-                terrain: TerrainKind::Plains,
-                elevation: 0,
-                owner: Some(2),
-                civilians: 0,
-                infantry: 65,
-                military_capacity: 100,
-                blocked: false,
-            },
-        );
-
-        let first = CombatFront {
-            front_key: "10:11:1".to_owned(),
-            attacker_player_id: 1,
-            defender_player_id: 2,
-            from_cell: 10,
-            to_cell: 11,
-            queued_infantry: 30,
-            attacker_engaged: 10,
-            defender_engaged: 10,
-            attacker_casualties: 5,
-            defender_casualties: 4,
-            frontage: 25,
-            uphill: false,
-            logical_step: 7,
-        };
-        let second = CombatFront {
-            front_key: "12:11:1".to_owned(),
-            from_cell: 12,
-            queued_infantry: 15,
-            attacker_engaged: 0,
-            attacker_casualties: 0,
-            ..first.clone()
-        };
-        let (overlays, contested) = fronts_to_overlays(&transport, &view, &[first, second]);
-
-        assert_eq!(overlays.len(), 2);
-        let contest = contested.get(&to).expect("target should be contested");
-        assert_eq!(contest.controller_player, 2);
-        assert_eq!(contest.attacker_player, 1);
-        assert_eq!(contest.attacker_strength, 50);
-        assert!((contest.attacker_share - (50.0 / 115.0)).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn cluster_policy_transport_preserves_facing_and_rejects_invalid_combinations() {
-        assert_eq!(
-            remote_cluster_policy(ClusterPolicy::Balanced, None),
-            Ok((RemoteClusterPolicyKind::Balanced, Axial::ZERO))
-        );
-        assert_eq!(
-            remote_cluster_policy(ClusterPolicy::Directional, Some(Axial::new(512, -341))),
-            Ok((RemoteClusterPolicyKind::Directional, Axial::new(512, -341)))
-        );
-        assert!(remote_cluster_policy(ClusterPolicy::Directional, None).is_err());
-        assert!(remote_cluster_policy(ClusterPolicy::Center, Some(Axial::new(1, 0))).is_err());
-    }
-
-    #[test]
-    fn policy_snapshot_maps_only_the_bound_players_authoritative_rows() {
-        let mut transport = OnlineTransport::new(test_config());
-        let local = Axial::new(2, -1);
-        let foreign = Axial::new(3, -1);
-        transport.id_to_coordinate.insert(20, local);
-        transport.id_to_coordinate.insert(21, foreign);
-        let mut view = MatchView::connecting(1);
-
-        update_cluster_policies(
-            &transport,
-            &mut view,
-            &[
-                ClusterPolicyAssignment {
-                    cell_id: 20,
-                    owner_player_id: 1,
-                    kind: RemoteClusterPolicyKind::Directional,
-                    orientation_q: 700,
-                    orientation_r: -250,
-                    revision: 8,
-                },
-                ClusterPolicyAssignment {
-                    cell_id: 21,
-                    owner_player_id: 2,
-                    kind: RemoteClusterPolicyKind::Perimeter,
-                    orientation_q: 0,
-                    orientation_r: 0,
-                    revision: 9,
-                },
-            ],
-        );
-
-        assert_eq!(
-            view.cluster_policies.get(&local),
-            Some(&ClusterPolicyView {
-                kind: ClusterPolicy::Directional,
-                orientation: Axial::new(700, -250),
-                revision: 8,
-            })
-        );
-        assert!(!view.cluster_policies.contains_key(&foreign));
-    }
-
-    #[test]
-    fn retask_projection_maps_a_contested_handle_to_all_current_order_cells() {
-        let mut transport = OnlineTransport::new(test_config());
-        let rear = Axial::ZERO;
-        let front = Axial::new(1, 0);
-        let handle = Axial::new(2, 0);
-        for (cell_id, coordinate) in [(10, rear), (11, front), (12, handle)] {
-            transport.id_to_coordinate.insert(cell_id, coordinate);
-        }
-
-        let mut view = MatchView::connecting(1);
-        for (coordinate, owner, infantry) in [
-            (rear, Some(1), 30),
-            (front, Some(1), 20),
-            (handle, Some(2), 40),
-        ] {
-            view.cells.insert(
-                coordinate,
-                CellView {
-                    coordinate,
-                    terrain: TerrainKind::Plains,
-                    elevation: 0,
-                    owner,
-                    civilians: 0,
-                    infantry,
-                    military_capacity: 100,
-                    blocked: false,
-                },
-            );
-        }
-
-        let combat = CombatFront {
-            front_key: "11:12:1".to_owned(),
-            attacker_player_id: 1,
-            defender_player_id: 2,
-            from_cell: 11,
-            to_cell: 12,
-            queued_infantry: 12,
-            attacker_engaged: 5,
-            defender_engaged: 5,
-            attacker_casualties: 0,
-            defender_casualties: 0,
-            frontage: 25,
-            uphill: false,
-            logical_step: 7,
-        };
-        let (_, contested) = fronts_to_overlays(&transport, &view, std::slice::from_ref(&combat));
-        view.set_contested_cells(contested);
-
-        let order = |order_id, player_id, status, kind| TransferOrder {
-            order_id,
-            player_id,
-            client_command_id: order_id,
-            kind,
-            status,
-            requested_infantry: 20,
-            committed_infantry: 20,
-            in_transit_infantry: 20,
-            delivered_infantry: 0,
-            casualty_infantry: 0,
-            orientation_q: 1,
-            orientation_r: 0,
-            created_step: 1,
-            updated_step: 7,
-        };
-        let packet = |packet_key: u64,
-                      order_id,
-                      current_cell,
-                      destination_cell,
-                      infantry,
-                      _route: Vec<u32>| TransitPacket {
-            packet_key,
-            order_id,
-            owner_player_id: 1,
-            origin_cell: 10,
-            current_cell,
-            destination_cell,
-            infantry,
-            pending_source_infantry: 0,
-            route_id: 0,
-            route_index: 0,
-            updated_step: 7,
-        };
-        let orders = [
-            order(
-                7,
-                1,
-                OrderStatus::Active,
-                match_bindings::OrderKind::PushFront,
-            ),
-            order(
-                8,
-                1,
-                OrderStatus::Active,
-                match_bindings::OrderKind::PushFront,
-            ),
-            order(
-                9,
-                1,
-                OrderStatus::Completed,
-                match_bindings::OrderKind::Balance,
-            ),
-            order(
-                10,
-                1,
-                OrderStatus::Active,
-                match_bindings::OrderKind::Balance,
-            ),
-            order(
-                11,
-                2,
-                OrderStatus::Active,
-                match_bindings::OrderKind::Reshape,
-            ),
-        ];
-        let packets = [
-            packet(1, 7, 11, 12, 12, vec![11, 12]),
-            packet(2, 7, 10, 10, 8, vec![10]),
-            packet(3, 8, 10, 10, 5, vec![10]),
-            packet(4, 9, 10, 10, 99, vec![10]),
-        ];
-        let destinations = [
-            TransferDestination {
-                destination_key: 1,
-                order_id: 7,
-                player_id: 1,
-                cell_id: 12,
-                target_infantry: 20,
-                received_infantry: 0,
-            },
-            TransferDestination {
-                destination_key: 2,
-                order_id: 9,
-                player_id: 1,
-                cell_id: 11,
-                target_infantry: 20,
-                received_infantry: 0,
-            },
-            TransferDestination {
-                destination_key: 3,
-                order_id: 10,
-                player_id: 1,
-                cell_id: 11,
-                target_infantry: 30,
-                received_infantry: 12,
-            },
-            TransferDestination {
-                destination_key: 4,
-                order_id: 11,
-                player_id: 1,
-                cell_id: 10,
-                target_infantry: 20,
-                received_infantry: 0,
-            },
-        ];
-        let sources = [
-            TransferSource {
-                source_key: 1,
-                order_id: 7,
-                player_id: 1,
-                cell_id: 10,
-                committed_infantry: 20,
-                queued_infantry: 0,
-            },
-            TransferSource {
-                source_key: 2,
-                order_id: 8,
-                player_id: 1,
-                cell_id: 10,
-                committed_infantry: 5,
-                queued_infantry: 0,
-            },
-        ];
-
-        let projection = retask_projection_from_authority(
-            &transport,
-            &view,
-            &orders,
-            &packets,
-            &BTreeMap::new(),
-            &[combat],
-            &sources,
-            &destinations,
-        );
-
-        assert_eq!(
-            projection.handle_orders,
-            BTreeMap::from([(handle, BTreeSet::from([7]))])
-        );
-        assert_eq!(projection.active_order_ids, BTreeSet::from([7, 8]));
-        assert_eq!(
-            projection.order_source_cells,
-            BTreeMap::from([(7, BTreeSet::from([rear])), (8, BTreeSet::from([rear])),])
-        );
-        assert_eq!(
-            projection.order_strength_by_cell[&7],
-            BTreeMap::from([(rear, 8), (front, 12)])
-        );
-        assert_eq!(
-            projection.active_strength_by_cell,
-            BTreeMap::from([(rear, 13), (front, 12)])
-        );
-        assert_eq!(
-            projection.destination_reservations_by_order,
-            BTreeMap::from([(10, BTreeMap::from([(front, 18)]))])
-        );
-        assert_eq!(
-            projection.destination_claims_by_order,
-            BTreeMap::from([
-                (7, BTreeSet::from([rear, handle])),
-                (8, BTreeSet::from([rear])),
-                (10, BTreeSet::from([front])),
-            ])
-        );
-    }
-
-    #[test]
-    fn retask_projection_classifies_only_internal_active_policy_orders() {
-        let transport = OnlineTransport::new(test_config());
-        let view = MatchView::connecting(1);
-        let order = |order_id, player_id, client_command_id, status, kind| TransferOrder {
-            order_id,
-            player_id,
-            client_command_id,
-            kind,
-            status,
-            requested_infantry: 20,
-            committed_infantry: 20,
-            in_transit_infantry: 20,
-            delivered_infantry: 0,
-            casualty_infantry: 0,
-            orientation_q: 0,
-            orientation_r: 0,
-            created_step: 1,
-            updated_step: 1,
-        };
-        let orders = [
-            order(
-                1,
-                1,
-                0,
-                OrderStatus::Active,
-                match_bindings::OrderKind::Balance,
-            ),
-            order(
-                2,
-                1,
-                2,
-                OrderStatus::Active,
-                match_bindings::OrderKind::FrontLoad,
-            ),
-            order(
-                3,
-                1,
-                0,
-                OrderStatus::Completed,
-                match_bindings::OrderKind::CoreLoad,
-            ),
-            order(
-                4,
-                2,
-                0,
-                OrderStatus::Active,
-                match_bindings::OrderKind::PerimeterLoad,
-            ),
-            order(
-                5,
-                1,
-                0,
-                OrderStatus::Active,
-                match_bindings::OrderKind::PushFront,
-            ),
-        ];
-
-        let projection = retask_projection_from_authority(
-            &transport,
-            &view,
-            &orders,
-            &[],
-            &BTreeMap::new(),
-            &[],
-            &[],
-            &[],
-        );
-
-        assert_eq!(projection.background_policy_order_ids, BTreeSet::from([1]));
-    }
-
-    #[test]
-    fn delayed_receipt_advances_command_allocator_before_deduplication() {
-        let mut transport = OnlineTransport::new(test_config());
-        transport.next_command_id = 40;
-        transport.command_ids_ready = true;
-        transport.terminal_command_ids.insert(72);
-
-        transport.observe_command_id(72);
-        assert_eq!(transport.next_command_id, 73);
-        assert!(transport.command_ids_ready);
-
-        transport.observe_command_id(12);
-        assert_eq!(transport.next_command_id, 73);
-
-        transport.observe_command_id(u64::MAX);
-        assert!(!transport.command_ids_ready);
-        assert_eq!(transport.allocate_command_id(), None);
-    }
-
-    #[test]
-    fn invalid_host_disables_connection_without_entering_sdk_builder() {
-        let mut config = test_config();
-        config.host = "http://[broken".to_owned();
-        let mut transport = OnlineTransport::new(config);
-        let mut view = MatchView::connecting(1);
-
-        connect_to_spacetimedb(&mut transport, &mut view);
-
-        assert!(transport.connection_disabled);
-        assert!(transport.connection.is_none());
-        assert!(!transport.subscription_lifecycle.commands_ready());
-        assert!(matches!(
-            view.authority,
-            AuthorityState::ConnectionUnavailable { .. }
-        ));
-    }
-
-    #[test]
-    fn relative_host_is_rejected_before_entering_sdk_builder() {
-        let mut config = test_config();
-        config.host = "localhost".to_owned();
-        let mut transport = OnlineTransport::new(config);
-        let mut view = MatchView::connecting(1);
-
-        connect_to_spacetimedb(&mut transport, &mut view);
-
-        assert!(transport.connection_disabled);
-        assert!(transport.connection.is_none());
-    }
-
-    #[test]
-    fn join_failure_is_terminal_and_preserves_the_authoritative_reason() {
-        let mut transport = OnlineTransport::new(test_config());
-        transport.subscription_lifecycle = SubscriptionLifecycle {
-            bootstrap_ready: true,
-            tactical_ready: true,
-        };
-        transport.command_ids_ready = true;
-        transport.bound_player = Some(1);
-        let mut view = MatchView::connecting(1);
-
-        mark_join_failed(
-            &mut transport,
-            &mut view,
-            "both player slots are already claimed".to_owned(),
-        );
-
-        assert!(transport.subscription_lifecycle.bootstrap_ready);
-        assert!(!transport.subscription_lifecycle.tactical_ready);
-        assert!(!transport.subscription_lifecycle.commands_ready());
-        assert!(!transport.command_ids_ready);
-        assert_eq!(transport.bound_player, None);
-        assert_eq!(
-            view.authority,
-            AuthorityState::SlotUnavailable {
-                reason: "both player slots are already claimed".to_owned()
-            }
-        );
-        assert_eq!(
-            view.authority.command_block_reason(),
-            "Player slot unavailable: both player slots are already claimed"
-        );
-        assert_eq!(
-            view.latest_result,
-            "SLOT UNAVAILABLE · both player slots are already claimed"
-        );
-    }
-
-    #[test]
-    fn slot_status_distinguishes_unknown_open_and_claimed_offline() {
-        let mut transport = OnlineTransport::new(test_config());
-        let mut view = MatchView::connecting(1);
-
-        update_players(&mut transport, &mut view, None, &[]);
-        assert_eq!(view.connection, [ConnectionState::Syncing; 2]);
-
-        let players = [
-            PlayerSlot {
-                player_id: 1,
-                identity: None,
-                display_name: String::new(),
-                connected: false,
-                has_reconnected: false,
-                reconnect_count: 0,
-                ready: false,
-                joined_at_us: 0,
-                last_seen_at_us: 0,
-            },
-            PlayerSlot {
-                player_id: 2,
-                identity: Some(spacetimedb_sdk::Identity::ZERO),
-                display_name: "Previous player".to_owned(),
-                connected: false,
-                has_reconnected: true,
-                reconnect_count: 1,
-                ready: true,
-                joined_at_us: 1,
-                last_seen_at_us: 2,
-            },
-        ];
-        update_players(&mut transport, &mut view, None, &players);
-
-        assert_eq!(view.connection[0], ConnectionState::Open);
-        assert_eq!(view.connection[1], ConnectionState::ClaimedOffline);
-        assert_eq!(view.connection[0].label(), "OPEN SLOT");
-        assert_eq!(view.connection[1].label(), "CLAIMED OFFLINE");
-    }
-
-    #[test]
-    fn impassable_water_does_not_receive_a_blocked_land_overlay() {
-        let terrain = CellTerrain {
-            cell_id: 1,
-            q: 0,
-            r: 0,
-            chunk_q: 0,
-            chunk_r: 0,
-            terrain: match_bindings::TerrainClass::Water,
-            elevation: 0,
-            passable: false,
-            capturable: false,
-            habitable: false,
-        };
-
-        assert!(!cell_view_from_rows(Axial::ZERO, &terrain, None).blocked);
-    }
-
-    #[test]
-    fn terrain_rebuild_retains_authoritative_capturability() {
-        let mut transport = OnlineTransport::new(test_config());
-        let mut view = MatchView::connecting(1);
-        let mut terrain = CellTerrain {
-            cell_id: 1,
-            q: 0,
-            r: 0,
-            chunk_q: 0,
-            chunk_r: 0,
-            terrain: match_bindings::TerrainClass::Plains,
-            elevation: 0,
-            passable: true,
-            capturable: false,
-            habitable: true,
-        };
-
-        rebuild_cells(&mut transport, &mut view, vec![terrain.clone()], None);
-        assert!(view.cell(Axial::ZERO).is_some_and(|cell| !cell.blocked));
-        assert!(!view.is_capturable(Axial::ZERO));
-
-        terrain.capturable = true;
-        rebuild_cells(&mut transport, &mut view, vec![terrain], None);
-        assert!(view.is_capturable(Axial::ZERO));
-    }
-
-    #[test]
-    fn civilian_only_updates_invalidate_the_render_chunk() {
-        let mut transport = OnlineTransport::new(test_config());
-        let mut view = MatchView::offline_fixture();
-        let coordinate = *view
-            .cells
-            .keys()
-            .find(|coordinate| view.cell(**coordinate).is_some_and(CellView::is_land))
-            .expect("fixture land cell");
-        let original = view.cell(coordinate).expect("indexed fixture cell").clone();
-        transport.id_to_coordinate.insert(42, coordinate);
-        view.dirty_chunks.clear();
-        let planning_revision = view.planning_revision;
-
-        update_cells(
-            &transport,
-            &mut view,
-            &[CellState {
-                cell_id: 42,
-                owner_player_id: original.owner.unwrap_or_default() as u16,
-                civilians: original.civilians + 1,
-                civilian_capacity: original.civilians + 100,
-                infantry: original.infantry,
-                military_capacity: original.military_capacity,
-                population_shard: 0,
-                chunk_q: 0,
-                chunk_r: 0,
-                last_changed_step: 1,
-                last_policy_changed_step: 1,
-            }],
-            MapViewMode::Civilians,
-        );
-
-        assert_eq!(
-            view.cell(coordinate).unwrap().civilians,
-            original.civilians + 1
-        );
-        assert_eq!(view.dirty_chunks, BTreeSet::from([chunk_of(coordinate)]));
-        assert_eq!(view.planning_revision, planning_revision);
-    }
-
-    #[test]
-    fn civilian_only_updates_do_not_recolor_the_soldier_view() {
-        let mut transport = OnlineTransport::new(test_config());
-        let mut view = MatchView::offline_fixture();
-        let coordinate = *view.cells.keys().next().expect("fixture cell");
-        let original = view.cell(coordinate).expect("fixture cell").clone();
-        transport.id_to_coordinate.insert(43, coordinate);
-        view.dirty_chunks.clear();
-        let planning_revision = view.planning_revision;
-
-        update_cells(
-            &transport,
-            &mut view,
-            &[CellState {
-                cell_id: 43,
-                owner_player_id: original.owner.unwrap_or_default() as u16,
-                civilians: original.civilians + 1,
-                civilian_capacity: original.civilians + 100,
-                infantry: original.infantry,
-                military_capacity: original.military_capacity,
-                population_shard: 0,
-                chunk_q: 0,
-                chunk_r: 0,
-                last_changed_step: 1,
-                last_policy_changed_step: 1,
-            }],
-            MapViewMode::Soldiers,
-        );
-
-        assert_eq!(
-            view.cell(coordinate).unwrap().civilians,
-            original.civilians + 1
-        );
-        assert!(view.dirty_chunks.is_empty());
-        assert_eq!(view.planning_revision, planning_revision);
-    }
-
-    #[test]
-    fn infantry_updates_preserve_ownership_revision_until_control_changes() {
-        let mut transport = OnlineTransport::new(test_config());
-        let mut view = MatchView::offline_fixture();
-        let coordinate = *view
-            .cells
-            .keys()
-            .find(|coordinate| view.is_local_owned(**coordinate))
-            .expect("fixture owned cell");
-        let original = view.cell(coordinate).expect("fixture cell").clone();
-        transport.id_to_coordinate.insert(44, coordinate);
-        let ownership_revision = view.ownership_revision;
-        let planning_revision = view.planning_revision;
-
-        let state = |owner_player_id, infantry| CellState {
-            cell_id: 44,
-            owner_player_id,
-            civilians: original.civilians,
-            civilian_capacity: original.civilians,
-            infantry,
-            military_capacity: original.military_capacity,
-            population_shard: 0,
-            chunk_q: 0,
-            chunk_r: 0,
-            last_changed_step: 1,
-            last_policy_changed_step: 1,
-        };
-        update_cells(
-            &transport,
-            &mut view,
-            &[state(1, original.infantry.saturating_add(1))],
-            MapViewMode::Soldiers,
-        );
-        assert_eq!(view.ownership_revision, ownership_revision);
-        assert_eq!(view.planning_revision, planning_revision.wrapping_add(1));
-
-        update_cells(
-            &transport,
-            &mut view,
-            &[state(2, original.infantry.saturating_add(1))],
-            MapViewMode::Soldiers,
-        );
-        assert_eq!(view.ownership_revision, ownership_revision.wrapping_add(1));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn token_save_is_atomic_and_repairs_private_permissions() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let directory = std::env::temp_dir().join(format!(
-            "of-token-test-{}-{}",
-            process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir(&directory).expect("create token test directory");
-        let path = directory.join("client.token");
-        fs::write(&path, "old").expect("seed existing token");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
-            .expect("make existing token permissive");
-
-        save_token(&path, "replacement").expect("save replacement token");
-
-        assert_eq!(
-            fs::read_to_string(&path).expect("read token"),
-            "replacement"
-        );
-        assert_eq!(
-            fs::metadata(&path).expect("token metadata").mode() & 0o777,
-            0o600
-        );
-        fs::remove_file(&path).expect("remove test token");
-        fs::remove_dir(&directory).expect("remove token test directory");
-    }
-
-    #[test]
-    fn bootstrap_subscription_is_metadata_and_terrain_only() {
-        let bootstrap = bootstrap_subscription_queries();
-        assert_eq!(bootstrap.len(), BOOTSTRAP_CLIENT_SUBSCRIPTIONS.len());
-        assert!(bootstrap.iter().all(|query| {
-            BOOTSTRAP_CLIENT_SUBSCRIPTIONS
-                .iter()
-                .any(|expected| expected == query)
-        }));
-        assert!(bootstrap.iter().all(|query| {
-            !query.contains("transfer_")
-                && !query.contains("transit_")
-                && !query.contains("command_receipt")
-                && !query.contains("mobilization_policy")
-                && !query.contains("cluster_policy")
-                && !query.contains("cell_state")
-                && !query.contains("combat_front")
-        }));
-        assert!(bootstrap.iter().any(|q| q.contains("cell_terrain")));
-        assert!(bootstrap.iter().any(|q| q.contains("match_config")));
-    }
-
-    #[test]
-    fn tactical_subscription_excludes_bootstrap_and_filters_high_scale() {
-        let low = tactical_subscription_queries(8, 3);
-        assert!(low.iter().any(|q| q == "SELECT * FROM transfer_order"));
-        assert!(low.iter().any(|q| q == "SELECT * FROM cell_state"));
-        assert!(low.iter().any(|q| q == "SELECT * FROM combat_front"));
-        assert!(low.iter().all(|q| !q.contains("WHERE player_id")));
-        assert!(low.iter().all(|q| {
-            !BOOTSTRAP_CLIENT_SUBSCRIPTIONS
-                .iter()
-                .any(|global| global == q)
-        }));
-        assert!(low.iter().any(|q| q == &route_query(None)));
-        assert!(low.iter().any(|q| q == &packet_query(None)));
-
-        let high = tactical_subscription_queries(500, 42);
-        assert!(
-            high.iter()
-                .any(|q| q == "SELECT * FROM transfer_order WHERE player_id = 42")
-        );
-        assert!(
-            high.iter()
-                .any(|q| q == "SELECT * FROM cell_state WHERE owner_player_id = 42")
-        );
-        // Spatial chunk interest is not on the tactical handle.
-        assert!(high.iter().all(|q| !q.contains("chunk_q")));
-        assert!(
-            high.iter()
-                .any(|q| q == "SELECT * FROM combat_front WHERE attacker_player_id = 42")
-        );
-        assert!(
-            high.iter()
-                .any(|q| q == "SELECT * FROM combat_front WHERE defender_player_id = 42")
-        );
-        assert!(high.iter().any(|q| q == &route_query(Some(42))));
-        assert!(high.iter().any(|q| q == &packet_query(Some(42))));
-        assert!(high.iter().all(|q| !q.contains("FROM match_config")));
-        assert!(high.iter().all(|q| !q.contains("FROM cell_terrain")));
-    }
-
-    #[test]
-    fn spatial_cell_queries_follow_focus_chunk_radius() {
-        let interest = SpatialInterest {
-            focus_chunk_q: 4,
-            focus_chunk_r: -2,
-            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
-        };
-        let queries = spatial_cell_state_queries(interest);
-        assert_eq!(queries.len(), 1);
-        assert!(queries[0].contains("FROM cell_state WHERE chunk_q >= 2"));
-        assert!(queries[0].contains("chunk_q <= 6"));
-        assert!(queries[0].contains("chunk_r >= -4"));
-        assert!(queries[0].contains("chunk_r <= 0"));
-        assert!(!queries[0].contains("owner_player_id"));
-    }
-
-    #[test]
-    fn high_scale_subscriptions_include_spatial_interest_and_local_rows() {
-        let low = client_subscription_queries(8, Some(3), None);
-        assert!(low.iter().any(|q| q == "SELECT * FROM transfer_order"));
-        assert!(low.iter().all(|q| !q.contains("WHERE player_id")));
-        assert!(low.iter().any(|q| q == "SELECT * FROM cell_state"));
-        // cell_state lives only in the tactical handle at low scale.
-        assert_eq!(
-            low.iter().filter(|q| q.contains("FROM cell_state")).count(),
-            1
-        );
-
-        let unbound = client_subscription_queries(64, None, None);
-        assert_eq!(unbound, bootstrap_subscription_queries());
-        assert!(unbound.iter().all(|q| !q.contains("transfer_order")));
-        assert!(unbound.iter().all(|q| !q.contains("cell_state")));
-
-        let interest = SpatialInterest {
-            focus_chunk_q: 1,
-            focus_chunk_r: 1,
-            radius: 2,
-        };
-        let high = client_subscription_queries(500, Some(42), Some(interest));
-        assert!(
-            high.iter()
-                .any(|q| q == "SELECT * FROM transfer_order WHERE player_id = 42")
-        );
-        assert!(
-            high.iter()
-                .any(|q| q == "SELECT * FROM cell_state WHERE owner_player_id = 42")
-        );
-        assert!(
-            high.iter()
-                .any(|q| q.contains("chunk_q >= -1") && q.contains("chunk_r <= 3"))
-        );
-        assert!(high.iter().any(|q| q == &packet_query(Some(42))));
-        // Bootstrap terrain once; no full unfiltered cell_state flood.
-        assert_eq!(
-            high.iter()
-                .filter(|q| *q == "SELECT * FROM cell_terrain")
-                .count(),
-            1
-        );
-        assert!(high.iter().all(|q| *q != "SELECT * FROM cell_state"));
-        // Local-owned tactical + separate spatial handle = two cell_state queries.
-        assert_eq!(
-            high.iter()
-                .filter(|q| q.contains("FROM cell_state"))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn camera_focus_chunk_changes_only_when_crossing_boundaries() {
-        let first = SpatialInterest {
-            focus_chunk_q: 2,
-            focus_chunk_r: 3,
-            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
-        };
-        let same_center = SpatialInterest {
-            focus_chunk_q: 2,
-            focus_chunk_r: 3,
-            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
-        };
-        let moved = SpatialInterest {
-            focus_chunk_q: 3,
-            focus_chunk_r: 3,
-            radius: HIGH_SCALE_INTEREST_CHUNK_RADIUS,
-        };
-        assert_eq!(first.center(), same_center.center());
-        assert_ne!(first.center(), moved.center());
-        // cell_id 0 is the map corner at (q_min, r_min).
-        assert_eq!(
-            chunk_coords_for_axial(Axial::new(-32, -32), -32, -32, 16),
-            chunk_coords_for_cell_id(0, 64, 16)
-        );
-        // Axial (0,0) on a centered 64 map is column/row 32 → chunk (2,2).
-        assert_eq!(
-            chunk_coords_for_axial(Axial::new(0, 0), -32, -32, 16),
-            (2, 2)
-        );
-        assert_eq!(chunk_coords_for_cell_id(32 + 32 * 64, 64, 16), (2, 2));
-    }
-
-    #[test]
-    fn cell_absence_projects_to_neutral_defaults() {
-        let mut transport = OnlineTransport::new(test_config());
-        let mut view = MatchView::connecting(2);
-        let coordinate = Axial::new(1, 2);
-        transport.coordinate_to_id.insert(coordinate, 9);
-        transport.id_to_coordinate.insert(9, coordinate);
-        view.cells.insert(
-            coordinate,
-            CellView {
-                coordinate,
-                terrain: TerrainKind::Plains,
-                elevation: 1,
-                owner: Some(3),
-                civilians: 40,
-                infantry: 12,
-                military_capacity: 100,
-                blocked: false,
-            },
-        );
-        neutralize_absent_cells(
-            &transport,
-            &mut view,
-            &BTreeSet::from([9]),
-            MapViewMode::Soldiers,
-        );
-        let cell = view.cells.get(&coordinate).expect("cell retained");
-        assert_eq!(cell.owner, None);
-        assert_eq!(cell.infantry, 0);
-        assert_eq!(cell.civilians, 0);
-        assert_eq!(cell.military_capacity, 0);
-        assert_eq!(cell.terrain, TerrainKind::Plains);
-    }
-
-    #[test]
-    fn clear_tactical_presentation_drops_stale_reconnect_state() {
-        let mut view = MatchView::connecting(2);
-        view.active_flows.push(ActiveFlow {
-            route: vec![Axial::ZERO],
-            strength: 1,
-            attacking: false,
-            age: 0.0,
-            lifetime: 1.0,
-        });
-        view.active_fronts.push(ActiveFront {
-            friendly: Axial::ZERO,
-            hostile: Axial::new(1, 0),
-            intensity: 1.0,
-            age: 0.0,
-        });
-        view.set_authoritative_flow(
-            7,
-            Some(ActiveFlow {
-                route: vec![Axial::new(1, 0)],
-                strength: 2,
-                attacking: true,
-                age: 0.0,
-                lifetime: 1.0,
-            }),
-        );
-        clear_tactical_presentation(&mut view);
-        assert!(view.active_flows.is_empty());
-        assert!(view.active_fronts.is_empty());
-        assert!(view.authoritative_flows.is_empty());
-        assert!(view.contested_cells.is_empty());
-        assert!(view.retask_projection.active_order_ids.is_empty());
-    }
-
-    #[test]
-    fn packet_and_route_queries_are_cfg_dependent() {
-        #[cfg(debug_assertions)]
-        {
-            assert!(packet_query(None).contains("transit_packet"));
-            assert!(route_query(Some(9)).contains("transit_route"));
-            assert!(!packet_query(None).contains("visible_packets"));
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            assert!(packet_query(None).contains("visible_packets"));
-            assert!(route_query(Some(9)).contains("visible_routes"));
-            assert!(!packet_query(None).contains("transit_packet"));
-        }
-        assert!(packet_query(Some(7)).contains("owner_player_id = 7"));
-        assert!(route_query(Some(7)).contains("player_id = 7"));
-    }
-
-    #[test]
-    fn chunk_coords_for_spawn_cell_match_server_div_euclid() {
-        // cell_id = row * width + column, chunk = column/size, row/size
-        assert_eq!(chunk_coords_for_cell_id(0, 64, 16), (0, 0));
-        assert_eq!(chunk_coords_for_cell_id(16, 64, 16), (1, 0));
-        assert_eq!(chunk_coords_for_cell_id(64 * 16, 64, 16), (0, 1));
-        assert_eq!(chunk_coords_for_cell_id(64 * 16 + 33, 64, 16), (2, 1));
-    }
-
-    #[test]
-    fn subscription_lifecycle_requires_bootstrap_and_tactical() {
-        let mut lifecycle = SubscriptionLifecycle::default();
-        assert!(!lifecycle.commands_ready());
-
-        lifecycle = lifecycle.on_bootstrap_applied();
-        assert!(lifecycle.bootstrap_ready);
-        assert!(!lifecycle.commands_ready());
-
-        lifecycle = lifecycle.on_tactical_start();
-        assert!(!lifecycle.tactical_ready);
-        assert!(!lifecycle.commands_ready());
-
-        lifecycle = lifecycle.on_tactical_applied();
-        assert!(lifecycle.commands_ready());
-
-        lifecycle = SubscriptionLifecycle::reset();
-        assert!(!lifecycle.bootstrap_ready);
-        assert!(!lifecycle.tactical_ready);
-        assert!(!lifecycle.commands_ready());
-    }
-
-    #[test]
-    fn update_players_is_linear_over_the_snapshot() {
-        let mut transport = OnlineTransport::new(ClientConfig {
-            offline: true,
-            host: String::new(),
-            database: String::new(),
-            preferred_player: 2,
-            display_name: "t".into(),
-            profile: "t".into(),
-            debug_policy_flows: false,
-        });
-        let mut view = MatchView::connecting(4);
-        view.player_count = 4;
-        let identity = spacetimedb_sdk::Identity::ZERO;
-        let players = (1..=4)
-            .map(|player_id| PlayerSlot {
-                player_id,
-                identity: if player_id == 2 { Some(identity) } else { None },
-                display_name: format!("P{player_id}"),
-                connected: player_id == 2,
-                has_reconnected: false,
-                reconnect_count: 0,
-                ready: true,
-                joined_at_us: 0,
-                last_seen_at_us: 0,
-            })
-            .collect::<Vec<_>>();
-        update_players(&mut transport, &mut view, Some(identity), &players);
-        assert_eq!(view.local_player, 2);
-        assert_eq!(transport.bound_player, Some(2));
-        assert_eq!(view.connection[0], ConnectionState::Open);
-        assert_eq!(view.connection[1], ConnectionState::Connected);
-    }
 }

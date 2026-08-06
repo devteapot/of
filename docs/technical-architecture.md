@@ -139,12 +139,12 @@ local`, then check the cumulative mean with:
 
 ```bash
 ./scripts/check-reducer-fuel.sh <database-identity> simulation_tick <fuel-limit>
-./scripts/check-reducer-fuel.sh <database-identity> set_cluster_policy <fuel-limit>
+./scripts/check-reducer-fuel.sh <database-identity> issue_front_rebalance <fuel-limit>
 ```
 
 Pin both the Rust and SpacetimeDB versions when comparing fuel baselines.
 
-The cluster-wave, persistent-policy, Reshape, and generic cancellation cutover
+The cluster-wave, strategic-front, Reshape, and cancellation cutover
 changes both persisted schema and the public reducer API. SpacetimeDB
 2.7.1 cannot migrate this development schema in place; recreate the local
 database and regenerate bindings after pulling the cutover:
@@ -162,35 +162,32 @@ The V1 client sends intentions for:
 - expanding complete selected source clusters across their reachable neutral
   perimeters, with one clicked focus;
 - attacking the complete selected enemy-cluster union from every shared front;
-- setting Balanced, Center, Perimeter, or Directional policy on complete source
-  clusters;
+- moving a selected Share between two strategic fronts of one source cluster;
 - best-effort Reshape of one complete source cluster into an owned, passable
   drawn footprint;
 - cancelling an exact frozen set of explicit dispatch order IDs.
 
-The client persists one Share percentage and sends it only with cluster
-expansion and attack. Policy and Reshape have no percentage field. A cluster
+The client persists one Share percentage and sends it with cluster expansion,
+attack, and Front Rebalance. Reshape has no percentage field. A cluster
 action's sparse source and target seeds are authority hints only: the module
 derives and validates complete current connected components before committing
 anything, so a stale or malicious client cannot create a hidden sub-cluster
 action.
 
 Cluster selection is client presentation state. It does not cancel, adopt, or
-supersede a live allocation. Expand, Attack, policy changes, and Reshape also do
-not implicitly retask another explicit action. Accepted explicit commands do
-automatically preempt intersecting background policy maintenance. Exact Stop is
-the only primary gesture that deliberately cancels the explicit dispatch IDs
-snapshotted by the client and revalidated by the authority.
+supersede a live allocation. Expand, Attack, Front Rebalance, and Reshape do not
+implicitly retask another explicit action. Exact Stop is the primary gesture
+that deliberately cancels explicit dispatch IDs snapshotted by the client and
+revalidated by the authority.
 
 An intention contains a stable player-scoped command ID. Its reducer verifies
 connection identity, player slot, match phase, source ownership, current
 component topology, available strength, target/front eligibility, and
-rule-specific constraints in one transaction. Accepted intentions create
-orders or policy state. Rejected gameplay intentions create only an idempotent
+rule-specific constraints in one transaction. Accepted intentions create explicit orders. Rejected gameplay intentions create only an idempotent
 receipt with a UI-suitable reason; they do not partially mutate gameplay state.
 
 The client never sends resulting troop counts, ownership, casualties, arrival
-times, policy redistribution targets, or victory. It may preview them, but the
+times, front-rebalance targets, or victory. It may preview them, but the
 module computes authoritative results. Visual interpolation is replaceable by
 the next subscription update.
 
@@ -215,7 +212,7 @@ When processing sets, sort by stable IDs or use ordered collections. Never let h
 
 Keep a logical simulation step counter in database state. A service interruption resumes from stored logical state rather than applying hours of combat instantly. If an optional wall-clock match limit is later enabled, its pause/recovery behavior must be an explicit game-mode rule.
 
-## Aggregate flows, cluster waves, policy, and combat
+## Aggregate flows, cluster waves, front logistics, and combat
 
 Every infantry point is stationary at a cell, allocated to an aggregate order at
 a current cell, or removed as a casualty. There is no row per soldier.
@@ -229,9 +226,8 @@ The simulation keeps three different constraints:
 Approved movement is bounded by queued strength, edge throughput over the
 logical step, and destination residual capacity. A two-phase update approves
 outgoing flow before atomically applying incoming flow, allowing capacity-safe
-pipelines. Capacity-blocked background-policy strength remains queued; a
-best-effort explicit command may settle strength only where that command's rules
-allow it. Strength always remains at its real physical cell and is never dropped
+pipelines. Capacity-blocked explicit logistics strength remains queued; a best-effort
+command may settle strength only where that command's rules allow it. Strength always remains at its real physical cell and is never dropped
 or teleported.
 
 The generic execution schema uses `transfer_order`, `transfer_source`,
@@ -245,31 +241,15 @@ Each simulation step decodes `transit_packet` once into a transaction-local,
 key-ordered packet index with secondary order, cell, and order/destination
 lookups. Routes use shared immutable slices inside that index so trim,
 branching, movement, combat, and finalization preserve their ordered phase
-semantics without repeatedly decoding or cloning every route vector. Packet
-writes are mirrored to the database immediately; reducers and policy
-maintenance outside the tick pipeline therefore continue to observe the
-current transactional state.
-
-The normal client animates explicit action packets but filters internal
-cluster-policy maintenance packets from flow overlays. Debug builds may restore
-those presentation-only animations at runtime with `F4`. The toggle forces an
-immediate packet-and-order reprojection, so hiding it also clears existing
-policy trails without waiting for an authority callback. `./scripts/dev.sh`
-starts with the overlay hidden; `--debug-policy-flows` remains an optional
-initial-visible state for both development clients. The key and argument are
-compiled out of release builds. Debug clients subscribe to the full packet
-table so the diagnostic and its local projections can include background
-policy traffic. Release clients subscribe to the `visible_packets` view and
-therefore omit background-policy packets from flow rendering, HUD active/free
-strength, and local retask projections. This intentionally previews the
-post-yield strength available to explicit commands; server-side order
-accounting and policy execution remain authoritative, while Stop/retask handles
-are unchanged because background-policy orders are never actionable there.
+semantics without repeatedly decoding or cloning every route vector. Packet writes are mirrored to the database immediately, so reducers continue
+to observe the current transactional state. Every remaining packet belongs to
+an explicit player command and is available through the public packet and route
+tables.
 
 ### Complete-component authority
 
-`issue_expand_clusters`, `issue_attack_clusters`, and
-`set_cluster_policy` accept sparse seed cells so payload size does not define
+`issue_expand_clusters`, `issue_attack_clusters`, `issue_front_rebalance`, and
+`issue_reshape` accept sparse seed cells so payload size does not define
 gameplay scope. The module rebuilds the complete ground-traversable owned or
 enemy components from authoritative ownership, passability, and elevation.
 Blocked cells and impassable edges split components; empty owned cells connect
@@ -320,54 +300,39 @@ one defender pool; strength and casualties remain conserved. Cancellation
 releases surviving packets where they physically are rather than rewinding
 captures.
 
-### Persistent policy accounting
+### Explicit strategic-front redistribution
 
-`cluster_policy_assignment` is public per-cell lineage with a monotonically
-increasing explicit revision. A cluster is always derived from current
-ownership. Split components inherit their cells' rows. Captured cells take the
-connected policy. On a merge, the greatest revision wins deterministically for
-the complete result; revision-zero Balanced is the default.
+A strategic front is derived from directed deployable boundary edges of one
+complete owned traversable component. Hostile runs are labeled by opponent;
+neutral runs between hostile runs against the same opponent bridge those runs.
+Different opponents split hostile frontage. Neutral-facing edges are grouped by
+the ordered hostile context around each geometric perimeter cycle. Repeated
+contact with the same hostile front does not split the neutral frontage, while
+neutral sections bounded on opposite sides by different hostile fronts remain
+independent. Neutral bridge edges remain members of their neutral front, so
+strategic fronts may overlap at edges and owned source cells. Off-map,
+terrain-disconnected edges are ignored markers on the geometric perimeter and
+never appear in emitted fronts. Derivation walks complete perimeter cycles,
+uses sorted integer inputs, and produces no durable front ID in the first
+implementation.
 
-Balanced, Center, Perimeter, and Directional map to deterministic internal
-redistribution targets. Center and Perimeter use exact boundary depth rather
-than a centroid; Directional uses a fixed-point axial vector. Setting policy
-does not cancel action orders. The policy maintenance pass plans from the free
-pool and may persist ordinary internal transfer packets.
+`issue_front_rebalance` receives owned component seeds, source/target front
+seeds, Share basis points, and an exact optional supersede set. Authority closes
+the seeds over the current complete component, re-derives both fronts, and
+rejects stale or same-front gestures before changing orders. It snapshots Share
+once from movable source-front infantry. Live unrelated action packets remain
+fixed and consume physical capacity.
 
-For policy target computation, infantry assigned to live action packets is
-removed from the population being distributed. Its occupancy is still removed
-from residual capacity at the packet's current cell. This separation is
-intentional:
+Cross-front allocation is an explicit player choice: fronts have equal default
+strategic importance, and a long front does not automatically claim more of the
+cluster-wide force. Within the chosen target front, exposed edge count and
+physical headroom weight deterministic capacity-safe target placement. Routing
+uses the current terrain graph once and persists aggregate routes and packets;
+troops then move physically through the normal movement pipeline.
 
-```text
-policy population = stationary/free infantry
-policy residual capacity = cell capacity - physically occupied active strength
-```
-
-Consequently, policy cannot move or counterbalance against an expanding,
-attacking, or reshaping allocation and cannot overbook the cell around it.
-Only background redistribution orders identified by the reserved maintenance
-command ID can yield automatically. An explicit reducer preflights its complete
-replacement plan, then atomically cancels any intersecting background policy
-orders and persists the accepted explicit order. Rejection leaves maintenance
-unchanged, and every other explicit allocation remains fixed.
-
-The assignment rows are independent of those temporary maintenance orders.
-They persist after a yield, so completed, settled, or cancelled infantry and
-new residual capacity become free input when maintenance resumes on a later
-pass.
-
-Maintenance reconciliation is receding-horizon rather than a promise to finish
-an obsolete route. It snapshots stationary strength, matching live policy
-packets, recruitment, and current reservations, prepares a replacement plan,
-then swaps it for the superseded background order. A planning failure leaves the
-old order intact. Capacity-blocked policy packets are not finalized at an
-intermediate cell: they stay queued until a later replacement starts from their
-actual position. Where a route crosses a saturated cell that is already at its
-target, one-edge relay legs can move resident strength onward while incoming
-strength replaces it; shared relay edges are coalesced before persistence. This
-policy-only reconciliation uses no action Share. Share remains an acceptance-time
-input only for Expand Clusters and Attack Clusters.
+There is no density-policy schema, reducer, cache, or scheduled maintenance
+path. Troop redistribution exists only as explicit Front Rebalance or Reshape
+orders.
 
 ### Best-effort Reshape and exact Stop
 
@@ -380,10 +345,8 @@ fixed and reserve capacity. A disconnected source portion without a reachable
 target remains unchanged.
 
 The generic `cancel_orders` reducer receives exact active explicit-order IDs
-captured by the Stop preview. Background policy-maintenance IDs are excluded.
-It revalidates ownership and liveness, then releases only that snapshot at
-current cells. This cancels dispatch, not policy metadata; maintenance may run
-again once capacity is free. Normal selection sends no supersede set, while an
+captured by the Stop preview. It revalidates ownership and liveness, then
+releases only that snapshot at current cells. Normal selection sends no supersede set, while an
 accepted contextual command automatically yields only intersecting background
 policy work as described above.
 
@@ -452,7 +415,7 @@ Store the authoritative map hash in the match database. During V1, terrain chunk
 On connect, the client first subscribes to match metadata, player projections,
 and immutable terrain. After the local seat binds, it adds one tactical
 subscription for cell state / combat (full or spatial+local-owned by scale),
-cluster-policy assignments, active orders, routes/packets, mobilization, and
+active orders, routes/packets, mobilization, and
 command receipts. The SpacetimeDB client cache is the network-facing source of
 truth for the client.
 
@@ -544,7 +507,7 @@ command IDs. UI-only preferences may remain local; no gameplay-critical state
 may exist only in Bevy.
 
 Simulation progress needed after a host restart is stored in tables: logical
-step, cluster-policy lineage, active orders, transit routes and queues, private
+step, active orders, transit routes and queues, private
 cluster-wave topology/focus/target masks and split cursors, sparse
 capture-garrison debt, fronts, the scheduled wake, match phase, and map seed.
 The persisted scheduled row resumes the fixed logical cadence. Explicit repair

@@ -1,4 +1,4 @@
-use spacetimedb::{AnonymousViewContext, Identity, Query, ScheduleAt, SpacetimeType};
+use spacetimedb::{Identity, ScheduleAt, SpacetimeType};
 
 use crate::simulation_tick;
 
@@ -55,11 +55,10 @@ pub enum TerrainClass {
 
 #[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderKind {
-    Balance,
-    FrontLoad,
-    CoreLoad,
-    PerimeterLoad,
     Reshape,
+    /// Explicit one-shot share of movable troops from one strategic front arc
+    /// onto another front of the same owned component.
+    FrontRebalance,
     PushFront,
     ExpandAll,
     ExpandClusters,
@@ -77,19 +76,6 @@ pub enum OrderStatus {
 pub enum ReceiptStatus {
     Accepted,
     Rejected,
-}
-
-/// Persistent distribution behavior for one owned traversable cluster.
-///
-/// Assignments are stored per cell so splits inherit their previous behavior
-/// without manufacturing a new cluster identity. When components merge, the
-/// assignment with the newest explicit revision wins for the whole component.
-#[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClusterPolicyKind {
-    Balanced,
-    Center,
-    Perimeter,
-    Directional,
 }
 
 #[derive(Clone)]
@@ -161,17 +147,9 @@ pub struct MatchState {
     /// Join uses this instead of scanning every slot to decide when the match
     /// can leave the lobby.
     pub claimed_players: u16,
-    /// Monotonic authority-owned revision for explicit cluster-policy changes.
-    pub latest_cluster_policy_revision: u64,
     /// Monotonic durable ownership/topology revision. Every capture or
     /// relinquishment advances it transactionally.
     pub ownership_revision: u64,
-    /// Ownership revision represented by the durable component topology rows.
-    /// A mismatch forces one cold-start-safe global relabeling pass.
-    pub policy_topology_revision: u64,
-    /// Stable key of the last component considered by periodic policy
-    /// maintenance. The next pass resumes after it and wraps deterministically.
-    pub policy_replan_cursor: u64,
     pub started_at_us: u64,
     pub completed_at_us: u64,
 }
@@ -246,48 +224,6 @@ pub struct CellState {
     pub chunk_q: i16,
     pub chunk_r: i16,
     pub last_changed_step: u64,
-    /// Last step at which ownership, infantry, or capacity changed. Civilian-
-    /// only growth does not dirty military distribution plans.
-    pub last_policy_changed_step: u64,
-}
-
-/// Small durable invalidation record for one derived owned component.
-#[derive(Clone)]
-#[spacetimedb::table(accessor = policy_replan_state)]
-pub struct PolicyReplanState {
-    /// `(owner_player_id << 32) | minimum_cell_id`.
-    #[primary_key]
-    pub component_key: u64,
-    pub shape_hash: u64,
-    pub policy_revision: u64,
-    pub last_plan_step: u64,
-}
-
-/// Durable boundary-weight cache. Large vectors are rewritten only when the
-/// component topology changes, never on ordinary recruitment or movement.
-#[derive(Clone)]
-#[spacetimedb::table(accessor = policy_topology_cache)]
-pub struct PolicyTopologyCache {
-    #[primary_key]
-    pub component_key: u64,
-    pub owner_player_id: u16,
-    pub ownership_revision: u64,
-    pub shape_hash: u64,
-    pub cell_ids: Vec<u32>,
-    /// Static cell data aligned with `cell_ids`. Keeping it beside the durable
-    /// topology turns periodic planning into one owner-indexed state scan
-    /// instead of two direct table probes per component cell.
-    pub q: Vec<i32>,
-    pub r: Vec<i32>,
-    pub terrain: Vec<TerrainClass>,
-    pub elevation: Vec<i16>,
-    pub capturable: Vec<bool>,
-    pub habitable: Vec<bool>,
-    pub civilian_capacity: Vec<u64>,
-    pub military_capacity: Vec<u64>,
-    /// CoreLoad weights aligned with `cell_ids`; PerimeterLoad uses the exact
-    /// complementary weight around the shared 20,000 midpoint sum.
-    pub core_weights: Vec<u32>,
 }
 
 /// Static, direction-aware movement limits for one undirected neighboring
@@ -309,28 +245,6 @@ pub struct StaticEdgeLimit {
     pub second_to_first_frontage: u64,
     pub first_to_second_uphill: bool,
     pub second_to_first_uphill: bool,
-}
-
-/// Policy lineage attached to one owned cell.
-///
-/// This table deliberately does not identify a cluster directly: connected
-/// components are derived from current ownership and terrain. Per-cell lineage
-/// makes a split free, while `revision` gives merges a deterministic winner.
-#[derive(Clone)]
-#[spacetimedb::table(
-    accessor = cluster_policy_assignment,
-    public,
-    index(accessor = policy_by_owner, btree(columns = [owner_player_id]))
-)]
-pub struct ClusterPolicyAssignment {
-    #[primary_key]
-    pub cell_id: u32,
-    pub owner_player_id: u16,
-    pub kind: ClusterPolicyKind,
-    /// Exact fixed-point axial facing used only by `Directional`.
-    pub orientation_q: i32,
-    pub orientation_r: i32,
-    pub revision: u64,
 }
 
 #[derive(Clone)]
@@ -484,31 +398,6 @@ pub struct TransitPacket {
     pub route_id: u64,
     pub route_index: u32,
     pub updated_step: u64,
-}
-
-/// Tactical packet stream for regular clients. Background policy packets are
-/// authoritative simulation detail, but are not rendered and previously made
-/// up most replicated packet traffic during large rebalances.
-#[spacetimedb::view(accessor = visible_packets, public, primary_key = packet_key)]
-pub fn visible_packets(ctx: &AnonymousViewContext) -> impl Query<TransitPacket> {
-    ctx.from
-        .transfer_order()
-        .r#where(|order| order.client_command_id.ne(0_u64))
-        .right_semijoin(ctx.from.transit_packet(), |order, packet| {
-            order.order_id.eq(packet.packet_by_order)
-        })
-}
-
-/// Route stream matching `visible_packets`; background policy routes stay
-/// authoritative but are not replicated to regular rendering clients.
-#[spacetimedb::view(accessor = visible_routes, public, primary_key = route_id)]
-pub fn visible_routes(ctx: &AnonymousViewContext) -> impl Query<TransitRoute> {
-    ctx.from
-        .transfer_order()
-        .r#where(|order| order.client_command_id.ne(0_u64))
-        .right_semijoin(ctx.from.transit_route(), |order, route| {
-            order.order_id.eq(route.route_by_order)
-        })
 }
 
 /// Compact private topology for one branching neutral or cluster-attack wave.

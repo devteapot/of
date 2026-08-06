@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use match_bindings::{
-    ClusterPolicyKind, MatchPhase, issue_attack_clusters as _, issue_expand_clusters as _,
-    set_cluster_policy as _, set_mobilization_target as _,
+    MatchPhase, issue_attack_clusters as _, issue_expand_clusters as _, issue_front_rebalance as _,
+    set_mobilization_target as _,
 };
 
 use crate::client::{Client, require_reducer_success};
@@ -19,6 +19,7 @@ use crate::common::{
     due_players_from_pending, validate_command_spread_for_schedule, worker_status_path,
     write_worker_status,
 };
+use crate::front_rebalance::FrontRebalancePlan;
 use crate::output::WorkerLog;
 use crate::queries::{subscription_mode_detail, worker_command_queries, worker_observer_queries};
 
@@ -49,7 +50,7 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub expand_steps: Option<u64>,
     #[arg(long)]
-    pub policy_steps: Option<u64>,
+    pub rebalance_steps: Option<u64>,
     #[arg(long)]
     pub attack_steps: Option<u64>,
     #[arg(long)]
@@ -57,7 +58,7 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub expand_secs: Option<u64>,
     #[arg(long)]
-    pub policy_secs: Option<u64>,
+    pub rebalance_secs: Option<u64>,
     #[arg(long)]
     pub attack_secs: Option<u64>,
     #[arg(long)]
@@ -90,24 +91,24 @@ pub struct WorkerArgs {
 
 fn resolve_schedule(args: &WorkerArgs) -> Result<PhaseSchedule> {
     let has_steps = args.expand_steps.is_some()
-        || args.policy_steps.is_some()
+        || args.rebalance_steps.is_some()
         || args.attack_steps.is_some()
         || args.reexpand_steps.is_some();
     let has_secs = args.expand_secs.is_some()
-        || args.policy_secs.is_some()
+        || args.rebalance_secs.is_some()
         || args.attack_secs.is_some()
         || args.reexpand_secs.is_some();
     if has_steps {
         PhaseSchedule::from_steps(
             args.expand_steps.unwrap_or(600),
-            args.policy_steps.unwrap_or(720),
+            args.rebalance_steps.unwrap_or(720),
             args.attack_steps.unwrap_or(360),
             args.reexpand_steps.unwrap_or(180),
         )
     } else if has_secs {
         PhaseSchedule::from_secs(
             args.expand_secs.unwrap_or(150),
-            args.policy_secs.unwrap_or(180),
+            args.rebalance_secs.unwrap_or(180),
             args.attack_secs.unwrap_or(90),
             args.reexpand_secs.unwrap_or(45),
             DEFAULT_LOGICAL_STEP_MS,
@@ -455,8 +456,11 @@ pub fn run(args: WorkerArgs) -> Result<()> {
 
     let mut last_expand_wave = u64::MAX;
     let mut pending_expand: BTreeSet<u16> = BTreeSet::new();
-    let mut pending_policy: Option<BTreeSet<u16>> = None;
+    let mut pending_rebalance: Option<BTreeSet<u16>> = None;
     let mut pending_attack: Option<BTreeSet<u16>> = None;
+    let mut front_rebalance_attempted = 0_u64;
+    let mut front_rebalance_accepted = 0_u64;
+    let mut front_rebalance_skipped = 0_u64;
     let mut expand_seq = 1_u32;
     let started = Instant::now();
     let budget = Duration::from_millis(
@@ -603,76 +607,127 @@ pub fn run(args: WorkerArgs) -> Result<()> {
             }
         }
 
-        if phase == ScenarioPhase::Policy {
-            if pending_policy.is_none() {
-                pending_policy = Some(range.iter().collect());
+        if phase == ScenarioPhase::Rebalance {
+            if pending_rebalance.is_none() {
+                pending_rebalance = Some(range.iter().collect());
             }
-            if let Some(pending_set) = pending_policy.as_mut() {
+            if let Some(pending_set) = pending_rebalance.as_mut() {
                 let players = due_players_from_pending(pending_set, step, args.command_spread);
                 if !players.is_empty() {
-                    let batch_timeout = command_timeout
-                        .saturating_mul(u32::try_from(players.len().max(1)).unwrap_or(u32::MAX));
-                    let pending = match fanout_then_await(
-                        players,
-                        |player_id, tx| {
-                            let command =
-                                deterministic_command_id(player_id, CommandKind::Policy, 1);
-                            let spawn = *spawns.get(&player_id).context("spawn missing")?;
-                            let client = commanders.get(&player_id).context("commander")?;
-                            let started = Instant::now();
-                            client
-                                .conn
-                                .reducers
-                                .set_cluster_policy_then(
-                                    command,
-                                    vec![spawn],
-                                    ClusterPolicyKind::Center,
-                                    0,
-                                    0,
-                                    move |_, result| {
-                                        let mapped = result
-                                            .map_err(|error| error.to_string())
-                                            .and_then(|inner| inner.map_err(|error| error.clone()));
-                                        let _ = tx.send((
-                                            player_id,
-                                            command,
-                                            format!("Center policy for player {player_id}"),
-                                            "set_cluster_policy",
-                                            started,
-                                            mapped,
-                                        ));
-                                    },
-                                )
-                                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                            Ok(())
-                        },
-                        batch_timeout,
-                    ) {
-                        Ok(pending) => pending,
-                        Err(error) => return fail(&args, range, error),
-                    };
-                    for item in pending {
-                        if let Err(error) = require_reducer_success(&item.action, item.result) {
-                            return fail(&args, range, error);
-                        }
-                        let client = commanders.get(&item.player_id).context("commander")?;
-                        if let Err(error) = client.require_receipt(
-                            item.player_id,
-                            &item.action,
-                            item.command_id,
-                            item.receipt_name,
-                            command_timeout,
+                    let max_elevation_step = config.max_elevation_step;
+                    // One observer snapshot for the whole due batch keeps derivation
+                    // deterministic across seats without re-walking tables per player.
+                    let map_cells = observer.map_cells();
+                    // Partition due seats into skippable topology vs issuable commands.
+                    let mut ready = Vec::new();
+                    for player_id in players {
+                        match crate::front_rebalance::plan_front_rebalance_for_player(
+                            &map_cells,
+                            player_id,
+                            max_elevation_step,
                         ) {
-                            return fail(&args, range, error);
+                            FrontRebalancePlan::Skipped(reason) => {
+                                pending_set.remove(&player_id);
+                                front_rebalance_skipped = front_rebalance_skipped.saturating_add(1);
+                                let _ = log.write_event(&serde_json::json!({
+                                    "event": "front_rebalance",
+                                    "player_id": player_id,
+                                    "ok": true,
+                                    "skipped": true,
+                                    "reason": reason,
+                                }));
+                                println!(
+                                    "worker {}-{}: skip front_rebalance player {player_id}: {reason}",
+                                    range.first_player,
+                                    range.last_player()
+                                );
+                            }
+                            FrontRebalancePlan::Ready(command) => {
+                                ready.push((player_id, command));
+                            }
                         }
-                        pending_set.remove(&item.player_id);
-                        let _ = log.write_event(&serde_json::json!({
-                            "event": "policy",
-                            "player_id": item.player_id,
-                            "command_id": item.command_id,
-                            "ok": true,
-                            "rtt_ms": item.rtt.as_secs_f64() * 1_000.0,
-                        }));
+                    }
+                    if !ready.is_empty() {
+                        let batch_timeout = command_timeout
+                            .saturating_mul(u32::try_from(ready.len().max(1)).unwrap_or(u32::MAX));
+                        let pending = match fanout_then_await(
+                            ready,
+                            |(player_id, plan), tx| {
+                                let command =
+                                    deterministic_command_id(player_id, CommandKind::Rebalance, 1);
+                                let client = commanders.get(&player_id).context("commander")?;
+                                let started = Instant::now();
+                                let component_cells = plan.component_cells.clone();
+                                let source_front_seed = plan.source_front_seed;
+                                let target_front_seed = plan.target_front_seed;
+                                client
+                                    .conn
+                                    .reducers
+                                    .issue_front_rebalance_then(
+                                        command,
+                                        component_cells,
+                                        source_front_seed,
+                                        target_front_seed,
+                                        args.command_share_bps,
+                                        Vec::new(),
+                                        move |_, result| {
+                                            let mapped =
+                                                result.map_err(|error| error.to_string()).and_then(
+                                                    |inner| inner.map_err(|error| error.clone()),
+                                                );
+                                            let _ = tx.send((
+                                                player_id,
+                                                command,
+                                                format!("front rebalance for player {player_id}"),
+                                                "issue_front_rebalance",
+                                                started,
+                                                mapped,
+                                            ));
+                                        },
+                                    )
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                Ok(())
+                            },
+                            batch_timeout,
+                        ) {
+                            Ok(pending) => pending,
+                            Err(error) => return fail(&args, range, error),
+                        };
+                        for item in pending {
+                            front_rebalance_attempted = front_rebalance_attempted.saturating_add(1);
+                            if let Err(error) = require_reducer_success(&item.action, item.result) {
+                                let _ = log.write_event(&serde_json::json!({
+                                    "event": "front_rebalance",
+                                    "player_id": item.player_id,
+                                    "command_id": item.command_id,
+                                    "ok": false,
+                                    "skipped": false,
+                                    "error": error.to_string(),
+                                    "rtt_ms": item.rtt.as_secs_f64() * 1_000.0,
+                                }));
+                                return fail(&args, range, error);
+                            }
+                            let client = commanders.get(&item.player_id).context("commander")?;
+                            if let Err(error) = client.require_receipt(
+                                item.player_id,
+                                &item.action,
+                                item.command_id,
+                                item.receipt_name,
+                                command_timeout,
+                            ) {
+                                return fail(&args, range, error);
+                            }
+                            pending_set.remove(&item.player_id);
+                            front_rebalance_accepted = front_rebalance_accepted.saturating_add(1);
+                            let _ = log.write_event(&serde_json::json!({
+                                "event": "front_rebalance",
+                                "player_id": item.player_id,
+                                "command_id": item.command_id,
+                                "ok": true,
+                                "skipped": false,
+                                "rtt_ms": item.rtt.as_secs_f64() * 1_000.0,
+                            }));
+                        }
                     }
                 }
             }
@@ -773,14 +828,14 @@ pub fn run(args: WorkerArgs) -> Result<()> {
             anyhow::anyhow!("expand wave left pending players {pending_expand:?}"),
         );
     }
-    if pending_policy
+    if pending_rebalance
         .as_ref()
         .is_some_and(|pending| !pending.is_empty())
     {
         return fail(
             &args,
             range,
-            anyhow::anyhow!("policy phase left pending players {pending_policy:?}"),
+            anyhow::anyhow!("front-rebalance phase left pending players {pending_rebalance:?}"),
         );
     }
     if pending_attack
@@ -795,10 +850,30 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     }
 
     let _ = log.write_event(&serde_json::json!({
+        "event": "front_rebalance_summary",
+        "first_player": range.first_player,
+        "last_player": range.last_player(),
+        "attempted": front_rebalance_attempted,
+        "accepted": front_rebalance_accepted,
+        "skipped": front_rebalance_skipped,
+    }));
+    println!(
+        "worker {}-{} front_rebalance attempted={} accepted={} skipped={}",
+        range.first_player,
+        range.last_player(),
+        front_rebalance_attempted,
+        front_rebalance_accepted,
+        front_rebalance_skipped
+    );
+
+    let _ = log.write_event(&serde_json::json!({
         "event": "complete",
         "first_player": range.first_player,
         "last_player": range.last_player(),
         "ok": true,
+        "front_rebalance_attempted": front_rebalance_attempted,
+        "front_rebalance_accepted": front_rebalance_accepted,
+        "front_rebalance_skipped": front_rebalance_skipped,
     }));
     emit_status(&args, range, WorkerStatusKind::Complete, "worker complete")?;
     println!(

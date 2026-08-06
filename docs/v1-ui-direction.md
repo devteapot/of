@@ -37,9 +37,8 @@ cancels or adopts a live order.
 | Shift + LMB enemy | Stage or toggle an additional enemy cluster |
 | Control + LMB enemy | Remove a staged enemy cluster |
 | `Enter` | Submit a staged enemy target union or ready Stop/Reshape preview |
-| `[` / `]` | Change Share for expansion and attack only |
-| `R` | Cycle Balanced, Perimeter, and Center policy |
-| Hold `F`, drag, release | Set exact Directional policy |
+| `[` / `]` | Change Share for expansion, attack, and Front Rebalance |
+| `B`, then LMB drag | Move Share from one strategic front to another |
 | `T`, then LMB drag | Draw one-cluster best-effort Reshape |
 | `X` | Preview exact Stop for explicit dispatches intersecting selected clusters |
 | Escape | Back out of staged targets/Reshape/Stop; idle clears selection |
@@ -90,32 +89,17 @@ The HUD shows staged cluster count, target hex count, participating source
 strength, and Share. Selecting several targets must never display Share as
 multiplied per target.
 
-### Persistent policy
+### Strategic Front Rebalance
 
-Policy changes are immediate cluster settings, not modal formation previews.
-`R` updates the policy label and target-density heatmap for all selected
-clusters. Holding `F` displays the continuous axial facing; release applies
-Directional policy.
+`B` enters a modal front gesture for exactly one complete selected cluster.
+Pressing the source boundary identifies and highlights its whole strategic arc;
+dragging to another front highlights the target arc. The compact HUD displays
+Share, projected movable strength, route validity, and estimated travel time.
 
-Balanced, Perimeter, Center, and Directional need one consistent visual
-language: a subtle target-density heatmap plus a compact name. The UI should
-distinguish free and active strength. Policy projection excludes live action
-troops from the target distribution but still treats their occupied capacity as
-unavailable. A tooltip/manual sentence should state this explicitly; the
-heatmap must not appear to demand counterweight against an attacking packet.
-Background policy movement may disappear when it yields to an intersecting
-explicit command, then resume from the unchanged policy setting as capacity
-becomes free. Unrelated explicit movement remains fixed.
-
-Internal policy routes are presentation noise in ordinary play and remain
-hidden when the client is launched with `./scripts/dev.sh`. In an online
-development client, `F4` toggles the diagnostic routes immediately for the
-focused window; `--debug-policy-flows` only changes their initial state. Neither
-control exists in release builds, and the switch does not change authority or
-troop accounting.
-
-On a merge, the subscribed newest-revision policy is authoritative. Avoid a
-special merge prompt; show the resulting policy and let `R` or `F` change it.
+The preview must distinguish source and target fronts and never imply that a
+larger perimeter automatically owns more cluster-wide troops. Exposed edge
+count only influences placement within the chosen target front. A stale topology
+or same-front gesture is rejected without moving troops.
 
 ### Single-cluster Reshape
 
@@ -142,9 +126,8 @@ and should be called out rather than reported as lost.
 ### Exact Stop
 
 `X` freezes the live explicit-order IDs currently intersecting selected
-clusters. Background policy-maintenance IDs are excluded. The preview reports
-exact order and packet counts. Confirming cancels that frozen dispatch set only;
-new unrelated orders do not join it and the cluster policy remains enabled.
+clusters. The preview reports exact order and packet counts. Confirming cancels
+that frozen dispatch set only; new unrelated orders do not join it.
 
 Stop feedback says that surviving troops settle at their current cells. It
 never promises a rewind, restored territory, or recovered casualties.
@@ -153,7 +136,7 @@ never promises a rewind, restored territory, or recovered casualties.
 
 The compact command strip switches between these states:
 
-1. **Idle / clusters selected** — contextual click hints, Share, policy, `T`,
+1. **Idle / clusters selected** — contextual click hints, Share, `B`, `T`,
    `X`, and selection keys.
 2. **Attack targets staged** — target count, all shared fronts, LMB/Enter submit,
    Shift toggle, Control remove, Escape back.
@@ -221,7 +204,7 @@ The first-run hint can fit in four lines:
 ```text
 C selects a whole owned cluster · Shift/Ctrl+C add/remove · Ctrl+A all
 LMB neutral expands all selected perimeters · LMB enemy attacks its cluster
-[ / ] Share for those two actions · R policy · F facing · T reshape · X stop
+B then drag rebalances fronts · [ / ] Share · T reshape · X stop
 ? opens the full field manual
 ```
 
@@ -231,8 +214,8 @@ LMB neutral expands all selected perimeters · LMB enemy attacks its cluster
    all-perimeter expansion.
 2. Complete enemy target masks may be hard to distinguish from currently active
    fronts as the attack progresses.
-3. Persistent policy motion may feel like action automation unless free versus
-   active strength is explicit.
+3. Front boundaries may be ambiguous at shared corner cells; source and target
+   arc highlighting must make the chosen fronts explicit.
 4. Multi-selecting complete clusters may be too coarse in specific tactical
    situations; record those cases before restoring sub-cluster controls.
 5. An undersized Reshape may look like failure unless conserved outside overflow

@@ -9,8 +9,8 @@ the front changes. Terrain height, capacity, throughput, frontage, garrisons,
 resistance, and travel time determine how far each branch advances.
 
 The project intentionally has no settled title, fiction, or production art yet.
-V1 is a graybox built to test the cluster conquest, troop-flow, and persistent
-formation-policy loop. The exact control contract lives in
+V1 is a graybox built to test cluster conquest and explicit troop logistics.
+The exact control contract lives in
 [Cluster-first troop controls](docs/cluster-controls.md).
 
 ## What V1 includes
@@ -24,12 +24,10 @@ formation-policy loop. The exact control contract lives in
   toward the clicked focus while preserving all-side pressure.
 - Target-mask enemy attacks from every shared front. Branches dynamically turn
   through the selected enemy clusters and never escape into an unselected one.
-- One persisted Force Share setting for expansion and attack, independent of
-  mobilization and applied once per participating free source cell.
-- Persistent Balanced, Center, Perimeter, and Directional policies attached to
-  clusters. Maintenance uses only free troops and residual capacity, yields to
-  intersecting explicit commands, and reconciles queued bottlenecks from current
-  troop positions without using the action Share.
+- One persisted Force Share setting for expansion, attack, and explicit
+  front-to-front rebalancing, independent of mobilization and applied once per
+  participating free source cell.
+- Deterministic strategic front arcs with terrain-aware, one-shot troop routing.
 - Single-cluster, player-drawn best-effort Reshape using the whole available
   pool, plus exact selected-order cancellation.
 - Height-aware movement, impassable cliffs, uphill combat penalties, edge
@@ -67,15 +65,6 @@ The offline fixture needs no database and is useful for learning the controls:
 Offline commands resolve locally for presentation testing. Multiplayer,
 authoritative timing, combat, and persistence must be evaluated online.
 
-Persistent cluster-policy redistribution is background behavior, so its packet
-movement is not animated in the normal client. Running `./scripts/dev.sh` keeps
-those trails hidden too. In an online development client, press `F4` to show or
-hide them immediately for that window. The optional `--debug-policy-flows`
-argument only starts them visible (`./scripts/dev.sh --debug-policy-flows`
-applies that initial state to both clients). Release builds expose neither the
-key nor the argument. This changes only flow overlays, never policy execution or
-troop accounting.
-
 ## Local multiplayer match
 
 Use separate terminals from the repository root.
@@ -97,8 +86,8 @@ Use separate terminals from the repository root.
 
    For later schema-compatible module updates that must preserve an in-progress
    match, use `./scripts/publish-local.sh` without arguments instead. The
-   cluster-action, persistent-policy, Reshape, and generic cancellation cutover
-   changes the persisted schema and reducer surface, so an older local database must be
+   strategic-front, Reshape, and cancellation cutover changes the persisted
+   schema and reducer surface, so an older local database must be
    recreated with the fresh command above.
 
 3. Before any player joins, optionally choose both map and player scale. The
@@ -166,9 +155,8 @@ relevant keys; `?` opens the field manual.
 | Shift + left click enemy | Stage or toggle another complete enemy target cluster |
 | Control + left click enemy | Remove that staged enemy cluster |
 | `Enter` | Submit the staged enemy-cluster union or another ready preview |
-| `[` / `]` | Lower or raise the persisted Share used by expansion and attack only |
-| `R` | Cycle selected clusters through Balanced, Perimeter, and Center policy |
-| Hold `F`, drag, release | Set Directional policy from the exact axial-facing gesture |
+| `[` / `]` | Lower or raise the persisted Share used by expansion, attack, and front rebalancing |
+| `B`, then left drag | For one selected cluster, move Share once from the source strategic front to the target front |
 | `T`, then left drag | For one selected cluster, draw and preview a best-effort troop footprint |
 | `[` / `]` while reshaping | Remove or add one symmetric brush ring |
 | Shift + `[` / `]` while reshaping | Change brush width only |
@@ -187,19 +175,14 @@ relevant keys; `?` opens the field manual.
 | `?` | Toggle the field manual |
 | `F3` | Toggle the performance overlay |
 
-Online development builds add one diagnostic control: `F4` toggles internal
-cluster-policy route trails. It is absent from release builds and from the
-in-game player manual.
-
 A cluster is the full connected set of owned passable cells. Empty owned cells
 can connect troop-bearing areas; blocked terrain and impassable elevation edges
 split it. Selection reconciles with authoritative ownership: growth and merges
 are absorbed, while both surviving children of a split remain selected.
 
-Expansion and attack are the only actions that use Share. Each participating
-source cell contributes that percentage of its action-available infantry once:
-stationary free strength plus yieldable background-policy strength physically
-inside the source, but never troops committed to another explicit action. This
+Expansion, attack, and Front Rebalance use Share. Each participating source
+cell contributes that percentage of its action-available infantry once:
+stationary free strength, but never troops committed to another explicit action. This
 happens once regardless of how many fronts or target clusters are involved.
 Repeating the exact same contextual click while it is in flight immediately
 queues another independent order against the remaining action-available pool;
@@ -211,20 +194,20 @@ local branches may turn, split, merge, stall, or be defeated as terrain,
 capacity, throughput, garrisons, and defenders are re-evaluated. An attack
 never leaves its target mask.
 
-Balanced, Perimeter, Center, and Directional are persistent cluster policies,
-not percentage actions. They continuously redistribute the free pool toward
-the selected density preference as cluster geometry changes, using only free
-troops and residual capacity. Infantry committed to an explicit action remains
-fixed and reserves the capacity it physically occupies. When a new explicit
-command intersects background policy movement, that maintenance order yields
-atomically if the command is accepted; unrelated explicit actions never yield.
-The policy metadata remains set and maintenance resumes when troops and capacity
-become free. Capacity-blocked policy movement stays queued rather than being
-reported as delivered; later reconciliation replans from current physical troop
-positions and can relay through saturated connector cells. This maintenance is
-independent of Share, which remains exclusive to expansion and attack. When
-clusters merge, the most recently explicitly set policy wins; split cells retain
-their policy lineage.
+A strategic front is a deterministic arc of deployable boundary edges on one
+owned cluster. Hostile runs are separated by opponent; neutral gaps between two
+runs against the same opponent keep the arc continuous. Impassable and off-map
+edges are not fronts. Press `B`, then drag from an owned source-front cell to a
+different target-front cell. The command snapshots Share of movable troops on
+the source arc, computes terrain-aware routes once, and persists aggregate
+packets that physically traverse those routes. There is no periodic background
+rebalance. Fronts have equal strategic importance by default; a larger front
+does not silently take a larger global share. Within the chosen target front,
+exposed edge count and available capacity distribute the arriving troops, so a
+longer arc can use more frontage without changing the player's cross-front
+choice. Fronts are currently derived from live topology rather than assigned
+durable IDs; a topology change can therefore invalidate an in-progress gesture,
+while already accepted packets remain physically conserved.
 
 Reshape is intentionally narrower: exactly one cluster may be selected, then
 `T` enables the resizable brush. The complete brush footprint distinguishes
@@ -234,12 +217,10 @@ transition through owned passable cells. A fitting drawing can drain movable
 strength outside it; an undersized drawing saturates and leaves conserved
 overflow outside. Unrelated live allocations remain fixed.
 
-`X` freezes the exact explicit dispatches intersecting the selected clusters;
-background policy maintenance is not a Stop target. Confirming Stop releases
-only those surviving explicit allocations at their current physical cells. It
-does not rewind captures or casualties, clear cluster policy, or disable later
-maintenance. Normal cluster selection never implicitly retasks an existing
-explicit order.
+`X` freezes the exact explicit dispatches intersecting the selected clusters.
+Confirming Stop releases only those surviving explicit allocations at their
+current physical cells. It does not rewind captures or casualties. Normal
+cluster selection never implicitly retasks an existing explicit order.
 
 The older painted sub-cluster Push Front, one-shot Formation/Bias, and contested
 retask-handle grammar are retained only as implementation history. They are not
@@ -268,13 +249,12 @@ spacetime publish --server local --module-path modules/match \
 cargo run -p match-e2e
 ```
 
-The live smoke exercises the public cluster-action and policy reducer surface,
-conserved branching movement, capacity-safe best-effort Reshape, exact Stop,
-and identity-token reuse. Deterministic module and client tests cover complete
+The live smoke exercises the public cluster-action reducer surface, conserved
+branching movement, capacity-safe best-effort Reshape, exact Stop, and
+identity-token reuse. Deterministic module and client tests cover complete
 cluster selection, focused all-side expansion, immutable enemy target masks,
-multi-front attack progression, Share-once accounting, policy inheritance, and
-policy exclusion of explicit action packets, atomic maintenance yield/resume,
-and Stop's exclusion of background maintenance.
+multi-front attack progression, Share-once accounting, strategic-front
+rebalancing, explicit-allocation isolation, and exact Stop.
 
 Generate inspectable maps at a chosen player scale with, for example,
 `cargo run -p mapgen -- --preset playtest --players 8`. For a short live scaling
@@ -285,7 +265,7 @@ profile, freshly publish an isolated database and run the distributed-capable
 spacetime publish --server local --module-path modules/match \
   --delete-data=always --yes of-match-perf
 cargo run -p match-perf -- run-local --database of-match-perf --preset playtest \
-  --players 4 --shard-size 2 --expand-steps 20 --policy-steps 20 --attack-steps 0
+  --players 4 --shard-size 2 --expand-steps 20 --rebalance-steps 20 --attack-steps 0
 ```
 
 `run-local` spawns one coordinator telemetry observer plus worker process shards.
@@ -293,12 +273,18 @@ cargo run -p match-perf -- run-local --database of-match-perf --preset playtest 
 `match-perf-runs/…` directory: `timeline.csv`, long-form `players.csv`, per-shard
 `worker-*.jsonl`, `metadata.json`, and `summary.json`. Prefer logical-step phase
 durations for distributed synchronization; wall-second aliases remain available.
-Required expansion/policy commands fail the run if rejected; an attack phase also
-fails unless each player has a real adjacent owned/enemy front. Do not point the
-profiler at an in-progress database: the coordinator calls one-shot
-`configure_match` before workers join. See [Performance profiling](docs/performance.md)
-for multi-host usage, the destructive matrix script, OS connection limits at 500
-clients, and the authority caveat (client load is distributed; simulation is not).
+Required expansion commands fail the run if rejected. The `--rebalance-steps`
+phase issues `issue_front_rebalance` (exact owned component + two strategic
+front seeds); seats without two usable fronts are skipped and counted rather than
+sent invalid commands. An optional attack phase fails unless each player has a
+real adjacent owned/enemy front. Do not point the profiler at an in-progress
+database: the coordinator calls one-shot `configure_match` before workers join.
+The destructive matrix script stays headless by default
+(`./scripts/run-match-perf-matrix.sh --confirm-destructive-matrix`); pass
+`--viewer` (or `OF_PERF_VIEWER=1`) to attach one Bevy client as player 1. See
+[Performance profiling](docs/performance.md) for multi-host usage, matrix
+env vars, OS connection limits at 500 clients, and the authority caveat (client
+load is distributed; simulation is not).
 
 ## Repository map
 

@@ -42,7 +42,7 @@ impl PresetArg {
 #[serde(rename_all = "snake_case")]
 pub enum ScenarioPhase {
     Expand,
-    Policy,
+    Rebalance,
     Attack,
     Done,
 }
@@ -51,7 +51,7 @@ impl ScenarioPhase {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Expand => "expand",
-            Self::Policy => "policy",
+            Self::Rebalance => "rebalance",
             Self::Attack => "attack",
             Self::Done => "done",
         }
@@ -63,7 +63,7 @@ impl ScenarioPhase {
 #[allow(clippy::struct_field_names)]
 pub struct PhaseSchedule {
     pub expand_steps: u64,
-    pub policy_steps: u64,
+    pub rebalance_steps: u64,
     pub attack_steps: u64,
     pub reexpand_steps: u64,
 }
@@ -71,7 +71,7 @@ pub struct PhaseSchedule {
 impl PhaseSchedule {
     pub fn from_steps(
         expand_steps: u64,
-        policy_steps: u64,
+        rebalance_steps: u64,
         attack_steps: u64,
         reexpand_steps: u64,
     ) -> Result<Self> {
@@ -80,7 +80,7 @@ impl PhaseSchedule {
         }
         Ok(Self {
             expand_steps,
-            policy_steps,
+            rebalance_steps,
             attack_steps,
             reexpand_steps,
         })
@@ -89,7 +89,7 @@ impl PhaseSchedule {
     /// Convert wall-second aliases into logical steps at the nominal cadence.
     pub fn from_secs(
         expand_secs: u64,
-        policy_secs: u64,
+        rebalance_secs: u64,
         attack_secs: u64,
         reexpand_secs: u64,
         logical_step_ms: u32,
@@ -98,7 +98,7 @@ impl PhaseSchedule {
         let to_steps = |secs: u64| secs.saturating_mul(1_000) / step_ms;
         Self::from_steps(
             to_steps(expand_secs),
-            to_steps(policy_secs),
+            to_steps(rebalance_secs),
             to_steps(attack_secs),
             to_steps(reexpand_secs).max(1),
         )
@@ -106,7 +106,7 @@ impl PhaseSchedule {
 
     pub fn total_steps(self) -> u64 {
         self.expand_steps
-            .saturating_add(self.policy_steps)
+            .saturating_add(self.rebalance_steps)
             .saturating_add(self.attack_steps)
     }
 
@@ -119,11 +119,11 @@ impl PhaseSchedule {
             return ScenarioPhase::Expand;
         }
         let after_expand = phase_progress - self.expand_steps;
-        if after_expand < self.policy_steps {
-            return ScenarioPhase::Policy;
+        if after_expand < self.rebalance_steps {
+            return ScenarioPhase::Rebalance;
         }
-        let after_policy = after_expand - self.policy_steps;
-        if self.attack_steps > 0 && after_policy < self.attack_steps {
+        let after_rebalance = after_expand - self.rebalance_steps;
+        if self.attack_steps > 0 && after_rebalance < self.attack_steps {
             return ScenarioPhase::Attack;
         }
         ScenarioPhase::Done
@@ -142,7 +142,7 @@ impl PhaseSchedule {
 pub enum CommandKind {
     Mobilization = 1,
     Expand = 2,
-    Policy = 3,
+    Rebalance = 3,
     Attack = 4,
 }
 
@@ -349,10 +349,10 @@ pub fn validate_command_spread(spread: u32, available_steps: u64, label: &str) -
     Ok(())
 }
 
-/// Validate spread against expand wave cadence and non-zero policy/attack phases.
+/// Validate spread against expand wave cadence and non-zero rebalance/attack phases.
 pub fn validate_command_spread_for_schedule(spread: u32, schedule: PhaseSchedule) -> Result<()> {
     validate_command_spread(spread, schedule.reexpand_steps, "reexpand wave")?;
-    validate_command_spread(spread, schedule.policy_steps, "policy phase")?;
+    validate_command_spread(spread, schedule.rebalance_steps, "rebalance phase")?;
     validate_command_spread(spread, schedule.attack_steps, "attack phase")?;
     Ok(())
 }
@@ -420,8 +420,8 @@ mod tests {
         let schedule = PhaseSchedule::from_steps(10, 20, 5, 4).expect("schedule");
         assert_eq!(schedule.phase_at(0), ScenarioPhase::Expand);
         assert_eq!(schedule.phase_at(9), ScenarioPhase::Expand);
-        assert_eq!(schedule.phase_at(10), ScenarioPhase::Policy);
-        assert_eq!(schedule.phase_at(29), ScenarioPhase::Policy);
+        assert_eq!(schedule.phase_at(10), ScenarioPhase::Rebalance);
+        assert_eq!(schedule.phase_at(29), ScenarioPhase::Rebalance);
         assert_eq!(schedule.phase_at(30), ScenarioPhase::Attack);
         assert_eq!(schedule.phase_at(34), ScenarioPhase::Attack);
         assert_eq!(schedule.phase_at(35), ScenarioPhase::Done);
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn phase_schedule_skips_attack_when_zero() {
         let schedule = PhaseSchedule::from_steps(3, 4, 0, 1).expect("schedule");
-        assert_eq!(schedule.phase_at(6), ScenarioPhase::Policy);
+        assert_eq!(schedule.phase_at(6), ScenarioPhase::Rebalance);
         assert_eq!(schedule.phase_at(7), ScenarioPhase::Done);
     }
 
@@ -439,7 +439,7 @@ mod tests {
     fn wall_second_aliases_use_nominal_cadence() {
         let schedule = PhaseSchedule::from_secs(10, 20, 5, 2, 250).expect("schedule");
         assert_eq!(schedule.expand_steps, 40);
-        assert_eq!(schedule.policy_steps, 80);
+        assert_eq!(schedule.rebalance_steps, 80);
         assert_eq!(schedule.attack_steps, 20);
         assert_eq!(schedule.reexpand_steps, 8);
     }
@@ -467,7 +467,7 @@ mod tests {
         );
         assert_eq!(
             schedule.phase_at(PhaseSchedule::phase_progress(18, 8)),
-            ScenarioPhase::Policy
+            ScenarioPhase::Rebalance
         );
         assert_eq!(
             schedule.phase_at(PhaseSchedule::phase_progress(23, 8)),

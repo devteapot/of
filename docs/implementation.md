@@ -83,8 +83,6 @@ Public state is split by read/update pattern:
 - `cell_state` holds mutable ownership, population, infantry, capacities, a
   deterministic `population_shard` (`u16`, validated against the interval), and
   denormalized `chunk_q`/`chunk_r` for high-scale spatial interest;
-- `cluster_policy_assignment` stores public per-cell policy lineage and explicit
-  policy revisions; clusters themselves remain derived connected components;
 - `command_receipt` records accepted and rejected idempotent commands;
 - `transfer_order`, `transfer_source`, `transfer_destination`, `transit_route`,
   and `transit_packet` expose generic internal aggregate-flow progress and
@@ -118,48 +116,26 @@ The cluster-first client uses these gameplay reducers:
   and enemy clusters, snapshot the enemy target union, and start from every
   shared passable front. Captures reveal the next masked cells, so local branches
   can turn, split, and merge but can never leave the accepted targets.
-- `set_cluster_policy` — persist Balanced, Center, Perimeter, or Directional
-  policy on every complete selected source cluster. The policy is metadata, not
-  a Share allocation; the authority immediately schedules any required
-  capacity-safe redistribution of the free pool.
+- `issue_front_rebalance` — move one Share of movable troops from a selected
+  strategic front to another front of the same complete owned cluster.
 - `issue_reshape` — prioritize a drawn owned, passable destination shape for
   one complete source cluster using all available affected strength. Exact fits
   drain movable non-target strength; undersized targets saturate and conserve
   deterministic overflow outside.
 - `cancel_orders` — atomically stop the exact explicit active-order IDs
-  snapshotted from current intersections with the selected clusters; the V1
-  Stop snapshot excludes background policy maintenance.
+  snapshotted from current intersections with the selected clusters.
 
-Both cluster action reducers accept sparse seed IDs and expand them
-authoritatively. The client therefore cannot create a hidden sub-cluster action
-by omitting cells. Share is a basis-point field only on expansion and attack;
-it is applied once to action-available infantry in each participating source.
-That pool includes stationary free strength and local yieldable policy strength
-but excludes other explicit allocations. Sources without an eligible route or
-shared front contribute nothing, and selecting several target clusters never
-multiplies a source commitment.
+Cluster reducers accept sparse seed IDs and expand them authoritatively. The
+client therefore cannot create a hidden sub-cluster action by omitting cells.
+Share is a basis-point field on expansion, attack, and Front Rebalance; it is
+applied once to stationary action-available infantry in each participating
+source. Existing explicit allocations remain fixed and reserve their physical
+capacity.
 
-`cluster_policy_assignment` stores per-cell policy lineage. Connected clusters
-are derived from current ownership and traversal. On a split, both children keep
-their cells' policy. On a merge, the greatest explicit revision wins
-deterministically for the complete merged component; newly captured cells
-inherit their connected cluster's policy.
-
-Policy planning excludes strength in live action packets from both the movable
-pool and the requested density calculation. Those packets still reserve the
-capacity of their physical cells. This prevents policy maintenance from
-counterbalancing against troops that are already expanding, attacking, or
-reshaping, while also preventing overfill. Settled, completed, or cancelled
-strength rejoins the free pool. An accepted explicit command atomically cancels
-only intersecting background maintenance orders and can use their released
-survivors; other explicit allocations remain fixed. The assignment rows persist,
-so maintenance resumes from the same policy on a later pass. Background policy
-packets blocked by capacity stay queued rather than completing at an
-intermediate cell. Reconciliation replaces stale maintenance from current
-physical positions and emits local relay handoffs through saturated connectors
-when necessary. The replacement is prepared before the old maintenance is
-cancelled, so failed planning preserves the live order. None of this reads
-Share; that percentage remains exclusive to expansion and attack.
+Front Rebalance derives current strategic arcs from authoritative ownership and
+traversal. It computes capacity-safe target placement and terrain-aware routes
+once, then persists explicit aggregate packets. No policy metadata, density
+cache, or periodic redistribution state exists.
 
 Reshape has the same accounting rule for unrelated allocations and has no Share
 parameter. A disconnected source part without a reachable drawn target remains
@@ -167,9 +143,8 @@ unchanged. All planning is best effort but conservative: capacity and route
 constraints can leave overflow outside the drawing, never drop strength, and
 never move it through non-friendly cells.
 
-Older reducers such as `issue_push_front`, `issue_expand_all`, and the
-one-shot distribution reducers remain in the module as compatibility and
-implementation-history surfaces. The V1 client does not expose their painted
+Older reducers such as `issue_push_front` and `issue_expand_all` remain in the
+module as compatibility and implementation-history surfaces. The V1 client does not expose their painted
 sub-cluster or retask-handle grammar as the primary interaction.
 
 Every gameplay intention carries a stable player-scoped command ID. Rejected
@@ -255,25 +230,16 @@ snapshot. The offline adapter implements the same intent boundary for interface
 work but is not a rules-equivalent substitute for authoritative timing, combat,
 or persistence.
 
-`[` and `]` change one persisted Share. Only contextual expansion and attack
-read it. Preview and HUD accounting use each source's action-available infantry
-once (stationary free strength plus local yieldable policy strength, excluding
-other explicit allocations); multiple shared fronts or staged targets do not
+`[` and `]` change one persisted Share. Contextual expansion, attack, and
+Front Rebalance read it. Preview and HUD accounting use each source's stationary
+action-available infantry once; multiple shared fronts or staged targets do not
 duplicate the source base.
 
-### Persistent policy, Reshape, and Stop
+### Front Rebalance, Reshape, and Stop
 
-`R` cycles selected clusters among Balanced, Perimeter, and Center.
-Holding `F`, dragging, and releasing writes Directional policy with the exact
-fixed-point axial vector used by the server. Subscribed
-`cluster_policy_assignment` rows rebuild the policy view; missing owned rows
-display the revision-zero Balanced default.
-
-Policy is not a pending one-shot command and is never multiplied by Share. The
-server redistributes only the free pool while excluding live action packets from
-the policy target calculation and reserving the capacity those packets occupy.
-The HUD reports the selected policy, or mixed policy when selected clusters
-differ.
+`B` enters Front Rebalance for one complete selected cluster. Dragging from one
+strategic-front boundary cell to another creates one explicit Share-based
+movement command. The preview highlights source and target arcs.
 
 `T` enters Reshape only when exactly one source cluster is selected. Left-drag
 draws an owned, passable desired troop footprint and release builds a best-effort
@@ -283,24 +249,22 @@ cells, and positions outside the world so the intended shape remains legible at
 boundaries. Reshape uses the whole available pool, never Share.
 
 `X` freezes the exact explicit active-order IDs whose current allocations
-intersect the selected clusters. Background policy-maintenance orders are
-excluded. Confirmation cancels only that snapshot and leaves policy metadata
-enabled. `Escape` backs out of staged attack targets, Reshape, or Stop; while
-idle it clears selection. Selection never supersedes an explicit order; an
-accepted contextual action yields intersecting background maintenance only.
+intersect the selected clusters. Confirmation cancels only that snapshot.
+`Escape` backs out of staged attack targets, Front Rebalance, Reshape, or Stop;
+while idle it clears selection. Selection never supersedes an explicit order.
 
 ### HUD and transport state
 
 The HUD is a compact text-only, keybind-first contextual strip with no command
-grid. Idle state shows cluster selection, Share, policy, and the few current
-keys. Attack staging, Directional policy, Reshape drawing, exact Stop,
+grid. Idle state shows cluster selection, Share, and the few current keys.
+Attack staging, Front Rebalance, Reshape drawing, exact Stop,
 invalid state, and locked submission each replace that copy with their relevant
 instructions. `?` toggles the complete field manual. The right panel remains
 a compact map-view, inspector, and order summary.
 
 Input produces `ClientIntent`. The online transport invokes generated typed
 reducers, pumps SpacetimeDB frames, and rebuilds `MatchView` from subscribed
-tables including cluster policy. Stable command IDs and receipts make retry
+authoritative tables. Stable command IDs and receipts make retry
 observation idempotent. Reconnect discards speculative UI state and rebuilds the
 selection-adjacent presentation from the new authoritative snapshot.
 
@@ -311,18 +275,17 @@ selection-adjacent presentation from the new authoritative snapshot.
   exact integer allocation, rotating fairness, and Conquest math.
 - Module tests cover authority expansion from sparse seeds to complete source
   and target clusters, Share-once accounting, all-shared-front attack topology,
-  immutable target containment, terrain/capacity/garrison constraints, policy
-  split/merge/capture lineage, live-packet exclusion with physical capacity
-  reservation, atomic background-maintenance yield, queued policy congestion,
-  saturated-connector relay, and shared-relay coalescing.
+  immutable target containment, terrain/capacity/garrison constraints,
+  front-rebalance routing, live-packet exclusion, and physical capacity
+  reservation.
 - Client interaction tests cover whole-cluster selection, modifiers and Select
   All, reconciliation after growth/merge/split, contextual neutral and enemy
-  clicks, staged enemy unions, persistent-policy keys, single-cluster Reshape,
-  explicit-only Stop, policy yield previews, and submission/rejection state.
+  clicks, staged enemy unions, Front Rebalance, single-cluster Reshape,
+  explicit Stop, and submission/rejection state.
 - `worldgen` pins all curated maps, round-trips serialization, rejects invalid
   metadata/duplicates, and sweeps supported custom seeds.
 - The real-server two-identity harness covers slot claims, match start,
-  subscriptions, idempotent receipts, public cluster actions and policies,
+  subscriptions, idempotent receipts, public cluster actions,
   conserved movement, cancellation, and reconnect.
 - The distributed `match-perf` harness (`coordinator` / `worker` / `run-local`)
   profiles client-observed step dilation under multi-process load through 500
@@ -339,9 +302,8 @@ selection-adjacent presentation from the new authoritative snapshot.
 - Attack snapshots complete enemy target clusters at acceptance. Fronts evolve
   within that mask, but later growth of the enemy cluster is not silently added
   and the wave never retargets another cluster.
-- Cluster policies have no priorities, minimum garrisons, or conditional
-  automation beyond Balanced, Center, Perimeter, and one Directional facing.
-  Their deliberate scope is redistribution of the currently free pool.
+- Strategic fronts do not yet have durable IDs or persistent per-front quotas;
+  topology changes require a new explicit rebalance gesture.
 - Reshape is confined to one selected owned cluster and owned passable target
   cells. It does not use drawing as an alternative conquest command.
 - The 32,768-cell materialized-selection limit is not a world-scale policy or

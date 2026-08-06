@@ -1,49 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    conquest::BASIS_POINTS,
     coord::Axial,
     map::{HexMap, PlayerId, Strength},
 };
 
-pub const BALANCE_WEIGHT: u32 = 10_000;
-const DEPTH_LOW_WEIGHT: u32 = 5_000;
-const DEPTH_HIGH_WEIGHT: u32 = 15_000;
-
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DistributionPreset {
-    /// Equal target occupancy ratio (`strength / capacity`).
-    Balance,
-    /// Density increases along an axial-space orientation vector.
-    FrontLoad {
-        direction: Axial,
-        rear_weight: u32,
-        front_weight: u32,
-    },
-    /// Density increases with distance from the selection's exposed boundary.
-    CoreLoad,
-    /// Density decreases with distance from the selection's exposed boundary.
-    PerimeterLoad,
-}
-
-impl DistributionPreset {
-    pub const fn front_load(direction: Axial) -> Self {
-        Self::FrontLoad {
-            direction,
-            rear_weight: 5_000,
-            front_weight: 15_000,
-        }
-    }
-}
+pub const UNIFORM_ALLOCATION_WEIGHT: u32 = 10_000;
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributionError {
     EmptySelection,
-    ZeroDirection,
-    InvalidWeights,
-    InvalidCommitmentBps(u32),
     UnknownCell(Axial),
     NotOwned {
         coordinate: Axial,
@@ -70,143 +37,6 @@ pub enum DistributionError {
     ArithmeticOverflow,
 }
 
-/// Produces stable relative density weights for a preview heatmap.
-///
-/// Front-load projection uses the Euclidean dot product of the two axial basis
-/// vectors, multiplied by two to remain integer-only. Normalizing by the
-/// selection's minimum and maximum makes the result translation invariant.
-pub fn distribution_weights<I>(
-    selection: I,
-    preset: DistributionPreset,
-) -> Result<BTreeMap<Axial, u32>, DistributionError>
-where
-    I: IntoIterator<Item = Axial>,
-{
-    let coordinates: BTreeSet<_> = selection.into_iter().collect();
-    if coordinates.is_empty() {
-        return Err(DistributionError::EmptySelection);
-    }
-
-    match preset {
-        DistributionPreset::Balance => Ok(coordinates
-            .into_iter()
-            .map(|coordinate| (coordinate, BALANCE_WEIGHT))
-            .collect()),
-        DistributionPreset::FrontLoad {
-            direction,
-            rear_weight,
-            front_weight,
-        } => {
-            if direction == Axial::ZERO {
-                return Err(DistributionError::ZeroDirection);
-            }
-            if rear_weight == 0 || front_weight < rear_weight {
-                return Err(DistributionError::InvalidWeights);
-            }
-
-            let projections: BTreeMap<_, _> = coordinates
-                .into_iter()
-                .map(|coordinate| (coordinate, axial_dot_twice(coordinate, direction)))
-                .collect();
-            let minimum = *projections.values().min().expect("selection is not empty");
-            let maximum = *projections.values().max().expect("selection is not empty");
-            let span = maximum - minimum;
-            let weight_span = u128::from(front_weight - rear_weight);
-
-            projections
-                .into_iter()
-                .map(|(coordinate, projection)| {
-                    let weight = if span == 0 {
-                        u128::from(rear_weight) + weight_span / 2
-                    } else {
-                        u128::from(rear_weight)
-                            + weight_span * (projection - minimum) as u128 / span as u128
-                    };
-                    Ok((coordinate, weight as u32))
-                })
-                .collect()
-        }
-        DistributionPreset::CoreLoad | DistributionPreset::PerimeterLoad => {
-            boundary_depth_weights(&coordinates, preset)
-        }
-    }
-}
-
-/// Measures topological depth from the exact exposed boundary of a selection.
-/// Every cell adjacent to any unselected coordinate seeds depth zero; a stable
-/// multi-source BFS then assigns inward layers. Concavities and holes therefore
-/// influence loading directly instead of being approximated by a centroid.
-fn boundary_depth_weights(
-    coordinates: &BTreeSet<Axial>,
-    preset: DistributionPreset,
-) -> Result<BTreeMap<Axial, u32>, DistributionError> {
-    let mut depths = BTreeMap::<Axial, u64>::new();
-    let mut pending = VecDeque::new();
-    for &coordinate in coordinates {
-        if coordinate
-            .neighbors()
-            .into_iter()
-            .any(|neighbor| !coordinates.contains(&neighbor))
-        {
-            depths.insert(coordinate, 0);
-            pending.push_back(coordinate);
-        }
-    }
-
-    while let Some(coordinate) = pending.pop_front() {
-        let next_depth = depths[&coordinate]
-            .checked_add(1)
-            .ok_or(DistributionError::ArithmeticOverflow)?;
-        for neighbor in coordinate.neighbors() {
-            if coordinates.contains(&neighbor) && !depths.contains_key(&neighbor) {
-                depths.insert(neighbor, next_depth);
-                pending.push_back(neighbor);
-            }
-        }
-    }
-    debug_assert_eq!(depths.len(), coordinates.len());
-    let max_depth = depths
-        .values()
-        .copied()
-        .max()
-        .expect("a finite non-empty selection has an exposed boundary");
-    if max_depth == 0 {
-        return Ok(coordinates
-            .iter()
-            .map(|&coordinate| (coordinate, BALANCE_WEIGHT))
-            .collect());
-    }
-
-    let weight_span = u128::from(DEPTH_HIGH_WEIGHT - DEPTH_LOW_WEIGHT);
-    depths
-        .into_iter()
-        .map(|(coordinate, depth)| {
-            let offset = weight_span
-                .checked_mul(u128::from(depth))
-                .ok_or(DistributionError::ArithmeticOverflow)?
-                / u128::from(max_depth);
-            let offset =
-                u32::try_from(offset).map_err(|_| DistributionError::ArithmeticOverflow)?;
-            let weight = match preset {
-                DistributionPreset::CoreLoad => DEPTH_LOW_WEIGHT + offset,
-                DistributionPreset::PerimeterLoad => DEPTH_HIGH_WEIGHT - offset,
-                DistributionPreset::Balance | DistributionPreset::FrontLoad { .. } => {
-                    unreachable!("boundary_depth_weights only accepts depth presets")
-                }
-            };
-            Ok((coordinate, weight))
-        })
-        .collect()
-}
-
-fn axial_dot_twice(coordinate: Axial, direction: Axial) -> i128 {
-    let q = i128::from(coordinate.q);
-    let r = i128::from(coordinate.r);
-    let dq = i128::from(direction.q);
-    let dr = i128::from(direction.r);
-    2 * q * dq + q * dr + r * dq + 2 * r * dr
-}
-
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetDistribution {
@@ -227,137 +57,8 @@ pub struct DenseTargetDistribution {
     pub unassigned: Strength,
 }
 
-/// Produces the same deterministic weights as [`distribution_weights`] without
-/// allocating one tree node per cell. Coordinate lookup is used only by the
-/// boundary BFS; all mutable work stays in contiguous vectors.
-pub fn distribution_weights_dense(
-    coordinates: &[Axial],
-    preset: DistributionPreset,
-) -> Result<Vec<u32>, DistributionError> {
-    if coordinates.is_empty() {
-        return Err(DistributionError::EmptySelection);
-    }
-    match preset {
-        DistributionPreset::Balance => Ok(vec![BALANCE_WEIGHT; coordinates.len()]),
-        DistributionPreset::FrontLoad {
-            direction,
-            rear_weight,
-            front_weight,
-        } => {
-            if direction == Axial::ZERO {
-                return Err(DistributionError::ZeroDirection);
-            }
-            if rear_weight == 0 || front_weight < rear_weight {
-                return Err(DistributionError::InvalidWeights);
-            }
-            let projections = coordinates
-                .iter()
-                .map(|&coordinate| axial_dot_twice(coordinate, direction))
-                .collect::<Vec<_>>();
-            let minimum = *projections.iter().min().expect("coordinates are not empty");
-            let maximum = *projections.iter().max().expect("coordinates are not empty");
-            let span = maximum - minimum;
-            let weight_span = u128::from(front_weight - rear_weight);
-            projections
-                .into_iter()
-                .map(|projection| {
-                    let weight = if span == 0 {
-                        u128::from(rear_weight) + weight_span / 2
-                    } else {
-                        u128::from(rear_weight)
-                            + weight_span * (projection - minimum) as u128 / span as u128
-                    };
-                    Ok(weight as u32)
-                })
-                .collect()
-        }
-        DistributionPreset::CoreLoad | DistributionPreset::PerimeterLoad => {
-            dense_boundary_depth_weights(coordinates, preset)
-        }
-    }
-}
-
-fn dense_boundary_depth_weights(
-    coordinates: &[Axial],
-    preset: DistributionPreset,
-) -> Result<Vec<u32>, DistributionError> {
-    let index_by_coordinate = coordinates
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, coordinate)| (coordinate, index))
-        .collect::<BTreeMap<_, _>>();
-    if index_by_coordinate.len() != coordinates.len() {
-        return Err(DistributionError::ConstraintCellsMismatch);
-    }
-    let mut depths = vec![u64::MAX; coordinates.len()];
-    let mut pending = VecDeque::new();
-    for (index, &coordinate) in coordinates.iter().enumerate() {
-        if coordinate
-            .neighbors()
-            .into_iter()
-            .any(|neighbor| !index_by_coordinate.contains_key(&neighbor))
-        {
-            depths[index] = 0;
-            pending.push_back(index);
-        }
-    }
-    while let Some(index) = pending.pop_front() {
-        let next_depth = depths[index]
-            .checked_add(1)
-            .ok_or(DistributionError::ArithmeticOverflow)?;
-        for neighbor in coordinates[index].neighbors() {
-            let Some(&neighbor_index) = index_by_coordinate.get(&neighbor) else {
-                continue;
-            };
-            if depths[neighbor_index] == u64::MAX {
-                depths[neighbor_index] = next_depth;
-                pending.push_back(neighbor_index);
-            }
-        }
-    }
-    let max_depth = depths
-        .iter()
-        .copied()
-        .max()
-        .expect("coordinates are not empty");
-    if max_depth == 0 {
-        return Ok(vec![BALANCE_WEIGHT; coordinates.len()]);
-    }
-    let weight_span = u128::from(DEPTH_HIGH_WEIGHT - DEPTH_LOW_WEIGHT);
-    depths
-        .into_iter()
-        .map(|depth| {
-            let offset = weight_span
-                .checked_mul(u128::from(depth))
-                .ok_or(DistributionError::ArithmeticOverflow)?
-                / u128::from(max_depth);
-            let offset =
-                u32::try_from(offset).map_err(|_| DistributionError::ArithmeticOverflow)?;
-            Ok(match preset {
-                DistributionPreset::CoreLoad => DEPTH_LOW_WEIGHT + offset,
-                DistributionPreset::PerimeterLoad => DEPTH_HIGH_WEIGHT - offset,
-                DistributionPreset::Balance | DistributionPreset::FrontLoad { .. } => {
-                    unreachable!("dense boundary weights only accept depth presets")
-                }
-            })
-        })
-        .collect()
-}
-
-/// Dense full-participation redistribution used by policy maintenance.
-pub fn redistribution_targets_dense(
-    coordinates: &[Axial],
-    capacities: &[Strength],
-    total_strength: Strength,
-    preset: DistributionPreset,
-) -> Result<DenseTargetDistribution, DistributionError> {
-    let weights = distribution_weights_dense(coordinates, preset)?;
-    redistribution_targets_dense_with_weights(coordinates, capacities, total_strength, weights)
-}
-
-/// Applies precomputed dense weights. This permits durable topology caches to
-/// skip the boundary-depth BFS while retaining the exact apportionment rules.
+/// Applies precomputed dense weights with capacity-safe largest-remainder
+/// apportionment. Used by explicit FrontRebalance placement.
 pub fn redistribution_targets_dense_with_weights(
     coordinates: &[Axial],
     capacities: &[Strength],
@@ -465,108 +166,6 @@ pub fn redistribution_targets_dense_with_weights(
     })
 }
 
-/// Converts density weights into capacity-safe integer strength targets.
-///
-/// The result assigns `min(total_strength, selected capacity)` exactly. Cells
-/// that would exceed capacity are saturated first; remaining strength is
-/// apportioned by largest remainder with coordinate tie-breaking.
-pub fn redistribution_targets<I>(
-    map: &HexMap,
-    owner: PlayerId,
-    selection: I,
-    total_strength: Strength,
-    preset: DistributionPreset,
-) -> Result<TargetDistribution, DistributionError>
-where
-    I: IntoIterator<Item = Axial>,
-{
-    redistribution_targets_with_commitment(
-        map,
-        owner,
-        selection,
-        total_strength,
-        preset,
-        BASIS_POINTS,
-    )
-}
-
-/// Produces capacity-safe targets while limiting how much of each current
-/// stack may participate.
-///
-/// `amount_bps` selects at most that share (rounded down) of every current
-/// stack. The remainder becomes a frozen lower bound for that cell. The full
-/// strength pool is then apportioned by the preset subject to those lower
-/// bounds and normal military capacities. This lets a partial command move
-/// strength into a cell freely while never moving more than the selected share
-/// out of any source.
-pub fn redistribution_targets_with_commitment<I>(
-    map: &HexMap,
-    owner: PlayerId,
-    selection: I,
-    total_strength: Strength,
-    preset: DistributionPreset,
-    amount_bps: u32,
-) -> Result<TargetDistribution, DistributionError>
-where
-    I: IntoIterator<Item = Axial>,
-{
-    if amount_bps > BASIS_POINTS {
-        return Err(DistributionError::InvalidCommitmentBps(amount_bps));
-    }
-    let weights = distribution_weights(selection, preset)?;
-    let mut capacities = BTreeMap::new();
-    let mut lower_bounds = BTreeMap::new();
-    for coordinate in weights.keys().copied() {
-        let cell = map
-            .get(coordinate)
-            .ok_or(DistributionError::UnknownCell(coordinate))?;
-        if cell.owner != Some(owner) {
-            return Err(DistributionError::NotOwned { coordinate, owner });
-        }
-        let current = cell.force();
-        if current > cell.military_capacity {
-            return Err(DistributionError::CurrentStrengthExceedsCapacity {
-                coordinate,
-                current,
-                capacity: cell.military_capacity,
-            });
-        }
-        let participating =
-            (u128::from(current) * u128::from(amount_bps) / u128::from(BASIS_POINTS)) as Strength;
-        let frozen = current - participating;
-        capacities.insert(coordinate, cell.military_capacity);
-        lower_bounds.insert(coordinate, frozen);
-    }
-
-    constrained_targets(weights, capacities, lower_bounds, total_strength)
-}
-
-/// Apportions strength with caller-supplied density weights and per-cell frozen
-/// lower bounds.
-///
-/// This is the shape-drawing primitive: target cells receive positive weight,
-/// source-only cells receive zero weight, and the lower bound limits how much
-/// of each source may leave. Unlike broad preset redistribution, a drawn shape
-/// is exact: every unit of `total_strength` must fit or the operation is
-/// rejected. All constrained cells must be owned map cells and the weight and
-/// lower-bound maps must have identical keys.
-pub fn redistribution_targets_with_constraints(
-    map: &HexMap,
-    owner: PlayerId,
-    weights: BTreeMap<Axial, u32>,
-    lower_bounds: BTreeMap<Axial, Strength>,
-    total_strength: Strength,
-) -> Result<TargetDistribution, DistributionError> {
-    let capacities = validated_constraint_capacities(map, owner, &weights, &lower_bounds)?;
-    let distribution = constrained_targets(weights, capacities, lower_bounds, total_strength)?;
-    if distribution.unassigned > 0 {
-        return Err(DistributionError::InsufficientTargetCapacity {
-            unassigned: distribution.unassigned,
-        });
-    }
-    Ok(distribution)
-}
-
 /// Apportions strength into preferred cells first, then uses zero-weight cells
 /// as deterministic overflow storage.
 ///
@@ -578,10 +177,6 @@ pub fn redistribution_targets_with_constraints(
 /// saturated before overflow is balanced across the fallback cells' current
 /// affected strength. Consequently a fallback source can only retain or lose
 /// strength, never gain it from another excluded source.
-///
-/// Unlike [`redistribution_targets_with_constraints`], insufficient capacity
-/// in the preferred cells is not an error. The operation fails only when the
-/// complete preferred-plus-fallback set cannot conserve `total_strength`.
 pub fn redistribution_targets_with_fallback_constraints(
     map: &HexMap,
     owner: PlayerId,
@@ -643,7 +238,7 @@ pub fn redistribution_targets_with_fallback_constraints(
     let fallback_distribution = constrained_targets(
         fallback
             .iter()
-            .map(|coordinate| (*coordinate, BALANCE_WEIGHT))
+            .map(|coordinate| (*coordinate, UNIFORM_ALLOCATION_WEIGHT))
             .collect(),
         fallback
             .iter()
@@ -795,9 +390,9 @@ fn constrained_targets(
     })
 }
 
-/// Apportions `goal` across `active` cells using preset density scores and
-/// military capacities. This is the original full-participation water fill,
-/// isolated so commitment lower bounds can repeatedly constrain it.
+/// Apportions `goal` across `active` cells using caller-provided weights and
+/// military capacities. This full-participation water fill is isolated so
+/// commitment lower bounds can repeatedly constrain it.
 fn weighted_targets(
     weights: &BTreeMap<Axial, u32>,
     capacities: &BTreeMap<Axial, Strength>,
@@ -903,402 +498,35 @@ mod tests {
         map
     }
 
-    fn hex_disk(radius: i32) -> BTreeSet<Axial> {
-        let mut selection = BTreeSet::new();
-        for q in -radius..=radius {
-            for r in -radius..=radius {
-                let coordinate = Axial::new(q, r);
-                if Axial::ZERO.distance(coordinate) <= radius as u64 {
-                    selection.insert(coordinate);
-                }
-            }
-        }
-        selection
-    }
-
     #[test]
-    fn balance_equalizes_occupancy_ratio_not_raw_strength() {
-        let map = line(&[100, 200]);
-        let result =
-            redistribution_targets(&map, 1, map.coordinates(), 150, DistributionPreset::Balance)
-                .unwrap();
-        assert_eq!(result.targets[&Axial::new(0, 0)], 50);
-        assert_eq!(result.targets[&Axial::new(1, 0)], 100);
-        assert_eq!(result.assigned, 150);
-    }
-
-    #[test]
-    fn orientation_selects_which_side_is_the_front() {
-        let map = line(&[100, 100, 100]);
-        let east = redistribution_targets(
-            &map,
-            1,
-            map.coordinates(),
-            150,
-            DistributionPreset::front_load(Axial::new(1, 0)),
-        )
-        .unwrap();
-        assert_eq!(
-            east.targets.values().copied().collect::<Vec<_>>(),
-            vec![25, 50, 75]
-        );
-
-        let west = redistribution_targets(
-            &map,
-            1,
-            map.coordinates(),
-            150,
-            DistributionPreset::front_load(Axial::new(-1, 0)),
-        )
-        .unwrap();
-        assert_eq!(
-            west.targets.values().copied().collect::<Vec<_>>(),
-            vec![75, 50, 25]
-        );
-    }
-
-    #[test]
-    fn commitment_freezes_the_unselected_share_of_each_stack() {
-        let map = occupied_line(&[100, 100], &[100, 0]);
-        for (amount_bps, expected) in [
-            (0, [100, 0]),
-            (2_500, [75, 25]),
-            (5_000, [50, 50]),
-            (10_000, [50, 50]),
-        ] {
-            let result = redistribution_targets_with_commitment(
-                &map,
-                1,
-                map.coordinates(),
-                100,
-                DistributionPreset::Balance,
-                amount_bps,
-            )
-            .unwrap();
-            assert_eq!(
-                result.targets.values().copied().collect::<Vec<_>>(),
-                expected,
-                "unexpected targets at {amount_bps} bps"
-            );
-        }
-    }
-
-    #[test]
-    fn commitment_respects_asymmetric_capacity_and_source_bounds() {
-        let map = occupied_line(&[100, 200], &[100, 0]);
-        let cases = [
-            (0, [100, 0]),
-            (2_500, [75, 25]),
-            (5_000, [50, 50]),
-            (10_000, [33, 67]),
-        ];
-        for (amount_bps, expected) in cases {
-            let result = redistribution_targets_with_commitment(
-                &map,
-                1,
-                map.coordinates(),
-                100,
-                DistributionPreset::Balance,
-                amount_bps,
-            )
-            .unwrap();
-            assert_eq!(
-                result.targets.values().copied().collect::<Vec<_>>(),
-                expected
-            );
-            assert_eq!(result.targets.values().sum::<u64>(), 100);
-            assert!(result.targets[&Axial::new(0, 0)] >= 100 - amount_bps as u64 / 100);
-        }
-    }
-
-    #[test]
-    fn weights_are_translation_invariant() {
-        let original = distribution_weights(
-            [Axial::new(0, 0), Axial::new(1, 0), Axial::new(2, 0)],
-            DistributionPreset::front_load(Axial::new(1, 0)),
-        )
-        .unwrap();
-        let translated = distribution_weights(
-            [
-                Axial::new(50, -20),
-                Axial::new(51, -20),
-                Axial::new(52, -20),
-            ],
-            DistributionPreset::front_load(Axial::new(1, 0)),
-        )
-        .unwrap();
-        assert_eq!(
-            original.values().copied().collect::<Vec<_>>(),
-            translated.values().copied().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn solid_disk_loads_by_exact_boundary_depth() {
-        let selection = hex_disk(2);
-        let core =
-            distribution_weights(selection.iter().copied(), DistributionPreset::CoreLoad).unwrap();
-        let perimeter =
-            distribution_weights(selection.iter().copied(), DistributionPreset::PerimeterLoad)
-                .unwrap();
-
-        for coordinate in selection {
-            let distance = Axial::ZERO.distance(coordinate);
-            let (expected_core, expected_perimeter) = match distance {
-                0 => (DEPTH_HIGH_WEIGHT, DEPTH_LOW_WEIGHT),
-                1 => (BALANCE_WEIGHT, BALANCE_WEIGHT),
-                2 => (DEPTH_LOW_WEIGHT, DEPTH_HIGH_WEIGHT),
-                _ => unreachable!("radius-two disk has only three inward layers"),
-            };
-            assert_eq!(core[&coordinate], expected_core);
-            assert_eq!(perimeter[&coordinate], expected_perimeter);
-        }
-    }
-
-    #[test]
-    fn a_notch_is_boundary_and_depth_weights_are_translation_invariant() {
-        let mut original = hex_disk(3);
-        for q in 1..=3 {
-            original.remove(&Axial::new(q, 0));
-        }
-        let translation = Axial::new(37, -91);
-        let translated = original
-            .iter()
-            .map(|&coordinate| coordinate + translation)
-            .collect::<BTreeSet<_>>();
-
-        for preset in [
-            DistributionPreset::CoreLoad,
-            DistributionPreset::PerimeterLoad,
-        ] {
-            let original_weights = distribution_weights(original.iter().copied(), preset).unwrap();
-            let translated_weights =
-                distribution_weights(translated.iter().copied(), preset).unwrap();
-            for &coordinate in &original {
-                assert_eq!(
-                    original_weights[&coordinate],
-                    translated_weights[&(coordinate + translation)]
-                );
-            }
-        }
-
-        let core =
-            distribution_weights(original.iter().copied(), DistributionPreset::CoreLoad).unwrap();
-        assert_eq!(core[&Axial::ZERO], DEPTH_LOW_WEIGHT);
-        assert!(core.values().any(|&weight| weight > DEPTH_LOW_WEIGHT));
-    }
-
-    #[test]
-    fn thin_and_single_cell_selections_use_the_midpoint_weight() {
-        let thin = (0..=6).map(|q| Axial::new(q, 0)).collect::<BTreeSet<_>>();
-        let single = BTreeSet::from([Axial::new(-4, 9)]);
-
-        for selection in [&thin, &single] {
-            for preset in [
-                DistributionPreset::CoreLoad,
-                DistributionPreset::PerimeterLoad,
-            ] {
-                let weights = distribution_weights(selection.iter().copied(), preset).unwrap();
-                assert!(weights.values().all(|&weight| weight == BALANCE_WEIGHT));
-            }
-        }
-    }
-
-    #[test]
-    fn core_and_perimeter_weights_are_complementary_at_every_depth() {
-        let mut selection = hex_disk(4);
-        selection.remove(&Axial::new(4, 0));
-        selection.remove(&Axial::new(3, 0));
-        let core =
-            distribution_weights(selection.iter().copied(), DistributionPreset::CoreLoad).unwrap();
-        let perimeter =
-            distribution_weights(selection.iter().copied(), DistributionPreset::PerimeterLoad)
-                .unwrap();
-
-        for coordinate in selection {
-            assert_eq!(
-                core[&coordinate] + perimeter[&coordinate],
-                DEPTH_LOW_WEIGHT + DEPTH_HIGH_WEIGHT
-            );
-        }
-    }
-
-    #[test]
-    fn targets_conserve_strength_and_never_exceed_capacity() {
-        let map = line(&[3, 7, 11, 19]);
-        for total in 0..=50 {
-            for preset in [
-                DistributionPreset::Balance,
-                DistributionPreset::front_load(Axial::new(1, -1)),
-                DistributionPreset::CoreLoad,
-                DistributionPreset::PerimeterLoad,
-            ] {
-                let result =
-                    redistribution_targets(&map, 1, map.coordinates(), total, preset).unwrap();
-                assert_eq!(result.assigned + result.unassigned, total);
-                assert_eq!(result.targets.values().sum::<u64>(), result.assigned);
-                for (coordinate, target) in result.targets {
-                    assert!(target <= map.get(coordinate).unwrap().military_capacity);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn dense_targets_match_tree_targets_for_every_preset_and_input_order() {
-        let selection = hex_disk(3);
-        let mut map = HexMap::new();
-        for (index, coordinate) in selection.iter().copied().enumerate() {
-            map.insert(Cell::ground(
-                coordinate,
-                0,
-                Some(1),
-                10 + (index as u64 * 17 % 91),
-            ));
-        }
-        let mut coordinates = selection.iter().copied().rev().collect::<Vec<_>>();
-        coordinates.rotate_left(7);
-        let capacities = coordinates
-            .iter()
-            .map(|coordinate| map.get(*coordinate).unwrap().military_capacity)
-            .collect::<Vec<_>>();
-
-        for total in [0, 1, 37, 500, 10_000] {
-            for preset in [
-                DistributionPreset::Balance,
-                DistributionPreset::front_load(Axial::new(2, -1)),
-                DistributionPreset::CoreLoad,
-                DistributionPreset::PerimeterLoad,
-            ] {
-                let tree =
-                    redistribution_targets(&map, 1, coordinates.iter().copied(), total, preset)
-                        .unwrap();
-                let dense =
-                    redistribution_targets_dense(&coordinates, &capacities, total, preset).unwrap();
-                assert_eq!(dense.assigned, tree.assigned);
-                assert_eq!(dense.unassigned, tree.unassigned);
-                for (index, coordinate) in coordinates.iter().enumerate() {
-                    assert_eq!(dense.weights[index], tree.weights[coordinate]);
-                    assert_eq!(dense.targets[index], tree.targets[coordinate]);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn cached_dense_weights_preserve_target_apportionment() {
-        let coordinates = hex_disk(4).into_iter().collect::<Vec<_>>();
-        let capacities = (0..coordinates.len())
-            .map(|index| 20 + index as u64 % 13)
-            .collect::<Vec<_>>();
-        let weights =
-            distribution_weights_dense(&coordinates, DistributionPreset::CoreLoad).unwrap();
-        let direct = redistribution_targets_dense(
+    fn dense_weighted_targets_equalize_by_capacity_when_weights_match() {
+        let coordinates = [Axial::new(0, 0), Axial::new(1, 0)];
+        let capacities = [100_u64, 200];
+        let result = redistribution_targets_dense_with_weights(
             &coordinates,
             &capacities,
-            1_000,
-            DistributionPreset::CoreLoad,
+            150,
+            vec![UNIFORM_ALLOCATION_WEIGHT, UNIFORM_ALLOCATION_WEIGHT],
         )
         .unwrap();
-        let cached =
-            redistribution_targets_dense_with_weights(&coordinates, &capacities, 1_000, weights)
-                .unwrap();
-        assert_eq!(cached, direct);
-    }
-
-    #[test]
-    fn committed_targets_conserve_and_stay_within_all_bounds() {
-        let capacities = [3, 7, 11, 19];
-        let strengths = [3, 5, 0, 12];
-        let map = occupied_line(&capacities, &strengths);
-        let total = strengths.into_iter().sum();
-
-        for amount_bps in [0, 1, 2_500, 5_000, 9_999, 10_000] {
-            for preset in [
-                DistributionPreset::Balance,
-                DistributionPreset::front_load(Axial::new(1, -1)),
-                DistributionPreset::CoreLoad,
-                DistributionPreset::PerimeterLoad,
-            ] {
-                let result = redistribution_targets_with_commitment(
-                    &map,
-                    1,
-                    map.coordinates(),
-                    total,
-                    preset,
-                    amount_bps,
-                )
-                .unwrap();
-                assert_eq!(result.assigned, total);
-                assert_eq!(result.unassigned, 0);
-                assert_eq!(result.targets.values().sum::<u64>(), total);
-                for (index, coordinate) in map.coordinates().enumerate() {
-                    let movable = u128::from(strengths[index]) * u128::from(amount_bps)
-                        / u128::from(BASIS_POINTS);
-                    let frozen = strengths[index] - movable as u64;
-                    assert!(result.targets[&coordinate] >= frozen);
-                    assert!(result.targets[&coordinate] <= capacities[index]);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn constrained_targets_move_only_the_unfrozen_share_into_a_drawn_shape() {
-        let map = occupied_line(&[100, 100, 100], &[80, 0, 0]);
-        let source = Axial::new(0, 0);
-        let middle = Axial::new(1, 0);
-        let target = Axial::new(2, 0);
-        let result = redistribution_targets_with_constraints(
-            &map,
-            1,
-            BTreeMap::from([(source, 0), (middle, 0), (target, BALANCE_WEIGHT)]),
-            BTreeMap::from([(source, 40), (middle, 0), (target, 0)]),
-            80,
-        )
-        .unwrap();
-
-        assert_eq!(result.targets[&source], 40);
-        assert_eq!(result.targets[&middle], 0);
-        assert_eq!(result.targets[&target], 40);
-        assert_eq!(result.assigned, 80);
+        assert_eq!(result.targets, vec![50, 100]);
+        assert_eq!(result.assigned, 150);
         assert_eq!(result.unassigned, 0);
-        assert_eq!(result.targets.values().sum::<u64>(), 80);
     }
 
     #[test]
-    fn constrained_targets_reject_a_shape_that_cannot_hold_the_movable_share() {
-        let map = occupied_line(&[100, 20], &[80, 0]);
-        let source = Axial::new(0, 0);
-        let target = Axial::new(1, 0);
-
-        assert_eq!(
-            redistribution_targets_with_constraints(
-                &map,
-                1,
-                BTreeMap::from([(source, 0), (target, BALANCE_WEIGHT)]),
-                BTreeMap::from([(source, 40), (target, 0)]),
-                80,
-            ),
-            Err(DistributionError::InsufficientTargetCapacity { unassigned: 20 })
-        );
-    }
-
-    #[test]
-    fn constrained_targets_reject_a_nonempty_movable_share_without_a_target() {
-        let map = occupied_line(&[100], &[80]);
-        let source = Axial::new(0, 0);
-
-        assert_eq!(
-            redistribution_targets_with_constraints(
-                &map,
-                1,
-                BTreeMap::from([(source, 0)]),
-                BTreeMap::from([(source, 79)]),
-                80,
-            ),
-            Err(DistributionError::InsufficientTargetCapacity { unassigned: 1 })
-        );
+    fn dense_weighted_targets_respect_capacity_and_weight_bias() {
+        let coordinates = [Axial::new(0, 0), Axial::new(1, 0), Axial::new(2, 0)];
+        let capacities = [100_u64, 100, 100];
+        let result = redistribution_targets_dense_with_weights(
+            &coordinates,
+            &capacities,
+            150,
+            vec![1, 2, 3],
+        )
+        .unwrap();
+        assert_eq!(result.targets, vec![25, 50, 75]);
+        assert_eq!(result.assigned, 150);
     }
 
     #[test]
@@ -1311,7 +539,11 @@ mod tests {
         let result = redistribution_targets_with_fallback_constraints(
             &map,
             1,
-            BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+            BTreeMap::from([
+                (source_a, 0),
+                (source_b, 0),
+                (target, UNIFORM_ALLOCATION_WEIGHT),
+            ]),
             BTreeMap::from([(source_a, 0), (source_b, 0), (target, 0)]),
             90,
         )
@@ -1334,7 +566,11 @@ mod tests {
         let result = redistribution_targets_with_fallback_constraints(
             &map,
             1,
-            BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+            BTreeMap::from([
+                (source_a, 0),
+                (source_b, 0),
+                (target, UNIFORM_ALLOCATION_WEIGHT),
+            ]),
             BTreeMap::from([(source_a, 0), (source_b, 0), (target, 0)]),
             120,
         )
@@ -1362,7 +598,11 @@ mod tests {
         let result = redistribution_targets_with_fallback_constraints(
             &map,
             1,
-            BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+            BTreeMap::from([
+                (source_a, 0),
+                (source_b, 0),
+                (target, UNIFORM_ALLOCATION_WEIGHT),
+            ]),
             BTreeMap::from([(source_a, 45), (source_b, 0), (target, 0)]),
             80,
         )
@@ -1383,7 +623,7 @@ mod tests {
             redistribution_targets_with_fallback_constraints(
                 &map,
                 1,
-                BTreeMap::from([(source, 0), (target, BALANCE_WEIGHT)]),
+                BTreeMap::from([(source, 0), (target, UNIFORM_ALLOCATION_WEIGHT)]),
                 BTreeMap::from([(source, 0), (target, 0)]),
                 50,
             ),
@@ -1407,7 +647,11 @@ mod tests {
                     let result = redistribution_targets_with_fallback_constraints(
                         &map,
                         1,
-                        BTreeMap::from([(source_a, 0), (source_b, 0), (target, BALANCE_WEIGHT)]),
+                        BTreeMap::from([
+                            (source_a, 0),
+                            (source_b, 0),
+                            (target, UNIFORM_ALLOCATION_WEIGHT),
+                        ]),
                         BTreeMap::from([(source_a, 0), (source_b, 0), (target, 0)]),
                         total,
                     )
@@ -1422,44 +666,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn selection_and_direction_errors_are_explicit() {
-        assert_eq!(
-            distribution_weights([], DistributionPreset::Balance),
-            Err(DistributionError::EmptySelection)
-        );
-        assert_eq!(
-            distribution_weights([Axial::ZERO], DistributionPreset::front_load(Axial::ZERO)),
-            Err(DistributionError::ZeroDirection)
-        );
-
-        let map = occupied_line(&[100], &[100]);
-        assert_eq!(
-            redistribution_targets_with_commitment(
-                &map,
-                1,
-                map.coordinates(),
-                100,
-                DistributionPreset::Balance,
-                BASIS_POINTS + 1,
-            ),
-            Err(DistributionError::InvalidCommitmentBps(BASIS_POINTS + 1))
-        );
-        assert_eq!(
-            redistribution_targets_with_commitment(
-                &map,
-                1,
-                map.coordinates(),
-                50,
-                DistributionPreset::Balance,
-                0,
-            ),
-            Err(DistributionError::InfeasibleFrozenStrength {
-                frozen: 100,
-                goal: 50,
-            })
-        );
     }
 }

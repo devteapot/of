@@ -34,7 +34,7 @@ pub struct RunLocalArgs {
     #[arg(long)]
     pub expand_steps: Option<u64>,
     #[arg(long)]
-    pub policy_steps: Option<u64>,
+    pub rebalance_steps: Option<u64>,
     #[arg(long)]
     pub attack_steps: Option<u64>,
     #[arg(long)]
@@ -42,7 +42,7 @@ pub struct RunLocalArgs {
     #[arg(long)]
     pub expand_secs: Option<u64>,
     #[arg(long)]
-    pub policy_secs: Option<u64>,
+    pub rebalance_secs: Option<u64>,
     #[arg(long)]
     pub attack_secs: Option<u64>,
     #[arg(long)]
@@ -149,11 +149,11 @@ pub fn run(args: RunLocalArgs) -> Result<()> {
         preset: args.preset,
         output_dir: args.output_dir.clone(),
         expand_steps: args.expand_steps,
-        policy_steps: args.policy_steps,
+        rebalance_steps: args.rebalance_steps,
         attack_steps: args.attack_steps,
         reexpand_steps: args.reexpand_steps,
         expand_secs: args.expand_secs,
-        policy_secs: args.policy_secs,
+        rebalance_secs: args.rebalance_secs,
         attack_secs: args.attack_secs,
         reexpand_secs: args.reexpand_secs,
         warmup_steps: args.warmup_steps,
@@ -312,8 +312,8 @@ fn base_command(
         })
         .arg("--expand-steps")
         .arg(schedule.expand_steps.to_string())
-        .arg("--policy-steps")
-        .arg(schedule.policy_steps.to_string())
+        .arg("--rebalance-steps")
+        .arg(schedule.rebalance_steps.to_string())
         .arg("--attack-steps")
         .arg(schedule.attack_steps.to_string())
         .arg("--reexpand-steps")

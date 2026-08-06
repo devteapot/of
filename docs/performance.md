@@ -10,15 +10,15 @@ not sharded.
 
 ## What is measured
 
-`match-perf` drives a fresh one-shot match through expansion, optional Center
-policy, and optional attack phases. The coordinator samples the authoritative
-`logical_step` counter and records:
+`match-perf` drives a fresh one-shot match through expansion, optional
+front-rebalance (`--rebalance-steps` phase), and optional attack phases.
+The coordinator samples the authoritative `logical_step` counter and records:
 
 | Artifact | Contents |
 | --- | --- |
 | `timeline.csv` | elapsed time, logical step/delta, client-observed gap and ms/step, phase, packet/order/front counts, controlled-cell min/p50/p95/max/sum |
 | `players.csv` | long-form `(logical_step, player_id, controlled_cells)` snapshots |
-| `worker-<first>-<last>.jsonl` | per-shard join/command receipt status and latency |
+| `worker-<first>-<last>.jsonl` | per-shard join/command receipt status and latency, including front-rebalance attempted/accepted/skipped counts |
 | `metadata.json` | full scenario, host/db, map size/hash, shard layout, git HEAD + dirty flag, timing caveat |
 | `summary.json` | observed steps (`sum(step_delta)`), weighted p50/p95/p99/max ms/step, max packets/orders/fronts, failures, early completion |
 
@@ -59,7 +59,7 @@ cargo run -p match-perf -- run-local \
   --players 32 \
   --shard-size 8 \
   --expand-steps 40 \
-  --policy-steps 40 \
+  --rebalance-steps 40 \
   --attack-steps 0
 ```
 
@@ -79,14 +79,14 @@ Prefer **logical-step** durations so distributed workers share one clock:
 | Flag | Meaning |
 | --- | --- |
 | `--expand-steps` | expansion phase length in authoritative steps |
-| `--policy-steps` | Center-policy measurement length |
+| `--rebalance-steps` | front-rebalance measurement length (issues `issue_front_rebalance`) |
 | `--attack-steps` | attack measurement length (`0` skips) |
 | `--reexpand-steps` | re-issue expansion waves every N steps while expanding |
 | `--warmup-steps` | shared absolute warmup before phase progress (default **120**) |
 | `--subscription-mode` | `full-client` (default) or `command-only` |
 | `--command-spread` | deterministic player stagger modulus for phase waves (`<=` wave/phase duration) |
 
-Wall-second aliases (`--expand-secs`, `--policy-secs`, `--attack-secs`,
+Wall-second aliases (`--expand-secs`, `--rebalance-secs`, `--attack-secs`,
 `--reexpand-secs`) convert at the nominal 250 ms cadence when step flags are
 omitted. Workers and the coordinator synchronize phase from
 `logical_step - warmup_steps` on the shared DB clock, not from wall time or
@@ -110,7 +110,7 @@ cargo run -p match-perf -- coordinator \
   --shard-size 50 \
   --output-dir /data/runs/val-500 \
   --expand-steps 80 \
-  --policy-steps 80 \
+  --rebalance-steps 80 \
   --attack-steps 0
 ```
 
@@ -125,14 +125,14 @@ cargo run -p match-perf -- worker \
   --database of-match-perf-500 \
   --first-player 1 --player-count 50 --match-players 500 \
   --output-dir /data/runs/val-500 \
-  --expand-steps 80 --policy-steps 80 --attack-steps 0
+  --expand-steps 80 --rebalance-steps 80 --attack-steps 0
 
 cargo run -p match-perf -- worker \
   --host http://match-host:3000 \
   --database of-match-perf-500 \
   --first-player 51 --player-count 50 --match-players 500 \
   --output-dir /data/runs/val-500 \
-  --expand-steps 80 --policy-steps 80 --attack-steps 0
+  --expand-steps 80 --rebalance-steps 80 --attack-steps 0
 # ... through player 500
 ```
 
@@ -150,9 +150,9 @@ Worker connections:
 
 Command IDs are deterministic and spread by player ID so concurrent workers never
 collide. `--command-spread` must not exceed the relevant expand-wave /
-policy / attack duration; workers keep pending player sets and dispatch due
+rebalance / attack duration; workers keep pending player sets and dispatch due
 residues across subsequent logical steps so every seat executes **exactly once**
-per expansion wave and once for policy/attack (default spread 1 = concurrent
+per expansion wave and once for rebalance/attack (default spread 1 = concurrent
 fanout of the full due batch). Phase progress uses one shared absolute epoch:
 `phase_progress = logical_step - warmup_steps` (default warmup 120). Workers fan
 out per-seat reducer submissions before awaiting callbacks so shard load is
@@ -165,12 +165,22 @@ grace window after a worker exit so that summary can finalize before remaining
 children are killed. Remote/no-shared-FS runs should omit
 `--wait-for-worker-status`; the phase clock remains database-based either way.
 
+The `--rebalance-steps` phase drives **front rebalance**. Each worker observer derives, when
+possible, one complete owned traversable component and two distinct strategic
+front seeds (`hex_core::strategic_fronts`), then seats issue
+`issue_front_rebalance` with the configured `--command-share-bps` and an empty
+supersede list. Component cell IDs are exact and deterministic. Players whose
+current topology lacks two usable fronts are **skipped and reported** (worker
+JSONL + console summary counts: attempted/accepted/skipped) rather than sent an
+invalid command. Issued commands still fail the run if rejected.
+
 Attack commands are optional. When enabled, each seat must have a real
 traversable adjacent owned→enemy front; otherwise the worker fails closed.
 
 ## Matrix script
 
-`scripts/run-match-perf-matrix.sh` walks the default scale matrix:
+`scripts/run-match-perf-matrix.sh` walks the default scale matrix **headless**
+by default:
 
 - players: `2 8 32 128 500`
 - presets: `dev playtest validation`
@@ -178,11 +188,24 @@ traversable adjacent owned→enemy front; otherwise the worker fails closed.
 It requires an explicit destructive confirmation flag, publishes a **unique**
 fresh database per cell with `--delete-data`, runs `run-local`, traps/cleans
 child processes, preserves non-overwriting run directories, and appends
-`matrix.csv` from each `summary.json`.
+`matrix.csv` from each `summary.json`. Matrix rows also aggregate
+`front_rebalance_attempted`, `front_rebalance_accepted`, and
+`front_rebalance_skipped` from worker logs so a fast run cannot hide a topology
+that exercised no rebalance commands.
 
 ```bash
+# Headless matrix (default): no Bevy window, CSV/JSON only.
 ./scripts/run-match-perf-matrix.sh --confirm-destructive-matrix
+
+# Optional Bevy viewer attached as player 1 (reuses the worker seat token).
+./scripts/run-match-perf-matrix.sh --confirm-destructive-matrix --viewer
+# or: OF_PERF_VIEWER=1 ./scripts/run-match-perf-matrix.sh --confirm-destructive-matrix
 ```
+
+`--viewer` / `OF_PERF_VIEWER` does not change headless load generation or
+artifact layout. The script copies `player-1.token` into a unique
+`.spacetime-data/client-perf-viewer-…` profile path so the game client reuses
+the worker identity, and tears the viewer + token down between cells / on exit.
 
 Useful environment overrides:
 
@@ -191,13 +214,14 @@ Useful environment overrides:
 | `OF_PERF_PLAYERS` | `2 8 32 128 500` | player counts |
 | `OF_PERF_PRESETS` | `dev playtest validation` | map presets |
 | `OF_PERF_SHARD_SIZE` | `32` | worker shard size |
-| `OF_PERF_EXPAND_STEPS` / `POLICY` / `ATTACK` / `REEXPAND` | short smoke defaults | phase lengths |
+| `OF_PERF_EXPAND_STEPS` / `POLICY` / `ATTACK` / `REEXPAND` | short smoke defaults | phase lengths (`POLICY` = front-rebalance phase) |
 | `OF_PERF_WARMUP_STEPS` | `120` | shared warmup before phase progress |
 | `OF_PERF_OUT_ROOT` | `match-perf-runs/matrix-<ts>` | artifact root |
 | `OF_PERF_TIMEOUT_SECS` | `3600` | per-cell timeout |
 | `OF_PERF_HOST` | `http://127.0.0.1:3000` | client SpacetimeDB URI |
 | `OF_PERF_SERVER` | `local` | explicit `spacetime publish --server` target |
 | `OF_PERF_BIN` | `cargo run -p match-perf --` | optional prebuilt binary |
+| `OF_PERF_VIEWER` | `0` | `1`/`true`/`yes`/`on` launches a Bevy viewer as player 1 |
 
 A full 500 × validation cell is a long run. Start with tiny step counts and a
 reduced player list when validating the harness itself.

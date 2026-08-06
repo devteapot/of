@@ -45,8 +45,8 @@ garrison cost, and enemy infantry are rechecked during execution.
 
 ## Force Share
 
-One persisted Share percentage applies only to Expand Clusters and Attack
-Clusters. Each participating source cell contributes that percentage of its
+One persisted Share percentage applies to Expand Clusters, Attack Clusters,
+and Front Rebalance. Each participating source cell contributes that percentage of its
 action-available infantry exactly once: stationary free strength plus
 yieldable background-policy strength physically inside the source, excluding
 troops committed to another explicit action. A selected source cluster with no
@@ -67,55 +67,36 @@ click neither replaces nor retasks the first. A click with different sources,
 targets, focus, or Share waits until the current rapid-repeat group settles so
 it cannot be mistaken for a replay.
 
-## Persistent cluster policy
+## Strategic fronts and explicit rebalance
 
-`R` cycles the selected clusters through Balanced, Perimeter, and Center policy.
-The directional key gesture sets Directional policy with an exact axial-facing
-vector. A policy is cluster metadata, not a one-shot percentage command:
+A strategic front is a set of deployable directed edges leaving one complete
+owned cluster. Hostile runs are grouped by opponent. A neutral gap between two
+runs against the same opponent keeps them in one hostile front; another opponent
+splits the hostile frontage. Neutral-facing edges are grouped by the hostile
+fronts that bound them around the perimeter: interruptions by the same hostile
+front remain one neutral front, while the neutral sections on opposite sides of
+two different hostile fronts remain independent. Neutral bridge edges remain in
+their neutral front, so an edge or owned boundary hex may correctly belong to
+more than one front. Off-map,
+impassable, uncapturable, and cliff-blocked edges are ignored as non-deployable
+markers and never appear in a front.
 
-- **Balanced** evens the free pool across residual capacity.
-- **Perimeter** weights free infantry toward the current boundary.
-- **Center** weights it toward increasing boundary depth.
-- **Directional** weights it toward the selected facing.
+Select exactly one complete cluster, press `B`, and drag from an owned cell on
+the source front to an owned cell on another front. Authority re-derives both
+fronts from current topology, snapshots Share once from movable source-front
+troops, and computes terrain-aware aggregate routes to the destination. Troops
+then move physically through the normal packet pipeline and remain subject to
+throughput, capacity, route invalidation, combat, and future interception.
 
-Policy maintenance plans only from free infantry and residual military
-capacity. Infantry committed to live Expand, Attack, Push, or Reshape packets
-is excluded from the policy population, while those packets still reserve the
-capacity they physically occupy. Policy therefore neither moves active action
-troops nor counterbalances against them, and it cannot overfill around them.
+Fronts have equal strategic importance by default. Their total-perimeter size
+does not silently alter the player's cross-front allocation. Once a target
+front is chosen, exposed edge count and available capacity weight placement
+inside that front. This gives longer fronts useful frontage without reintroducing
+constant global balancing.
 
-An accepted explicit command atomically preempts any background
-policy-maintenance order intersecting its source clusters. The allocation
-yields to that command; if planning rejects the command, the maintenance order
-is left intact. This automatic yield never applies to another player-issued
-action, whose allocation remains fixed until it settles, completes, or is
-explicitly stopped.
-
-Yielding cancels only the temporary maintenance dispatch, not the cluster's
-policy metadata. The assignment persists through the explicit action and a
-later maintenance pass resumes it whenever troops and capacity become free.
-
-Capacity pressure does not make background policy movement count as delivered.
-Blocked policy packets remain queued until reconciliation replaces their stale
-plan from the troops' current physical cells. That replacement can use local
-relay handoffs through a saturated connector: resident strength moves onward as
-incoming strength replaces it. This prevents a full, already-on-target cell from
-creating a permanent high-strength pocket elsewhere in a large cluster. The
-policy calculation still uses the whole free pool; the player's Share is not an
-input and remains exclusive to Expand Clusters and Attack Clusters.
-
-Normal clients do not render packet-flow trails for this automatic maintenance.
-The authority still executes and accounts for every policy packet; only its
-presentation is filtered. `./scripts/dev.sh` keeps the trails hidden by default;
-press `F4` in an online development client to show or hide them immediately for
-that window. `--debug-policy-flows` remains available only as an optional
-initial-visible state (and applies to both clients when passed to `dev.sh`).
-Release builds expose neither the key nor the argument.
-
-Newly captured cells inherit the policy of their current connected cluster. A
-split keeps the per-cell lineage on both children. When clusters merge, the
-policy with the newest explicit player revision wins for the merged component;
-the player can change it immediately afterward.
+There is no scheduled background redistribution or persistent troop-density
+policy. Redistribution occurs only through explicit Front Rebalance or Reshape
+commands.
 
 ## Reshape and stop
 
@@ -132,10 +113,9 @@ conserved overflow outside it. Active unrelated allocations remain fixed, and
 disconnected source parts with no reachable target stay unchanged.
 
 `X` snapshots and previews the exact live explicit dispatches intersecting the
-selected clusters. Background policy maintenance is excluded. Confirming stops
-only that explicit snapshot; it does not clear policy metadata or disable later
-maintenance. `Escape` cancels a staged target, reshape, or stop preview; in idle
-mode it clears the cluster selection.
+selected clusters. Confirming stops only that explicit snapshot. `Escape`
+cancels a staged target, front rebalance, reshape, or stop preview; in idle mode
+it clears the cluster selection.
 
 ## Deliberate V1 boundary
 

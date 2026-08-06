@@ -477,18 +477,6 @@ fn draw_preview(
 
     if matches!(
         interaction.mode,
-        OrderMode::FrontLoadOrient { .. } | OrderMode::FrontLoadPreview { .. }
-    ) && let Some(direction) = interaction.frontload_direction()
-        && let Some(center) = projected_selection_center(view, interaction)
-    {
-        let direction = Vec3::new(direction.x, 0.0, direction.y);
-        gizmos
-            .arrow(center - direction * 1.2, center + direction * 1.7, SOURCE)
-            .with_tip_length(0.34);
-    }
-
-    if matches!(
-        interaction.mode,
         OrderMode::PushFrontOrient { .. } | OrderMode::PushFrontPreview { .. }
     ) && let Some(direction) = interaction.push_direction()
         && let Some(center) = projected_selection_center(view, interaction)

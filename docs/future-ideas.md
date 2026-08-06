@@ -9,7 +9,7 @@ The intended extension point is the same throughout: troops, resources, and infr
 ### Precise movement for future discrete units
 
 Aggregate infantry intentionally has no exact-strength cell-to-cell command.
-Contextual cluster expansion/attack, persistent density policy, and
+Contextual cluster expansion/attack, strategic Front Rebalance, and
 single-cluster Reshape should first prove that aggregate infantry logistics can
 remain expressive without destination micromanagement. Reshape draws a target
 footprint, but the deterministic allocator—not the player—chooses capacity-safe

@@ -36,14 +36,6 @@ struct ClientArgs {
     /// Credential profile used for the persisted auth token (env: `OF_PROFILE`).
     #[arg(long)]
     profile: Option<String>,
-
-    /// Start with persistent cluster-policy packet animations visible.
-    ///
-    /// This presentation-only switch is intentionally absent from release
-    /// builds so it cannot become part of the normal player control surface.
-    #[cfg(debug_assertions)]
-    #[arg(long)]
-    debug_policy_flows: bool,
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -54,16 +46,11 @@ pub struct ClientConfig {
     pub preferred_player: u16,
     pub display_name: String,
     pub profile: String,
-    /// Presentation-only diagnostic state. Debug clients may toggle it at
-    /// runtime with F4; authoritative policy execution and troop accounting
-    /// never consult this value.
-    pub debug_policy_flows: bool,
 }
 
 impl ClientConfig {
     pub fn from_process() -> Self {
         let args = ClientArgs::parse();
-        let debug_policy_flows = debug_policy_flows(&args);
         let preferred_player = args
             .player
             .or_else(|| env_u16("OF_PLAYER"))
@@ -95,7 +82,6 @@ impl ClientConfig {
                 .unwrap_or_else(|| format!("Player {preferred_player}")),
             preferred_player,
             profile,
-            debug_policy_flows,
         }
     }
 
@@ -109,16 +95,6 @@ impl ClientConfig {
     pub const fn mode_label(&self) -> &'static str {
         if self.offline { "Offline" } else { "Online" }
     }
-}
-
-#[cfg(debug_assertions)]
-const fn debug_policy_flows(args: &ClientArgs) -> bool {
-    args.debug_policy_flows
-}
-
-#[cfg(not(debug_assertions))]
-const fn debug_policy_flows(_args: &ClientArgs) -> bool {
-    false
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -159,26 +135,5 @@ mod tests {
         assert_eq!(safe_profile("player_2"), Some("player_2".to_owned()));
         assert_eq!(safe_profile("../../token"), None);
         assert_eq!(safe_profile(""), None);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn debug_build_keeps_policy_flows_off_unless_requested() {
-        let normal = ClientArgs::try_parse_from(["game-client"])
-            .expect("debug clients accept their normal command line");
-        assert!(!debug_policy_flows(&normal));
-
-        let args = ClientArgs::try_parse_from(["game-client", "--debug-policy-flows"])
-            .expect("debug builds expose the diagnostic flag");
-        assert!(debug_policy_flows(&args));
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn release_build_rejects_the_policy_flow_diagnostic_flag() {
-        assert!(
-            ClientArgs::try_parse_from(["game-client", "--debug-policy-flows"]).is_err(),
-            "release CLI must not expose the debug-only flag"
-        );
     }
 }

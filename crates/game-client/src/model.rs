@@ -86,46 +86,6 @@ pub enum MatchPhase {
     Victory(u32),
 }
 
-/// Persistent troop-distribution behavior attached to a complete owned
-/// traversable cluster. The policy describes only troops that are currently
-/// free; live action packets remain outside its target calculation while still
-/// occupying physical capacity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClusterPolicy {
-    Balanced,
-    Center,
-    Perimeter,
-    Directional,
-}
-
-impl ClusterPolicy {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Balanced => "BALANCED",
-            Self::Center => "CENTER",
-            Self::Perimeter => "PERIMETER",
-            Self::Directional => "DIRECTIONAL",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterPolicyView {
-    pub kind: ClusterPolicy,
-    /// Exact fixed-point axial facing for `Directional`; zero otherwise.
-    pub orientation: Axial,
-    /// Authority-owned revision used to resolve cluster merges.
-    pub revision: u64,
-}
-
-impl ClusterPolicyView {
-    pub const BALANCED_DEFAULT: Self = Self {
-        kind: ClusterPolicy::Balanced,
-        orientation: Axial::ZERO,
-        revision: 0,
-    };
-}
-
 impl MatchPhase {
     pub fn label(self, conquest_threshold_bps: u32) -> String {
         match self {
@@ -210,10 +170,6 @@ pub struct ContestedCellView {
 pub struct RetaskProjection {
     pub handle_orders: BTreeMap<Axial, BTreeSet<u64>>,
     pub active_order_ids: BTreeSet<u64>,
-    /// Active internal redistribution orders issued by persistent cluster
-    /// policy maintenance. These orders yield automatically to an explicit
-    /// cluster action, but are not exposed as user-selected retask handles.
-    pub background_policy_order_ids: BTreeSet<u64>,
     /// Persistent launch cells from authoritative `TransferSource` rows.
     /// Unlike packet locations these remain stable after an action advances,
     /// allowing a selected source cluster to stop work it originally issued.
@@ -249,11 +205,6 @@ pub struct ProjectedOrderSelection {
     pub unrelated_destination_claims: BTreeSet<Axial>,
     pub superseded_order_count: usize,
     pub superseded_strength: u64,
-    /// Background policy work the authority will preempt automatically. This
-    /// is reported separately from explicit retask handles because these IDs
-    /// must never be sent in a user supersede payload.
-    pub released_policy_order_count: usize,
-    pub released_policy_strength: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,10 +291,6 @@ pub struct MatchView {
     /// coordinates so their vertex colors are refreshed.
     pub contested_cells: BTreeMap<Axial, ContestedCellView>,
     pub retask_projection: RetaskProjection,
-    /// Per-cell projection of the persistent cluster policy. Storing the
-    /// authority rows directly preserves split lineage and lets the client
-    /// report a mixed selection without inventing stable cluster IDs.
-    pub cluster_policies: BTreeMap<Axial, ClusterPolicyView>,
     /// Advances independently of cell state so order/packet-only changes
     /// invalidate redistribution previews without forcing terrain recoloring.
     pub retask_revision: u64,
@@ -354,15 +301,6 @@ pub struct MatchView {
 }
 
 impl MatchView {
-    pub fn cluster_policy_at(&self, coordinate: Axial) -> Option<ClusterPolicyView> {
-        self.is_local_owned_passable(coordinate).then(|| {
-            self.cluster_policies
-                .get(&coordinate)
-                .copied()
-                .unwrap_or(ClusterPolicyView::BALANCED_DEFAULT)
-        })
-    }
-
     pub fn connecting(preferred_player: u16) -> Self {
         let player_count = preferred_player.max(2);
         Self {
@@ -395,7 +333,6 @@ impl MatchView {
             active_fronts: Vec::new(),
             contested_cells: BTreeMap::new(),
             retask_projection: RetaskProjection::default(),
-            cluster_policies: BTreeMap::new(),
             retask_revision: 0,
             latest_result: "Connecting to authoritative match…".to_owned(),
             order_log: VecDeque::new(),
@@ -531,7 +468,6 @@ impl MatchView {
             }],
             contested_cells: BTreeMap::new(),
             retask_projection: RetaskProjection::default(),
-            cluster_policies: BTreeMap::new(),
             retask_revision: 0,
             latest_result: "Offline fixture loaded · commands resolve locally".to_owned(),
             order_log,
@@ -665,78 +601,6 @@ impl MatchView {
         sources: &BTreeSet<Axial>,
         supersede_order_ids: &BTreeSet<u64>,
     ) -> Result<ProjectedOrderSelection, OrderSelectionProjectionError> {
-        self.project_order_selection_with_policy_release(
-            sources,
-            supersede_order_ids,
-            &BTreeSet::new(),
-        )
-    }
-
-    /// Projects an explicit cluster action using the same priority rule as
-    /// authority: intersecting background policy orders yield automatically,
-    /// while every other active allocation remains fixed.
-    ///
-    /// Cancelling a policy order releases all of its packets, but an explicit
-    /// action may only draw from released strength whose current cell is in
-    /// the selected cluster union. Remote survivors therefore do not expand
-    /// the action's physical source set.
-    pub fn project_cluster_action_selection(
-        &self,
-        sources: &BTreeSet<Axial>,
-        supersede_order_ids: &BTreeSet<u64>,
-    ) -> Result<ProjectedOrderSelection, OrderSelectionProjectionError> {
-        // Legacy explicit retasks may contribute current packet cells beyond
-        // the painted source set. Authority resolves that physical source
-        // union before checking which background policy orders intersect it.
-        let physical_sources = self
-            .project_order_selection(sources, supersede_order_ids)?
-            .cells;
-        let released_policy_order_ids = self
-            .intersecting_background_policy_orders(&physical_sources)
-            .difference(supersede_order_ids)
-            .copied()
-            .collect();
-        self.project_order_selection_with_policy_release(
-            &physical_sources,
-            supersede_order_ids,
-            &released_policy_order_ids,
-        )
-    }
-
-    fn intersecting_background_policy_orders(&self, sources: &BTreeSet<Axial>) -> BTreeSet<u64> {
-        self.retask_projection
-            .background_policy_order_ids
-            .iter()
-            .filter(|&&order_id| {
-                self.retask_projection
-                    .order_source_cells
-                    .get(&order_id)
-                    .is_some_and(|cells| !cells.is_disjoint(sources))
-                    || self
-                        .retask_projection
-                        .order_strength_by_cell
-                        .get(&order_id)
-                        .is_some_and(|strength| {
-                            strength
-                                .keys()
-                                .any(|coordinate| sources.contains(coordinate))
-                        })
-                    || self
-                        .retask_projection
-                        .destination_claims_by_order
-                        .get(&order_id)
-                        .is_some_and(|cells| !cells.is_disjoint(sources))
-            })
-            .copied()
-            .collect()
-    }
-
-    fn project_order_selection_with_policy_release(
-        &self,
-        sources: &BTreeSet<Axial>,
-        supersede_order_ids: &BTreeSet<u64>,
-        released_policy_order_ids: &BTreeSet<u64>,
-    ) -> Result<ProjectedOrderSelection, OrderSelectionProjectionError> {
         if let Some(&invalid) = sources
             .iter()
             .find(|coordinate| !self.is_local_owned_passable(**coordinate))
@@ -760,21 +624,6 @@ impl MatchView {
             }
         }
 
-        let mut released_policy_by_cell = BTreeMap::<Axial, u64>::new();
-        for &order_id in released_policy_order_ids {
-            let Some(strength_by_cell) =
-                self.retask_projection.order_strength_by_cell.get(&order_id)
-            else {
-                continue;
-            };
-            for (&coordinate, &strength) in strength_by_cell {
-                if sources.contains(&coordinate) {
-                    let pooled = released_policy_by_cell.entry(coordinate).or_default();
-                    *pooled = pooled.saturating_add(strength);
-                }
-            }
-        }
-
         let mut projected = ProjectedOrderSelection {
             cells: sources
                 .iter()
@@ -783,14 +632,10 @@ impl MatchView {
                 .collect(),
             superseded_order_count: supersede_order_ids.len(),
             superseded_strength: superseded_by_cell.values().copied().sum(),
-            released_policy_order_count: released_policy_order_ids.len(),
-            released_policy_strength: released_policy_by_cell.values().copied().sum(),
             ..Default::default()
         };
         for (&order_id, reservations) in &self.retask_projection.destination_reservations_by_order {
-            if supersede_order_ids.contains(&order_id)
-                || released_policy_order_ids.contains(&order_id)
-            {
+            if supersede_order_ids.contains(&order_id) {
                 continue;
             }
             for (&coordinate, &strength) in reservations {
@@ -804,9 +649,7 @@ impl MatchView {
             }
         }
         for (&order_id, claims) in &self.retask_projection.destination_claims_by_order {
-            if !supersede_order_ids.contains(&order_id)
-                && !released_policy_order_ids.contains(&order_id)
-            {
+            if !supersede_order_ids.contains(&order_id) {
                 projected
                     .unrelated_destination_claims
                     .extend(claims.iter().copied());
@@ -828,20 +671,12 @@ impl MatchView {
                 .copied()
                 .unwrap_or(0)
                 .min(active);
-            let released_policy = released_policy_by_cell
-                .get(&coordinate)
-                .copied()
-                .unwrap_or(0)
-                .min(active.saturating_sub(superseded));
             // Once an order is explicitly superseded, its current packet cells
             // become physical sources. All otherwise-unallocated infantry at
             // those cells is available too; only unrelated active allocations
             // remain outside the replacement command.
             let unallocated = cell.infantry.saturating_sub(active);
-            let affected = unallocated
-                .saturating_add(superseded)
-                .saturating_add(released_policy)
-                .min(cell.infantry);
+            let affected = unallocated.saturating_add(superseded).min(cell.infantry);
             projected
                 .affected_strength_by_cell
                 .insert(coordinate, affected);
@@ -850,6 +685,16 @@ impl MatchView {
                 .insert(coordinate, cell.infantry.saturating_sub(affected));
         }
         Ok(projected)
+    }
+
+    /// Projects an explicit cluster action. With only explicit orders,
+    /// this matches ordinary order selection over the painted source set.
+    pub fn project_cluster_action_selection(
+        &self,
+        sources: &BTreeSet<Axial>,
+        supersede_order_ids: &BTreeSet<u64>,
+    ) -> Result<ProjectedOrderSelection, OrderSelectionProjectionError> {
+        self.project_order_selection(sources, supersede_order_ids)
     }
 
     pub fn conquest_percent(&self, player: u32) -> f32 {
@@ -1216,34 +1061,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_clusters_default_to_balanced_until_an_authoritative_policy_arrives() {
-        let coordinate = Axial::ZERO;
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(coordinate, flat_cell(coordinate, 10));
-        assert_eq!(
-            view.cluster_policy_at(coordinate),
-            Some(ClusterPolicyView::BALANCED_DEFAULT)
-        );
-
-        view.cluster_policies.insert(
-            coordinate,
-            ClusterPolicyView {
-                kind: ClusterPolicy::Directional,
-                orientation: Axial::new(2, -1),
-                revision: 4,
-            },
-        );
-        assert_eq!(
-            view.cluster_policy_at(coordinate),
-            Some(ClusterPolicyView {
-                kind: ClusterPolicy::Directional,
-                orientation: Axial::new(2, -1),
-                revision: 4,
-            })
-        );
-    }
-
-    #[test]
     fn local_route_respects_cliffs_and_water() {
         let fixture = MatchView::offline_fixture();
         let sources = BTreeSet::from([Axial::new(-10, 1)]);
@@ -1437,133 +1254,6 @@ mod tests {
             projected.unrelated_destination_claims,
             BTreeSet::from([second])
         );
-    }
-
-    #[test]
-    fn cluster_action_releases_only_local_strength_from_intersecting_background_policy() {
-        let selected = Axial::ZERO;
-        let remote = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(selected, flat_cell(selected, 100));
-        view.cells.insert(remote, flat_cell(remote, 50));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7, 9]),
-            background_policy_order_ids: BTreeSet::from([7]),
-            order_source_cells: BTreeMap::from([
-                (7, BTreeSet::from([selected])),
-                (9, BTreeSet::from([selected])),
-            ]),
-            order_strength_by_cell: BTreeMap::from([
-                (7, BTreeMap::from([(selected, 40), (remote, 10)])),
-                (9, BTreeMap::from([(selected, 20), (remote, 20)])),
-            ]),
-            active_strength_by_cell: BTreeMap::from([(selected, 60), (remote, 30)]),
-            destination_reservations_by_order: BTreeMap::from([
-                (7, BTreeMap::from([(remote, 10)])),
-                (9, BTreeMap::from([(selected, 15)])),
-            ]),
-            destination_claims_by_order: BTreeMap::from([
-                (7, BTreeSet::from([remote])),
-                (9, BTreeSet::from([selected])),
-            ]),
-            ..Default::default()
-        });
-
-        let projected = view
-            .project_cluster_action_selection(&BTreeSet::from([selected]), &BTreeSet::new())
-            .expect("intersecting policy work should yield to the cluster action");
-
-        assert_eq!(projected.cells, BTreeSet::from([selected]));
-        assert_eq!(projected.released_policy_order_count, 1);
-        assert_eq!(projected.released_policy_strength, 40);
-        assert_eq!(projected.superseded_order_count, 0);
-        assert_eq!(
-            projected.affected_strength_by_cell,
-            BTreeMap::from([(selected, 80)])
-        );
-        assert_eq!(
-            projected.unaffected_strength_by_cell,
-            BTreeMap::from([(selected, 20)])
-        );
-        assert_eq!(
-            projected.unrelated_destination_reservations_by_cell,
-            BTreeMap::from([(selected, 15)])
-        );
-        assert_eq!(
-            projected.unrelated_destination_claims,
-            BTreeSet::from([selected])
-        );
-    }
-
-    #[test]
-    fn cluster_action_keeps_nonintersecting_policy_and_explicit_actions_fixed() {
-        let selected = Axial::ZERO;
-        let remote = Axial::new(2, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(selected, flat_cell(selected, 100));
-        view.cells.insert(remote, flat_cell(remote, 50));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7, 9]),
-            background_policy_order_ids: BTreeSet::from([7]),
-            order_source_cells: BTreeMap::from([
-                (7, BTreeSet::from([remote])),
-                (9, BTreeSet::from([selected])),
-            ]),
-            order_strength_by_cell: BTreeMap::from([
-                (7, BTreeMap::from([(remote, 10)])),
-                (9, BTreeMap::from([(selected, 30)])),
-            ]),
-            active_strength_by_cell: BTreeMap::from([(selected, 30), (remote, 10)]),
-            destination_claims_by_order: BTreeMap::from([
-                (7, BTreeSet::from([remote])),
-                (9, BTreeSet::from([selected])),
-            ]),
-            ..Default::default()
-        });
-
-        let projected = view
-            .project_cluster_action_selection(&BTreeSet::from([selected]), &BTreeSet::new())
-            .expect("unrelated allocations remain fixed");
-
-        assert_eq!(projected.released_policy_order_count, 0);
-        assert_eq!(
-            projected.affected_strength_by_cell,
-            BTreeMap::from([(selected, 70)])
-        );
-        assert_eq!(
-            projected.unaffected_strength_by_cell,
-            BTreeMap::from([(selected, 30)])
-        );
-    }
-
-    #[test]
-    fn policy_intersection_uses_the_physical_union_from_an_explicit_retask() {
-        let selected = Axial::ZERO;
-        let packet_cell = Axial::new(1, 0);
-        let mut view = MatchView::connecting(1);
-        view.cells.insert(selected, flat_cell(selected, 100));
-        view.cells.insert(packet_cell, flat_cell(packet_cell, 50));
-        view.set_retask_projection(RetaskProjection {
-            active_order_ids: BTreeSet::from([7, 9]),
-            background_policy_order_ids: BTreeSet::from([7]),
-            order_source_cells: BTreeMap::from([(7, BTreeSet::from([packet_cell]))]),
-            order_strength_by_cell: BTreeMap::from([
-                (7, BTreeMap::from([(packet_cell, 20)])),
-                (9, BTreeMap::from([(packet_cell, 10)])),
-            ]),
-            active_strength_by_cell: BTreeMap::from([(packet_cell, 30)]),
-            ..Default::default()
-        });
-
-        let projected = view
-            .project_cluster_action_selection(&BTreeSet::from([selected]), &BTreeSet::from([9]))
-            .expect("the explicit packet cell should participate in policy intersection");
-
-        assert_eq!(projected.cells, BTreeSet::from([selected, packet_cell]));
-        assert_eq!(projected.released_policy_order_count, 1);
-        assert_eq!(projected.released_policy_strength, 20);
-        assert_eq!(projected.superseded_strength, 10);
-        assert_eq!(projected.affected_strength_by_cell[&packet_cell], 50);
     }
 
     #[test]

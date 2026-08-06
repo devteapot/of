@@ -183,13 +183,12 @@ garrisons are evaluated authoritatively during progress.
 
 ### Force Share and live allocations
 
-One persisted **Share** percentage applies only to Expand Clusters and Attack
-Clusters. `[` and `]` adjust it. It is independent of the mobilization
+One persisted **Share** percentage applies to Expand Clusters, Attack Clusters,
+and Front Rebalance. `[` and `]` adjust it. It is independent of the mobilization
 target, which controls future civilian conversion.
 
 On acceptance, each participating source cell contributes Share of its
-action-available infantry exactly once: stationary free strength plus yieldable
-background-policy strength physically inside the source, excluding troops
+action-available infantry exactly once: stationary free strength, excluding troops
 committed to another explicit action. A source with no eligible neutral route
 or shared enemy front contributes nothing. Multiple exits, shared fronts, or
 staged target clusters never multiply the source base. Strength remains
@@ -200,42 +199,23 @@ Selecting the same cluster again does not retask, supersede, or double-allocate
 it. The player must explicitly stop that order if its surviving strength should
 become free.
 
-### Persistent cluster policy
+### Strategic fronts and Front Rebalance
 
-Every cluster has one density policy:
+A strategic front is a continuous arc of deployable edges around one owned
+cluster. Hostile runs are grouped by opponent; neutral gaps may bridge runs
+against the same opponent, while another opponent splits the arc. Impassable,
+uncapturable, cliff-blocked, and off-map edges are excluded.
 
-- **Balanced** evens the free pool across residual military capacity.
-- **Perimeter** weights free infantry toward the current boundary.
-- **Center** weights it toward increasing exact boundary depth.
-- **Directional** weights it toward one exact fixed-point axial facing.
+With exactly one cluster selected, `B` enters Front Rebalance. Dragging from a
+source-front cell to another front snapshots Share of movable source-front
+infantry and creates one explicit terrain-aware movement order. Routes are
+computed once and aggregate packets remain physical and interceptable.
 
-`R` cycles Balanced, Perimeter, and Center on all selected clusters.
-Holding `F`, dragging, and releasing sets Directional policy. Policies are
-persistent metadata rather than one-shot formation commands. As the cluster
-grows, contracts, or changes shape, the authority can redistribute its free
-troops toward the current policy.
-
-Policy computation deliberately excludes infantry in live expansion, attack,
-Push, or Reshape packets from the target population. The same packets still
-consume capacity in the cells they physically occupy. Therefore policy neither
-moves active action troops nor counterbalances its free distribution against
-them, but it also cannot overfill around them. Settled, completed, or cancelled
-strength rejoins the free pool.
-
-Background policy movement yields atomically when an accepted explicit command
-intersects it. A rejected command leaves maintenance untouched, and unrelated
-explicit actions remain fixed. Yielding does not clear the policy metadata; the
-authority resumes maintenance on a later pass when troops and capacity are free.
-Capacity-blocked policy strength remains queued rather than being finalized at
-an intermediate cell. Reconciliation replans from current physical positions
-and can relay resident strength through a saturated connector while incoming
-strength replaces it. Policy always considers the whole free pool and never the
-player's Share; Share remains exclusive to expansion and attack.
-
-Policy lineage is stored on owned cells. Both children of a split inherit their
-existing lineage. Captured cells inherit the connected cluster policy. When
-clusters merge, the policy with the newest explicit player revision wins across
-the merged component; the player can immediately set another one.
+Fronts have equal default strategic importance. Perimeter length does not
+silently assign a larger cluster-wide share. Within the chosen target front,
+exposed edge count and available capacity weight placement. New, split, and
+merged fronts cause no automatic movement; the player issues another explicit
+rebalance when desired.
 
 ### Single-cluster Reshape
 
@@ -259,10 +239,10 @@ target stays unchanged. Internal routes never cross non-friendly ground.
 ### Exact Stop and cancellation
 
 `X` snapshots the exact live explicit-order IDs whose current allocations
-intersect the selected clusters. Background policy maintenance is excluded.
-Confirming Stop cancels only that frozen dispatch set and releases its surviving
-strength at current physical cells. It does not rewind captures, restore
-casualties, clear policy metadata, or cancel a newly arriving unrelated order.
+intersect the selected clusters. Confirming Stop cancels only that frozen
+dispatch set and releases its surviving strength at current physical cells. It
+does not rewind captures, restore casualties, or cancel a newly arriving
+unrelated order.
 
 `Escape` cancels a staged enemy union, Reshape, or Stop preview. In idle mode
 it clears source selection. Successful contextual actions retain source
@@ -369,7 +349,7 @@ Also provisional:
 - terrain capacity and throughput modifiers;
 - combat lethality, frontage ratio, neutral resistance, and uphill penalty;
 - the timer's resolution rule if a timer is enabled;
-- contextual expansion/attack weighting and cluster-policy tuning details.
+- contextual expansion/attack weighting and strategic-front tuning details.
 
 ## V1 Acceptance Criteria
 
@@ -410,7 +390,7 @@ are true:
     movable strength outside; undersized shapes saturate and conserve overflow;
     unrelated allocations remain fixed.
 11. `X` cancels only the exact explicit-dispatch snapshot intersecting selected
-    clusters; background policy maintenance is excluded. Normal selection and
+    clusters. Normal selection and
     contextual commands never implicitly retask another explicit order.
 12. Cutting a corridor creates genuinely independent components whose existing
     population and forces remain usable locally but cannot transfer across it.

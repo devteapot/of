@@ -17,7 +17,6 @@ pub struct CellState {
     pub chunk_q: i16,
     pub chunk_r: i16,
     pub last_changed_step: u64,
-    pub last_policy_changed_step: u64,
 }
 
 impl __sdk::InModule for CellState {
@@ -38,7 +37,6 @@ pub struct CellStateCols {
     pub chunk_q: __sdk::__query_builder::Col<CellState, i16>,
     pub chunk_r: __sdk::__query_builder::Col<CellState, i16>,
     pub last_changed_step: __sdk::__query_builder::Col<CellState, u64>,
-    pub last_policy_changed_step: __sdk::__query_builder::Col<CellState, u64>,
 }
 
 impl __sdk::__query_builder::HasCols for CellState {
@@ -55,10 +53,6 @@ impl __sdk::__query_builder::HasCols for CellState {
             chunk_q: __sdk::__query_builder::Col::new(table_name, "chunk_q"),
             chunk_r: __sdk::__query_builder::Col::new(table_name, "chunk_r"),
             last_changed_step: __sdk::__query_builder::Col::new(table_name, "last_changed_step"),
-            last_policy_changed_step: __sdk::__query_builder::Col::new(
-                table_name,
-                "last_policy_changed_step",
-            ),
         }
     }
 }

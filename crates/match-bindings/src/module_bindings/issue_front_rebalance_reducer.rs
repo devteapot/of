@@ -6,61 +6,76 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct IssuePerimeterLoadArgs {
+pub(super) struct IssueFrontRebalanceArgs {
     pub client_command_id: u64,
-    pub source_cells: Vec<u32>,
+    pub source_component_cells: Vec<u32>,
+    pub source_front_seed: u32,
+    pub target_front_seed: u32,
+    pub commitment_bps: u32,
     pub supersede_order_ids: Vec<u64>,
 }
 
-impl From<IssuePerimeterLoadArgs> for super::Reducer {
-    fn from(args: IssuePerimeterLoadArgs) -> Self {
-        Self::IssuePerimeterLoad {
+impl From<IssueFrontRebalanceArgs> for super::Reducer {
+    fn from(args: IssueFrontRebalanceArgs) -> Self {
+        Self::IssueFrontRebalance {
             client_command_id: args.client_command_id,
-            source_cells: args.source_cells,
+            source_component_cells: args.source_component_cells,
+            source_front_seed: args.source_front_seed,
+            target_front_seed: args.target_front_seed,
+            commitment_bps: args.commitment_bps,
             supersede_order_ids: args.supersede_order_ids,
         }
     }
 }
 
-impl __sdk::InModule for IssuePerimeterLoadArgs {
+impl __sdk::InModule for IssueFrontRebalanceArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `issue_perimeter_load`.
+/// Extension trait for access to the reducer `issue_front_rebalance`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait issue_perimeter_load {
-    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible.
+pub trait issue_front_rebalance {
+    /// Request that the remote module invoke the reducer `issue_front_rebalance` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`issue_perimeter_load:issue_perimeter_load_then`] to run a callback after the reducer completes.
-    fn issue_perimeter_load(
+    /// /// Use [`issue_front_rebalance:issue_front_rebalance_then`] to run a callback after the reducer completes.
+    fn issue_front_rebalance(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
+        source_component_cells: Vec<u32>,
+        source_front_seed: u32,
+        target_front_seed: u32,
+        commitment_bps: u32,
         supersede_order_ids: Vec<u64>,
     ) -> __sdk::Result<()> {
-        self.issue_perimeter_load_then(
+        self.issue_front_rebalance_then(
             client_command_id,
-            source_cells,
+            source_component_cells,
+            source_front_seed,
+            target_front_seed,
+            commitment_bps,
             supersede_order_ids,
             |_, _| {},
         )
     }
 
-    /// Request that the remote module invoke the reducer `issue_perimeter_load` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `issue_front_rebalance` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn issue_perimeter_load_then(
+    fn issue_front_rebalance_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
+        source_component_cells: Vec<u32>,
+        source_front_seed: u32,
+        target_front_seed: u32,
+        commitment_bps: u32,
         supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
@@ -71,11 +86,14 @@ pub trait issue_perimeter_load {
     ) -> __sdk::Result<()>;
 }
 
-impl issue_perimeter_load for super::RemoteReducers {
-    fn issue_perimeter_load_then(
+impl issue_front_rebalance for super::RemoteReducers {
+    fn issue_front_rebalance_then(
         &self,
         client_command_id: u64,
-        source_cells: Vec<u32>,
+        source_component_cells: Vec<u32>,
+        source_front_seed: u32,
+        target_front_seed: u32,
+        commitment_bps: u32,
         supersede_order_ids: Vec<u64>,
 
         callback: impl FnOnce(
@@ -85,9 +103,12 @@ impl issue_perimeter_load for super::RemoteReducers {
         + 'static,
     ) -> __sdk::Result<()> {
         self.imp.invoke_reducer_with_callback(
-            IssuePerimeterLoadArgs {
+            IssueFrontRebalanceArgs {
                 client_command_id,
-                source_cells,
+                source_component_cells,
+                source_front_seed,
+                target_front_seed,
+                commitment_bps,
                 supersede_order_ids,
             },
             callback,

@@ -15,6 +15,7 @@ mod attack;
 mod client;
 mod common;
 mod coordinator;
+mod front_rebalance;
 mod output;
 mod queries;
 mod run_local;
@@ -37,7 +38,8 @@ Use `run-local` for a one-host multi-process load generation, or run \
 `coordinator` and `worker` independently on different hosts.\n\n\
 Example (local 32-player playtest):\n  \
 cargo run -p match-perf -- run-local --database of-match-perf --preset playtest \
---players 32 --shard-size 8 --expand-steps 20 --policy-steps 20 --attack-steps 0"
+--players 32 --shard-size 8 --expand-steps 20 --rebalance-steps 20 --attack-steps 0\n\n\
+The --rebalance-steps phase issues issue_front_rebalance."
 )]
 struct Cli {
     #[command(subcommand)]

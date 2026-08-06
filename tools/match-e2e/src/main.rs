@@ -17,16 +17,14 @@ use hex_core::{
     redistribution_targets_with_fallback_constraints,
 };
 use match_bindings::{
-    CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess,
-    ClusterPolicyAssignmentTableAccess, ClusterPolicyKind, CommandReceipt,
+    CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, CommandReceipt,
     CommandReceiptTableAccess, DbConnection, MatchConfigTableAccess, MatchPhase,
     MatchStateTableAccess, MobilizationPolicyTableAccess, OrderKind, OrderStatus,
     PlayerSlotTableAccess, ReceiptStatus, TerrainClass, TransferDestinationTableAccess,
     TransferOrder, TransferOrderTableAccess, TransferSourceTableAccess, TransitPacket,
     TransitPacketTableAccess, TransitRouteTableAccess, cancel_orders as _,
     issue_attack_clusters as _, issue_expand_all as _, issue_expand_clusters as _,
-    issue_push_front as _, issue_reshape as _, join_match as _, set_cluster_policy as _,
-    set_mobilization_target as _,
+    issue_push_front as _, issue_reshape as _, join_match as _, set_mobilization_target as _,
 };
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
@@ -316,31 +314,6 @@ impl Client {
             )
             .context("send issue_attack_clusters")?;
         wait_for_reducer(&rx, timeout, "issue_attack_clusters")
-    }
-
-    fn set_cluster_policy(
-        &self,
-        command_id: u64,
-        seed_cells: &[u32],
-        kind: ClusterPolicyKind,
-        orientation: Axial,
-        timeout: Duration,
-    ) -> Result<()> {
-        let (tx, rx) = mpsc::channel();
-        self.conn
-            .reducers
-            .set_cluster_policy_then(
-                command_id,
-                seed_cells.to_vec(),
-                kind,
-                orientation.q,
-                orientation.r,
-                move |_, result| {
-                    let _ = tx.send(flatten_reducer_result(result));
-                },
-            )
-            .context("send set_cluster_policy")?;
-        wait_for_reducer(&rx, timeout, "set_cluster_policy")
     }
 
     fn issue_reshape(
@@ -1387,8 +1360,8 @@ fn main() -> Result<()> {
         },
     )?;
 
-    println!("[9/10] proving cluster-first expansion, policy, and attack controls");
-    let cluster_control_id = exercise_cluster_first_controls(
+    println!("[9/10] proving cluster-first expansion and attack controls");
+    let _cluster_control_id = exercise_cluster_first_controls(
         &player_two,
         expand_cancel_id
             .checked_add(1)
@@ -1396,63 +1369,6 @@ fn main() -> Result<()> {
         timeout,
         poll,
     )?;
-    let completed_policy_order_floor = player_two
-        .conn
-        .db
-        .transfer_order()
-        .iter()
-        .filter(|order| {
-            order.player_id == PLAYER_TWO
-                && is_background_policy_order(order)
-                && order.status == OrderStatus::Completed
-        })
-        .map(|order| order.order_id)
-        .max()
-        .unwrap_or(0);
-    let settle_policy_id = unused_command_id(
-        &player_two.conn,
-        PLAYER_TWO,
-        cluster_control_id
-            .checked_add(1)
-            .context("cluster control command ID overflow")?,
-    )?;
-    player_two.set_mobilization_target(settle_policy_id, 0, timeout)?;
-    let settle_receipt = wait_for_receipt(
-        &player_two,
-        PLAYER_TWO,
-        settle_policy_id,
-        "set_mobilization_target",
-        timeout,
-        poll,
-    )?;
-    ensure!(
-        settle_receipt.order_id == 0,
-        "post-attack mobilization receipt unexpectedly referenced order {}",
-        settle_receipt.order_id
-    );
-    wait_until("player-two recruitment stop", timeout, poll, || {
-        Ok(player_two
-            .conn
-            .db
-            .mobilization_policy()
-            .player_id()
-            .find(&PLAYER_TWO)
-            .and_then(|policy| (policy.target_bps == 0).then_some(())))
-    })?;
-    // The live scale fixture grows Player Two past one thousand cells before
-    // freezing recruitment. Draining that physical redistribution can
-    // legitimately outlast one command deadline even while every checkpoint
-    // makes progress, so give convergence two normal operation windows.
-    let policy_settle_timeout = timeout.saturating_mul(2);
-    wait_for_policy_quiescence(&player_two, PLAYER_TWO, policy_settle_timeout, poll)?;
-    wait_for_completed_background_policy_delivery(
-        &player_two,
-        PLAYER_TWO,
-        completed_policy_order_floor,
-        timeout,
-        poll,
-    )?;
-
     println!("[10/10] reconnecting player one with its persisted token");
     let reconnect_count_before = player_two
         .conn
@@ -1508,7 +1424,7 @@ fn main() -> Result<()> {
     reconnected.disconnect(timeout)?;
     player_two.disconnect(timeout)?;
     println!(
-        "PASS: receipts, sparse-seed whole-cluster best-effort Reshape, atomic invalid-shape rejection, persistent cluster policy coexistence and destination delivery, directional Push and retasking, neutral perimeter expansion, cluster-first expansion/attack, conservation/cancellation, and token reuse verified"
+        "PASS: receipts, sparse-seed whole-cluster best-effort Reshape, atomic invalid-shape rejection, directional Push and retasking, neutral perimeter expansion, cluster-first expansion/attack, conservation/cancellation, and token reuse verified"
     );
     Ok(())
 }
@@ -1593,87 +1509,6 @@ fn exercise_cluster_first_controls(
         },
     )?;
 
-    let policy_deadline = Instant::now() + timeout;
-    let mut policy_id_floor = expand_id
-        .checked_add(1)
-        .context("focused cluster expansion command ID overflow")?;
-    let (policy_id, policy_receipt) = loop {
-        let current_action = client
-            .conn
-            .db
-            .transfer_order()
-            .order_id()
-            .find(&expand_receipt.order_id)
-            .context("focused expansion disappeared before policy isolation")?;
-        ensure!(
-            current_action.status == OrderStatus::Active,
-            "focused expansion stopped before a policy transaction could be isolated from simulation progression"
-        );
-        let action_before_policy = stable_action_order_snapshot(&client.conn, &current_action)?;
-        let policy_id = unused_command_id(&client.conn, PLAYER_TWO, policy_id_floor)?;
-        let remaining = policy_deadline.saturating_duration_since(Instant::now());
-        ensure!(
-            !remaining.is_zero(),
-            "simulation advanced across every set_cluster_policy attempt before its action-isolation snapshot could complete"
-        );
-        client.set_cluster_policy(
-            policy_id,
-            &[expand_candidate.source_seed],
-            ClusterPolicyKind::Perimeter,
-            Axial::ZERO,
-            remaining,
-        )?;
-        let policy_receipt = wait_for_receipt(
-            client,
-            PLAYER_TWO,
-            policy_id,
-            "set_cluster_policy",
-            remaining,
-            poll,
-        )?;
-        let action_after_policy = stable_action_order_snapshot(&client.conn, &current_action)?;
-        if action_after_policy.logical_step != action_before_policy.logical_step {
-            policy_id_floor = policy_id
-                .checked_add(1)
-                .context("cluster policy retry command ID overflow")?;
-            continue;
-        }
-        ensure!(
-            action_after_policy == action_before_policy,
-            "set_cluster_policy changed a live ExpandClusters action transactionally: before={action_before_policy:?}, after={action_after_policy:?}"
-        );
-        break (policy_id, policy_receipt);
-    };
-    ensure!(
-        policy_receipt.order_id == 0,
-        "cluster policy metadata command unexpectedly claimed action order {}",
-        policy_receipt.order_id
-    );
-    let component_after_policy =
-        owned_component_containing(&client.conn, PLAYER_TWO, expand_candidate.source_seed)?;
-    assert_complete_cluster_policy_assignment(
-        &client.conn,
-        PLAYER_TWO,
-        &component_after_policy,
-        expand_candidate.source_seed,
-        ClusterPolicyKind::Perimeter,
-        Axial::ZERO,
-    )?;
-    let persisted_action = client
-        .conn
-        .db
-        .transfer_order()
-        .order_id()
-        .find(&expand_receipt.order_id)
-        .context("focused cluster expansion disappeared after policy assignment")?;
-    ensure!(
-        persisted_action.player_id == PLAYER_TWO
-            && persisted_action.client_command_id == expand_id
-            && persisted_action.kind == OrderKind::ExpandClusters
-            && persisted_action.status == OrderStatus::Active,
-        "cluster policy replaced or cancelled the live focused expansion"
-    );
-
     let focused_progress = wait_until(
         "clicked focus participation in the persisted cluster expansion",
         timeout,
@@ -1726,9 +1561,9 @@ fn exercise_cluster_first_controls(
         let expand_cancel_id = unused_command_id(
             &client.conn,
             PLAYER_TWO,
-            policy_id
+            expand_id
                 .checked_add(1)
-                .context("cluster policy command ID overflow")?,
+                .context("focused expansion command ID overflow")?,
         )?;
         client.cancel_orders(expand_cancel_id, &[expand_receipt.order_id], timeout)?;
         let cancel_receipt = wait_for_receipt(
@@ -1783,7 +1618,7 @@ fn exercise_cluster_first_controls(
             "focused expansion entered unexpected status {:?}",
             focused_progress.status
         );
-        policy_id
+        expand_id
     };
 
     let contact_setup_command_id = establish_cluster_contact_with_expansions(
@@ -2213,7 +2048,7 @@ fn exercise_internal_controls(
     timeout: Duration,
     poll: Duration,
 ) -> Result<u64> {
-    wait_for_policy_quiescence(client, PLAYER_ONE, timeout, poll)?;
+    wait_for_order_quiescence(client, PLAYER_ONE, timeout, poll)?;
     let candidate = select_cluster_reshape_candidate(&client.conn, PLAYER_ONE)?;
     ensure!(
         candidate.source_component.len() > 1
@@ -2345,7 +2180,7 @@ fn exercise_internal_controls(
         timeout,
         poll,
     )?;
-    wait_for_policy_quiescence(client, PLAYER_ONE, timeout, poll)?;
+    wait_for_order_quiescence(client, PLAYER_ONE, timeout, poll)?;
     Ok(invalid_reshape_id)
 }
 
@@ -2414,7 +2249,7 @@ fn wait_for_internal_order_completion(
     )
 }
 
-fn wait_for_policy_quiescence(
+fn wait_for_order_quiescence(
     client: &Client,
     player_id: u16,
     timeout: Duration,
@@ -2427,133 +2262,36 @@ fn wait_for_policy_quiescence(
             .match_config()
             .singleton_id()
             .find(&SINGLETON_ID)
-            .context("match config disappeared while waiting for cluster-policy quiescence")?
+            .context("match config disappeared while waiting for order quiescence")?
             .population_step_interval
             .max(1),
     );
     let mut quiet_since = None;
-    wait_until(
-        "persistent cluster-policy quiescence",
-        timeout,
-        poll,
-        || {
-            let logical_step = client
-                .conn
-                .db
-                .match_state()
-                .singleton_id()
-                .find(&SINGLETON_ID)
-                .context("match state disappeared while waiting for cluster-policy quiescence")?
-                .logical_step;
-            let has_active =
-                client.conn.db.transfer_order().iter().any(|order| {
-                    order.player_id == player_id && order.status == OrderStatus::Active
-                });
-            if has_active {
-                quiet_since = None;
-                return Ok(None);
-            }
-            let first_quiet_step = *quiet_since.get_or_insert(logical_step);
-            Ok(
-                (logical_step >= first_quiet_step.saturating_add(population_interval + 1))
-                    .then_some(()),
-            )
-        },
-    )
-}
-
-fn wait_for_completed_background_policy_delivery(
-    client: &Client,
-    player_id: u16,
-    order_id_floor: u64,
-    timeout: Duration,
-    poll: Duration,
-) -> Result<()> {
-    wait_until(
-        "completed background-policy destination delivery",
-        timeout,
-        poll,
-        || {
-            let mut completed_nonzero_orders = 0_usize;
-            for order in client.conn.db.transfer_order().iter().filter(|order| {
-                order.order_id > order_id_floor
-                    && order.player_id == player_id
-                    && is_background_policy_order(order)
-                    && order.status == OrderStatus::Completed
-                    && order.committed_infantry > 0
-            }) {
-                assert_order_conservation(&order)?;
-                ensure!(
-                    order.in_transit_infantry == 0
-                        && order.delivered_infantry == order.committed_infantry
-                        && order.casualty_infantry == 0,
-                    "completed background policy order {} has invalid terminal accounting: committed={}, in_transit={}, delivered={}, casualties={}",
-                    order.order_id,
-                    order.committed_infantry,
-                    order.in_transit_infantry,
-                    order.delivered_infantry,
-                    order.casualty_infantry,
-                );
-
-                let destinations = client
-                    .conn
-                    .db
-                    .transfer_destination()
-                    .iter()
-                    .filter(|destination| destination.order_id == order.order_id)
-                    .collect::<Vec<_>>();
-                ensure!(
-                    !destinations.is_empty(),
-                    "completed background policy order {} has no declared transfer destinations",
-                    order.order_id
-                );
-                let (target_total, received_total) = destinations.iter().try_fold(
-                    (0_u64, 0_u64),
-                    |(target_total, received_total), destination| {
-                        ensure!(
-                            destination.received_infantry == destination.target_infantry,
-                            "completed background policy order {} falsely delivered {} infantry: destination {} received {}/{}",
-                            order.order_id,
-                            order.delivered_infantry,
-                            destination.cell_id,
-                            destination.received_infantry,
-                            destination.target_infantry,
-                        );
-                        Ok::<_, anyhow::Error>((
-                            target_total
-                                .checked_add(destination.target_infantry)
-                                .context("background policy destination target overflow")?,
-                            received_total
-                                .checked_add(destination.received_infantry)
-                                .context("background policy destination receipt overflow")?,
-                        ))
-                    },
-                )?;
-                ensure!(
-                    target_total == order.committed_infantry
-                        && received_total == order.committed_infantry,
-                    "completed background policy order {} committed {} infantry but its declared destinations target {} and actually received {}",
-                    order.order_id,
-                    order.committed_infantry,
-                    target_total,
-                    received_total,
-                );
-                completed_nonzero_orders += 1;
-            }
-            Ok((completed_nonzero_orders > 0).then_some(()))
-        },
-    )
-}
-
-fn is_background_policy_order(order: &TransferOrder) -> bool {
-    order.client_command_id == 0
-        && matches!(
-            order.kind,
-            OrderKind::Balance
-                | OrderKind::FrontLoad
-                | OrderKind::CoreLoad
-                | OrderKind::PerimeterLoad
+    wait_until("persistent order quiescence", timeout, poll, || {
+        let logical_step = client
+            .conn
+            .db
+            .match_state()
+            .singleton_id()
+            .find(&SINGLETON_ID)
+            .context("match state disappeared while waiting for order quiescence")?
+            .logical_step;
+        let has_active = client
+            .conn
+            .db
+            .transfer_order()
+            .iter()
+            .any(|order| order.player_id == player_id && order.status == OrderStatus::Active);
+        if has_active {
+            quiet_since = None;
+            return Ok(None);
+        }
+        let first_quiet_step = *quiet_since.get_or_insert(logical_step);
+        Ok(
+            (logical_step >= first_quiet_step.saturating_add(population_interval + 1))
+                .then_some(()),
         )
+    })
 }
 
 fn assert_internal_order(
@@ -2927,7 +2665,7 @@ fn select_cluster_reshape_candidate(
         .context("whole-cluster Reshape coverage needs a foreign, neutral, or impassable target")?;
     ensure!(
         allocated_infantry_by_cell(conn, player_id)?.is_empty(),
-        "whole-cluster Reshape candidate must be selected after policy orders are quiescent"
+        "whole-cluster Reshape candidate must be selected after active orders are quiescent"
     );
 
     let mut candidates = Vec::new();
@@ -3135,9 +2873,9 @@ fn select_push_front_candidate(conn: &DbConnection, player_id: u16) -> Result<Pu
         .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
         .collect();
 
-    // Explicit movement preempts intersecting background policy work, so only
+    // Only
     // other explicit actions stay unavailable when predicting the commitment.
-    let allocated_by_source = explicit_action_allocated_infantry_by_cell(conn, player_id)?;
+    let allocated_by_source = allocated_infantry_by_cell(conn, player_id)?;
 
     let mut owned_coordinates: Vec<_> = cell_by_coordinate
         .iter()
@@ -3302,9 +3040,8 @@ fn select_expand_all_candidate(conn: &DbConnection, player_id: u16) -> Result<Ex
         .values()
         .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
         .collect();
-    // Background policy packets yield atomically to this explicit expansion;
-    // explicit action packets remain fixed and therefore reduce availability.
-    let allocated_by_cell = explicit_action_allocated_infantry_by_cell(conn, player_id)?;
+    // Existing explicit action packets remain fixed and reduce availability.
+    let allocated_by_cell = allocated_infantry_by_cell(conn, player_id)?;
 
     let owned_ground = cell_by_id
         .values()
@@ -3489,7 +3226,7 @@ fn select_focused_cluster_expand_candidate(
         .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
         .collect::<HashMap<_, _>>();
     let max_elevation_step = current_max_elevation_step(conn)?;
-    let allocated_by_cell = explicit_action_allocated_infantry_by_cell(conn, player_id)?;
+    let allocated_by_cell = allocated_infantry_by_cell(conn, player_id)?;
     let mut candidates = Vec::new();
     for source_component in owned_traversable_components(conn, player_id)? {
         let mut first_ring = BTreeSet::new();
@@ -3582,7 +3319,7 @@ fn select_contact_cluster_expand_candidate(
         .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
         .collect::<HashMap<_, _>>();
     let max_elevation_step = current_max_elevation_step(conn)?;
-    let allocated_by_cell = explicit_action_allocated_infantry_by_cell(conn, player_id)?;
+    let allocated_by_cell = allocated_infantry_by_cell(conn, player_id)?;
     let mut candidates = Vec::new();
     for source_component in owned_traversable_components(conn, player_id)? {
         let Some((distance, focus_cell)) = nearest_neutral_focus_toward_enemy(
@@ -3752,7 +3489,7 @@ fn select_cluster_attack_candidate(
         .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
         .collect::<HashMap<_, _>>();
     let max_elevation_step = current_max_elevation_step(conn)?;
-    let allocated_by_cell = explicit_action_allocated_infantry_by_cell(conn, player_id)?;
+    let allocated_by_cell = allocated_infantry_by_cell(conn, player_id)?;
     let source_components = owned_traversable_components(conn, player_id)?;
     let target_components = owned_traversable_components(conn, enemy_player_id)?;
     let source_sizes = source_components
@@ -3990,21 +3727,6 @@ fn owned_traversable_components(conn: &DbConnection, player_id: u16) -> Result<V
     Ok(components)
 }
 
-fn owned_component_containing(
-    conn: &DbConnection,
-    player_id: u16,
-    seed_cell: u32,
-) -> Result<BTreeSet<u32>> {
-    owned_traversable_components(conn, player_id)?
-        .into_iter()
-        .find(|component| component.contains(&seed_cell))
-        .with_context(|| {
-            format!(
-                "cell {seed_cell} is not in any traversable component owned by player {player_id}"
-            )
-        })
-}
-
 fn allocated_infantry_by_cell(conn: &DbConnection, player_id: u16) -> Result<HashMap<u32, u64>> {
     let mut allocated = HashMap::<u32, u64>::new();
     for packet in conn
@@ -4017,39 +3739,6 @@ fn allocated_infantry_by_cell(conn: &DbConnection, player_id: u16) -> Result<Has
         *current = current
             .checked_add(packet.infantry)
             .context("allocated cluster-action infantry overflow")?;
-    }
-    Ok(allocated)
-}
-
-fn explicit_action_allocated_infantry_by_cell(
-    conn: &DbConnection,
-    player_id: u16,
-) -> Result<HashMap<u32, u64>> {
-    let mut allocated = HashMap::<u32, u64>::new();
-    for packet in conn
-        .db
-        .transit_packet()
-        .iter()
-        .filter(|packet| packet.owner_player_id == player_id)
-    {
-        let order = conn
-            .db
-            .transfer_order()
-            .order_id()
-            .find(&packet.order_id)
-            .with_context(|| {
-                format!(
-                    "allocated packet {} references missing order {}",
-                    packet.packet_key, packet.order_id
-                )
-            })?;
-        if is_background_policy_order(&order) {
-            continue;
-        }
-        let current = allocated.entry(packet.current_cell).or_default();
-        *current = current
-            .checked_add(packet.infantry)
-            .context("explicit action allocation overflow")?;
     }
     Ok(allocated)
 }
@@ -4748,12 +4437,10 @@ fn assert_cluster_action_order(
     require_exact_source_snapshot: bool,
 ) -> Result<()> {
     let snapshot = stable_action_order_snapshot(conn, order)?;
-    // Once a persistent policy is active, its packets (and recruitment) can
-    // change per-cell availability between the client snapshot and reducer
-    // acceptance. Percentage rounding also means even the aggregate stale
-    // snapshot is not a valid lower bound. Dynamic actions therefore prove
-    // the authoritative source ledger and conservation, while the pre-policy
-    // focused expansion retains the exact acceptance-snapshot assertion.
+    // Recruitment and concurrent explicit packets can change per-cell
+    // availability between the client snapshot and reducer acceptance.
+    // Dynamic actions therefore prove the authoritative source ledger and
+    // conservation; stable fixtures retain the exact snapshot assertion.
     let commitment_matches_snapshot =
         !require_exact_source_snapshot || snapshot.committed_infantry == expected_requested;
     ensure!(
@@ -4866,65 +4553,6 @@ fn assert_cluster_action_order(
         "cluster action order {} reports {} in transit but has {packet_total} public packet infantry",
         order.order_id,
         snapshot.in_transit_infantry
-    );
-    Ok(())
-}
-
-fn assert_complete_cluster_policy_assignment(
-    conn: &DbConnection,
-    player_id: u16,
-    expected_component: &BTreeSet<u32>,
-    seed_cell: u32,
-    expected_kind: ClusterPolicyKind,
-    expected_orientation: Axial,
-) -> Result<()> {
-    let seed_assignment = conn
-        .db
-        .cluster_policy_assignment()
-        .cell_id()
-        .find(&seed_cell)
-        .with_context(|| format!("cluster policy assignment is missing seed cell {seed_cell}"))?;
-    ensure!(
-        seed_assignment.owner_player_id == player_id
-            && seed_assignment.kind == expected_kind
-            && (seed_assignment.orientation_q, seed_assignment.orientation_r)
-                == (expected_orientation.q, expected_orientation.r)
-            && seed_assignment.revision > 0,
-        "seed policy assignment does not persist the requested policy: owner={}, kind={:?}, orientation=({}, {}), revision={}",
-        seed_assignment.owner_player_id,
-        seed_assignment.kind,
-        seed_assignment.orientation_q,
-        seed_assignment.orientation_r,
-        seed_assignment.revision
-    );
-    let revision_cells = conn
-        .db
-        .cluster_policy_assignment()
-        .iter()
-        .filter(|assignment| {
-            assignment.owner_player_id == player_id
-                && assignment.revision == seed_assignment.revision
-        })
-        .map(|assignment| {
-            ensure!(
-                assignment.kind == expected_kind
-                    && (assignment.orientation_q, assignment.orientation_r)
-                        == (expected_orientation.q, expected_orientation.r),
-                "policy revision {} has inconsistent assignment at cell {}",
-                assignment.revision,
-                assignment.cell_id
-            );
-            Ok(assignment.cell_id)
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
-    ensure!(
-        revision_cells == *expected_component,
-        "one policy seed did not cover its complete authority component: expected {} cells {:?}, revision {} covers {} cells {:?}",
-        expected_component.len(),
-        expected_component,
-        seed_assignment.revision,
-        revision_cells.len(),
-        revision_cells
     );
     Ok(())
 }

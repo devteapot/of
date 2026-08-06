@@ -38,9 +38,9 @@ pub struct CoordinatorArgs {
     /// Logical steps of full-share expansion.
     #[arg(long)]
     pub expand_steps: Option<u64>,
-    /// Logical steps of Center-policy measurement.
+    /// Logical steps of front-rebalance measurement (`--rebalance-steps`).
     #[arg(long)]
-    pub policy_steps: Option<u64>,
+    pub rebalance_steps: Option<u64>,
     /// Logical steps of mutual attack measurement (0 skips).
     #[arg(long)]
     pub attack_steps: Option<u64>,
@@ -51,7 +51,7 @@ pub struct CoordinatorArgs {
     #[arg(long)]
     pub expand_secs: Option<u64>,
     #[arg(long)]
-    pub policy_secs: Option<u64>,
+    pub rebalance_secs: Option<u64>,
     #[arg(long)]
     pub attack_secs: Option<u64>,
     #[arg(long)]
@@ -91,24 +91,24 @@ pub struct CoordinatorArgs {
 
 pub fn resolve_schedule(args: &CoordinatorArgs) -> Result<PhaseSchedule> {
     let has_steps = args.expand_steps.is_some()
-        || args.policy_steps.is_some()
+        || args.rebalance_steps.is_some()
         || args.attack_steps.is_some()
         || args.reexpand_steps.is_some();
     let has_secs = args.expand_secs.is_some()
-        || args.policy_secs.is_some()
+        || args.rebalance_secs.is_some()
         || args.attack_secs.is_some()
         || args.reexpand_secs.is_some();
     if has_steps {
         PhaseSchedule::from_steps(
             args.expand_steps.unwrap_or(600),
-            args.policy_steps.unwrap_or(720),
+            args.rebalance_steps.unwrap_or(720),
             args.attack_steps.unwrap_or(360),
             args.reexpand_steps.unwrap_or(180),
         )
     } else if has_secs {
         PhaseSchedule::from_secs(
             args.expand_secs.unwrap_or(150),
-            args.policy_secs.unwrap_or(180),
+            args.rebalance_secs.unwrap_or(180),
             args.attack_secs.unwrap_or(90),
             args.reexpand_secs.unwrap_or(45),
             DEFAULT_LOGICAL_STEP_MS,

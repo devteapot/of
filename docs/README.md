@@ -7,7 +7,7 @@ current interaction or simulation contract.
 ## Documents
 
 - [Cluster-first troop controls](./cluster-controls.md) — canonical V1 input,
-  action, Share, persistent-policy, Reshape, and Stop contract.
+  action, Share, strategic-front, Reshape, and Stop contract.
 - [V1 game design](./v1-game-design.md) — player experience, rules, interaction experiments, provisional tuning, and acceptance criteria.
 - [Technical architecture](./technical-architecture.md) — Bevy and SpacetimeDB boundaries, simulation and data flow, scalability, testing, and the implementation sequence.
 - [V1 implementation guide](./implementation.md) — executable components, runtime topology, operational flow, evidence, and known limits.

@@ -20,16 +20,14 @@ improve legibility but must not change its authority or accounting rules.
 3. Click neutral territory to expand every reachable selected perimeter,
    weighted somewhat toward the click.
 4. Click one or more complete enemy clusters to attack every shared front.
-5. Use Share only to choose how much free infantry expansion/attack commits.
-6. Give clusters a persistent Balanced, Perimeter, Center, or Directional
-   density policy.
+5. Use Share to choose how much free infantry expansion, attack, or Front
+   Rebalance commits.
+6. Press `B` and drag between strategic fronts to move troops explicitly.
 7. Use one-cluster Reshape for a best-effort drawn troop footprint and `X` for
    exact Stop.
 
 Selection never means retask. Explicit actions remain allocated until they
-settle, complete, or are explicitly stopped. Background policy maintenance is
-not a Stop target: it yields to intersecting explicit commands and later resumes
-from the persistent cluster setting.
+settle, complete, or are explicitly stopped.
 
 ## Required V1 interactions
 
@@ -45,12 +43,11 @@ from the persistent cluster setting.
    front.
 6. Support Shift staging/toggling and Control removal of several complete enemy
    target clusters.
-7. Display one persisted Share only for expansion and attack; never show policy
-   or Reshape as percentage-limited.
-8. Expose Balanced, Perimeter, Center, and Directional as persistent cluster
-   settings rather than one-shot commands.
-9. Distinguish free infantry from live action troops. Policy targets exclude
-   live action strength but reserve the capacity it physically occupies.
+7. Display one persisted Share for expansion, attack, and Front Rebalance;
+   never show Reshape as percentage-limited.
+8. Highlight complete source and target strategic-front arcs during a rebalance
+   gesture.
+9. Distinguish free infantry from troops committed to explicit actions.
 10. Enable Reshape only for one selected cluster. Show the complete brush with
     independent width, independent height, symmetric ring growth, unavailable
     in-map cells, and out-of-world positions.
@@ -71,7 +68,7 @@ The control strip must have distinct copy for:
 
 - idle selection and contextual click;
 - staged enemy targets;
-- Directional policy gesture;
+- Front Rebalance source/target gesture;
 - Reshape drawing and ready preview;
 - exact Stop preview;
 - invalid action with a specific reason;
@@ -111,6 +108,6 @@ Source selection should survive successful commands and ordinary rejections.
 ## Requested output
 
 A code-oriented graybox direction that can be implemented with Bevy primitives,
-text, line geometry, vertex-color updates, and target-density heatmaps. Prioritize
+text, line geometry, vertex-color updates, and allocation heatmaps. Prioritize
 clarity of complete-cluster scope, contextual click result, Share accounting,
-persistent policy, and exact Stop over decorative style.
+strategic fronts, and exact Stop over decorative style.

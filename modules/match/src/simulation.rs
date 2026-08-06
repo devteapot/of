@@ -11,7 +11,6 @@ use hex_core::{
 };
 use spacetimedb::{ReducerContext, Table, log_stopwatch::LogStopwatch};
 
-use crate::orders::{is_background_policy_order, maintain_cluster_policies};
 use crate::rules::{
     allocated_infantry_at_cell, cell_id_for_coordinate, cell_state, config, coordinate_for_cell,
     core_cell, edge_runtime_limits, order_cell_key, state, terrain,
@@ -450,8 +449,8 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     let population_interval = u64::from(config.population_step_interval.max(1));
     let high_scale = config.player_count > crate::schema::HIGH_SCALE_PLAYER_THRESHOLD;
     // Low-scale keeps the historical cadence: full population every interval
-    // steps, policy on the intervening ticks. High-scale shards population so
-    // each cell still updates once per interval while work stays bounded.
+    // steps. High-scale shards population so each cell still updates once per
+    // interval while work stays bounded.
     let run_population = if high_scale {
         true
     } else {
@@ -460,10 +459,6 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     if run_population {
         let _phase_stopwatch = LogStopwatch::new("simulation_population");
         population_step(ctx, logical_step, high_scale)?;
-    }
-    {
-        let _phase_stopwatch = LogStopwatch::new("simulation_policy");
-        maintain_cluster_policies(ctx, logical_step)?;
     }
     Ok(state(ctx)?.phase == MatchPhase::Running)
 }
@@ -561,14 +556,7 @@ fn stop_blocked_internal_edges(
 }
 
 fn internal_order_requires_friendly_route(kind: OrderKind) -> bool {
-    matches!(
-        kind,
-        OrderKind::Balance
-            | OrderKind::FrontLoad
-            | OrderKind::CoreLoad
-            | OrderKind::PerimeterLoad
-            | OrderKind::Reshape
-    )
+    matches!(kind, OrderKind::Reshape | OrderKind::FrontRebalance)
 }
 
 fn internal_next_owner_is_blocked(kind: OrderKind, player_id: u16, next_owner: u16) -> bool {
@@ -1066,9 +1054,6 @@ fn population_step(
         }
         if cell.civilians != previous_civilians || cell.infantry != previous_infantry {
             cell.last_changed_step = logical_step;
-            if cell.infantry != previous_infantry {
-                cell.last_policy_changed_step = logical_step;
-            }
             ctx.db.cell_state().cell_id().update(cell);
         }
     }
@@ -1196,15 +1181,9 @@ fn should_station_capacity_blocked_packet(
     order: &TransferOrder,
     limits: &BTreeSet<MovementLimit>,
 ) -> bool {
-    // Policy maintenance is replanned from the packets' current physical
-    // positions at each policy checkpoint. Keep capacity-blocked packets
-    // queued until then: prematurely stationing them marks undelivered demand
-    // as completed and is the source of large-cluster redistribution churn.
-    // Explicit one-shot logistics and bounded expansion waves retain their
-    // best-effort stop-in-place semantics.
-    !is_background_policy_order(order)
-        && (internal_order_requires_friendly_route(order.kind)
-            || is_expansion_wave_order(order.kind))
+    // Explicit one-shot logistics and bounded expansion waves use best-effort
+    // stop-in-place when destination capacity is exhausted.
+    (internal_order_requires_friendly_route(order.kind) || is_expansion_wave_order(order.kind))
         && limits.contains(&MovementLimit::DestinationCapacity)
 }
 
@@ -1319,9 +1298,6 @@ fn move_friendly_packets(
             .ok_or_else(|| "movement result omitted a participating cell".to_string())?
             .force();
         let mut row = cell_state(ctx, cell_id)?;
-        if row.infantry != infantry {
-            row.last_policy_changed_step = logical_step;
-        }
         row.infantry = infantry;
         row.last_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(row);
@@ -1597,9 +1573,6 @@ fn resolve_target_combat(
 
     defender.infantry = defender.infantry.saturating_sub(defender_casualties);
     defender.last_changed_step = logical_step;
-    if defender_casualties > 0 {
-        defender.last_policy_changed_step = logical_step;
-    }
     ctx.db.cell_state().cell_id().update(defender.clone());
     trim_packets_at_cell(
         ctx,
@@ -1650,7 +1623,6 @@ fn apply_attacker_casualties(
         let mut source_state = cell_state(ctx, current.current_cell)?;
         source_state.infantry = source_state.infantry.saturating_sub(lost);
         source_state.last_changed_step = logical_step;
-        source_state.last_policy_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(source_state);
         reduce_packet_metadata(ctx, packet_state, current, lost, logical_step, true)?;
         casualties -= lost;
@@ -1685,7 +1657,6 @@ fn occupy_after_combat(
     target.owner_player_id = front.attacker;
     target.infantry = target.infantry.saturating_add(occupancy);
     target.last_changed_step = logical_step;
-    target.last_policy_changed_step = logical_step;
     ctx.db.cell_state().cell_id().update(target.clone());
 
     let mut remaining = occupancy;
@@ -1711,7 +1682,6 @@ fn occupy_after_combat(
         let mut source = cell_state(ctx, packet.current_cell)?;
         source.infantry = source.infantry.saturating_sub(moved);
         source.last_changed_step = logical_step;
-        source.last_policy_changed_step = logical_step;
         ctx.db.cell_state().cell_id().update(source);
         advance_packet(
             ctx,
@@ -2530,7 +2500,6 @@ fn complete_retreat_abandonments(
             let old_owner = cell.owner_player_id;
             cell.owner_player_id = NEUTRAL_PLAYER;
             cell.last_changed_step = logical_step;
-            cell.last_policy_changed_step = logical_step;
             ctx.db.cell_state().cell_id().update(cell);
             record_capture(ctx, candidate.cell_id, old_owner, NEUTRAL_PLAYER)?;
         }
@@ -3065,7 +3034,7 @@ mod tests {
             &capacity,
         ));
         assert!(!should_settle_capacity_blocked_friendly_lane(
-            OrderKind::Balance,
+            OrderKind::Reshape,
             1,
             3,
             &capacity,
@@ -3092,13 +3061,7 @@ mod tests {
     fn explicit_logistics_and_expand_capacity_backpressure_station_but_throughput_queues() {
         let capacity = BTreeSet::from([MovementLimit::DestinationCapacity]);
         let throughput = BTreeSet::from([MovementLimit::EdgeThroughput]);
-        for kind in [
-            OrderKind::Balance,
-            OrderKind::FrontLoad,
-            OrderKind::CoreLoad,
-            OrderKind::PerimeterLoad,
-            OrderKind::Reshape,
-        ] {
+        for kind in [OrderKind::Reshape, OrderKind::FrontRebalance] {
             let order = test_order(kind, OrderStatus::Active);
             assert!(should_station_capacity_blocked_packet(&order, &capacity));
             assert!(!should_station_capacity_blocked_packet(&order, &throughput));
@@ -3127,33 +3090,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_policy_capacity_backpressure_waits_for_the_next_replan() {
-        let capacity = BTreeSet::from([MovementLimit::DestinationCapacity]);
-        let throughput = BTreeSet::from([MovementLimit::EdgeThroughput]);
-        for kind in [
-            OrderKind::Balance,
-            OrderKind::FrontLoad,
-            OrderKind::CoreLoad,
-            OrderKind::PerimeterLoad,
-        ] {
-            let mut policy = test_order(kind, OrderStatus::Active);
-            policy.client_command_id = 0;
-            assert!(!should_station_capacity_blocked_packet(&policy, &capacity));
-            assert!(!should_station_capacity_blocked_packet(
-                &policy,
-                &throughput
-            ));
-        }
-
-        // Command ID zero is not enough on its own: only the strict set of
-        // persistent-policy order kinds receives receding-horizon behavior.
-        let mut reshape = test_order(OrderKind::Reshape, OrderStatus::Active);
-        reshape.client_command_id = 0;
-        assert!(should_station_capacity_blocked_packet(&reshape, &capacity));
-    }
-
-    #[test]
-    fn queued_policy_funnel_converges_while_stationing_reproduces_the_pockets() {
+    fn queued_internal_funnel_converges_while_stationing_reproduces_the_pockets() {
         let (queued, saw_backpressure, passes) = run_capacity_funnel(false);
         assert!(saw_backpressure);
         assert!(passes > 1, "the regression must exercise a real pipeline");
@@ -3310,13 +3247,7 @@ mod tests {
 
     #[test]
     fn internal_orders_stop_before_every_non_friendly_route_cell() {
-        for kind in [
-            OrderKind::Balance,
-            OrderKind::FrontLoad,
-            OrderKind::CoreLoad,
-            OrderKind::PerimeterLoad,
-            OrderKind::Reshape,
-        ] {
+        for kind in [OrderKind::Reshape, OrderKind::FrontRebalance] {
             assert!(!internal_next_owner_is_blocked(kind, 1, 1));
             assert!(internal_next_owner_is_blocked(kind, 1, NEUTRAL_PLAYER));
             assert!(internal_next_owner_is_blocked(kind, 1, 2));
@@ -3334,13 +3265,7 @@ mod tests {
 
     #[test]
     fn only_active_internal_orders_reserve_recruitment_capacity() {
-        for kind in [
-            OrderKind::Balance,
-            OrderKind::FrontLoad,
-            OrderKind::CoreLoad,
-            OrderKind::PerimeterLoad,
-            OrderKind::Reshape,
-        ] {
+        for kind in [OrderKind::Reshape, OrderKind::FrontRebalance] {
             let order = test_order(kind, OrderStatus::Active);
             assert!(order_reserves_recruitment_capacity(&order));
         }
@@ -3366,8 +3291,9 @@ mod tests {
     #[test]
     fn internal_destination_reservation_tracks_only_the_unreceived_remainder() {
         let mut reservations = BTreeMap::new();
-        let balance = test_order(OrderKind::Balance, OrderStatus::Active);
-        add_internal_destination_reservation(&mut reservations, &balance, 7, 50, 20).unwrap();
+        let front_rebalance = test_order(OrderKind::FrontRebalance, OrderStatus::Active);
+        add_internal_destination_reservation(&mut reservations, &front_rebalance, 7, 50, 20)
+            .unwrap();
         assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 30);
 
         let reshape = test_order(OrderKind::Reshape, OrderStatus::Active);
@@ -3376,11 +3302,11 @@ mod tests {
 
         let push = test_order(OrderKind::PushFront, OrderStatus::Active);
         add_internal_destination_reservation(&mut reservations, &push, 7, 100, 0).unwrap();
-        let completed = test_order(OrderKind::CoreLoad, OrderStatus::Completed);
+        let completed = test_order(OrderKind::Reshape, OrderStatus::Completed);
         add_internal_destination_reservation(&mut reservations, &completed, 7, 100, 0).unwrap();
         assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 35);
 
-        let mut foreign = test_order(OrderKind::PerimeterLoad, OrderStatus::Active);
+        let mut foreign = test_order(OrderKind::FrontRebalance, OrderStatus::Active);
         foreign.player_id = 2;
         add_internal_destination_reservation(&mut reservations, &foreign, 7, 40, 10).unwrap();
         assert_eq!(reserved_recruitment_capacity(&reservations, 1, 7), 35);
@@ -3406,13 +3332,7 @@ mod tests {
 
     #[test]
     fn blocked_internal_packets_station_in_place_and_finalize_without_combat() {
-        for kind in [
-            OrderKind::Balance,
-            OrderKind::FrontLoad,
-            OrderKind::CoreLoad,
-            OrderKind::PerimeterLoad,
-            OrderKind::Reshape,
-        ] {
+        for kind in [OrderKind::Reshape, OrderKind::FrontRebalance] {
             let cell_infantry_before = 55_u64;
             let packet_infantry = 30_u64;
             let delivered_before = 10_u64;
