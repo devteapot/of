@@ -9,9 +9,6 @@ use bevy::{
     },
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-use bevy::app::AppExit;
-
 use crate::{
     interaction::{InteractionState, OrderMode},
     map_view::map_view_status_bundle,
