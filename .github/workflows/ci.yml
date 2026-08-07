@@ -46,6 +46,7 @@ jobs:
       - name: Check formatting
         run: |
           cargo fmt --all -- --check
+          cargo fmt --manifest-path modules/lobby/Cargo.toml -- --check
           cargo fmt --manifest-path modules/match/Cargo.toml -- --check
 
       - name: Test workspace
@@ -60,11 +61,24 @@ jobs:
       - name: Test authoritative module
         run: cargo test --manifest-path modules/match/Cargo.toml
 
+      - name: Test lobby control module
+        run: cargo test --manifest-path modules/lobby/Cargo.toml
+
       - name: Lint authoritative module
         run: cargo clippy --manifest-path modules/match/Cargo.toml --all-targets -- -D warnings
 
+      - name: Lint lobby control module
+        run: cargo clippy --manifest-path modules/lobby/Cargo.toml --all-targets -- -D warnings
+
       - name: Build SpacetimeDB module
-        run: spacetime build --module-path modules/match
+        run: |
+          spacetime build --module-path modules/lobby
+          spacetime build --module-path modules/match
+
+      - name: Check Vercel functions
+        run: |
+          node --check deployment/vercel/api/lobbies.mjs
+          node --check deployment/vercel/api/session.mjs
 
       - name: Verify generated bindings are current
         run: |

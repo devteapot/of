@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#071014" />
+    <title>OpenFrontier · Lobbies</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        background: #071014;
+        color: #e4eff1;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 15% 0%, #12333a, #071014 44%); }
+      main { width: min(960px, calc(100% - 32px)); margin: 0 auto; padding: 64px 0; }
+      header { display: flex; justify-content: space-between; gap: 24px; align-items: end; margin-bottom: 28px; }
+      h1 { margin: 0; font-size: clamp(34px, 7vw, 72px); line-height: .9; letter-spacing: -.06em; }
+      .eyebrow { color: #65dce4; font: 700 12px/1 monospace; letter-spacing: .16em; margin-bottom: 12px; }
+      .status { color: #91aeb3; max-width: 380px; text-align: right; }
+      .panel { border: 1px solid #29464c; background: rgba(8, 24, 29, .9); padding: 20px; }
+      form { display: grid; grid-template-columns: 1.4fr 1fr .7fr auto; gap: 12px; margin-bottom: 24px; }
+      label { display: grid; gap: 7px; color: #91aeb3; font: 700 11px/1 monospace; letter-spacing: .1em; }
+      input, select, button { min-height: 44px; border: 1px solid #365960; background: #0c2026; color: #eef7f8; padding: 0 13px; font: inherit; }
+      button { cursor: pointer; border-color: #55c8d1; color: #8de7ed; font-weight: 750; }
+      button:hover:not(:disabled) { background: #12383e; }
+      button:disabled { cursor: not-allowed; opacity: .4; }
+      .list { display: grid; gap: 10px; }
+      .empty { padding: 36px; color: #759399; text-align: center; border: 1px dashed #29464c; }
+      .lobby { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 18px; border: 1px solid #29464c; padding: 16px; background: #091a1f; }
+      .lobby h2 { margin: 0 0 7px; font-size: 17px; }
+      .meta { color: #86a4a9; font: 12px/1.6 monospace; text-transform: uppercase; }
+      .names { color: #bfd0d3; font-size: 13px; margin-top: 5px; }
+      .error { color: #ff9c91; }
+      @media (max-width: 720px) {
+        main { padding-top: 34px; }
+        header { display: block; }
+        .status { text-align: left; margin-top: 18px; }
+        form { grid-template-columns: 1fr 1fr; }
+        form label:first-child { grid-column: 1 / -1; }
+        form button { align-self: end; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div><div class="eyebrow">OPENFRONTIER</div><h1>Choose a front.</h1></div>
+        <div id="status" class="status">Connecting to lobby authority…</div>
+      </header>
+      <section class="panel">
+        <form id="create-form">
+          <label>PLAYER NAME<input id="name" maxlength="32" autocomplete="nickname" required /></label>
+          <label>MAP<select id="map"><option value="small">Small · 64×64</option><option value="medium">Medium · 128×128</option><option value="large">Large · 192×192</option></select></label>
+          <label>PLAYERS<input id="players" type="number" min="2" max="500" value="2" required /></label>
+          <button id="create" type="submit">CREATE</button>
+        </form>
+        <div id="list" class="list"><div class="empty">Loading lobbies…</div></div>
+      </section>
+    </main>
+    <script type="module">
+      const HOST = "https://maincloud.spacetimedb.com";
+      const SESSION_KEY = "of.lobby.session";
+      const NAME_KEY = "of.lobby.name";
+      const status = document.querySelector("#status");
+      const list = document.querySelector("#list");
+      const form = document.querySelector("#create-form");
+      const nameInput = document.querySelector("#name");
+      nameInput.value = localStorage.getItem(NAME_KEY) ?? "";
+
+      async function session() {
+        const saved = localStorage.getItem(SESSION_KEY);
+        if (saved) return JSON.parse(saved);
+        const response = await fetch("/api/session", { method: "POST" });
+        if (!response.ok) throw new Error("Could not create a lobby session");
+        const value = await response.json();
+        localStorage.setItem(SESSION_KEY, JSON.stringify(value));
+        return value;
+      }
+
+      async function api(body) {
+        const identity = await session();
+        const response = await fetch("/api/lobbies", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.token}` },
+          body: JSON.stringify(body),
+        });
+        const value = await response.json();
+        if (!response.ok) throw new Error(value.error ?? "Lobby action failed");
+        return { ...value, identity };
+      }
+
+      function enter(lobby, identity, displayName) {
+        const profile = "lobby";
+        localStorage.setItem(`of.auth.${HOST}.${lobby.matchDatabase}.${profile}`, identity.token);
+        const query = new URLSearchParams({ database: lobby.matchDatabase, player: "1", name: displayName, profile });
+        location.assign(`/game.html?${query}`);
+      }
+
+      function lobbyId() {
+        return [...crypto.getRandomValues(new Uint8Array(6))]
+          .map((value) => value.toString(16).padStart(2, "0"))
+          .join("");
+      }
+
+      function render(lobbies) {
+        list.replaceChildren();
+        const visible = lobbies.filter((lobby) => !["cancelled"].includes(lobby.status));
+        if (!visible.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "No active lobbies. Create the first one.";
+          list.append(empty);
+          return;
+        }
+        for (const lobby of visible) {
+          const row = document.createElement("article");
+          row.className = "lobby";
+          const copy = document.createElement("div");
+          const title = document.createElement("h2");
+          title.textContent = `Lobby ${lobby.lobbyId}`;
+          const meta = document.createElement("div");
+          meta.className = `meta ${lobby.status === "failed" ? "error" : ""}`;
+          meta.textContent = `${lobby.mapPreset} map · ${lobby.memberCount}/${lobby.playerCount} players · ${lobby.status}`;
+          const names = document.createElement("div");
+          names.className = "names";
+          names.textContent = lobby.failureReason || lobby.members.map((member) => member.displayName).join(" · ");
+          copy.append(title, meta, names);
+          const join = document.createElement("button");
+          join.textContent = "JOIN";
+          join.disabled = lobby.status !== "open" || lobby.memberCount >= lobby.playerCount;
+          join.addEventListener("click", async () => {
+            const displayName = nameInput.value.trim();
+            if (!displayName) return nameInput.focus();
+            join.disabled = true;
+            status.textContent = `Joining ${lobby.lobbyId}…`;
+            try {
+              localStorage.setItem(NAME_KEY, displayName);
+              const result = await api({ action: "join", lobbyId: lobby.lobbyId, displayName });
+              enter(result.lobby, result.identity, displayName);
+            } catch (error) {
+              status.textContent = error.message;
+              join.disabled = false;
+            }
+          });
+          row.append(copy, join);
+          list.append(row);
+        }
+      }
+
+      async function refresh() {
+        try {
+          const response = await fetch("/api/lobbies", { cache: "no-store" });
+          const value = await response.json();
+          if (!response.ok) throw new Error(value.error ?? "Could not load lobbies");
+          render(value.lobbies);
+          status.textContent = "Create a lobby or join an open front.";
+        } catch (error) {
+          status.textContent = error.message;
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const displayName = nameInput.value.trim();
+        const button = document.querySelector("#create");
+        button.disabled = true;
+        status.textContent = "Provisioning an isolated match database…";
+        try {
+          localStorage.setItem(NAME_KEY, displayName);
+          const result = await api({
+            action: "create",
+            lobbyId: lobbyId(),
+            mapPreset: document.querySelector("#map").value,
+            playerCount: Number(document.querySelector("#players").value),
+            displayName,
+          });
+          enter(result.lobby, result.identity, displayName);
+        } catch (error) {
+          status.textContent = error.message;
+          button.disabled = false;
+          await refresh();
+        }
+      });
+
+      await session();
+      await refresh();
+      setInterval(refresh, 3000);
+    </script>
+  </body>
+</html>

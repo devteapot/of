@@ -10,6 +10,9 @@ the executable boundaries, operational flow, and intentional simplifications.
 
 ```mermaid
 flowchart LR
+    L["Browser lobby directory"] -->|"create / join"| CDB["SpacetimeDB lobby database"]
+    O["Vercel orchestrator"] -->|"publish + configure"| DB
+    CDB <--> O
     A["Bevy client · player 1"] -->|"reducers"| DB["SpacetimeDB match database"]
     B["Bevy client · player 2"] -->|"reducers"| DB
     DB -->|"typed subscriptions"| A
@@ -23,10 +26,11 @@ flowchart LR
     BIND --> B
 ```
 
-One SpacetimeDB host can run many databases. V1 manually provisions one logical
-database per match; it does not require a host process per match. A future lobby
-or orchestrator can create databases and assign players without changing the
-match module's authority boundary.
+One SpacetimeDB host can run many databases. Local development manually
+provisions one logical database per match. Production publishes a small lobby
+control module and uses a Vercel function to create `of-match-<lobby-id>`
+databases from the pinned match Wasm, configure them once, and assign browsers
+without changing the match module's authority boundary.
 
 ## Authority and cadence
 

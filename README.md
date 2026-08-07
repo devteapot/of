@@ -100,6 +100,35 @@ credentials; WebGPU itself requires a secure context (localhost is allowed for
 local development). Run `trunk build` from `crates/game-client` to
 produce a deployable bundle in `target/web`.
 
+## Production deployment
+
+Production runs a lightweight lobby control module as `of-lobby` on SpacetimeDB
+Maincloud and the browser client at <https://of.carlid.dev>. Creating a lobby
+publishes an isolated `of-match-<lobby-id>` database from the pinned match Wasm,
+configures its map and player count, then sends joined browsers to `game.html`
+with that database assignment.
+
+Publish and build locally with authenticated CLIs:
+
+```bash
+./scripts/publish-production.sh
+./scripts/build-vercel-production.sh
+vercel deploy target/vercel --prod --yes --project of --scope dc-ss
+```
+
+`.github/workflows/deploy.yml` repeats that deployment after every push to
+`main` and can also be run manually. Configure the `SPACETIMEDB_TOKEN` and
+`VERCEL_TOKEN` repository secrets before enabling it. Production database
+publishes use `--delete-data=never`; schema changes that require destroying
+persisted lobby state fail the deployment instead of deleting data. The
+SpacetimeDB token is also installed as a Vercel runtime secret because the
+orchestrator must publish match databases as the same owner captured by the
+lobby module's initialization reducer.
+
+The Vercel project owns the `of.carlid.dev` hostname. Because `carlid.dev` uses
+Cloudflare DNS, the `of` record must be the unproxied CNAME recommended by
+`vercel domains verify of.carlid.dev --scope dc-ss`.
+
 ## Local multiplayer match
 
 Use separate terminals from the repository root.

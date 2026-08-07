@@ -1,0 +1,81 @@
+name: Deploy production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  OF_DATABASE: of-lobby
+  OF_WEB_DATABASE: of-match
+  OF_WEB_HOST: https://maincloud.spacetimedb.com
+  SPACETIMEDB_SERVER: maincloud
+  VERCEL_PROJECT: of
+  VERCEL_SCOPE: dc-ss
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            modules/match -> modules/match/target
+
+      - name: Install pinned SpacetimeDB CLI
+        run: |
+          curl -sSf https://install.spacetimedb.com | sh -s -- --yes
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/spacetime" version install 2.7.1 --use --yes
+
+      - name: Install pinned Trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+
+      - name: Build production deployment
+        run: ./scripts/build-vercel-production.sh
+
+      - name: Publish authoritative module
+        env:
+          SPACETIMEDB_TOKEN: ${{ secrets.SPACETIMEDB_TOKEN }}
+        run: |
+          : "${SPACETIMEDB_TOKEN:?Configure the SPACETIMEDB_TOKEN repository secret}"
+          spacetime login --token "$SPACETIMEDB_TOKEN"
+          ./scripts/publish-production.sh
+
+      - name: Install pinned Vercel CLI
+        run: npm install --global vercel@58.7.1
+
+      - name: Deploy web client
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          : "${VERCEL_TOKEN:?Configure the VERCEL_TOKEN repository secret}"
+          vercel deploy target/vercel \
+            --prod \
+            --yes \
+            --project "$VERCEL_PROJECT" \
+            --scope "$VERCEL_SCOPE" \
+            --env "SPACETIME_HOST=$OF_WEB_HOST" \
+            --env "LOBBY_DATABASE=$OF_DATABASE" \
+            --env "SPACETIMEDB_TOKEN=$SPACETIMEDB_TOKEN" \
+            --token "$VERCEL_TOKEN"
