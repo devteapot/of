@@ -89,7 +89,7 @@ pub enum MatchPhase {
 impl MatchPhase {
     pub fn label(self, conquest_threshold_bps: u32) -> String {
         match self {
-            Self::Lobby => "LOBBY · WAITING FOR PLAYER".to_owned(),
+            Self::Lobby => "LOBBY · WAITING FOR PLAYERS".to_owned(),
             Self::Running => format!(
                 "CONQUEST · {:.0}% TO WIN",
                 conquest_threshold_bps as f32 / 100.0
@@ -260,6 +260,7 @@ pub struct MatchView {
     /// Authoritative `MatchState.claimed_players` when online. High-scale HUD
     /// uses this instead of treating Syncing seats as claimed.
     pub claimed_players: u16,
+    pub lobby: LobbyView,
     pub authority: AuthorityState,
     pub connection: Vec<ConnectionState>,
     pub phase: MatchPhase,
@@ -300,6 +301,19 @@ pub struct MatchView {
     pub dirty_chunks: BTreeSet<ChunkCoord>,
 }
 
+#[derive(Debug)]
+pub struct LobbyView {
+    /// Lobby configuration projected from the authoritative singleton.
+    pub map_size: u16,
+    pub configuration_locked: bool,
+    pub available: bool,
+    pub action_pending: bool,
+    /// Bound local seat, if this identity has joined the lobby.
+    pub local_player: Option<u16>,
+    /// Display name by zero-based seat index; empty entries are open seats.
+    pub player_names: Vec<String>,
+}
+
 impl MatchView {
     pub fn connecting(preferred_player: u16) -> Self {
         let player_count = preferred_player.max(2);
@@ -314,6 +328,14 @@ impl MatchView {
             local_player: u32::from(preferred_player),
             player_count,
             claimed_players: 0,
+            lobby: LobbyView {
+                map_size: 64,
+                configuration_locked: false,
+                available: false,
+                action_pending: false,
+                local_player: None,
+                player_names: vec![String::new(); usize::from(player_count)],
+            },
             authority: AuthorityState::Connecting,
             connection: vec![ConnectionState::Syncing; usize::from(player_count)],
             phase: MatchPhase::Lobby,
@@ -444,6 +466,16 @@ impl MatchView {
             local_player: PLAYER_ONE,
             player_count,
             claimed_players: player_count,
+            lobby: LobbyView {
+                map_size: 64,
+                configuration_locked: true,
+                available: false,
+                action_pending: false,
+                local_player: Some(1),
+                player_names: (1..=player_count)
+                    .map(|player| format!("Player {player}"))
+                    .collect(),
+            },
             authority: AuthorityState::Offline,
             connection: vec![ConnectionState::Offline; usize::from(player_count)],
             phase: MatchPhase::Running,

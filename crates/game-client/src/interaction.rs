@@ -593,6 +593,10 @@ fn process_order_input(
     mut view: ResMut<MatchView>,
     mut intents: MessageWriter<ClientIntent>,
 ) {
+    if view.phase != crate::model::MatchPhase::Running {
+        for _ in actions.read() {}
+        return;
+    }
     if keyboard.just_pressed(KeyCode::Slash) {
         interaction.show_help = !interaction.show_help;
     }

@@ -45,6 +45,7 @@ pub mod receipt_status_type;
 pub mod retreat_abandonment_type;
 pub mod set_mobilization_target_reducer;
 pub mod simulation_schedule_type;
+pub mod start_match_reducer;
 pub mod static_edge_limit_type;
 pub mod terrain_class_type;
 pub mod transfer_destination_table;
@@ -97,6 +98,7 @@ pub use receipt_status_type::ReceiptStatus;
 pub use retreat_abandonment_type::RetreatAbandonment;
 pub use set_mobilization_target_reducer::set_mobilization_target;
 pub use simulation_schedule_type::SimulationSchedule;
+pub use start_match_reducer::start_match;
 pub use static_edge_limit_type::StaticEdgeLimit;
 pub use terrain_class_type::TerrainClass;
 pub use transfer_destination_table::*;
@@ -177,6 +179,7 @@ pub enum Reducer {
         client_command_id: u64,
         target_bps: u32,
     },
+    StartMatch,
 }
 
 impl __sdk::InModule for Reducer {
@@ -197,6 +200,7 @@ impl __sdk::Reducer for Reducer {
             Reducer::IssueReshape { .. } => "issue_reshape",
             Reducer::JoinMatch { .. } => "join_match",
             Reducer::SetMobilizationTarget { .. } => "set_mobilization_target",
+            Reducer::StartMatch => "start_match",
             _ => unreachable!(),
         }
     }
@@ -312,6 +316,7 @@ impl __sdk::Reducer for Reducer {
                     target_bps: target_bps.clone(),
                 },
             ),
+            Reducer::StartMatch => __sats::bsatn::to_vec(&start_match_reducer::StartMatchArgs {}),
             _ => unreachable!(),
         }
     }

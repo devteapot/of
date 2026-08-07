@@ -17,14 +17,15 @@ use bevy::prelude::*;
 use hex_core::{Axial, TerrainKind};
 use match_bindings::{
     CellState, CellStateTableAccess, CellTerrain, CellTerrainTableAccess, CombatFront,
-    CombatFrontTableAccess, CommandReceipt, CommandReceiptTableAccess, DbConnection, MatchConfig,
-    MatchConfigTableAccess, MatchPhase as RemoteMatchPhase, MatchState, MatchStateTableAccess,
-    MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus, PlayerSlot,
-    PlayerSlotTableAccess, PlayerState, PlayerStateTableAccess, ReceiptStatus, SubscriptionHandle,
-    TransferDestination, TransferDestinationTableAccess, TransferOrder, TransferOrderTableAccess,
-    TransferSource, TransferSourceTableAccess, TransitPacket, TransitRoute, cancel_orders,
-    issue_attack_clusters, issue_expand_all, issue_expand_clusters, issue_front_rebalance,
-    issue_push_front, issue_reshape, join_match, set_mobilization_target,
+    CombatFrontTableAccess, CommandReceipt, CommandReceiptTableAccess, DbConnection, MapPreset,
+    MatchConfig, MatchConfigTableAccess, MatchPhase as RemoteMatchPhase, MatchState,
+    MatchStateTableAccess, MobilizationPolicy, MobilizationPolicyTableAccess, OrderStatus,
+    PlayerSlot, PlayerSlotTableAccess, PlayerState, PlayerStateTableAccess, ReceiptStatus,
+    SubscriptionHandle, TransferDestination, TransferDestinationTableAccess, TransferOrder,
+    TransferOrderTableAccess, TransferSource, TransferSourceTableAccess, TransitPacket,
+    TransitRoute, cancel_orders, configure_match, issue_attack_clusters, issue_expand_all,
+    issue_expand_clusters, issue_front_rebalance, issue_push_front, issue_reshape, join_match,
+    set_mobilization_target, start_match,
 };
 use match_bindings::{TransitPacketTableAccess, TransitRouteTableAccess};
 use spacetimedb_sdk::__codegen::InternalError;
@@ -34,6 +35,7 @@ use crate::{
     camera::{CameraRig, GameCamera},
     config::ClientConfig,
     geometry::{axial_to_plane, chunk_of, plane_to_axial},
+    lobby::{LobbyIntent, LobbyMapPreset},
     map_view::MapViewMode,
     model::{
         ActiveFlow, ActiveFront, AuthorityState, CellView, ConnectionState, ContestedCellView,
@@ -232,14 +234,40 @@ pub struct OnlineSyncSet;
 
 #[derive(Clone, Debug)]
 enum LifecycleEvent {
-    Connected { generation: u64 },
-    BootstrapSubscribed { generation: u64 },
-    TacticalSubscribed { generation: u64 },
-    JoinFailed { generation: u64, reason: String },
-    ConnectionFailed { generation: u64, reason: String },
-    Disconnected { generation: u64, reason: String },
-    CommandFailed { command_id: u64, reason: String },
-    TokenWarning { generation: u64, message: String },
+    Connected {
+        generation: u64,
+    },
+    BootstrapSubscribed {
+        generation: u64,
+    },
+    TacticalSubscribed {
+        generation: u64,
+    },
+    JoinFailed {
+        generation: u64,
+        reason: String,
+    },
+    ConnectionFailed {
+        generation: u64,
+        reason: String,
+    },
+    Disconnected {
+        generation: u64,
+        reason: String,
+    },
+    CommandFailed {
+        command_id: u64,
+        reason: String,
+    },
+    TokenWarning {
+        generation: u64,
+        message: String,
+    },
+    LobbyActionFinished {
+        generation: u64,
+        action: &'static str,
+        error: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -624,6 +652,7 @@ struct OnlineTransport {
     reconnect_attempt: u32,
     reconnect_delay_seconds: f32,
     connection_disabled: bool,
+    auto_start_requested: bool,
 }
 
 impl OnlineTransport {
@@ -658,6 +687,7 @@ impl OnlineTransport {
             reconnect_attempt: 0,
             reconnect_delay_seconds: 0.0,
             connection_disabled: false,
+            auto_start_requested: false,
         }
     }
 
@@ -735,6 +765,8 @@ impl Plugin for OnlineTransportPlugin {
                 (
                     maintain_connection,
                     maintain_moving_viewport_interest,
+                    send_lobby_intents,
+                    maybe_auto_start,
                     send_online_intents,
                     frame_tick,
                 )
@@ -803,10 +835,14 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     transport.subscription_lifecycle = SubscriptionLifecycle::reset();
     transport.clear_subscription_handles();
     transport.command_ids_ready = false;
+    transport.auto_start_requested = false;
     transport.signals.clear_pending_deltas();
     transport.tactical = TacticalCache::default();
     clear_tactical_presentation(view);
     view.authority = AuthorityState::Connecting;
+    view.lobby.available = false;
+    view.lobby.action_pending = false;
+    view.lobby.local_player = None;
 
     let token = match load_token(&transport.config) {
         Ok(token) => token,
@@ -826,6 +862,7 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     let credential_config = transport.config.clone();
     let preferred_player = transport.config.preferred_player;
     let display_name = transport.config.display_name.clone();
+    let auto_join = transport.config.auto_join;
 
     let connection = DbConnection::builder()
         .with_uri(host)
@@ -847,21 +884,23 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
                 .on_applied(move |context| {
                     applied_signals.mark(ALL_DIRTY);
                     applied_signals.push(LifecycleEvent::BootstrapSubscribed { generation });
-                    let join_signals = Arc::clone(&applied_signals);
-                    if let Err(error) = context.reducers.join_match_then(
-                        preferred_player,
-                        display_name,
-                        move |_context, result| {
-                            if let Some(reason) = reducer_failure(result) {
-                                join_signals
-                                    .push(LifecycleEvent::JoinFailed { generation, reason });
-                            }
-                        },
-                    ) {
-                        applied_signals.push(LifecycleEvent::JoinFailed {
-                            generation,
-                            reason: error.to_string(),
-                        });
+                    if auto_join {
+                        let join_signals = Arc::clone(&applied_signals);
+                        if let Err(error) = context.reducers.join_match_then(
+                            preferred_player,
+                            display_name,
+                            move |_context, result| {
+                                if let Some(reason) = reducer_failure(result) {
+                                    join_signals
+                                        .push(LifecycleEvent::JoinFailed { generation, reason });
+                                }
+                            },
+                        ) {
+                            applied_signals.push(LifecycleEvent::JoinFailed {
+                                generation,
+                                reason: error.to_string(),
+                            });
+                        }
                     }
                 })
                 .on_error(move |_context, error| {
@@ -1212,6 +1251,121 @@ fn frame_tick(transport: Res<OnlineTransport>) {
             generation: transport.active_generation,
             reason: error.to_string(),
         });
+    }
+}
+
+fn send_lobby_intents(
+    mut intents: MessageReader<LobbyIntent>,
+    mut view: ResMut<MatchView>,
+    transport: Res<OnlineTransport>,
+) {
+    for intent in intents.read() {
+        if view.lobby.action_pending {
+            continue;
+        }
+        let Some(connection) = &transport.connection else {
+            view.show_toast("Lobby connection is unavailable", ToastKind::Rejection);
+            continue;
+        };
+        if !transport.subscription_lifecycle.bootstrap_ready {
+            view.show_toast("Lobby is still synchronizing", ToastKind::Rejection);
+            continue;
+        }
+        view.lobby.action_pending = true;
+        let generation = transport.active_generation;
+        let signals = Arc::clone(&transport.signals);
+        let dispatch = match intent {
+            LobbyIntent::Create {
+                preset,
+                player_count,
+                display_name,
+            } => {
+                let preset = match preset {
+                    LobbyMapPreset::Small => MapPreset::Dev64,
+                    LobbyMapPreset::Medium => MapPreset::Playtest128,
+                    LobbyMapPreset::Large => MapPreset::Validation192,
+                };
+                let display_name = display_name.clone();
+                connection.reducers.configure_match_then(
+                    preset,
+                    *player_count,
+                    move |context, result| {
+                        if let Some(error) = reducer_failure(result) {
+                            signals.push(LifecycleEvent::LobbyActionFinished {
+                                generation,
+                                action: "Create lobby",
+                                error: Some(error),
+                            });
+                            return;
+                        }
+                        let join_signals = Arc::clone(&signals);
+                        if let Err(error) = context.reducers.join_match_then(
+                            1,
+                            display_name,
+                            move |_context, result| {
+                                join_signals.push(LifecycleEvent::LobbyActionFinished {
+                                    generation,
+                                    action: "Create lobby",
+                                    error: reducer_failure(result),
+                                });
+                            },
+                        ) {
+                            signals.push(LifecycleEvent::LobbyActionFinished {
+                                generation,
+                                action: "Create lobby",
+                                error: Some(error.to_string()),
+                            });
+                        }
+                    },
+                )
+            }
+            LobbyIntent::Join { display_name } => connection.reducers.join_match_then(
+                transport.config.preferred_player,
+                display_name.clone(),
+                move |_context, result| {
+                    signals.push(LifecycleEvent::LobbyActionFinished {
+                        generation,
+                        action: "Join lobby",
+                        error: reducer_failure(result),
+                    });
+                },
+            ),
+            LobbyIntent::Start => connection
+                .reducers
+                .start_match_then(move |_context, result| {
+                    signals.push(LifecycleEvent::LobbyActionFinished {
+                        generation,
+                        action: "Start game",
+                        error: reducer_failure(result),
+                    });
+                }),
+        };
+        if let Err(error) = dispatch {
+            view.lobby.action_pending = false;
+            view.show_toast(
+                format!("Lobby action failed: {error}"),
+                ToastKind::Rejection,
+            );
+        }
+    }
+}
+
+/// Preserve the existing scripted-client workflow: explicitly configured
+/// clients still auto-join and launch once the final scripted seat arrives.
+fn maybe_auto_start(mut transport: ResMut<OnlineTransport>, view: Res<MatchView>) {
+    if !transport.config.auto_join
+        || transport.auto_start_requested
+        || view.lobby.local_player.is_none()
+        || view.phase != MatchPhase::Lobby
+        || view.claimed_players != view.player_count
+    {
+        return;
+    }
+    let Some(connection) = &transport.connection else {
+        return;
+    };
+    if connection.reducers.start_match().is_ok() {
+        transport.auto_start_requested = true;
     }
 }
 
@@ -1654,8 +1808,17 @@ fn synchronize_authoritative_view(
 
     if let Some(config) = snapshot.config {
         view.player_count = config.player_count;
+        view.lobby.map_size = match config.map_preset {
+            MapPreset::Dev64 => 64,
+            MapPreset::Playtest128 => 128,
+            MapPreset::Validation192 => 192,
+        };
+        view.lobby.configuration_locked = config.lobby_configuration_locked;
         view.connection
             .resize(usize::from(config.player_count), ConnectionState::Syncing);
+        view.lobby
+            .player_names
+            .resize(usize::from(config.player_count), String::new());
         view.conquest_threshold_bps = config.conquest_threshold_bps;
         view.max_elevation_step = u16::from(config.max_elevation_step);
         // Config may arrive after the local seat bind in a later dirty batch;
@@ -1760,9 +1923,15 @@ fn apply_lifecycle_event(
             transport.reconnect_delay_seconds = 0.0;
             transport.subscription_lifecycle =
                 transport.subscription_lifecycle.on_bootstrap_applied();
+            view.lobby.available = true;
             view.authority = AuthorityState::Connecting;
-            "Authoritative lobby snapshot applied · joining match…"
-                .clone_into(&mut view.latest_result);
+            if transport.config.auto_join {
+                "Authoritative lobby snapshot applied · joining match…"
+                    .clone_into(&mut view.latest_result);
+            } else {
+                "Authoritative lobby ready · choose create or join"
+                    .clone_into(&mut view.latest_result);
+            }
         }
         LifecycleEvent::TacticalSubscribed { generation }
             if lifecycle_is_current(transport, generation) =>
@@ -1778,7 +1947,22 @@ fn apply_lifecycle_event(
         LifecycleEvent::JoinFailed { generation, reason }
             if lifecycle_is_current(transport, generation) =>
         {
+            view.lobby.action_pending = false;
             mark_join_failed(transport, view, reason);
+        }
+        LifecycleEvent::LobbyActionFinished {
+            generation,
+            action,
+            error,
+        } if lifecycle_is_current(transport, generation) => {
+            view.lobby.action_pending = false;
+            if let Some(error) = error {
+                view.push_log(format!("{action} failed: {error}"));
+                view.show_toast(format!("{action} failed: {error}"), ToastKind::Rejection);
+            } else {
+                view.push_log(format!("{action} accepted"));
+                view.show_toast(format!("{action} accepted"), ToastKind::Success);
+            }
         }
         LifecycleEvent::ConnectionFailed { generation, reason } => {
             handle_connection_loss(
@@ -1818,6 +2002,7 @@ fn apply_lifecycle_event(
         | LifecycleEvent::BootstrapSubscribed { .. }
         | LifecycleEvent::TacticalSubscribed { .. }
         | LifecycleEvent::JoinFailed { .. }
+        | LifecycleEvent::LobbyActionFinished { .. }
         | LifecycleEvent::TokenWarning { .. } => {}
     }
 }
@@ -1867,6 +2052,9 @@ fn handle_connection_loss(
     transport.tactical = TacticalCache::default();
     clear_tactical_presentation(view);
     view.authority = AuthorityState::Connecting;
+    view.lobby.available = false;
+    view.lobby.action_pending = false;
+    view.lobby.local_player = None;
     if let Some(connection) = transport.connection.take() {
         let _ = connection.disconnect();
     }
@@ -2035,6 +2223,12 @@ fn update_players(
     for state in &mut view.connection {
         *state = ConnectionState::Syncing;
     }
+    view.lobby
+        .player_names
+        .resize(usize::from(view.player_count), String::new());
+    for name in &mut view.lobby.player_names {
+        name.clear();
+    }
     let mut local_slot = None;
     for slot in players {
         let Some(index) = (slot.player_id as usize).checked_sub(1) else {
@@ -2050,11 +2244,14 @@ fn update_players(
         } else {
             ConnectionState::ClaimedOffline
         };
+        slot.display_name
+            .clone_into(&mut view.lobby.player_names[index]);
         if identity.is_some() && slot.identity.as_ref() == identity.as_ref() {
             local_slot = Some(slot);
         }
     }
     if let Some(slot) = local_slot {
+        view.lobby.local_player = Some(slot.player_id);
         let local_player = u32::from(slot.player_id);
         if view.local_player != local_player {
             view.local_player = local_player;
@@ -2071,6 +2268,8 @@ fn update_players(
             );
             ensure_tactical_subscriptions(transport, view.player_count, slot.player_id);
         }
+    } else {
+        view.lobby.local_player = None;
     }
 }
 

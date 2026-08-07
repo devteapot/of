@@ -334,20 +334,10 @@ fn verified_claimed_players(ctx: &ReducerContext) -> u16 {
     u16::try_from(count).unwrap_or(u16::MAX)
 }
 
-/// Recompute `claimed_players` from verified configured seats and, when the
-/// lobby is full, transition to Running and install the simulation schedule.
-///
-/// Shared by both fresh claims and recovered/repaired identity joins so a
-/// repaired seat can complete the lobby without a preliminary counter bump
-/// that could fail or drift from the verified seat set.
-fn reconcile_claimed_players_and_maybe_start(ctx: &ReducerContext, now: u64) -> Result<(), String> {
-    let player_count = ctx
-        .db
-        .match_config()
-        .singleton_id()
-        .find(SINGLETON_ID)
-        .ok_or("match config is missing")?
-        .player_count;
+/// Recompute `claimed_players` from verified configured seats. Starting is an
+/// explicit lobby action so the last player joining does not immediately move
+/// every client into the match.
+fn reconcile_claimed_players(ctx: &ReducerContext) -> Result<(), String> {
     let mut state = ctx
         .db
         .match_state()
@@ -356,14 +346,7 @@ fn reconcile_claimed_players_and_maybe_start(ctx: &ReducerContext, now: u64) -> 
         .ok_or("match state is missing")?;
     let verified = verified_claimed_players(ctx);
     state.claimed_players = verified;
-    if state.phase == MatchPhase::Lobby && verified == player_count {
-        state.phase = MatchPhase::Running;
-        state.started_at_us = now;
-        ctx.db.match_state().singleton_id().update(state);
-        ensure_simulation_schedule(ctx)?;
-    } else {
-        ctx.db.match_state().singleton_id().update(state);
-    }
+    ctx.db.match_state().singleton_id().update(state);
     Ok(())
 }
 
@@ -416,7 +399,7 @@ pub fn join_match(
         }
         // Recovered seats (including index repair) must still reconcile the
         // verified claim count so a repaired final seat can start the lobby.
-        reconcile_claimed_players_and_maybe_start(ctx, now)?;
+        reconcile_claimed_players(ctx)?;
         return Ok(());
     }
 
@@ -463,7 +446,54 @@ pub fn join_match(
     }
     ctx.db.player_slot().player_id().update(slot);
     bind_identity(ctx, sender, player_id)?;
-    reconcile_claimed_players_and_maybe_start(ctx, now)?;
+    reconcile_claimed_players(ctx)?;
+    Ok(())
+}
+
+/// Starts a fully claimed lobby. Any player who belongs to this lobby may
+/// start it; the full-seat requirement prevents an incomplete match launch.
+#[spacetimedb::reducer]
+pub fn start_match(ctx: &ReducerContext) -> Result<(), String> {
+    let joined = player_id_for_identity(ctx, ctx.sender()).is_some();
+    let player_count = ctx
+        .db
+        .match_config()
+        .singleton_id()
+        .find(SINGLETON_ID)
+        .ok_or("match config is missing")?
+        .player_count;
+    let mut state = ctx
+        .db
+        .match_state()
+        .singleton_id()
+        .find(SINGLETON_ID)
+        .ok_or("match state is missing")?;
+    let verified = verified_claimed_players(ctx);
+    validate_match_start(joined, state.phase, verified, player_count)?;
+    state.claimed_players = verified;
+    state.phase = MatchPhase::Running;
+    state.started_at_us = timestamp_us(ctx);
+    ctx.db.match_state().singleton_id().update(state);
+    ensure_simulation_schedule(ctx)
+}
+
+fn validate_match_start(
+    joined: bool,
+    phase: MatchPhase,
+    verified: u16,
+    player_count: u16,
+) -> Result<(), String> {
+    if !joined {
+        return Err("join the lobby before starting the match".into());
+    }
+    if phase != MatchPhase::Lobby {
+        return Err("the match is not in the lobby".into());
+    }
+    if verified != player_count {
+        return Err(format!(
+            "all player slots must be claimed before starting ({verified}/{player_count})"
+        ));
+    }
     Ok(())
 }
 
@@ -662,36 +692,18 @@ mod tests {
     }
 
     #[test]
-    fn match_start_requires_exact_verified_claim_count() {
-        // Mirrors reconcile_claimed_players_and_maybe_start: only the exact
-        // configured seat count starts the match. No preliminary counter bump.
+    fn explicit_match_start_requires_membership_lobby_and_full_roster() {
         let player_count = 4_u16;
-        for verified in [0_u16, 1, 3, 5, 4] {
-            let should_start = verified == player_count;
-            assert_eq!(should_start, verified == 4);
-        }
+        assert!(validate_match_start(true, MatchPhase::Lobby, 4, player_count).is_ok());
+        assert!(validate_match_start(false, MatchPhase::Lobby, 4, player_count).is_err());
+        assert!(validate_match_start(true, MatchPhase::Running, 4, player_count).is_err());
+        assert!(validate_match_start(true, MatchPhase::Lobby, 3, player_count).is_err());
     }
 
     #[test]
     fn join_reconciliation_helper_is_shared_by_recovered_and_fresh_paths() {
-        // Both join_match arms call reconcile_claimed_players_and_maybe_start
-        // after seat/index mutation. Recovered index repair must be able to
-        // complete a full lobby: verified seats alone drive claimed_players and
-        // the Lobby→Running transition (no checked_add before replacement).
-        let player_count = 3_u16;
-        let cases = [
-            (2_u16, MatchPhase::Lobby, false),
-            (3_u16, MatchPhase::Lobby, true),
-            (3_u16, MatchPhase::Running, false),
-            (4_u16, MatchPhase::Lobby, false),
-        ];
-        for (verified, phase, expect_start) in cases {
-            let should_start = phase == MatchPhase::Lobby && verified == player_count;
-            assert_eq!(
-                should_start, expect_start,
-                "verified={verified} phase={phase:?}"
-            );
-        }
+        // Both join paths reconcile the durable count. Neither path starts the
+        // match; that transition belongs exclusively to `start_match`.
         // Corrupted counters are ignored; verified seat count is authoritative.
         let corrupted_counter = u16::MAX;
         let verified_seats = 3_u16;
@@ -701,13 +713,13 @@ mod tests {
     }
 
     #[test]
-    fn recovered_identity_repair_can_complete_lobby_start_predicate() {
+    fn recovered_identity_repair_can_make_lobby_startable() {
         let recovered = recover_join_identity(None, Some(2), IndexedSlotBinding::MissingSlot)
             .expect("slot-only identity is recoverable")
             .expect("recovered");
         assert!(recovered.needs_index_repair);
-        // After repair the seat is verified; if it was the final open seat the
-        // shared reconciliation helper starts the match.
+        // After repair the final seat is verified, so a subsequent explicit
+        // start request may launch the match.
         let player_count = 2_u16;
         let verified_after_repair = 2_u16;
         assert!(verified_after_repair == player_count);

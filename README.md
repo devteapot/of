@@ -89,6 +89,11 @@ SpacetimeDB server. Browser settings are URL parameters: `offline`, `host`,
 http://127.0.0.1:8080/?player=2&name=Player%20Two&profile=player-two
 ```
 
+Opening the browser without a `player` parameter shows the interactive lobby,
+where you can enter a name, create a lobby with a map size and player count, or
+join the current lobby. Supplying `player` keeps the direct development path:
+the client auto-joins with the URL's `name` and `profile` values.
+
 Browser identity tokens are scoped by host, database, and profile in
 `localStorage`. Production deployments must use HTTPS/WSS to protect those
 credentials; WebGPU itself requires a secure context (localhost is allowed for
@@ -98,6 +103,27 @@ produce a deployable bundle in `target/web`.
 ## Local multiplayer match
 
 Use separate terminals from the repository root.
+
+For the all-in-one native development workflow, `dev.sh` accepts either named
+or positional lobby settings. Providing a map configures the fresh local match,
+launches one distinctly profiled client per player, auto-joins every seat, and
+starts when the roster is full:
+
+```bash
+./scripts/dev.sh --players 4 --map 128
+# equivalent: ./scripts/dev.sh 4 128
+```
+
+Supported map sizes are `64`, `128`, and `192`. Without a map, the requested
+number of clients opens on the interactive lobby instead of claiming seats:
+
+```bash
+./scripts/dev.sh --players 4
+```
+
+Like the previous `dev.sh`, each initial run recreates the local
+`of-match-dev` database. Run `./scripts/dev.sh --help` for client-argument
+forwarding and controls.
 
 1. Start the local SpacetimeDB host:
 
@@ -151,8 +177,12 @@ Use separate terminals from the repository root.
      ./scripts/run-client.sh
    ```
 
-The match begins when every configured slot is claimed. Use `OF_PLAYER=3`
-through `OF_PLAYER=8` for larger matches. Profile tokens are stored below
+Interactive clients show the shared roster and enable **Start Game** once every
+configured slot is claimed. Explicitly configured development clients
+(`--player`, `OF_PLAYER`, or browser `?player=`) retain the scripted workflow:
+they auto-join and the full scripted roster auto-starts. `--auto-join` or
+`OF_AUTO_JOIN=1` can also opt into that behavior. Use `OF_PLAYER=3` through
+`OF_PLAYER=8` for larger matches. Profile tokens are stored below
 the ignored `.spacetime-data/` directory; reuse the same profile to reclaim a
 slot after reconnecting. If a different identity tries to enter a fully claimed
 match, the client remains an unbound observer and reports the exact slot error;
