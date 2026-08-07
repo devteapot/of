@@ -1812,13 +1812,7 @@ fn synchronize_authoritative_view(
 ) {
     let previous_local_player = view.local_player;
     for event in transport.signals.drain() {
-        apply_lifecycle_event(
-            &mut transport,
-            &mut view,
-            &mut updates,
-            &mut observe,
-            event,
-        );
+        apply_lifecycle_event(&mut transport, &mut view, &mut updates, &mut observe, event);
     }
 
     let dirty = transport.signals.take_dirty();

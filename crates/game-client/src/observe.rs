@@ -112,9 +112,10 @@ impl ObserveState {
     }
 
     fn note_frame_spike(&mut self, now_secs: f64, frame_ms: f64, fps: Option<f64>) {
-        if self.last_frame_spike_at_secs.is_some_and(|previous| {
-            now_secs - previous < FRAME_SPIKE_COOLDOWN_SECS
-        }) {
+        if self
+            .last_frame_spike_at_secs
+            .is_some_and(|previous| now_secs - previous < FRAME_SPIKE_COOLDOWN_SECS)
+        {
             return;
         }
         self.last_frame_spike_at_secs = Some(now_secs);
