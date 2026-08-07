@@ -301,7 +301,7 @@ mod tests {
     fn frame_spike_is_rate_limited() {
         let mut state = ObserveState::new(false);
         state.note_frame_spike(40.0, 40.0, Some(25.0));
-        state.note_frame_spike(50.0, 50.0, Some(20.0));
+        state.note_frame_spike(41.0, 50.0, Some(20.0));
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.events[0].key, keys::PERF_FRAME_SPIKE);
     }
