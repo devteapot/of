@@ -19,6 +19,7 @@ mod lobby;
 mod map_view;
 mod model;
 mod network;
+mod observe;
 mod online;
 mod overlays;
 mod performance;
@@ -35,6 +36,7 @@ use lobby::LobbyPlugin;
 use map_view::MapViewPlugin;
 use model::{MatchView, update_transient_state};
 use network::{NetworkBoundaryPlugin, NetworkSet, OfflineTransportPlugin, apply_server_updates};
+use observe::ObservePlugin;
 use online::{OnlineSyncSet, OnlineTransportPlugin};
 use overlays::OverlayPlugin;
 use performance::PerformanceOverlayPlugin;
@@ -101,6 +103,9 @@ fn main() {
             LobbyPlugin,
             HudPlugin,
             PerformanceOverlayPlugin,
+            ObservePlugin {
+                console_enabled: config.observe,
+            },
         ))
         .insert_resource(ClearColor(Color::srgb(0.018, 0.025, 0.031)))
         .insert_resource(GlobalAmbientLight {

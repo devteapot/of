@@ -239,7 +239,10 @@ pub fn run(args: CoordinatorArgs) -> Result<()> {
         .collect::<Vec<_>>();
 
     let join_deadline = Instant::now() + Duration::from_secs(args.join_timeout_secs);
-    while observer.phase()? == MatchPhase::Lobby {
+    // Stay in Lobby until every seat is claimed; worker 1 then calls start_match.
+    while observer.phase()? == MatchPhase::Lobby
+        && observer.claimed_players() < usize::from(args.players)
+    {
         if args.wait_for_worker_status {
             let (count, messages) = poll_worker_failures_so_far(&run_dir, &shards)?;
             if count > 0 {

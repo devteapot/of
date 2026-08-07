@@ -32,6 +32,23 @@ control module and uses a Vercel function to create `of-match-<lobby-id>`
 databases from the pinned match Wasm, configure them once, and assign browsers
 without changing the match module's authority boundary.
 
+### Two lobby surfaces
+
+There are two distinct UIs named “lobby”; they operate at different boundaries:
+
+- The production browser lobby directory at
+  [`deployment/vercel/index.html`](../deployment/vercel/index.html) is the
+  directory and provisioning surface. It creates, joins, and leaves control
+  lobbies in the lobby database. The Vercel orchestrator provisions a fresh
+  `of-match-<lobby-id>` match database for a ready lobby, then assigns each
+  browser to that database.
+- The in-game Bevy **MATCH LOBBY** at
+  [`crates/game-client/src/lobby.rs`](../crates/game-client/src/lobby.rs)
+  operates inside an already selected match database. Its creator uses
+  `configure_match` to choose the one-shot map and seat count; players claim
+  seats with `join_match`; an eligible seated player starts the configured
+  match. It neither lists production lobbies nor provisions match databases.
+
 ## Authority and cadence
 
 The Bevy client sends intentions only. The match module owns identity slots,
@@ -276,6 +293,13 @@ invalid state, and locked submission each replace that copy with their relevant
 instructions. `?` toggles the complete field manual. The right panel remains
 a compact map-view, inspector, and order summary.
 
+When authoritative state reports victory, a centered result overlay names the
+winner, distinguishes local victory from defeat, and records the resolving
+logical step. `Escape` returns web players to the lobby directory (where they
+can leave the lobby) and exits the native client. The directory captures a
+final member's provisioned match database before deleting its lobby row, then
+best-effort deletes the database without failing that completed leave.
+
 Input produces `ClientIntent`. The online transport invokes generated typed
 reducers, pumps SpacetimeDB frames, and rebuilds `MatchView` from subscribed
 authoritative tables. Stable command IDs and receipts make retry
@@ -300,17 +324,24 @@ selection-adjacent presentation from the new authoritative snapshot.
   metadata/duplicates, and sweeps supported custom seeds.
 - The real-server two-identity harness covers slot claims, match start,
   subscriptions, idempotent receipts, public cluster actions,
-  conserved movement, cancellation, and reconnect.
+  conserved movement, cancellation, and reconnect. Optional
+  `--reconnect-only` / `--reconnect-cycles` soaks record reclaim latency;
+  see [Browser release gates](./browser-gates.md).
 - The distributed `match-perf` harness (`coordinator` / `worker` / `run-local`)
   profiles client-observed step dilation under multi-process load through 500
   seats; see [Performance profiling](./performance.md).
-- CI repeats formatting, workspace tests/lints, module tests/lints/build, and
-  generated-binding drift detection.
+- CI repeats formatting, workspace tests/lints, module tests/lints/build,
+  generated-binding drift detection, and a fresh local-server `match-e2e`
+  two-identity smoke. Production deploy enforces the web-bundle size gate after
+  Trunk build.
 
 ## Known V1 limits
 
 - Infantry is the only force composition serialized by the module.
-- The second join auto-starts the match; there is no lobby UI or ready toggle.
+- The production browser directory supports lobby create/join/leave and
+  provisions `of-match-<lobby-id>` databases. The separate in-game MATCH LOBBY
+  configures, claims seats, and starts an already-selected match database;
+  match configuration remains one-shot per database.
 - Expansion topology is deterministic from the accepted state. The focus changes
   branch allocation but is not a continuously replanned destination.
 - Attack snapshots complete enemy target clusters at acceptance. Fronts evolve
@@ -324,8 +355,10 @@ selection-adjacent presentation from the new authoritative snapshot.
   region-selection architecture.
 - Population/mobilization uses a provisional full-state cadence and leaves
   military headroom for unreceived active internal-order destinations.
-  Movement and combat use active sets, but nominal/stress performance gates
-  still need representative playtest measurement.
+  Movement and combat use active sets. Representative `match-perf` baselines for
+  128-seat playtest/validation dilation are recorded in
+  [Performance profiling](./performance.md); 500-seat nominal and 256×256
+  stretch remain larger follow-ups.
 - There is no morale, explicit supply penalty, HQ defeat, time limit,
   economy/upkeep, demobilization, infrastructure, fog, armor, naval/air force,
   diplomacy, AI, matchmaking, or production art.
@@ -334,8 +367,11 @@ selection-adjacent presentation from the new authoritative snapshot.
   requirement is that soldiers impose both lost civilian labor and an explicit,
   ongoing economic burden.
 - Native desktop and WebAssembly/WebGPU compile targets are supported. The web
-  target uses `localStorage` credentials and asynchronous browser networking;
-  representative browser performance is not yet qualified for production.
+  target uses `localStorage` credentials and asynchronous browser networking.
+  Wasm size, measured 128/192 WebGPU frame budgets, isolated reconnect, and
+  reconnect under concurrent `match-perf` load all **PASS**; see
+  [Browser release gates](./browser-gates.md). Browser-tab seat reclaim (vs map
+  rebuild after reload) remains a thinner evidence path.
 
 These are bounded omissions, not hidden placeholders. Candidate extensions and
 their dependencies are recorded in [future ideas](./future-ideas.md).

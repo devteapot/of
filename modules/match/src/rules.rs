@@ -113,6 +113,25 @@ pub fn write_receipt(
     message: impl Into<String>,
 ) -> Result<(), String> {
     let logical_step = state(ctx)?.logical_step;
+    let message = message.into();
+    let status_label = match status {
+        ReceiptStatus::Accepted => "accept",
+        ReceiptStatus::Rejected => "reject",
+    };
+    match status {
+        ReceiptStatus::Accepted => {
+            log::info!(
+                target: "of",
+                "event=cmd.{status_label} player_id={player_id} command_id={client_command_id} command={command_name} order_id={order_id} step={logical_step}"
+            );
+        }
+        ReceiptStatus::Rejected => {
+            log::warn!(
+                target: "of",
+                "event=cmd.{status_label} player_id={player_id} command_id={client_command_id} command={command_name} step={logical_step} reason={message}"
+            );
+        }
+    }
     ctx.db.command_receipt().insert(CommandReceipt {
         receipt_key: command_key(player_id, client_command_id),
         player_id,
@@ -120,7 +139,7 @@ pub fn write_receipt(
         command_name: command_name.into(),
         status,
         order_id,
-        message: message.into(),
+        message,
         logical_step,
     });
     Ok(())

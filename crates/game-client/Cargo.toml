@@ -24,6 +24,7 @@ clap.workspace = true
 bevy = { workspace = true, features = ["webgpu"] }
 js-sys = "=0.3.103"
 spacetimedb-sdk = { workspace = true, features = ["browser"] }
+wasm-bindgen = "=0.2.126"
 wasm-bindgen-futures = "=0.4.76"
 web-sys = { version = "=0.3.103", features = [
     "Location",

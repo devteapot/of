@@ -59,6 +59,13 @@ async function callReducer(database, reducer, args, token) {
   });
 }
 
+async function deleteMatchDatabase(database) {
+  return upstream(`/v1/database/${encodeURIComponent(database)}`, {
+    method: "DELETE",
+    token: serviceToken(),
+  });
+}
+
 async function query(sql) {
   const text = await upstream(`/v1/database/${LOBBY_DATABASE}/sql`, {
     method: "POST",
@@ -196,9 +203,31 @@ export default async function handler(request, response) {
 
     if (body.action === "leave") {
       const lobbyId = String(body.lobbyId ?? "");
+      // The reducer removes the final member's lobby row, so keep the provisioned
+      // database name before calling it. Only delete after confirming that row is gone.
+      const leavingLobby = (await listLobbies()).find((candidate) => candidate.lobbyId === lobbyId);
       await callReducer(LOBBY_DATABASE, "leave_lobby", [lobbyId], token);
       const lobby = (await listLobbies()).find((candidate) => candidate.lobbyId === lobbyId);
-      return response.status(200).json({ lobby: lobby ?? null });
+      let cleanup = null;
+      if (!lobby && leavingLobby?.matchDatabase) {
+        try {
+          await deleteMatchDatabase(leavingLobby.matchDatabase);
+          cleanup = { database: leavingLobby.matchDatabase, deleted: true };
+        } catch (error) {
+          // Leaving has already succeeded. Report the cleanup failure so callers
+          // can surface it without trapping a user in the lobby.
+          cleanup = {
+            database: leavingLobby.matchDatabase,
+            deleted: false,
+            error: error.message || "match_database_cleanup_failed",
+          };
+          console.error(
+            `Failed to delete match database ${leavingLobby.matchDatabase} after lobby ${lobbyId} was deleted:`,
+            error,
+          );
+        }
+      }
+      return response.status(200).json({ lobby: lobby ?? null, cleanup });
     }
 
     return response.status(400).json({ error: "unknown_action" });

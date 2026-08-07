@@ -98,7 +98,9 @@ Browser identity tokens are scoped by host, database, and profile in
 `localStorage`. Production deployments must use HTTPS/WSS to protect those
 credentials; WebGPU itself requires a secure context (localhost is allowed for
 local development). Run `trunk build` from `crates/game-client` to
-produce a deployable bundle in `target/web`.
+produce a deployable bundle in `target/web`. Measure and enforce the download
+budget with `./scripts/measure-web-bundle.sh --enforce` (see
+[Browser release gates](docs/browser-gates.md)).
 
 ## Production deployment
 
@@ -263,6 +265,7 @@ relevant keys; `?` opens the field manual.
 | `V` | Cycle map views |
 | `?` | Toggle the field manual |
 | `F3` | Toggle the performance overlay |
+| `F4` | Toggle the observe event ring (`OF_OBSERVE=1` / `?observe=1` for console) |
 
 A cluster is the full connected set of owned passable cells. Empty owned cells
 can connect troop-bearing areas; blocked terrain and impassable elevation edges

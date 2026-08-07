@@ -360,6 +360,45 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     }
 
     let join_deadline = Instant::now() + Duration::from_secs(args.ready_timeout_secs);
+    // Player 1's shard starts the match once every configured seat is claimed.
+    // Interactive lobby cutover removed auto-start from join_match.
+    if range.first_player == 1 {
+        while observer.claimed_players() < usize::from(args.match_players) {
+            if Instant::now() >= join_deadline {
+                return fail(
+                    &args,
+                    range,
+                    anyhow::anyhow!(
+                        "timed out waiting for {} claimed seats before start_match (have {})",
+                        args.match_players,
+                        observer.claimed_players()
+                    ),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let Some(starter) = commanders.get(&1) else {
+            return fail(
+                &args,
+                range,
+                anyhow::anyhow!("player 1 commander missing; cannot call start_match"),
+            );
+        };
+        match starter.start_match(command_timeout) {
+            Ok(rtt) => println!(
+                "worker {}-{}: start_match accepted in {rtt:.2?}",
+                range.first_player,
+                range.last_player()
+            ),
+            Err(error) => {
+                let already_running = matches!(observer.phase(), Ok(MatchPhase::Running));
+                if !already_running {
+                    return fail(&args, range, error);
+                }
+            }
+        }
+    }
+
     while match observer.phase() {
         Ok(phase) => phase != MatchPhase::Running,
         Err(error) => return fail(&args, range, error),

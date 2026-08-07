@@ -54,6 +54,9 @@ jobs:
       - name: Build production deployment
         run: ./scripts/build-vercel-production.sh
 
+      - name: Enforce web bundle size gate
+        run: ./scripts/measure-web-bundle.sh --dist target/web --enforce
+
       - name: Publish authoritative module
         env:
           SPACETIMEDB_TOKEN: ${{ secrets.SPACETIMEDB_TOKEN }}

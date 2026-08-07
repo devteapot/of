@@ -111,11 +111,9 @@ fn update_performance_overlay(
     mut state: ResMut<PerformanceOverlayState>,
     text: Single<&mut Text, With<PerformanceText>>,
 ) {
-    if !state.visible {
-        return;
-    }
-
     let refresh_due = state.refresh.tick(time.delta()).just_finished();
+    // Always sample on the cadence so wasm automation can read `window.__ofPerf`
+    // without requiring the F3 panel to be open.
     if !state.refresh_now && !refresh_due {
         return;
     }
@@ -127,13 +125,29 @@ fn update_performance_overlay(
         .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
         .and_then(bevy::diagnostic::Diagnostic::value)
         .unwrap_or(0.0);
+    let chunk_count = chunks.iter().count();
+    #[cfg(target_arch = "wasm32")]
+    publish_browser_perf(
+        fps,
+        frame_time,
+        entities,
+        chunk_count,
+        map_view.visible_chunks,
+        view.cells.len(),
+        view.dirty_chunks.len(),
+    );
+
+    if !state.visible {
+        return;
+    }
+
     let mut text = text.into_inner();
     let value = format!(
         "PERFORMANCE  //  F3\nFPS {:>6}  ·  FRAME {:>7}\nENTITIES {:>6.0}  ·  CHUNKS {:>4} / {:>4} VISIBLE\nCELLS {:>9}  ·  LABELS {:>4}  ·  DIRTY {:>5}\nORDERS {:>8}  ·  FLOWS {:>5}  ·  FRONTS {:>4}",
         format_metric(fps, 1, ""),
         format_metric(frame_time, 2, " ms"),
         entities,
-        chunks.iter().count(),
+        chunk_count,
         map_view.visible_chunks,
         view.cells.len(),
         map_view.active_labels,
@@ -145,6 +159,44 @@ fn update_performance_overlay(
     if **text != value {
         **text = value;
     }
+}
+
+/// Exposes smoothed F3 diagnostics for browser gate automation (`Runtime.evaluate`).
+#[cfg(target_arch = "wasm32")]
+fn publish_browser_perf(
+    fps: Option<f64>,
+    frame_ms: Option<f64>,
+    entities: f64,
+    chunks: usize,
+    visible_chunks: usize,
+    cells: usize,
+    dirty: usize,
+) {
+    use js_sys::{Date, Object, Reflect};
+    use wasm_bindgen::JsValue;
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let perf = Object::new();
+    let set = |key: &str, value: JsValue| {
+        let _ = Reflect::set(&perf, &JsValue::from_str(key), &value);
+    };
+    match fps {
+        Some(value) => set("fps", JsValue::from_f64(value)),
+        None => set("fps", JsValue::NULL),
+    }
+    match frame_ms {
+        Some(value) => set("frame_ms", JsValue::from_f64(value)),
+        None => set("frame_ms", JsValue::NULL),
+    }
+    set("entities", JsValue::from_f64(entities));
+    set("chunks", JsValue::from_f64(chunks as f64));
+    set("visible_chunks", JsValue::from_f64(visible_chunks as f64));
+    set("cells", JsValue::from_f64(cells as f64));
+    set("dirty", JsValue::from_f64(dirty as f64));
+    set("updated_at_ms", JsValue::from_f64(Date::now()));
+    let _ = Reflect::set(&window, &JsValue::from_str("__ofPerf"), &perf);
 }
 
 fn diagnostic_smoothed(

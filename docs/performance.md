@@ -265,6 +265,28 @@ Authority remains **one scheduled reducer and one atomic simulation tick**.
 loaded via `source_by_order` for the union of active packet order IDs **and**
 active transfer order IDs (queued sources on active orders with no packet yet).
 
+## Recorded baselines (2026-08-07)
+
+Budgets from [technical architecture](./technical-architecture.md): cadence
+250 ms; nominal active-step processing p95 **&lt; 62.5 ms**; stretch **&lt; 125 ms**.
+`match-perf` reports client-observed wall-clock ms/step (includes cadence).
+Processing dilation ≈ `max(0, observed_p95 − 250)`.
+
+| Scenario | Preset / seats | observed p50 / p95 ms/step | dilation p95 | vs budget | Artifact dir |
+| --- | --- | ---: | ---: | --- | --- |
+| Nominal-ish 128 | `playtest` / 128 | 251.0 / 268.3 | **18.3 ms** | **PASS** (&lt; 62.5) | `artifacts/performance/runs/playtest128-20260807T181657Z` |
+| Stretch map 192 | `validation` / 128 | 250.0 / 269.1 | **19.1 ms** | **PASS** (&lt; 62.5 / &lt; 125) | `artifacts/performance/runs/validation-nominal-20260807T181753Z` |
+
+Notes: both 128-seat runs failures=0. The playtest run hit max packets 1813 /
+fronts 1502; validation hit max packets 1817 / fronts 1407. p99/max show rare
+spikes while p95 stays near cadence. A 500-seat validation attempt on this host
+failed during lobby joins with WebSocket handshake errors (connection limits);
+raise `ulimit -n` / ephemeral ports before treating that as a module regression.
+True architecture stretch (256×256) remains an unbuilt map preset.
+
+`match-perf` calls `start_match` from player 1 after all seats are claimed
+(interactive lobby cutover removed auto-start on join).
+
 ## Authority boundary and caveats
 
 - **One match database, one scheduled simulation.** Distributing `match-perf`
@@ -284,5 +306,6 @@ active transfer order IDs (queued sources on active orders with no packet yet).
 ## Related docs
 
 - [Technical architecture](./technical-architecture.md) — subscriptions, cadence, scale bands
+- [Browser release gates](./browser-gates.md) — Wasm download, WebGPU 128/192, reconnect soak
 - [Implementation guide](./implementation.md) — authority and table layout
 - [README](../README.md) — toolchain and local multiplayer quick start

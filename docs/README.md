@@ -18,6 +18,12 @@ current interaction or simulation contract.
 - [Graybox UI brief](./v1-ui-brief.md) — concise requirements for visual and
   interaction exploration within the canonical control contract.
 - [Future ideas](./future-ideas.md) — explicitly deferred mechanics and research topics that should not be forgotten or treated as V1 commitments.
+- [Browser release gates](./browser-gates.md) — Wasm download budgets, WebGPU
+  128/192 frame-cost procedure, and reconnect soak status.
+- [Observability](./observability.md) — structured client/module events (F4,
+  `OF_OBSERVE`, SpacetimeDB `event=` logs).
+- [Performance profiling](./performance.md) — distributed `match-perf` harness
+  and step-dilation measurement.
 
 ## Document status
 

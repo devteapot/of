@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hex-core = { path = "../../crates/hex-core" }
+log = "0.4"
 spacetimedb = "=2.7.1"
 worldgen = { path = "../../crates/worldgen" }
 
