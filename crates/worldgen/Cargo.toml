@@ -3,7 +3,7 @@ name = "worldgen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Deterministic curated-map generation for the hex RTS"
+description = "Deterministic curated-map generation for OnlyFronts"
 
 [dependencies]
 hex-core = { workspace = true, features = ["serde"] }

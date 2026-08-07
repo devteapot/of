@@ -76,9 +76,9 @@ fn main() {
         MatchView::connecting(config.preferred_player)
     };
     let window_title = if config.layered_world.is_some() {
-        "Hex RTS · Layered V2 Viewer".to_owned()
+        "OnlyFronts · Layered V2 Viewer".to_owned()
     } else {
-        format!("Hex RTS · V1 {}", config.mode_label())
+        format!("OnlyFronts · V1 {}", config.mode_label())
     };
     let mut app = App::new();
     app.insert_resource(config.clone())

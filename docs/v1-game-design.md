@@ -4,7 +4,7 @@ Status: implemented V1 gameplay baseline, ready for playtesting. Values explicit
 
 ## Vision
 
-Build a native 2–8 player RTS on a stepped 2.5D hex world. The player controls territory and the movement and distribution of aggregate forces, not individual foot soldiers.
+**OnlyFronts** is a native 2–8 player RTS on a stepped 2.5D hex world. The player controls territory and the movement and distribution of aggregate forces, not individual foot soldiers.
 
 The defining mechanic is **spatially conserved troop flow**:
 
@@ -325,7 +325,7 @@ Later, the Bevy client may render a small deterministic sample of representative
 - Per-cell target-density scripting, conditional automation, or automatic
   enemy-target selection.
 - Browser delivery, matchmaking, progression, or production operations.
-- Production art, asset generation, or a settled fiction/theme.
+- Production art, asset generation, or fiction beyond the OnlyFronts title.
 
 These are scope exclusions, not permanent rejections. In particular, infrastructure, fog of war, mutable terrain, armor, naval and air forces, diplomacy, population logistics, economic depth, and demobilization are recorded as post-V1 directions.
 

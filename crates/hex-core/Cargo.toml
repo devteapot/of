@@ -3,7 +3,7 @@ name = "hex-core"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Deterministic, engine-independent simulation rules for the hex RTS"
+description = "Deterministic, engine-independent simulation rules for OnlyFronts"
 
 [lib]
 path = "src/lib.rs"

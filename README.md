@@ -1,4 +1,4 @@
-# Hex RTS V1
+# OnlyFronts
 
 A native 2–500 player RTS prototype about moving conserved aggregate forces across
 a stepped 2.5D hex world. The primary interaction is cluster-first: select one
@@ -8,8 +8,9 @@ attack every shared front. The authoritative wave may split, merge, and turn as
 the front changes. Terrain height, capacity, throughput, frontage, garrisons,
 resistance, and travel time determine how far each branch advances.
 
-The project intentionally has no settled title, fiction, or production art yet.
-V1 is a graybox built to test cluster conquest and explicit troop logistics.
+The working title is **OnlyFronts**. V1 remains a graybox built to test cluster
+conquest and explicit troop logistics; fiction and production art are still
+unsettled.
 The exact control contract lives in
 [Cluster-first troop controls](docs/cluster-controls.md).
 

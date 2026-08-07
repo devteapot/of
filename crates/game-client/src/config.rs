@@ -25,7 +25,7 @@ const DEFAULT_DATABASE: &str = match option_env!("OF_WEB_DATABASE") {
 #[derive(Parser, Debug)]
 #[command(
     name = "game-client",
-    about = "Native hex RTS client",
+    about = "OnlyFronts native client",
     disable_version_flag = true
 )]
 #[allow(clippy::struct_excessive_bools)]
