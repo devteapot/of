@@ -104,7 +104,7 @@
           .join("");
       }
 
-      function render(lobbies) {
+      function render(lobbies, identity) {
         list.replaceChildren();
         const visible = lobbies.filter((lobby) => !["cancelled"].includes(lobby.status));
         if (!visible.length) {
@@ -114,6 +114,7 @@
           list.append(empty);
           return;
         }
+        const self = String(identity?.identity ?? "");
         for (const lobby of visible) {
           const row = document.createElement("article");
           row.className = "lobby";
@@ -127,9 +128,30 @@
           names.className = "names";
           names.textContent = lobby.failureReason || lobby.members.map((member) => member.displayName).join(" · ");
           copy.append(title, meta, names);
+          const actions = document.createElement("div");
+          actions.style.display = "grid";
+          actions.style.gap = "8px";
+          const member = lobby.members.some((entry) => String(entry.identity) === self);
+          if (member) {
+            const leave = document.createElement("button");
+            leave.textContent = "LEAVE";
+            leave.addEventListener("click", async () => {
+              leave.disabled = true;
+              status.textContent = `Leaving ${lobby.lobbyId}…`;
+              try {
+                await api({ action: "leave", lobbyId: lobby.lobbyId });
+                status.textContent = "Left lobby.";
+                await refresh();
+              } catch (error) {
+                status.textContent = error.message;
+                leave.disabled = false;
+              }
+            });
+            actions.append(leave);
+          }
           const join = document.createElement("button");
           join.textContent = "JOIN";
-          join.disabled = lobby.status !== "open" || lobby.memberCount >= lobby.playerCount;
+          join.disabled = member || lobby.status !== "open" || lobby.memberCount >= lobby.playerCount;
           join.addEventListener("click", async () => {
             const displayName = nameInput.value.trim();
             if (!displayName) return nameInput.focus();
@@ -144,17 +166,19 @@
               join.disabled = false;
             }
           });
-          row.append(copy, join);
+          actions.append(join);
+          row.append(copy, actions);
           list.append(row);
         }
       }
 
       async function refresh() {
         try {
+          const identity = await session();
           const response = await fetch("/api/lobbies", { cache: "no-store" });
           const value = await response.json();
           if (!response.ok) throw new Error(value.error ?? "Could not load lobbies");
-          render(value.lobbies);
+          render(value.lobbies, identity);
           status.textContent = "Create a lobby or join an open front.";
         } catch (error) {
           status.textContent = error.message;
