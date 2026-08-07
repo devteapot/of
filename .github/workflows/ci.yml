@@ -84,3 +84,71 @@ jobs:
         run: |
           ./scripts/generate-bindings.sh
           git diff --exit-code -- crates/match-bindings
+
+  match-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            modules/match -> modules/match/target
+
+      - name: Install pinned SpacetimeDB CLI
+        run: |
+          curl -sSf https://install.spacetimedb.com | sh -s -- --yes
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          spacetime version install 2.7.1 --use --yes
+          ./scripts/check-toolchain.sh
+
+      - name: Start local SpacetimeDB
+        run: |
+          spacetime start \
+            --listen-addr 127.0.0.1:3000 \
+            --data-dir "$GITHUB_WORKSPACE/.spacetime-e2e-data" \
+            --non-interactive \
+            > "$RUNNER_TEMP/spacetime-e2e.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/spacetime-e2e.pid"
+          for attempt in {1..60}; do
+            if curl --fail --silent --show-error http://127.0.0.1:3000/v1/metrics > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/spacetime-e2e.log"
+          exit 1
+
+      - name: Publish fresh match database
+        run: |
+          spacetime publish \
+            --server local \
+            --module-path modules/match \
+            --delete-data=always \
+            --yes \
+            of-match-e2e-ci
+
+      - name: Run live match smoke
+        run: |
+          cargo run -p match-e2e -- \
+            --host http://127.0.0.1:3000 \
+            --database of-match-e2e-ci
+
+      - name: Stop local SpacetimeDB
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/spacetime-e2e.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/spacetime-e2e.pid")" || true
+          fi
+          if [ -f "$RUNNER_TEMP/spacetime-e2e.log" ]; then
+            cat "$RUNNER_TEMP/spacetime-e2e.log"
+          fi
