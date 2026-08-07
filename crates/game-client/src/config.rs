@@ -39,6 +39,10 @@ struct ClientArgs {
     /// Credential profile used for the persisted auth token (env: `OF_PROFILE`).
     #[arg(long)]
     profile: Option<String>,
+
+    /// Skip the lobby UI and join immediately (env: `OF_AUTO_JOIN`).
+    #[arg(long)]
+    auto_join: bool,
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -49,12 +53,16 @@ pub struct ClientConfig {
     pub preferred_player: u16,
     pub display_name: String,
     pub profile: String,
+    /// Automation/dev path: connect and call `join_match` after bootstrap.
+    pub auto_join: bool,
 }
 
 impl ClientConfig {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_process() -> Self {
         let args = ClientArgs::parse();
+        let explicit_player = args.player.is_some() || env_nonempty("OF_PLAYER").is_some();
+        let auto_join = args.auto_join || env_flag("OF_AUTO_JOIN") || explicit_player;
         let preferred_player = args
             .player
             .or_else(|| env_u16("OF_PLAYER"))
@@ -68,6 +76,16 @@ impl ClientConfig {
             eprintln!("invalid profile {profile:?}: use only ASCII letters, digits, '-' and '_'");
             std::process::exit(2);
         });
+        let display_name = args
+            .name
+            .or_else(|| env_nonempty("OF_NAME"))
+            .unwrap_or_else(|| {
+                if auto_join {
+                    format!("Player {preferred_player}")
+                } else {
+                    String::new()
+                }
+            });
         Self {
             offline: args.offline || env_flag("OF_OFFLINE"),
             host: args
@@ -80,17 +98,17 @@ impl ClientConfig {
                 .or_else(|| env_nonempty("OF_DATABASE"))
                 .or_else(|| env_nonempty("SPACETIMEDB_DATABASE"))
                 .unwrap_or_else(|| DEFAULT_DATABASE.to_owned()),
-            display_name: args
-                .name
-                .or_else(|| env_nonempty("OF_NAME"))
-                .unwrap_or_else(|| format!("Player {preferred_player}")),
+            display_name,
             preferred_player,
             profile,
+            auto_join,
         }
     }
 
     #[cfg(target_arch = "wasm32")]
     pub fn from_process() -> Self {
+        let explicit_player = browser_param("player").is_some();
+        let auto_join = browser_flag("autojoin") || explicit_player;
         let preferred_player = browser_param("player")
             .and_then(|value| value.parse().ok())
             .filter(|player| (1..=500).contains(player))
@@ -106,10 +124,16 @@ impl ClientConfig {
             database: browser_param("database")
                 .or_else(|| browser_param("db"))
                 .unwrap_or_else(|| DEFAULT_DATABASE.to_owned()),
-            display_name: browser_param("name")
-                .unwrap_or_else(|| format!("Player {preferred_player}")),
+            display_name: browser_param("name").unwrap_or_else(|| {
+                if auto_join {
+                    format!("Player {preferred_player}")
+                } else {
+                    String::new()
+                }
+            }),
             preferred_player,
             profile,
+            auto_join,
         }
     }
 
