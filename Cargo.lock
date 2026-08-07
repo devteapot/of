@@ -2991,6 +2991,7 @@ dependencies = [
  "spacetimedb-sdk",
  "wasm-bindgen-futures",
  "web-sys",
+ "worldgen",
 ]
 
 [[package]]
@@ -3950,6 +3951,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex-core",
+ "serde",
  "serde_json",
  "worldgen",
 ]

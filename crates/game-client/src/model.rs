@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bevy::prelude::*;
 use hex_core::{Axial, ChunkCoord, TerrainKind};
+use worldgen::v2::{Landform, LayeredWorld, Surface};
 
 use crate::geometry::chunk_of;
 
@@ -103,6 +104,10 @@ impl MatchPhase {
 pub struct CellView {
     pub coordinate: Axial,
     pub terrain: TerrainKind,
+    /// V2-only visual metadata. Authoritative V1 cells leave this false.
+    pub river: bool,
+    /// Distinguishes generated lakes from ocean water in the viewer.
+    pub lake: bool,
     pub elevation: i16,
     pub owner: Option<u32>,
     pub civilians: u64,
@@ -389,6 +394,8 @@ impl MatchView {
                         CellView {
                             coordinate,
                             terrain: TerrainKind::Water,
+                            river: false,
+                            lake: false,
                             elevation: 0,
                             owner: None,
                             civilians: 0,
@@ -439,6 +446,8 @@ impl MatchView {
                     CellView {
                         coordinate,
                         terrain,
+                        river: false,
+                        lake: false,
                         elevation,
                         owner,
                         civilians,
@@ -505,6 +514,134 @@ impl MatchView {
             order_log,
             toast: Some(Toast {
                 text: "Offline fixture · Player 1".to_owned(),
+                kind: ToastKind::Info,
+                remaining: 4.0,
+            }),
+            dirty_chunks,
+        }
+    }
+
+    /// Projects a generated layered world into the existing offline client
+    /// model. Static V2 layers remain authoritative in `worldgen`; this view
+    /// keeps only the fields that the current renderer and interaction model
+    /// can display.
+    pub fn offline_layered_world(world: &LayeredWorld, preferred_player: u16) -> Self {
+        let player_count = world.manifest.player_count.clamp(2, 500);
+        let local_player = u32::from(preferred_player.min(player_count).max(1));
+        let spawn_owners = layered_spawn_owners(world);
+        let mut cells = BTreeMap::new();
+        let mut non_capturable_cells = BTreeSet::new();
+        let mut capturable_cells = 0_u64;
+
+        for (cell_id, layered) in world.cells().iter().enumerate() {
+            let coordinate = world
+                .coordinate(u32::try_from(cell_id).expect("V2 cell IDs fit in u32"))
+                .expect("V2 dense cell has a coordinate");
+            let water = layered.surface != Surface::Land;
+            let terrain = if water {
+                TerrainKind::Water
+            } else {
+                match layered.landform {
+                    Landform::Plain | Landform::Valley => TerrainKind::Plains,
+                    Landform::Hill | Landform::Plateau => TerrainKind::Hills,
+                    Landform::Mountain => TerrainKind::Mountain,
+                }
+            };
+            // V2 stores broad signed relief while the V1 viewer models six
+            // discrete elevation steps. Quantize without flattening ridges.
+            let elevation = if water {
+                0
+            } else {
+                i16::try_from(((i32::from(layered.elevation).max(0) + 99) / 100).clamp(1, 6))
+                    .expect("viewer elevation is clamped")
+            };
+            let owner = spawn_owners.get(&coordinate).copied();
+            let military_capacity = u64::from(layered.gameplay.military_capacity);
+            let civilians = owner.map_or(0, |_| u64::from(layered.gameplay.civilian_capacity) / 2);
+            let infantry = owner.map_or(0, |_| military_capacity / 2);
+            if layered.gameplay.capturable {
+                capturable_cells += 1;
+            } else if !water {
+                non_capturable_cells.insert(coordinate);
+            }
+            cells.insert(
+                coordinate,
+                CellView {
+                    coordinate,
+                    terrain,
+                    river: layered.river.is_some(),
+                    lake: layered.surface == Surface::Lake,
+                    elevation,
+                    owner,
+                    civilians,
+                    infantry,
+                    military_capacity,
+                    blocked: !layered.gameplay.passable,
+                },
+            );
+        }
+
+        let cells_by_chunk = index_cells_by_chunk(&cells);
+        let dirty_chunks = cells_by_chunk.keys().copied().collect();
+        let required_control =
+            capturable_cells.saturating_mul(8_000).saturating_add(9_999) / 10_000;
+        let mut order_log = VecDeque::new();
+        order_log.push_front(format!(
+            "Layered V2 map {:016x} · {}x{} · seed {}",
+            world.manifest.content_hash,
+            world.width(),
+            world.height(),
+            world.manifest.seed,
+        ));
+
+        Self {
+            cells,
+            cells_by_chunk,
+            chunk_index_revision: 1,
+            cell_state_revision: 1,
+            planning_revision: 1,
+            ownership_revision: 1,
+            contest_revision: 0,
+            local_player,
+            player_count,
+            claimed_players: player_count,
+            lobby: LobbyView {
+                map_size: u16::try_from(world.width().max(world.height())).unwrap_or(u16::MAX),
+                configuration_locked: true,
+                available: false,
+                action_pending: false,
+                local_player: Some(u16::try_from(local_player).expect("local player fits u16")),
+                player_names: (1..=player_count)
+                    .map(|player| format!("Player {player}"))
+                    .collect(),
+            },
+            authority: AuthorityState::Offline,
+            connection: vec![ConnectionState::Offline; usize::from(player_count)],
+            phase: MatchPhase::Running,
+            conquest_threshold_bps: 8_000,
+            max_elevation_step: 2,
+            non_capturable_cells,
+            authoritative_control: None,
+            capturable_cells,
+            required_control,
+            logical_step: 0,
+            mobilization_target: 0.55,
+            active_orders: 0,
+            queued_infantry: 0,
+            active_flows: Vec::new(),
+            authoritative_flows: BTreeMap::new(),
+            authoritative_flows_by_chunk: BTreeMap::new(),
+            active_fronts: Vec::new(),
+            contested_cells: BTreeMap::new(),
+            retask_projection: RetaskProjection::default(),
+            retask_revision: 0,
+            latest_result: format!(
+                "Layered V2 viewer · {} land · {} lakes · {} rivers",
+                world.manifest.land_cells, world.manifest.lake_cells, world.manifest.river_cells,
+            ),
+            order_log,
+            toast: Some(Toast {
+                text: format!("Layered V2 · Player {local_player}"),
                 kind: ToastKind::Info,
                 remaining: 4.0,
             }),
@@ -848,6 +985,42 @@ fn offline_owner(coordinate: Axial, player_count: u16) -> Option<u32> {
         })
 }
 
+fn layered_spawn_owners(world: &LayeredWorld) -> BTreeMap<Axial, u32> {
+    const SPAWN_RADIUS: i32 = 2;
+    // Reserve each exact spawn before expanding neighborhoods so even dense
+    // high-player-count maps visibly retain one cell for every player.
+    let mut owners = world
+        .manifest
+        .spawn_cells
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, spawn)| {
+            (
+                spawn,
+                u32::try_from(index + 1).expect("V2 supports at most 500 players"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (index, spawn) in world.manifest.spawn_cells.iter().copied().enumerate() {
+        let player = u32::try_from(index + 1).expect("V2 supports at most 500 players");
+        for q_offset in -SPAWN_RADIUS..=SPAWN_RADIUS {
+            let r_min = (-SPAWN_RADIUS).max(-q_offset - SPAWN_RADIUS);
+            let r_max = SPAWN_RADIUS.min(-q_offset + SPAWN_RADIUS);
+            for r_offset in r_min..=r_max {
+                let coordinate = Axial::new(spawn.q + q_offset, spawn.r + r_offset);
+                if world
+                    .cell(coordinate)
+                    .is_some_and(|cell| cell.gameplay.passable)
+                {
+                    owners.entry(coordinate).or_insert(player);
+                }
+            }
+        }
+    }
+    owners
+}
+
 fn offline_player_anchors(player_count: u16) -> Vec<Axial> {
     if player_count <= 8 {
         return OFFLINE_PLAYER_ANCHORS
@@ -1014,6 +1187,8 @@ mod tests {
         CellView {
             coordinate,
             terrain: TerrainKind::Plains,
+            river: false,
+            lake: false,
             elevation: 0,
             owner: Some(PLAYER_ONE),
             civilians: 0,
@@ -1080,6 +1255,36 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(owners.contains(&1));
         assert!(owners.iter().any(|owner| *owner > 8));
+    }
+
+    #[test]
+    fn layered_world_projects_terrain_hydrology_and_spawns_into_viewer() {
+        let mut spec = worldgen::v2::WorldSpec::new("viewer-test", 96, 96, 42);
+        spec.player_count = 4;
+        let world = worldgen::v2::generate(&spec).expect("layered fixture");
+        let view = MatchView::offline_layered_world(&world, 99);
+
+        assert_eq!(view.cells.len(), 96 * 96);
+        assert_eq!(view.player_count, 4);
+        assert_eq!(view.local_player, 4);
+        assert!(view.cells.values().any(CellView::is_water));
+        assert!(view.cells.values().any(|cell| cell.river));
+        assert!(
+            view.cells.values().any(|cell| {
+                matches!(cell.terrain, TerrainKind::Mountain) && cell.elevation > 0
+            })
+        );
+        assert_eq!(
+            view.cells.values().filter(|cell| cell.lake).count(),
+            world.manifest.lake_cells as usize
+        );
+        assert_eq!(
+            view.cells
+                .values()
+                .filter_map(|cell| cell.owner)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2, 3, 4])
+        );
     }
 
     #[test]

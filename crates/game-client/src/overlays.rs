@@ -803,6 +803,8 @@ mod tests {
         CellView {
             coordinate,
             terrain: TerrainKind::Plains,
+            river: false,
+            lake: false,
             elevation: 0,
             owner,
             civilians: 0,
