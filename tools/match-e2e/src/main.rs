@@ -1986,6 +1986,20 @@ fn exercise_cluster_first_controls(
             else {
                 return Ok(None);
             };
+            let visible_packet_total = client
+                .conn
+                .db
+                .transit_packet()
+                .iter()
+                .filter(|packet| packet.order_id == order.order_id)
+                .map(|packet| packet.infantry)
+                .sum::<u64>();
+            if visible_packet_total != order.in_transit_infantry {
+                // Table callbacks from one transaction may reach the SDK
+                // cache in different turns. Wait for the coherent snapshot;
+                // a durable mismatch still times out and fails this phase.
+                return Ok(None);
+            }
             assert_cluster_action_order(
                 &client.conn,
                 &order,
