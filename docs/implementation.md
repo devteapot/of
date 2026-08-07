@@ -32,6 +32,23 @@ control module and uses a Vercel function to create `of-match-<lobby-id>`
 databases from the pinned match Wasm, configure them once, and assign browsers
 without changing the match module's authority boundary.
 
+### Two lobby surfaces
+
+There are two distinct UIs named “lobby”; they operate at different boundaries:
+
+- The production browser lobby directory at
+  [`deployment/vercel/index.html`](../deployment/vercel/index.html) is the
+  directory and provisioning surface. It creates, joins, and leaves control
+  lobbies in the lobby database. The Vercel orchestrator provisions a fresh
+  `of-match-<lobby-id>` match database for a ready lobby, then assigns each
+  browser to that database.
+- The in-game Bevy **MATCH LOBBY** at
+  [`crates/game-client/src/lobby.rs`](../crates/game-client/src/lobby.rs)
+  operates inside an already selected match database. Its creator uses
+  `configure_match` to choose the one-shot map and seat count; players claim
+  seats with `join_match`; an eligible seated player starts the configured
+  match. It neither lists production lobbies nor provisions match databases.
+
 ## Authority and cadence
 
 The Bevy client sends intentions only. The match module owns identity slots,
@@ -313,15 +330,18 @@ selection-adjacent presentation from the new authoritative snapshot.
 - The distributed `match-perf` harness (`coordinator` / `worker` / `run-local`)
   profiles client-observed step dilation under multi-process load through 500
   seats; see [Performance profiling](./performance.md).
-- CI repeats formatting, workspace tests/lints, module tests/lints/build, and
-  generated-binding drift detection. Production deploy enforces the web-bundle
-  size gate after Trunk build.
+- CI repeats formatting, workspace tests/lints, module tests/lints/build,
+  generated-binding drift detection, and a fresh local-server `match-e2e`
+  two-identity smoke. Production deploy enforces the web-bundle size gate after
+  Trunk build.
 
 ## Known V1 limits
 
 - Infantry is the only force composition serialized by the module.
-- Lobby create/join/start is implemented; empty lobbies can be cleaned up by
-  leave/auto-delete flows. Match configuration remains one-shot per database.
+- The production browser directory supports lobby create/join/leave and
+  provisions `of-match-<lobby-id>` databases. The separate in-game MATCH LOBBY
+  configures, claims seats, and starts an already-selected match database;
+  match configuration remains one-shot per database.
 - Expansion topology is deterministic from the accepted state. The focus changes
   branch allocation but is not a continuously replanned destination.
 - Attack snapshots complete enemy target clusters at acceptance. Fronts evolve
@@ -345,10 +365,11 @@ selection-adjacent presentation from the new authoritative snapshot.
   requirement is that soldiers impose both lost civilian labor and an explicit,
   ongoing economic burden.
 - Native desktop and WebAssembly/WebGPU compile targets are supported. The web
-  target uses `localStorage` credentials and asynchronous browser networking;
-  representative browser performance is not yet qualified for production. See
-  [Browser release gates](./browser-gates.md) for budgets, the Wasm size
-  baseline, and the remaining WebGPU / reconnect evidence checklist.
+  target uses `localStorage` credentials and asynchronous browser networking.
+  Wasm size and the measured 128/192 WebGPU frame budgets pass, and isolated
+  reconnect plus browser reload smoke are recorded; reconnect under concurrent
+  load remains unqualified. See [Browser release gates](./browser-gates.md) for
+  the evidence and remaining reconnect gate.
 
 These are bounded omissions, not hidden placeholders. Candidate extensions and
 their dependencies are recorded in [future ideas](./future-ideas.md).
