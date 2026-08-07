@@ -184,7 +184,7 @@ representative wide fronts.
 
 ## Browser target
 
-A browser build remains a desirable later target while native desktop is the V1 focus. Core simulation and data formats should avoid unnecessary platform coupling, but browser-specific compromises should not constrain the first implementation before its mechanics are proven.
+A browser build remains a desirable later target while native desktop is the V1 focus. Core simulation and data formats should avoid unnecessary platform coupling, but browser-specific compromises should not constrain the first implementation before its mechanics are proven. Concrete download, WebGPU frame-cost, and reconnect budgets now live in [Browser release gates](./browser-gates.md).
 
 **Depends on:** Bevy target compatibility at the chosen pinned version, graphics/shader portability, asset size and loading, memory limits, input differences, networking behavior, and profiling representative maps on actual browsers.
 

@@ -222,11 +222,15 @@ pub fn create_lobby(
     });
     ctx.db.lobby_member().insert(LobbyMember {
         member_key: member_key(&lobby_id, ctx.sender()),
-        lobby_id,
+        lobby_id: lobby_id.clone(),
         identity: ctx.sender(),
         display_name,
         joined_at_us: now,
     });
+    log::info!(
+        target: "of",
+        "event=lobby.create lobby_id={lobby_id} players={player_count} preset={map_preset:?}"
+    );
     Ok(())
 }
 
@@ -261,7 +265,7 @@ pub fn join_lobby(
     let now = timestamp_us(ctx);
     ctx.db.lobby_member().insert(LobbyMember {
         member_key: member_key(&lobby_id, ctx.sender()),
-        lobby_id,
+        lobby_id: lobby_id.clone(),
         identity: ctx.sender(),
         display_name,
         joined_at_us: now,
@@ -271,7 +275,13 @@ pub fn join_lobby(
     if lobby.member_count == lobby.player_count {
         lobby.status = LobbyStatus::Full;
     }
+    let member_count = lobby.member_count;
+    let status = lobby.status;
     ctx.db.lobby().lobby_id().update(lobby);
+    log::info!(
+        target: "of",
+        "event=lobby.join lobby_id={lobby_id} members={member_count} status={status:?}"
+    );
     Ok(())
 }
 
@@ -296,6 +306,10 @@ pub fn leave_lobby(ctx: &ReducerContext, lobby_id: String) -> Result<(), String>
             // lobby — so drop the row instead of leaving an orphan that blocks
             // create_lobby via active membership.
             delete_lobby_and_members(ctx, &lobby_id);
+            log::info!(
+                target: "of",
+                "event=lobby.leave lobby_id={lobby_id} outcome=deleted"
+            );
             Ok(())
         }
         Ok(status) => {
@@ -303,6 +317,10 @@ pub fn leave_lobby(ctx: &ReducerContext, lobby_id: String) -> Result<(), String>
             lobby.status = status;
             lobby.updated_at_us = timestamp_us(ctx);
             ctx.db.lobby().lobby_id().update(lobby);
+            log::info!(
+                target: "of",
+                "event=lobby.leave lobby_id={lobby_id} members={member_count} status={status:?}"
+            );
             Ok(())
         }
     }
@@ -326,6 +344,10 @@ pub fn begin_provision(ctx: &ReducerContext, lobby_id: String) -> Result<(), Str
     lobby.status = LobbyStatus::Provisioning;
     lobby.updated_at_us = timestamp_us(ctx);
     ctx.db.lobby().lobby_id().update(lobby);
+    log::info!(
+        target: "of",
+        "event=lobby.provision_begin lobby_id={lobby_id}"
+    );
     Ok(())
 }
 
@@ -357,6 +379,11 @@ pub fn complete_provision(
     lobby.match_database = match_database;
     lobby.failure_reason.clear();
     lobby.updated_at_us = timestamp_us(ctx);
+    log::info!(
+        target: "of",
+        "event=lobby.provision_complete lobby_id={lobby_id} match_database={}",
+        lobby.match_database
+    );
     ctx.db.lobby().lobby_id().update(lobby);
     Ok(())
 }
@@ -383,6 +410,11 @@ pub fn fail_provision(
     lobby.status = LobbyStatus::Failed;
     lobby.failure_reason = reason.trim().chars().take(160).collect();
     lobby.updated_at_us = timestamp_us(ctx);
+    log::warn!(
+        target: "of",
+        "event=lobby.provision_fail lobby_id={lobby_id} reason={}",
+        lobby.failure_reason
+    );
     ctx.db.lobby().lobby_id().update(lobby);
     Ok(())
 }

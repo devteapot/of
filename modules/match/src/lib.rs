@@ -393,6 +393,7 @@ pub fn join_match(
             return Err("player slot is already claimed by another identity".into());
         }
         apply_reconnect_to_slot(&mut existing, sender, now, &display_name);
+        let reconnect_count = existing.reconnect_count;
         ctx.db.player_slot().player_id().update(existing);
         if recovered.needs_index_repair {
             bind_identity(ctx, sender, recovered.player_id)?;
@@ -400,6 +401,12 @@ pub fn join_match(
         // Recovered seats (including index repair) must still reconcile the
         // verified claim count so a repaired final seat can start the lobby.
         reconcile_claimed_players(ctx)?;
+        log::info!(
+            target: "of",
+            "event=match.join mode=reconnect player_id={} reconnect_count={reconnect_count} repair={}",
+            recovered.player_id,
+            u8::from(recovered.needs_index_repair)
+        );
         return Ok(());
     }
 
@@ -447,6 +454,10 @@ pub fn join_match(
     ctx.db.player_slot().player_id().update(slot);
     bind_identity(ctx, sender, player_id)?;
     reconcile_claimed_players(ctx)?;
+    log::info!(
+        target: "of",
+        "event=match.join mode=claim player_id={player_id} preferred={preferred_player_id}"
+    );
     Ok(())
 }
 
@@ -474,7 +485,12 @@ pub fn start_match(ctx: &ReducerContext) -> Result<(), String> {
     state.phase = MatchPhase::Running;
     state.started_at_us = timestamp_us(ctx);
     ctx.db.match_state().singleton_id().update(state);
-    ensure_simulation_schedule(ctx)
+    ensure_simulation_schedule(ctx)?;
+    log::info!(
+        target: "of",
+        "event=match.start players={player_count} claimed={verified}"
+    );
+    Ok(())
 }
 
 fn validate_match_start(
@@ -504,13 +520,21 @@ pub fn identity_connected(ctx: &ReducerContext) {
         return;
     };
     if let Some(mut slot) = ctx.db.player_slot().player_id().find(player_id) {
+        let was_connected = slot.connected;
         if !slot.connected {
             slot.has_reconnected = true;
             slot.reconnect_count = slot.reconnect_count.saturating_add(1);
         }
         slot.connected = true;
         slot.last_seen_at_us = timestamp_us(ctx);
+        let reconnect_count = slot.reconnect_count;
         ctx.db.player_slot().player_id().update(slot);
+        if !was_connected {
+            log::info!(
+                target: "of",
+                "event=match.connected player_id={player_id} reconnect_count={reconnect_count}"
+            );
+        }
     }
 }
 
@@ -524,6 +548,10 @@ pub fn identity_disconnected(ctx: &ReducerContext) {
         slot.connected = false;
         slot.last_seen_at_us = timestamp_us(ctx);
         ctx.db.player_slot().player_id().update(slot);
+        log::info!(
+            target: "of",
+            "event=match.disconnected player_id={player_id}"
+        );
     }
 }
 

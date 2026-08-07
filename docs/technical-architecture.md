@@ -49,6 +49,8 @@ Connection setup is asynchronous and identity tokens are stored in browser
 filesystem-backed credential adapter. Browser compile coverage is part of the
 compatibility gate; representative browser graphics, reconnect, download-size,
 and map-performance measurements remain required before production release.
+Track budgets, scripts, and measured status in
+[Browser release gates](./browser-gates.md).
 
 Upgrade Bevy or SpacetimeDB intentionally on a dedicated branch, regenerate
 bindings, run migrations if required, and repeat native, web-compile,
@@ -497,7 +499,7 @@ selection and target outlines inspect visible render chunks, and hidden chunks
 converge under budgets. Authoritative scheduled work remains active-order and
 active-front driven. Native-only credentials, windowing, and startup behavior
 stay behind narrow adapters; browser delivery remains a later qualification
-gate.
+gate tracked in [Browser release gates](./browser-gates.md).
 
 ## Reconnect and recovery
 
@@ -632,7 +634,7 @@ The following questions stay open until profiling or playtesting supplies eviden
   aggregated with `EXPANSION_AGGREGATE_ORIGIN`.
 - Static map delivery through database rows versus content-addressed baked assets with hash verification.
 - Region-level summaries and level of detail for maps intended to represent a whole world.
-- Browser delivery, WebGPU/WebGL compatibility, download size, threading limits, and browser-specific SpacetimeDB behavior. WASM portability is retained, but web release work follows native V1.
+- Browser delivery, WebGPU/WebGL compatibility, download size, threading limits, and browser-specific SpacetimeDB behavior. WASM portability is retained, but web release work follows native V1. Concrete download, frame-cost, and reconnect budgets live in [Browser release gates](./browser-gates.md) until those measurements close.
 - Roads, cities, bridges, destructible infrastructure, additional recruitment structures and policies, fog of war, diplomacy, naval/air movement, and mutable terrain.
 - Multi-hex armored formations and deliberate spatial blocking. These remain separate from scalar infantry flow and must be prototyped after V1.
 - AI opponents, teams, spectators, matchmaking, and long-term persistence beyond match results.

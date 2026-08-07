@@ -2989,6 +2989,7 @@ dependencies = [
  "js-sys",
  "match-bindings",
  "spacetimedb-sdk",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "worldgen",
@@ -3972,6 +3973,8 @@ dependencies = [
  "clap",
  "hex-core",
  "match-bindings",
+ "serde",
+ "serde_json",
  "spacetimedb-sdk",
 ]
 

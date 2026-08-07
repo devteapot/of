@@ -28,6 +28,7 @@ const DEFAULT_DATABASE: &str = match option_env!("OF_WEB_DATABASE") {
     about = "Native hex RTS client",
     disable_version_flag = true
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct ClientArgs {
     /// Use the local deterministic fixture instead of `SpacetimeDB`.
     #[arg(long)]
@@ -88,6 +89,10 @@ struct ClientArgs {
     /// Skip the lobby UI and join immediately (env: `OF_AUTO_JOIN`).
     #[arg(long)]
     auto_join: bool,
+
+    /// Emit structured `[of.observe]` events to the log/console (env: `OF_OBSERVE`).
+    #[arg(long)]
+    observe: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +114,8 @@ pub struct ClientConfig {
     pub profile: String,
     /// Automation/dev path: connect and call `join_match` after bootstrap.
     pub auto_join: bool,
+    /// Emit structured observe events to stderr / browser console.
+    pub observe: bool,
 }
 
 impl ClientConfig {
@@ -167,6 +174,7 @@ impl ClientConfig {
             preferred_player,
             profile,
             auto_join,
+            observe: args.observe || env_flag("OF_OBSERVE"),
         }
     }
 
@@ -200,6 +208,7 @@ impl ClientConfig {
             preferred_player,
             profile,
             auto_join,
+            observe: browser_flag("observe"),
         }
     }
 

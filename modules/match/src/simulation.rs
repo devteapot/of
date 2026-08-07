@@ -460,6 +460,14 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
         let _phase_stopwatch = LogStopwatch::new("simulation_population");
         population_step(ctx, logical_step, high_scale)?;
     }
+    if logical_step.is_multiple_of(40) {
+        log::info!(
+            target: "of",
+            "event=sim.heartbeat step={logical_step} packets={} high_scale={}",
+            packets.rows.len(),
+            u8::from(high_scale)
+        );
+    }
     Ok(state(ctx)?.phase == MatchPhase::Running)
 }
 

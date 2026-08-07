@@ -300,17 +300,21 @@ selection-adjacent presentation from the new authoritative snapshot.
   metadata/duplicates, and sweeps supported custom seeds.
 - The real-server two-identity harness covers slot claims, match start,
   subscriptions, idempotent receipts, public cluster actions,
-  conserved movement, cancellation, and reconnect.
+  conserved movement, cancellation, and reconnect. Optional
+  `--reconnect-only` / `--reconnect-cycles` soaks record reclaim latency;
+  see [Browser release gates](./browser-gates.md).
 - The distributed `match-perf` harness (`coordinator` / `worker` / `run-local`)
   profiles client-observed step dilation under multi-process load through 500
   seats; see [Performance profiling](./performance.md).
 - CI repeats formatting, workspace tests/lints, module tests/lints/build, and
-  generated-binding drift detection.
+  generated-binding drift detection. Production deploy enforces the web-bundle
+  size gate after Trunk build.
 
 ## Known V1 limits
 
 - Infantry is the only force composition serialized by the module.
-- The second join auto-starts the match; there is no lobby UI or ready toggle.
+- Lobby create/join/start is implemented; empty lobbies can be cleaned up by
+  leave/auto-delete flows. Match configuration remains one-shot per database.
 - Expansion topology is deterministic from the accepted state. The focus changes
   branch allocation but is not a continuously replanned destination.
 - Attack snapshots complete enemy target clusters at acceptance. Fronts evolve
@@ -335,7 +339,9 @@ selection-adjacent presentation from the new authoritative snapshot.
   ongoing economic burden.
 - Native desktop and WebAssembly/WebGPU compile targets are supported. The web
   target uses `localStorage` credentials and asynchronous browser networking;
-  representative browser performance is not yet qualified for production.
+  representative browser performance is not yet qualified for production. See
+  [Browser release gates](./browser-gates.md) for budgets, the Wasm size
+  baseline, and the remaining WebGPU / reconnect evidence checklist.
 
 These are bounded omissions, not hidden placeholders. Candidate extensions and
 their dependencies are recorded in [future ideas](./future-ideas.md).

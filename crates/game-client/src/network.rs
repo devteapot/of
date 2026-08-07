@@ -20,6 +20,7 @@ use crate::model::{
     ActiveFlow, ActiveFront, MatchPhase, MatchView, OrderSelectionProjectionError,
     ProjectedOrderSelection, ToastKind,
 };
+use crate::observe::{ObserveLevel, ObserveState, keys as observe_keys};
 
 #[derive(Message, Clone, Debug)]
 pub enum ClientIntent {
@@ -194,12 +195,17 @@ pub fn resolve_offline_intents(
     }
 }
 
-pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: ResMut<MatchView>) {
+pub fn apply_server_updates(
+    mut updates: MessageReader<ServerUpdate>,
+    mut view: ResMut<MatchView>,
+    mut observe: ResMut<ObserveState>,
+) {
     let mut offline_ownership_changed = false;
     for update in updates.read() {
         match update {
             ServerUpdate::SubmissionStarted { .. } => {}
             ServerUpdate::Accepted {
+                command_id,
                 summary,
                 patches,
                 flow,
@@ -219,12 +225,28 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
                 if let Some(front) = front {
                     view.active_fronts.push(front.clone());
                 }
+                observe.emit(
+                    ObserveLevel::Info,
+                    observe_keys::CMD_ACCEPT,
+                    format!(
+                        "command_id={} summary={summary}",
+                        command_id.map_or_else(|| "-".to_owned(), |id| id.to_string())
+                    ),
+                );
                 view.push_log(summary);
                 view.show_toast("Command accepted", ToastKind::Success);
             }
             ServerUpdate::MobilizationChanged { command_id, target } => {
                 view.mobilization_target = *target;
                 let command = command_id.map_or_else(String::new, |id| format!(" · command #{id}"));
+                observe.emit(
+                    ObserveLevel::Info,
+                    observe_keys::CMD_ACCEPT,
+                    format!(
+                        "command_id={} kind=set_mobilization_target target={target:.2}",
+                        command_id.map_or_else(|| "-".to_owned(), |id| id.to_string())
+                    ),
+                );
                 view.push_log(format!(
                     "Mobilization target set to {:.0}%{command}",
                     target * 100.0
@@ -232,6 +254,7 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
                 view.show_toast("Future recruitment target updated", ToastKind::Success);
             }
             ServerUpdate::Rejected {
+                command_id,
                 reason,
                 relevant_cell,
                 ..
@@ -239,6 +262,14 @@ pub fn apply_server_updates(mut updates: MessageReader<ServerUpdate>, mut view: 
                 let marker = relevant_cell.map_or_else(String::new, |cell| {
                     format!(" · marked {},{}", cell.q, cell.r)
                 });
+                observe.emit(
+                    ObserveLevel::Warn,
+                    observe_keys::CMD_REJECT,
+                    format!(
+                        "command_id={} reason={reason}",
+                        command_id.map_or_else(|| "-".to_owned(), |id| id.to_string())
+                    ),
+                );
                 view.push_log(format!("Rejected: {reason}{marker}"));
                 view.show_toast(reason, ToastKind::Rejection);
             }

@@ -25,6 +25,7 @@ use match_bindings::{
     TransitPacketTableAccess, TransitRouteTableAccess, cancel_orders as _,
     issue_attack_clusters as _, issue_expand_all as _, issue_expand_clusters as _,
     issue_push_front as _, issue_reshape as _, join_match as _, set_mobilization_target as _,
+    start_match as _,
 };
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
@@ -62,6 +63,15 @@ struct Args {
     #[arg(long, default_value = ".match-e2e-tokens")]
     token_dir: PathBuf,
 
+    /// Optional override for player one's token file (for example a match-perf
+    /// `player-1.token` during reconnect-under-load soaks).
+    #[arg(long)]
+    player_one_token: Option<PathBuf>,
+
+    /// Optional override for player two's token file / reconnect observer.
+    #[arg(long)]
+    player_two_token: Option<PathBuf>,
+
     /// Maximum time allowed for each asynchronous phase.
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
@@ -69,6 +79,41 @@ struct Args {
     /// Client-cache polling interval.
     #[arg(long, default_value_t = 20)]
     poll_ms: u64,
+
+    /// Skip the gameplay smoke and only exercise reconnect reclaim cycles.
+    /// Requires a published database; joins seats and calls `start_match` when
+    /// the match is still in Lobby.
+    #[arg(long, default_value_t = false)]
+    reconnect_only: bool,
+
+    /// Extra disconnect/reconnect cycles after the functional reclaim proof
+    /// (or the sole workload when `--reconnect-only` is set).
+    #[arg(long, default_value_t = 0)]
+    reconnect_cycles: u32,
+
+    /// Optional JSON report path for reconnect soak timings.
+    #[arg(long)]
+    reconnect_report: Option<PathBuf>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReconnectCycleReport {
+    cycle: u32,
+    disconnect_to_reclaim_ms: u128,
+    reconnect_count_after: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReconnectSoakReport {
+    kind: &'static str,
+    host: String,
+    database: String,
+    cycles_requested: u32,
+    cycles_completed: u32,
+    p50_ms: u128,
+    p95_ms: u128,
+    max_ms: u128,
+    cycles: Vec<ReconnectCycleReport>,
 }
 
 enum LifecycleEvent {
@@ -183,6 +228,17 @@ impl Client {
             })
             .with_context(|| format!("send join_match for {}", self.label))?;
         wait_for_reducer(&rx, timeout, &format!("{} join_match", self.label))
+    }
+
+    fn start_match(&self, timeout: Duration) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.conn
+            .reducers
+            .start_match_then(move |_, result| {
+                let _ = tx.send(flatten_reducer_result(result));
+            })
+            .with_context(|| format!("send start_match for {}", self.label))?;
+        wait_for_reducer(&rx, timeout, &format!("{} start_match", self.label))
     }
 
     fn set_mobilization_target(
@@ -475,11 +531,23 @@ fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.timeout_secs > 0, "--timeout-secs must be positive");
     ensure!(args.poll_ms > 0, "--poll-ms must be positive");
+    if args.reconnect_only {
+        ensure!(
+            args.reconnect_cycles > 0,
+            "--reconnect-only requires --reconnect-cycles > 0"
+        );
+    }
     let timeout = Duration::from_secs(args.timeout_secs);
     let poll = Duration::from_millis(args.poll_ms);
 
-    let player_one_token = args.token_dir.join("player-one.token");
-    let player_two_token = args.token_dir.join("player-two.token");
+    let player_one_token = args
+        .player_one_token
+        .clone()
+        .unwrap_or_else(|| args.token_dir.join("player-one.token"));
+    let player_two_token = args
+        .player_two_token
+        .clone()
+        .unwrap_or_else(|| args.token_dir.join("player-two.token"));
 
     println!("[1/10] connecting two persistent identity profiles");
     let mut player_one = Client::connect(
@@ -509,6 +577,7 @@ fn main() -> Result<()> {
     player_two.join_match(PLAYER_TWO, "E2E Player 2", timeout)?;
     wait_for_slot(&player_one, PLAYER_ONE, player_one.identity, timeout, poll)?;
     wait_for_slot(&player_one, PLAYER_TWO, player_two.identity, timeout, poll)?;
+    ensure_match_running(&player_one, timeout, poll)?;
     let running_step = wait_until("match phase Running", timeout, poll, || {
         let state = player_one
             .conn
@@ -518,6 +587,31 @@ fn main() -> Result<()> {
             .find(&SINGLETON_ID);
         Ok(state.and_then(|row| (row.phase == MatchPhase::Running).then_some(row.logical_step)))
     })?;
+
+    if args.reconnect_only {
+        println!(
+            "reconnect-only: skipping gameplay smoke; running {} reclaim cycles",
+            args.reconnect_cycles
+        );
+        let report = run_reconnect_soak(
+            &mut player_one,
+            &player_two,
+            &player_one_token,
+            &args.host,
+            &args.database,
+            args.reconnect_cycles,
+            timeout,
+            poll,
+        )?;
+        write_reconnect_report(args.reconnect_report.as_deref(), &report)?;
+        player_one.disconnect(timeout)?;
+        player_two.disconnect(timeout)?;
+        println!(
+            "PASS: reconnect soak completed {} cycles (p50={}ms p95={}ms max={}ms)",
+            report.cycles_completed, report.p50_ms, report.p95_ms, report.max_ms
+        );
+        return Ok(());
+    }
 
     println!("[3/10] verifying idempotent mobilization and its receipt");
     let mobilization_id = unused_command_id(&player_one.conn, PLAYER_ONE, COMMAND_ID_FLOOR)?;
@@ -1371,62 +1465,223 @@ fn main() -> Result<()> {
         poll,
     )?;
     println!("[10/10] reconnecting player one with its persisted token");
-    let reconnect_count_before = player_two
-        .conn
-        .db
-        .player_slot()
-        .player_id()
-        .find(&PLAYER_ONE)
-        .context("player one slot disappeared before reconnect test")?
-        .reconnect_count;
-    let original_identity = player_one.identity;
-    player_one.disconnect(timeout)?;
-    wait_until("player one disconnect visibility", timeout, poll, || {
-        Ok(player_two
-            .conn
-            .db
-            .player_slot()
-            .player_id()
-            .find(&PLAYER_ONE)
-            .and_then(|slot| (!slot.connected).then_some(())))
-    })?;
-    let mut reconnected = Client::connect(
-        "player one reconnect",
+    let functional = run_reconnect_soak(
+        &mut player_one,
+        &player_two,
         &player_one_token,
         &args.host,
         &args.database,
+        1,
         timeout,
+        poll,
     )?;
     ensure!(
-        reconnected.identity == original_identity,
-        "persisted player-one token resolved to a different identity"
+        functional.cycles_completed == 1,
+        "functional reconnect reclaim did not complete"
     );
-    reconnected.join_match(PLAYER_ONE, "E2E Player 1", timeout)?;
-    wait_until("player one reconnect visibility", timeout, poll, || {
-        let Some(slot) = player_two
-            .conn
-            .db
-            .player_slot()
-            .player_id()
-            .find(&PLAYER_ONE)
-        else {
-            return Ok(None);
-        };
-        ensure!(
-            slot.identity.as_ref() == Some(&original_identity),
-            "reconnected slot identity changed"
-        );
-        Ok((slot.connected
-            && slot.has_reconnected
-            && slot.reconnect_count > reconnect_count_before)
-            .then_some(()))
-    })?;
 
-    reconnected.disconnect(timeout)?;
+    if args.reconnect_cycles > 0 {
+        println!(
+            "running {} additional reconnect soak cycles",
+            args.reconnect_cycles
+        );
+        let soak = run_reconnect_soak(
+            &mut player_one,
+            &player_two,
+            &player_one_token,
+            &args.host,
+            &args.database,
+            args.reconnect_cycles,
+            timeout,
+            poll,
+        )?;
+        write_reconnect_report(args.reconnect_report.as_deref(), &soak)?;
+        println!(
+            "reconnect soak: {} cycles p50={}ms p95={}ms max={}ms",
+            soak.cycles_completed, soak.p50_ms, soak.p95_ms, soak.max_ms
+        );
+    } else if let Some(path) = args.reconnect_report.as_deref() {
+        write_reconnect_report(Some(path), &functional)?;
+    }
+
+    player_one.disconnect(timeout)?;
     player_two.disconnect(timeout)?;
     println!(
         "PASS: receipts, sparse-seed whole-cluster best-effort Reshape, atomic invalid-shape rejection, directional Push and retasking, neutral perimeter expansion, cluster-first expansion/attack, conservation/cancellation, and token reuse verified"
     );
+    Ok(())
+}
+
+fn ensure_match_running(client: &Client, timeout: Duration, poll: Duration) -> Result<()> {
+    let phase = client
+        .conn
+        .db
+        .match_state()
+        .singleton_id()
+        .find(&SINGLETON_ID)
+        .map(|state| state.phase);
+    match phase {
+        Some(MatchPhase::Running) => Ok(()),
+        Some(MatchPhase::Lobby) => {
+            match client.start_match(timeout) {
+                Ok(()) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    let already_running = client
+                        .conn
+                        .db
+                        .match_state()
+                        .singleton_id()
+                        .find(&SINGLETON_ID)
+                        .is_some_and(|state| state.phase == MatchPhase::Running);
+                    if !already_running {
+                        return Err(error).context(format!(
+                            "start_match failed while match remained non-running: {message}"
+                        ));
+                    }
+                }
+            }
+            wait_until("match phase Running after start_match", timeout, poll, || {
+                let state = client
+                    .conn
+                    .db
+                    .match_state()
+                    .singleton_id()
+                    .find(&SINGLETON_ID);
+                Ok(state.and_then(|row| (row.phase == MatchPhase::Running).then_some(())))
+            })?;
+            Ok(())
+        }
+        Some(other) => bail!("match is in unexpected phase {other:?}; expected Lobby or Running"),
+        None => bail!("match state is missing before start/reconnect"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_reconnect_soak(
+    player_one: &mut Client,
+    observer: &Client,
+    token_path: &Path,
+    host: &str,
+    database: &str,
+    cycles: u32,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<ReconnectSoakReport> {
+    ensure!(cycles > 0, "reconnect soak requires at least one cycle");
+    let original_identity = player_one.identity;
+    let mut cycle_reports = Vec::with_capacity(cycles as usize);
+
+    for cycle in 1..=cycles {
+        let reconnect_count_before = observer
+            .conn
+            .db
+            .player_slot()
+            .player_id()
+            .find(&PLAYER_ONE)
+            .context("player one slot disappeared before reconnect soak")?
+            .reconnect_count;
+        let started = Instant::now();
+        player_one.disconnect(timeout)?;
+        wait_until(
+            &format!("player one disconnect visibility (cycle {cycle})"),
+            timeout,
+            poll,
+            || {
+                Ok(observer
+                    .conn
+                    .db
+                    .player_slot()
+                    .player_id()
+                    .find(&PLAYER_ONE)
+                    .and_then(|slot| (!slot.connected).then_some(())))
+            },
+        )?;
+        let reconnected = Client::connect(
+            "player one reconnect",
+            token_path,
+            host,
+            database,
+            timeout,
+        )?;
+        ensure!(
+            reconnected.identity == original_identity,
+            "persisted player-one token resolved to a different identity on cycle {cycle}"
+        );
+        reconnected.join_match(PLAYER_ONE, "E2E Player 1", timeout)?;
+        let reconnect_count_after = wait_until(
+            &format!("player one reconnect visibility (cycle {cycle})"),
+            timeout,
+            poll,
+            || {
+                let Some(slot) = observer
+                    .conn
+                    .db
+                    .player_slot()
+                    .player_id()
+                    .find(&PLAYER_ONE)
+                else {
+                    return Ok(None);
+                };
+                ensure!(
+                    slot.identity.as_ref() == Some(&original_identity),
+                    "reconnected slot identity changed on cycle {cycle}"
+                );
+                Ok((slot.connected
+                    && slot.has_reconnected
+                    && slot.reconnect_count > reconnect_count_before)
+                    .then_some(slot.reconnect_count))
+            },
+        )?;
+        cycle_reports.push(ReconnectCycleReport {
+            cycle,
+            disconnect_to_reclaim_ms: started.elapsed().as_millis(),
+            reconnect_count_after,
+        });
+        *player_one = reconnected;
+    }
+
+    let mut sorted: Vec<u128> = cycle_reports
+        .iter()
+        .map(|cycle| cycle.disconnect_to_reclaim_ms)
+        .collect();
+    sorted.sort_unstable();
+    let p50_ms = percentile_sorted(&sorted, 50);
+    let p95_ms = percentile_sorted(&sorted, 95);
+    let max_ms = *sorted.last().context("reconnect soak produced no timings")?;
+
+    Ok(ReconnectSoakReport {
+        kind: "reconnect-soak",
+        host: host.to_owned(),
+        database: database.to_owned(),
+        cycles_requested: cycles,
+        cycles_completed: cycle_reports.len() as u32,
+        p50_ms,
+        p95_ms,
+        max_ms,
+        cycles: cycle_reports,
+    })
+}
+
+fn percentile_sorted(sorted: &[u128], percentile: u8) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (u128::from(percentile) * (sorted.len() as u128 - 1)) / 100;
+    sorted[rank as usize]
+}
+
+fn write_reconnect_report(path: Option<&Path>, report: &ReconnectSoakReport) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create reconnect report directory {}", parent.display()))?;
+    }
+    let payload = serde_json::to_vec_pretty(report).context("serialize reconnect soak report")?;
+    fs::write(path, payload)
+        .with_context(|| format!("write reconnect soak report {}", path.display()))?;
     Ok(())
 }
 

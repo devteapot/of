@@ -284,5 +284,6 @@ active transfer order IDs (queued sources on active orders with no packet yet).
 ## Related docs
 
 - [Technical architecture](./technical-architecture.md) — subscriptions, cadence, scale bands
+- [Browser release gates](./browser-gates.md) — Wasm download, WebGPU 128/192, reconnect soak
 - [Implementation guide](./implementation.md) — authority and table layout
 - [README](../README.md) — toolchain and local multiplayer quick start

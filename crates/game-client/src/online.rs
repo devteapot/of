@@ -42,6 +42,7 @@ use crate::{
         MatchPhase, MatchView, RetaskProjection, ToastKind,
     },
     network::{ClientIntent, NetworkSet, ServerUpdate},
+    observe::{ObserveLevel, ObserveState, keys as observe_keys},
 };
 
 const TERRAIN_DIRTY: u32 = 1 << 0;
@@ -786,13 +787,14 @@ fn maintain_connection(
     time: Res<Time>,
     mut transport: ResMut<OnlineTransport>,
     mut view: ResMut<MatchView>,
+    mut observe: ResMut<ObserveState>,
 ) {
     if transport.connection.is_some() || transport.connection_disabled {
         return;
     }
     #[cfg(target_arch = "wasm32")]
     if transport.pending_connection.is_some() {
-        poll_pending_connection(&mut transport, &mut view);
+        poll_pending_connection(&mut transport, &mut view, &mut observe);
         return;
     }
     transport.reconnect_delay_seconds =
@@ -800,10 +802,14 @@ fn maintain_connection(
     if transport.reconnect_delay_seconds > 0.0 {
         return;
     }
-    connect_to_spacetimedb(&mut transport, &mut view);
+    connect_to_spacetimedb(&mut transport, &mut view, &mut observe);
 }
 
-fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView) {
+fn connect_to_spacetimedb(
+    transport: &mut OnlineTransport,
+    view: &mut MatchView,
+    observe: &mut ObserveState,
+) {
     let host = match transport
         .config
         .host
@@ -843,6 +849,20 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     view.lobby.available = false;
     view.lobby.action_pending = false;
     view.lobby.local_player = None;
+
+    let attempt = transport.reconnect_attempt;
+    observe.emit(
+        ObserveLevel::Info,
+        if attempt == 0 {
+            observe_keys::NET_CONNECT_BEGIN
+        } else {
+            observe_keys::NET_RECONNECT
+        },
+        format!(
+            "gen={generation} attempt={attempt} host={} db={} profile={}",
+            transport.config.host, transport.config.database, transport.config.profile
+        ),
+    );
 
     let token = match load_token(&transport.config) {
         Ok(token) => token,
@@ -927,6 +947,7 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     finish_connection_setup(
         transport,
         view,
+        observe,
         connection.build().map_err(|error| error.to_string()),
     );
 
@@ -946,20 +967,25 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn poll_pending_connection(transport: &mut OnlineTransport, view: &mut MatchView) {
+fn poll_pending_connection(
+    transport: &mut OnlineTransport,
+    view: &mut MatchView,
+    observe: &mut ObserveState,
+) {
     let Some(pending) = transport.pending_connection.clone() else {
         return;
     };
     let result = pending.lock().ok().and_then(|mut slot| slot.take());
     if let Some(result) = result {
         transport.pending_connection = None;
-        finish_connection_setup(transport, view, result);
+        finish_connection_setup(transport, view, observe, result);
     }
 }
 
 fn finish_connection_setup(
     transport: &mut OnlineTransport,
     view: &mut MatchView,
+    observe: &mut ObserveState,
     result: Result<DbConnection, String>,
 ) {
     match result {
@@ -970,6 +996,14 @@ fn finish_connection_setup(
         }
         Err(error) => {
             transport.schedule_reconnect();
+            observe.emit(
+                ObserveLevel::Error,
+                observe_keys::NET_CONNECT_FAIL,
+                format!(
+                    "gen={} setup_failed reason={error} retry_s={:.1}",
+                    transport.active_generation, transport.reconnect_delay_seconds
+                ),
+            );
             view.push_log(format!(
                 "Connection setup failed: {error} · retrying in {:.1}s",
                 transport.reconnect_delay_seconds
@@ -1374,6 +1408,7 @@ fn send_online_intents(
     view: Res<MatchView>,
     mut transport: ResMut<OnlineTransport>,
     mut updates: MessageWriter<ServerUpdate>,
+    mut observe: ResMut<ObserveState>,
 ) {
     for intent in intents.read() {
         if !transport.subscription_lifecycle.commands_ready() || !transport.command_ids_ready {
@@ -1399,9 +1434,23 @@ fn send_online_intents(
         let result = invoke_intent(&transport, &view, command_id, intent);
         match result {
             Ok(kind) => {
+                observe.emit(
+                    ObserveLevel::Info,
+                    observe_keys::CMD_SUBMIT,
+                    format!(
+                        "command_id={command_id} kind={} step={}",
+                        kind.receipt_name(),
+                        view.logical_step
+                    ),
+                );
                 transport.pending.insert(command_id, kind);
             }
             Err(reason) => {
+                observe.emit(
+                    ObserveLevel::Warn,
+                    observe_keys::CMD_REJECT,
+                    format!("command_id={command_id} reason={reason}"),
+                );
                 transport.terminal_command_ids.insert(command_id);
                 updates.write(ServerUpdate::Rejected {
                     command_id: Some(command_id),
@@ -1759,10 +1808,17 @@ fn synchronize_authoritative_view(
     mut view: ResMut<MatchView>,
     mode: Res<MapViewMode>,
     mut updates: MessageWriter<ServerUpdate>,
+    mut observe: ResMut<ObserveState>,
 ) {
     let previous_local_player = view.local_player;
     for event in transport.signals.drain() {
-        apply_lifecycle_event(&mut transport, &mut view, &mut updates, event);
+        apply_lifecycle_event(
+            &mut transport,
+            &mut view,
+            &mut updates,
+            &mut observe,
+            event,
+        );
     }
 
     let dirty = transport.signals.take_dirty();
@@ -1776,6 +1832,17 @@ fn synchronize_authoritative_view(
         };
         AuthoritySnapshot::capture(connection, dirty, transport.signals.take_cell_changes())
     };
+    let cell_delta = snapshot.cells.as_ref().map_or(0, Vec::len);
+    observe.emit(
+        ObserveLevel::Debug,
+        observe_keys::SYNC_APPLY,
+        format!(
+            "gen={} dirty={dirty:#x} cells={cell_delta} absences={} step={}",
+            transport.active_generation,
+            cell_absences.len(),
+            view.logical_step
+        ),
+    );
     let tactical_changes = transport.signals.take_tactical_changes();
     let full_tactical_rebuild = snapshot.tactical.is_some();
     let mut projection_impact = ProjectionImpact::before(&transport.tactical, &tactical_changes);
@@ -1909,16 +1976,27 @@ fn apply_lifecycle_event(
     transport: &mut OnlineTransport,
     view: &mut MatchView,
     updates: &mut MessageWriter<ServerUpdate>,
+    observe: &mut ObserveState,
     event: LifecycleEvent,
 ) {
     match event {
         LifecycleEvent::Connected { generation } if lifecycle_is_current(transport, generation) => {
+            observe.emit(
+                ObserveLevel::Info,
+                observe_keys::NET_CONNECTED,
+                format!("gen={generation}"),
+            );
             view.authority = AuthorityState::Connecting;
             "Connected · subscribing to authoritative tables…".clone_into(&mut view.latest_result);
         }
         LifecycleEvent::BootstrapSubscribed { generation }
             if lifecycle_is_current(transport, generation) =>
         {
+            observe.emit(
+                ObserveLevel::Info,
+                observe_keys::NET_BOOTSTRAP,
+                format!("gen={generation} auto_join={}", transport.config.auto_join),
+            );
             transport.reconnect_attempt = 0;
             transport.reconnect_delay_seconds = 0.0;
             transport.subscription_lifecycle =
@@ -1936,6 +2014,16 @@ fn apply_lifecycle_event(
         LifecycleEvent::TacticalSubscribed { generation }
             if lifecycle_is_current(transport, generation) =>
         {
+            observe.emit(
+                ObserveLevel::Info,
+                observe_keys::NET_TACTICAL,
+                format!(
+                    "gen={generation} player={}",
+                    transport
+                        .bound_player
+                        .map_or_else(|| "-".to_owned(), |player| player.to_string())
+                ),
+            );
             transport.subscription_lifecycle =
                 transport.subscription_lifecycle.on_tactical_applied();
             if transport.bound_player.is_some() {
@@ -1947,6 +2035,11 @@ fn apply_lifecycle_event(
         LifecycleEvent::JoinFailed { generation, reason }
             if lifecycle_is_current(transport, generation) =>
         {
+            observe.emit(
+                ObserveLevel::Error,
+                observe_keys::NET_JOIN_FAIL,
+                format!("gen={generation} reason={reason}"),
+            );
             view.lobby.action_pending = false;
             mark_join_failed(transport, view, reason);
         }
@@ -1957,9 +2050,19 @@ fn apply_lifecycle_event(
         } if lifecycle_is_current(transport, generation) => {
             view.lobby.action_pending = false;
             if let Some(error) = error {
+                observe.emit(
+                    ObserveLevel::Warn,
+                    observe_keys::LOBBY_ACTION,
+                    format!("gen={generation} action={action} ok=0 reason={error}"),
+                );
                 view.push_log(format!("{action} failed: {error}"));
                 view.show_toast(format!("{action} failed: {error}"), ToastKind::Rejection);
             } else {
+                observe.emit(
+                    ObserveLevel::Info,
+                    observe_keys::LOBBY_ACTION,
+                    format!("gen={generation} action={action} ok=1"),
+                );
                 view.push_log(format!("{action} accepted"));
                 view.show_toast(format!("{action} accepted"), ToastKind::Success);
             }
@@ -1969,6 +2072,7 @@ fn apply_lifecycle_event(
                 transport,
                 view,
                 updates,
+                observe,
                 generation,
                 format!("Connection failed: {reason}"),
             );
@@ -1978,6 +2082,7 @@ fn apply_lifecycle_event(
                 transport,
                 view,
                 updates,
+                observe,
                 generation,
                 format!("Disconnected: {reason}"),
             );
@@ -1986,6 +2091,11 @@ fn apply_lifecycle_event(
             if transport.terminal_command_ids.insert(command_id) {
                 let pending = transport.pending.remove(&command_id);
                 if pending.is_some() {
+                    observe.emit(
+                        ObserveLevel::Warn,
+                        observe_keys::CMD_FAIL,
+                        format!("command_id={command_id} reason={reason}"),
+                    );
                     updates.write(ServerUpdate::Rejected {
                         command_id: Some(command_id),
                         reason,
@@ -1997,7 +2107,14 @@ fn apply_lifecycle_event(
         LifecycleEvent::TokenWarning {
             generation,
             message,
-        } if generation == transport.active_generation => view.push_log(message),
+        } if generation == transport.active_generation => {
+            observe.emit(
+                ObserveLevel::Warn,
+                observe_keys::TOKEN_WARN,
+                format!("gen={generation} {message}"),
+            );
+            view.push_log(message);
+        }
         LifecycleEvent::Connected { .. }
         | LifecycleEvent::BootstrapSubscribed { .. }
         | LifecycleEvent::TacticalSubscribed { .. }
@@ -2035,6 +2152,7 @@ fn handle_connection_loss(
     transport: &mut OnlineTransport,
     view: &mut MatchView,
     updates: &mut MessageWriter<ServerUpdate>,
+    observe: &mut ObserveState,
     generation: u64,
     reason: String,
 ) {
@@ -2073,6 +2191,14 @@ fn handle_connection_loss(
     }
 
     transport.schedule_reconnect();
+    observe.emit(
+        ObserveLevel::Warn,
+        observe_keys::NET_DISCONNECT,
+        format!(
+            "gen={generation} reason={reason} retry_s={:.1} attempt={}",
+            transport.reconnect_delay_seconds, transport.reconnect_attempt
+        ),
+    );
     view.connection = vec![ConnectionState::Syncing; usize::from(view.player_count)];
     view.latest_result = format!(
         "Connection lost · retrying in {:.1}s",

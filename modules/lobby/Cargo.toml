@@ -8,6 +8,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+log = "0.4"
 spacetimedb = "=2.7.1"
 
 [lints.rust]
