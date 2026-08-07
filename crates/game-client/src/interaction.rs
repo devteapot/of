@@ -2799,7 +2799,10 @@ mod tests {
         input
     }
 
-    fn order_input_app(view: MatchView, interaction: InteractionState) -> App {
+    fn order_input_app(mut view: MatchView, interaction: InteractionState) -> App {
+        // Order-input tests build from MatchView::connecting (Lobby); the
+        // production gate requires Running before accepting map input.
+        view.phase = crate::model::MatchPhase::Running;
         let mut app = App::new();
         app.add_message::<UiAction>()
             .add_message::<ClientIntent>()
