@@ -964,7 +964,7 @@ fn update_hud(
     {
         let mut overlay = panels.p2();
         if let MatchPhase::Victory(winner) = view.phase {
-            let local_won = winner == u32::from(view.local_player);
+            let local_won = winner == view.local_player;
             overlay.0.display = Display::Flex;
             overlay.1.set_all(if local_won { CYAN } else { CORAL });
 

@@ -1652,7 +1652,8 @@ fn run_reconnect_soak(
         host: host.to_owned(),
         database: database.to_owned(),
         cycles_requested: cycles,
-        cycles_completed: cycle_reports.len() as u32,
+        cycles_completed: u32::try_from(cycle_reports.len())
+            .context("reconnect soak cycle count exceeds u32")?,
         p50_ms,
         p95_ms,
         max_ms,
