@@ -355,8 +355,10 @@ selection-adjacent presentation from the new authoritative snapshot.
   region-selection architecture.
 - Population/mobilization uses a provisional full-state cadence and leaves
   military headroom for unreceived active internal-order destinations.
-  Movement and combat use active sets, but nominal/stress performance gates
-  still need representative playtest measurement.
+  Movement and combat use active sets. Representative `match-perf` baselines for
+  128-seat playtest/validation dilation are recorded in
+  [Performance profiling](./performance.md); 500-seat nominal and 256×256
+  stretch remain larger follow-ups.
 - There is no morale, explicit supply penalty, HQ defeat, time limit,
   economy/upkeep, demobilization, infrastructure, fog, armor, naval/air force,
   diplomacy, AI, matchmaking, or production art.
@@ -366,10 +368,10 @@ selection-adjacent presentation from the new authoritative snapshot.
   ongoing economic burden.
 - Native desktop and WebAssembly/WebGPU compile targets are supported. The web
   target uses `localStorage` credentials and asynchronous browser networking.
-  Wasm size and the measured 128/192 WebGPU frame budgets pass, and isolated
-  reconnect plus browser reload smoke are recorded; reconnect under concurrent
-  load remains unqualified. See [Browser release gates](./browser-gates.md) for
-  the evidence and remaining reconnect gate.
+  Wasm size, measured 128/192 WebGPU frame budgets, isolated reconnect, and
+  reconnect under concurrent `match-perf` load all **PASS**; see
+  [Browser release gates](./browser-gates.md). Browser-tab seat reclaim (vs map
+  rebuild after reload) remains a thinner evidence path.
 
 These are bounded omissions, not hidden placeholders. Candidate extensions and
 their dependencies are recorded in [future ideas](./future-ideas.md).

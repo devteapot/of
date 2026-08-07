@@ -3,7 +3,7 @@
 ## Session
 
 - Method: desk review + code inspection; no GUI session was run.
-- Git SHA: `8037c75` (working tree contains unrelated WIP).
+- Git SHA: `ec06915` (+ docs commits after desk review).
 - Intended local endpoint: `http://127.0.0.1:3000`.
 - Blocker: the checked-in local data directory contains `spacetime.pid` owned
   by PID 41307, but the endpoint was not reachable. Starting another server

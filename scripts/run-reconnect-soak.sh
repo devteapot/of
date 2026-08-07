@@ -17,8 +17,9 @@
 #   ./scripts/run-reconnect-soak.sh --fresh --cycles 20
 #
 #   # Against an in-flight match-perf database while workers are busy
-#   ./scripts/run-reconnect-soak.sh --database of-match-perf --cycles 30
-#   # (use match-e2e --player-one-token / --player-two-token for worker seats)
+#   ./scripts/run-reconnect-soak.sh --database of-match-perf --cycles 30 \
+#     --player-one-token .match-perf-tokens/player-1.token \
+#     --player-two-token .match-perf-tokens/player-2.token
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +32,8 @@ cycles="${OF_RECONNECT_CYCLES:-20}"
 timeout_secs="${OF_RECONNECT_TIMEOUT_SECS:-60}"
 fresh=0
 out_path=""
+player_one_token=""
+player_two_token=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,13 +43,15 @@ while [[ $# -gt 0 ]]; do
     --cycles) cycles="$2"; shift 2 ;;
     --timeout-secs) timeout_secs="$2"; shift 2 ;;
     --fresh) fresh=1; shift ;;
+    --player-one-token) player_one_token="$2"; shift 2 ;;
+    --player-two-token) player_two_token="$2"; shift 2 ;;
     --skip-setup)
       # Accepted for compatibility; soak always uses reconnect-only.
       shift
       ;;
     --out) out_path="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,22p' "$0"
+      sed -n '2,24p' "$0"
       exit 0
       ;;
     *)
@@ -88,6 +93,12 @@ extra_args=(
   --reconnect-cycles "${cycles}"
   --reconnect-report "${out_path}"
 )
+if [[ -n "${player_one_token}" ]]; then
+  extra_args+=(--player-one-token "${player_one_token}")
+fi
+if [[ -n "${player_two_token}" ]]; then
+  extra_args+=(--player-two-token "${player_two_token}")
+fi
 
 echo "running reconnect soak: database=${database} cycles=${cycles}"
 cargo run -q -p match-e2e -- "${extra_args[@]}"

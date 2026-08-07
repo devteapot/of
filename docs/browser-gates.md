@@ -1,6 +1,6 @@
 # Browser release gates
 
-Status: Wasm size + isolated reconnect + WebGPU 128/192 frame cost measured  
+Status: Wasm size + reconnect (isolated + under load) + WebGPU 128/192 frame cost measured  
 Last updated: 2026-08-07
 
 Architecture commits a Bevy WebAssembly/WebGPU client, but treats representative
@@ -22,7 +22,7 @@ Related:
 | Wasm / web download size | ≤ **14 MiB** total gzip-9 transfer; ≤ **50 MiB** largest `.wasm` raw | `./scripts/measure-web-bundle.sh` | **Measured — PASS** (see baseline below) |
 | WebGPU frame cost @ 128×128 | Sustained **≥ 55 FPS** / frame **≤ 18 ms** during ordinary pan/zoom (F3 overlay) | Browser procedure below | **Measured — PASS** (p50 59.9 FPS / 16.7 ms) |
 | WebGPU frame cost @ 192×192 | Same as 128, plus no sustained stall when large subscription batches apply | Browser procedure below | **Measured — PASS** (p50 60.2 FPS / 16.6 ms) |
-| Reconnect under load | Token reclaim succeeds; disconnect→reclaim p95 **≤ 5 s** over ≥ 20 cycles while the match is running | `./scripts/run-reconnect-soak.sh` (native SDK path) + browser smoke | **Isolated soak measured — PASS**; concurrent-load still open; browser reload smoke recorded |
+| Reconnect under load | Token reclaim succeeds; disconnect→reclaim p95 **≤ 5 s** over ≥ 20 cycles while the match is running | `./scripts/run-reconnect-soak.sh` (native SDK path) + browser smoke | **PASS** (isolated + concurrent `match-perf` 128); browser reload smoke recorded |
 | Browser compile | `cargo clippy -p game-client --target wasm32-unknown-unknown -D warnings` | CI already | **PASS** (CI) |
 
 Budgets are engineering gates, not marketing claims. Revisit them if Bevy/WebGPU
@@ -176,8 +176,24 @@ presets — useful for WebGPU bring-up only.
 | max | 86 ms |
 | budget | p95 ≤ 5000 ms |
 
-Gate result for the **isolated** path: **PASS**. Concurrent `match-perf`
-under-load remains open.
+Gate result for the **isolated** path: **PASS**.
+
+### Measured under-load baseline (2026-08-07)
+
+Ran 20 reclaim cycles against worker seats 1–2 while `match-perf` drove
+`playtest` / 128 players / expand+rebalance on `of-match-perf-128` (git
+`ec06915`, after `start_match` accepted). Report:
+`artifacts/browser/reconnect-under-load-20260807.json`.
+
+| Metric | Value |
+| --- | ---: |
+| cycles | 20 |
+| p50 disconnect→reclaim | 186 ms |
+| p95 | 191 ms |
+| max | 196 ms |
+| budget | p95 ≤ 5000 ms |
+
+Gate result under concurrent load: **PASS**.
 
 Provisional budget: disconnect→reclaim **p95 ≤ 5000 ms** over the soak report.
 
@@ -188,19 +204,18 @@ running 192 match: page reload restored `net.connected` / bootstrap and
 `cells=36864` with ~60 FPS. In that session leftover CDP tabs still held both
 seats, so `join_match` returned “all player slots are already claimed” rather
 than a clean token reclaim — treat this as **map rebuild after reload**
-evidence, not a full seat-reclaim proof. Concurrent `match-perf` under-load
-soak remains open.
+evidence, not a full seat-reclaim proof.
 
-### Still required for full browser qualification
+### Still optional for deeper qualification
 
-1. Run the native soak under concurrent `match-perf` workers and file the JSON.
-2. Optional later: the architecture’s 30-minute soak with scheduler recovery.
+1. Architecture’s 30-minute soak with scheduler recovery.
+2. Browser-path seat reclaim (not just map rebuild) with a single owning tab.
 
 ## CI / deploy hooks
 
 | Pipeline | Browser-related check |
 | --- | --- |
-| `.github/workflows/ci.yml` | Wasm **compile/lint** only (no Trunk artifact, no size gate) |
+| `.github/workflows/ci.yml` | Wasm **compile/lint** + live local `match-e2e` smoke job |
 | `.github/workflows/deploy.yml` | Trunk production build, then `measure-web-bundle.sh --enforce` |
 | Local | `measure-web-bundle.sh`, `run-reconnect-soak.sh`, manual/CDP WebGPU procedure |
 
@@ -213,6 +228,6 @@ soak remains open.
 - [x] Record isolated reconnect soak JSON (5-cycle PASS; extend to 20+ at will)
 - [x] Record WebGPU 128 sample (PASS JSON)
 - [x] Record WebGPU 192 sample (PASS JSON)
-- [ ] Record reconnect soak JSON under concurrent `match-perf` load
+- [x] Record reconnect soak JSON under concurrent `match-perf` load
 - [x] Manual browser reconnect smoke on the live path (reload restored map; seat reclaim still contested when other tabs hold slots)
-- [ ] Flip architecture/implementation wording from “unqualified” to measured status when under-load reconnect evidence also lands
+- [x] Flip gate summary for under-load reconnect to measured PASS
