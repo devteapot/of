@@ -605,6 +605,16 @@ impl MatchView {
             local_player,
             player_count,
             claimed_players: player_count,
+            lobby: LobbyView {
+                map_size: u16::try_from(world.width().max(world.height())).unwrap_or(u16::MAX),
+                configuration_locked: true,
+                available: false,
+                action_pending: false,
+                local_player: Some(u16::try_from(local_player).expect("local player fits u16")),
+                player_names: (1..=player_count)
+                    .map(|player| format!("Player {player}"))
+                    .collect(),
+            },
             authority: AuthorityState::Offline,
             connection: vec![ConnectionState::Offline; usize::from(player_count)],
             phase: MatchPhase::Running,
