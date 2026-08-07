@@ -68,8 +68,10 @@ jobs:
       - name: Deploy web client
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          SPACETIMEDB_TOKEN: ${{ secrets.SPACETIMEDB_TOKEN }}
         run: |
           : "${VERCEL_TOKEN:?Configure the VERCEL_TOKEN repository secret}"
+          : "${SPACETIMEDB_TOKEN:?Configure the SPACETIMEDB_TOKEN repository secret}"
           vercel deploy target/vercel \
             --prod \
             --yes \

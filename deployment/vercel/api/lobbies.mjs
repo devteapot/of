@@ -169,6 +169,9 @@ export default async function handler(request, response) {
       if (!lobbyPreset || !Number.isInteger(playerCount)) {
         return response.status(400).json({ error: "invalid_lobby_parameters" });
       }
+      // Require the orchestrator token before create_lobby so a misconfigured
+      // deploy cannot leave an orphan Pending row that join cannot use.
+      serviceToken();
       await callReducer(
         LOBBY_DATABASE,
         "create_lobby",
