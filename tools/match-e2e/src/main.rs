@@ -1541,15 +1541,20 @@ fn ensure_match_running(client: &Client, timeout: Duration, poll: Duration) -> R
                     }
                 }
             }
-            wait_until("match phase Running after start_match", timeout, poll, || {
-                let state = client
-                    .conn
-                    .db
-                    .match_state()
-                    .singleton_id()
-                    .find(&SINGLETON_ID);
-                Ok(state.and_then(|row| (row.phase == MatchPhase::Running).then_some(())))
-            })?;
+            wait_until(
+                "match phase Running after start_match",
+                timeout,
+                poll,
+                || {
+                    let state = client
+                        .conn
+                        .db
+                        .match_state()
+                        .singleton_id()
+                        .find(&SINGLETON_ID);
+                    Ok(state.and_then(|row| (row.phase == MatchPhase::Running).then_some(())))
+                },
+            )?;
             Ok(())
         }
         Some(other) => bail!("match is in unexpected phase {other:?}; expected Lobby or Running"),
@@ -1597,13 +1602,8 @@ fn run_reconnect_soak(
                     .and_then(|slot| (!slot.connected).then_some(())))
             },
         )?;
-        let reconnected = Client::connect(
-            "player one reconnect",
-            token_path,
-            host,
-            database,
-            timeout,
-        )?;
+        let reconnected =
+            Client::connect("player one reconnect", token_path, host, database, timeout)?;
         ensure!(
             reconnected.identity == original_identity,
             "persisted player-one token resolved to a different identity on cycle {cycle}"
@@ -1614,12 +1614,7 @@ fn run_reconnect_soak(
             timeout,
             poll,
             || {
-                let Some(slot) = observer
-                    .conn
-                    .db
-                    .player_slot()
-                    .player_id()
-                    .find(&PLAYER_ONE)
+                let Some(slot) = observer.conn.db.player_slot().player_id().find(&PLAYER_ONE)
                 else {
                     return Ok(None);
                 };
@@ -1648,14 +1643,17 @@ fn run_reconnect_soak(
     sorted.sort_unstable();
     let p50_ms = percentile_sorted(&sorted, 50);
     let p95_ms = percentile_sorted(&sorted, 95);
-    let max_ms = *sorted.last().context("reconnect soak produced no timings")?;
+    let max_ms = *sorted
+        .last()
+        .context("reconnect soak produced no timings")?;
 
     Ok(ReconnectSoakReport {
         kind: "reconnect-soak",
         host: host.to_owned(),
         database: database.to_owned(),
         cycles_requested: cycles,
-        cycles_completed: cycle_reports.len() as u32,
+        cycles_completed: u32::try_from(cycle_reports.len())
+            .context("reconnect soak cycle count exceeds u32")?,
         p50_ms,
         p95_ms,
         max_ms,
@@ -1989,6 +1987,20 @@ fn exercise_cluster_first_controls(
             else {
                 return Ok(None);
             };
+            let visible_packet_total = client
+                .conn
+                .db
+                .transit_packet()
+                .iter()
+                .filter(|packet| packet.order_id == order.order_id)
+                .map(|packet| packet.infantry)
+                .sum::<u64>();
+            if visible_packet_total != order.in_transit_infantry {
+                // Table callbacks from one transaction may reach the SDK
+                // cache in different turns. Wait for the coherent snapshot;
+                // a durable mismatch still times out and fails this phase.
+                return Ok(None);
+            }
             assert_cluster_action_order(
                 &client.conn,
                 &order,
@@ -2257,6 +2269,20 @@ fn establish_cluster_contact_with_expansions(
                 else {
                     return Ok(None);
                 };
+                let visible_packet_total = client
+                    .conn
+                    .db
+                    .transit_packet()
+                    .iter()
+                    .filter(|packet| packet.order_id == order.order_id)
+                    .map(|packet| packet.infantry)
+                    .sum::<u64>();
+                if visible_packet_total != order.in_transit_infantry {
+                    // Table callbacks from one transaction may reach the SDK
+                    // cache in different turns. Wait for the coherent snapshot;
+                    // a durable mismatch still times out and fails this phase.
+                    return Ok(None);
+                }
                 assert_cluster_action_order(
                     &client.conn,
                     &order,

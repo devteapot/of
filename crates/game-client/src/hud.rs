@@ -1,5 +1,4 @@
 use bevy::{
-    app::AppExit,
     picking::hover::Hovered,
     prelude::*,
     ui::UiRect,
@@ -7,6 +6,9 @@ use bevy::{
         Slider, SliderDragState, SliderRange, SliderThumb, SliderValue, TrackClick, ValueChange,
     },
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::app::AppExit;
 
 use crate::{
     interaction::{InteractionState, OrderMode},
@@ -964,7 +966,7 @@ fn update_hud(
     {
         let mut overlay = panels.p2();
         if let MatchPhase::Victory(winner) = view.phase {
-            let local_won = winner == u32::from(view.local_player);
+            let local_won = winner == view.local_player;
             overlay.0.display = Display::Flex;
             overlay.1.set_all(if local_won { CYAN } else { CORAL });
 
@@ -997,7 +999,7 @@ fn update_hud(
 fn leave_match_after_victory(
     keyboard: Res<ButtonInput<KeyCode>>,
     view: Res<MatchView>,
-    mut app_exit: MessageWriter<AppExit>,
+    #[cfg(not(target_arch = "wasm32"))] mut app_exit: MessageWriter<AppExit>,
 ) {
     if !matches!(view.phase, MatchPhase::Victory(_)) || !keyboard.just_pressed(KeyCode::Escape) {
         return;

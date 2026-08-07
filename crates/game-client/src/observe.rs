@@ -112,9 +112,10 @@ impl ObserveState {
     }
 
     fn note_frame_spike(&mut self, now_secs: f64, frame_ms: f64, fps: Option<f64>) {
-        if self.last_frame_spike_at_secs.is_some_and(|previous| {
-            now_secs - previous < FRAME_SPIKE_COOLDOWN_SECS
-        }) {
+        if self
+            .last_frame_spike_at_secs
+            .is_some_and(|previous| now_secs - previous < FRAME_SPIKE_COOLDOWN_SECS)
+        {
             return;
         }
         self.last_frame_spike_at_secs = Some(now_secs);
@@ -299,8 +300,8 @@ mod tests {
     #[test]
     fn frame_spike_is_rate_limited() {
         let mut state = ObserveState::new(false);
-        state.note_frame_spike(40.0, Some(25.0));
-        state.note_frame_spike(50.0, Some(20.0));
+        state.note_frame_spike(40.0, 40.0, Some(25.0));
+        state.note_frame_spike(41.0, 50.0, Some(20.0));
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.events[0].key, keys::PERF_FRAME_SPIKE);
     }
