@@ -6,7 +6,9 @@ database="of-match-dev"
 player_count=2
 map_size=""
 client_args=()
+has_client_args=false
 client_pids=()
+client_pid_count=0
 
 usage() {
   cat <<'EOF'
@@ -81,7 +83,10 @@ while (( $# > 0 )); do
       ;;
     --)
       shift
-      client_args=("$@")
+      if (( $# > 0 )); then
+        client_args=("$@")
+        has_client_args=true
+      fi
       break
       ;;
     -*)
@@ -167,23 +172,41 @@ start_clients() {
 
   for ((player = 1; player <= player_count; player++)); do
     if [[ -n "${map_size}" ]]; then
-      OF_PLAYER="${player}" \
-      OF_NAME="Player ${player}" \
-      OF_PROFILE="dev-player-${player}" \
-        "${script_dir}/run-client.sh" "${client_args[@]}" </dev/null &
-    else
-      env -u OF_PLAYER -u OF_AUTO_JOIN \
+      if [[ "${has_client_args}" == true ]]; then
+        OF_PLAYER="${player}" \
         OF_NAME="Player ${player}" \
         OF_PROFILE="dev-player-${player}" \
-        "${script_dir}/run-client.sh" "${client_args[@]}" </dev/null &
+          "${script_dir}/run-client.sh" "${client_args[@]}" </dev/null &
+      else
+        OF_PLAYER="${player}" \
+        OF_NAME="Player ${player}" \
+        OF_PROFILE="dev-player-${player}" \
+          "${script_dir}/run-client.sh" </dev/null &
+      fi
+    else
+      if [[ "${has_client_args}" == true ]]; then
+        env -u OF_PLAYER -u OF_AUTO_JOIN \
+          OF_NAME="Player ${player}" \
+          OF_PROFILE="dev-player-${player}" \
+          "${script_dir}/run-client.sh" "${client_args[@]}" </dev/null &
+      else
+        env -u OF_PLAYER -u OF_AUTO_JOIN \
+          OF_NAME="Player ${player}" \
+          OF_PROFILE="dev-player-${player}" \
+          "${script_dir}/run-client.sh" </dev/null &
+      fi
     fi
     client_pids+=("$!")
+    client_pid_count=$((client_pid_count + 1))
   done
 }
 
 stop_clients() {
   local pid
 
+  if (( client_pid_count == 0 )); then
+    return
+  fi
   for pid in "${client_pids[@]}"; do
     kill -TERM -- "-${pid}" 2>/dev/null || true
   done
@@ -191,6 +214,7 @@ stop_clients() {
     wait "${pid}" 2>/dev/null || true
   done
   client_pids=()
+  client_pid_count=0
 }
 
 cleanup() {
