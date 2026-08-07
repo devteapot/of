@@ -386,12 +386,14 @@ fn update_lobby(
     view: Res<MatchView>,
     form: Res<LobbyForm>,
     mut root: Single<&mut Node, With<LobbyRoot>>,
-    mut status: Single<&mut Text, With<LobbyStatus>>,
-    mut roster: Single<&mut Text, With<LobbyRoster>>,
-    mut name: Single<&mut Text, With<NameValue>>,
-    mut count: Single<&mut Text, With<PlayerCountValue>>,
-    mut preset_buttons: Query<(&PresetButton, &mut BackgroundColor)>,
-    mut actions: ParamSet<(
+    mut texts: ParamSet<(
+        Single<&mut Text, With<LobbyStatus>>,
+        Single<&mut Text, With<LobbyRoster>>,
+        Single<&mut Text, With<NameValue>>,
+        Single<&mut Text, With<PlayerCountValue>>,
+    )>,
+    mut button_colors: ParamSet<(
+        Query<(&PresetButton, &mut BackgroundColor)>,
         Single<&mut BackgroundColor, With<CreateButton>>,
         Single<&mut BackgroundColor, With<JoinButton>>,
         Single<&mut BackgroundColor, With<StartButton>>,
@@ -406,15 +408,18 @@ fn update_lobby(
         return;
     }
 
-    ***name = if form.display_name.is_empty() {
-        "Type your name…|".to_owned()
-    } else if form.name_focused && view.lobby.local_player.is_none() {
-        format!("{}|", form.display_name)
-    } else {
-        form.display_name.clone()
-    };
-    ***count = format!("{} PLAYERS", form.player_count);
-    ***status = if !view.lobby.available {
+    {
+        let mut name = texts.p2();
+        ***name = if form.display_name.is_empty() {
+            "Type your name…|".to_owned()
+        } else if form.name_focused && view.lobby.local_player.is_none() {
+            format!("{}|", form.display_name)
+        } else {
+            form.display_name.clone()
+        };
+    }
+    ***texts.p3() = format!("{} PLAYERS", form.player_count);
+    ***texts.p0() = if !view.lobby.available {
         "Connecting to lobby authority…".to_owned()
     } else if view.lobby.action_pending {
         "Applying lobby action…".to_owned()
@@ -449,14 +454,17 @@ fn update_lobby(
     if view.player_count > 12 {
         lines.push(format!("…and {} more seats", view.player_count - 12));
     }
-    ***roster = lines.join("\n");
+    ***texts.p1() = lines.join("\n");
 
-    for (preset, mut color) in &mut preset_buttons {
-        *color = BackgroundColor(if preset.0 == form.preset {
-            ACTIVE
-        } else {
-            FIELD
-        });
+    {
+        let mut preset_buttons = button_colors.p0();
+        for (preset, mut color) in &mut preset_buttons {
+            *color = BackgroundColor(if preset.0 == form.preset {
+                ACTIVE
+            } else {
+                FIELD
+            });
+        }
     }
     let valid_name = !form.display_name.trim().is_empty();
     let create_enabled = view.lobby.available
@@ -474,7 +482,31 @@ fn update_lobby(
         && !view.lobby.action_pending
         && view.lobby.local_player.is_some()
         && view.claimed_players == view.player_count;
-    **actions.p0() = BackgroundColor(if create_enabled { ACTIVE } else { DISABLED });
-    **actions.p1() = BackgroundColor(if join_enabled { ACTIVE } else { DISABLED });
-    **actions.p2() = BackgroundColor(if start_enabled { ACTIVE } else { DISABLED });
+    **button_colors.p1() = BackgroundColor(if create_enabled { ACTIVE } else { DISABLED });
+    **button_colors.p2() = BackgroundColor(if join_enabled { ACTIVE } else { DISABLED });
+    **button_colors.p3() = BackgroundColor(if start_enabled { ACTIVE } else { DISABLED });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lobby_update_queries_initialize_without_conflicts() {
+        let mut app = App::new();
+        app.insert_resource(MatchView::connecting(1))
+            .insert_resource(LobbyForm {
+                interactive: true,
+                display_name: String::new(),
+                preset: LobbyMapPreset::Small,
+                player_count: 2,
+                name_focused: true,
+            })
+            .add_systems(Startup, spawn_lobby)
+            .add_systems(Update, update_lobby);
+
+        // Bevy validates every system parameter on first initialization. This
+        // update therefore catches overlapping mutable UI component queries.
+        app.update();
+    }
 }
