@@ -2751,7 +2751,6 @@ fn persist_expand_order(
     ctx.db.expansion_wave().insert(ExpansionWave {
         order_id: order.order_id,
         selected_cells: plan.selected_cells,
-        split_cursors: vec![0; plan.outside_depths.len()],
         outside_depths: plan.outside_depths,
         focus_cell_id: plan.focus_cell_id,
         target_cells: plan.target_cells,
@@ -2876,6 +2875,7 @@ fn cancel_order(ctx: &ReducerContext, player_id: u16, order_id: u64) -> Result<(
         }
     }
     ctx.db.expansion_wave().order_id().delete(order_id);
+    crate::simulation::clear_expansion_split_cursors(ctx, order_id);
     let abandonment_keys = ctx
         .db
         .retreat_abandonment()

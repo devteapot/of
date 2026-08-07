@@ -143,11 +143,44 @@ impl HexDirection {
 }
 
 /// A canonical undirected edge between adjacent hexes.
+///
+/// Deserialization enforces the constructor invariants: the endpoints must be
+/// adjacent and stored in canonical `a <= b` order, so a snapshot cannot smuggle
+/// in an edge that API-built state could never contain.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawHexEdge"))]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HexEdge {
     pub a: Axial,
     pub b: Axial,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RawHexEdge {
+    a: Axial,
+    b: Axial,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawHexEdge> for HexEdge {
+    type Error = String;
+
+    fn try_from(raw: RawHexEdge) -> Result<Self, Self::Error> {
+        let edge = HexEdge::new(raw.a, raw.b).ok_or_else(|| {
+            format!(
+                "hex edge endpoints are not adjacent: {:?} and {:?}",
+                raw.a, raw.b
+            )
+        })?;
+        if edge.a != raw.a {
+            return Err(format!(
+                "hex edge is not in canonical a <= b order: {:?} and {:?}",
+                raw.a, raw.b
+            ));
+        }
+        Ok(edge)
+    }
 }
 
 impl HexEdge {
@@ -257,6 +290,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn hex_edges_round_trip_and_reject_non_canonical_input() {
+        let edge = HexEdge::new(Axial::new(1, 0), Axial::new(0, 0)).unwrap();
+        assert_eq!(edge.a, Axial::new(0, 0), "constructor canonicalizes order");
+        let json = serde_json::to_string(&edge).unwrap();
+        assert_eq!(serde_json::from_str::<HexEdge>(&json).unwrap(), edge);
+
+        let swapped = r#"{"a":{"q":1,"r":0},"b":{"q":0,"r":0}}"#;
+        let error = serde_json::from_str::<HexEdge>(swapped).unwrap_err();
+        assert!(error.to_string().contains("canonical"), "{error}");
+
+        let non_adjacent = r#"{"a":{"q":0,"r":0},"b":{"q":2,"r":0}}"#;
+        let error = serde_json::from_str::<HexEdge>(non_adjacent).unwrap_err();
+        assert!(error.to_string().contains("not adjacent"), "{error}");
     }
 
     #[test]

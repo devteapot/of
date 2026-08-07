@@ -1,0 +1,27 @@
+[package]
+name = "match-playtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Automated no-human live playtest for the cluster-first control surface"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hex-core.workspace = true
+match-bindings = { path = "../../crates/match-bindings" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+spacetimedb-sdk.workspace = true
+
+# Scaffold is owned by the playtest agent. Keep workspace `clippy -D warnings`
+# green without rewriting their in-progress surface; pedantic cleanup stays
+# with that agent. Mirror workspace rust lints explicitly so we can relax
+# clippy pedantic here (Cargo forbids mixing `lints.workspace = true` with
+# overrides).
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "allow"

@@ -3380,6 +3380,7 @@ name = "hex-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3980,6 +3981,19 @@ dependencies = [
 
 [[package]]
 name = "match-perf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex-core",
+ "match-bindings",
+ "serde",
+ "serde_json",
+ "spacetimedb-sdk",
+]
+
+[[package]]
+name = "match-playtest"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -185,10 +185,12 @@ forwarding and controls.
    ```
 
    Player counts from 2 through 500 are supported. Counts above eight use one-cell high-scale spawns, a compact HUD summary, and selective local tactical subscriptions. Other presets are `dev64` and
-   `validation192`. Lobby configuration is one-shot: the first successful
-   `configure_match` or `configure_map` locks it against further regeneration
-   without claiming a player slot. Every configured slot remains open for a
-   normal `join_match` call. The compatibility reducer `configure_map` changes
+   `validation192`. The first successful `configure_match` or `configure_map`
+   records the calling identity and locks configuration against every other
+   identity without claiming a player slot; the recorded configurator may still
+   reconfigure until the first player joins. Every configured slot remains open
+   for a normal `join_match` call (fresh slot claims are lobby-only; reconnects
+   work in any phase). The compatibility reducer `configure_map` changes
    only the preset while retaining the currently configured player count:
 
    ```bash
@@ -394,6 +396,16 @@ load is distributed; simulation is not).
 - `modules/match` — authoritative SpacetimeDB schema, reducers, and scheduler.
 - `tools/mapgen` — curated map generator/validator CLI.
 - `tools/match-e2e` — real-server two-client acceptance smoke test.
+- `tools/match-playtest` — automated no-human cluster-controls live playtest
+  (six behavioral scenarios + conservation monitor). One command:
+
+```bash
+./scripts/run-automated-playtest.sh
+```
+
+This publishes a fresh isolated `of-match-e2e-auto` database (never
+`of-match-dev`) and writes evidence to `docs/playtests/` and
+`artifacts/playtests/`.
 - `tools/match-perf` — distributed-capable live-match load driver and step-rate profiler.
 - `docs` — the game design, architecture, UI direction, implementation notes,
   performance profiling, and deliberately deferred ideas.

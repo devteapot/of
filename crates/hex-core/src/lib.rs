@@ -23,7 +23,8 @@ pub use branching::{
     weighted_branch_quotas_rotated,
 };
 pub use combat::{
-    AttackFront, AttackOutcome, CombatConfig, CombatError, CombatResolution, resolve_edge_combat,
+    AttackFront, AttackOutcome, CombatConfig, CombatError, CombatResolution, FrontRejection,
+    RejectedFront, resolve_edge_combat, select_capture,
 };
 pub use connectivity::{connected_components, owned_components};
 pub use conquest::{ConquestError, ConquestProgress, ConquestRule};

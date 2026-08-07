@@ -76,7 +76,19 @@ Low-scale matches (`player_count <= 8`) keep the historical full population scan
 every population interval; high-scale matches shard population by denormalized
 `population_shard` so each cell still updates once per interval while work stays
 bounded. Client commands carry stable IDs and produce public receipts, making
-retries idempotent. A reconnecting client reuses its stored SpacetimeDB token,
+retries idempotent; a private per-player monotonic command watermark keeps
+dedup correct while receipts older than a bounded recent window are pruned,
+and terminal Completed/Cancelled orders are pruned after a fixed feedback
+window. When a tick hits an invariant violation attributable to one order, the
+order is quarantined (packets retired in place with strength conserved, order
+row parked with the visible `Quarantined` status, failure logged as
+`event=order.quarantine`) instead of failing the tick and freezing the match;
+only global failures still fail-stop. The live path is exercised by
+`./scripts/run-quarantine-harness.sh`, which publishes an isolated database,
+calls lobby-only `enable_debug_harness` (inserts a private `DebugHarness` row
+that production publish never sets), then `debug_break_order_conservation` to
+force an attributable conservation fault on an active order. Production configs
+leave the harness disabled, so those debug reducers reject every caller. A reconnecting client reuses its stored SpacetimeDB token,
 recovers its seat from `player_identity` and/or slot identity (repairing a
 missing index without a new claim, then reconciling verified claims so a
 repaired final seat can start the lobby), clears generation-scoped pending
@@ -97,25 +109,34 @@ passability. Combat separately enforces frontage and the uphill modifier.
 
 Public state is split by read/update pattern:
 
-- `player_slot`, `player_identity`, `player_state`, `match_config`, `match_state`,
-  and `mobilization_policy` hold match-wide state. Authoritative player IDs are
+- `player_slot`, `player_state`, `match_config`, `match_state`, and
+  `mobilization_policy` hold match-wide state. Authoritative player IDs are
   `u16` with neutral `0` and configured seats `1..=player_count` (`2..=500`);
 - `cell_terrain` is immutable after lobby configuration;
 - `cell_state` holds mutable ownership, population, infantry, capacities, a
   deterministic `population_shard` (`u16`, validated against the interval), and
   denormalized `chunk_q`/`chunk_r` for high-scale spatial interest;
-- `command_receipt` records accepted and rejected idempotent commands;
+- `command_receipt` records accepted and rejected idempotent commands, retained
+  as a bounded recent window per player (dedup is carried by a private
+  monotonic watermark, so pruning cannot break idempotency);
 - `transfer_order`, `transfer_source`, `transfer_destination`, `transit_route`,
   and `transit_packet` expose generic internal aggregate-flow progress and
   congestion. Child source/destination/route rows denormalize `player_id` so
   high-scale clients can subscribe selectively by seat;
 - `combat_front` exposes the current contested edges and casualties.
 
-`simulation_schedule`, `expansion_wave`, and `expansion_garrison_debt` are
-private. A wave stores its deterministic outward topology, participating
-perimeter cells, optional
-neutral focus, immutable enemy target mask, and rotating fair-split cursors.
-Sparse cell-keyed garrison debt ensures partial asynchronous arrivals finish the
+`player_identity`, `simulation_schedule`, `expansion_wave`,
+`expansion_split_cursor`, `expansion_garrison_debt`, `lobby_configurator`,
+`command_watermark`, `static_edge_limit`, and `retreat_abandonment` are
+private. Privacy here cuts subscription bandwidth and API surface — V1 has no
+fog of war, so it is not a security boundary (high-scale clients still use
+bandwidth-oriented interest management; see
+[Technical architecture](./technical-architecture.md)). A wave stores its
+deterministic outward topology, participating perimeter cells, optional
+neutral focus, and immutable enemy target mask; the rotating fair-split
+cursors live in the sparse cell-keyed `expansion_split_cursor` table so
+per-branch cursor updates never rewrite the wave's large immutable depth
+field. Sparse cell-keyed garrison debt ensures partial asynchronous arrivals finish the
 full occupation cost before later strength branches, even when another wave
 also reaches the cell. Pre-existing friendly transit cells create no debt.
 Clients see only source accounting and resting/one-edge packets. Clients cannot
@@ -125,9 +146,9 @@ call the scheduled reducer as a player identity.
 
 The cluster-first client uses these gameplay reducers:
 
-- `configure_map` — make the lobby's one-shot map selection while retaining the configured player count.
-- `configure_match` — make the lobby's one-shot map and 2–500 contiguous-player selection. Configuration locks further regeneration but does not claim a slot.
-- `join_match` — separately claim or reclaim one of the configured player slots; every slot remains open after configuration.
+- `configure_map` — make the lobby's map selection while retaining the configured player count.
+- `configure_match` — make the lobby's map and 2–500 contiguous-player selection. Configuration does not claim a slot. The first successful configure records the calling identity; only that identity may reconfigure, and only until the first player joins (databases configured before the record existed keep strict one-shot behavior). This mitigates configure griefing without changing the production lobby-orchestrator flow, which configures each published match database once.
+- `join_match` — separately claim or reclaim one of the configured player slots; every slot remains open after configuration. Fresh slot claims are accepted only while the match is in the Lobby phase; reconnects of already-bound identities remain allowed in every phase.
 - `set_mobilization_target` — change the global recruitment target in basis
   points.
 - `issue_expand_clusters` — expand every complete owned cluster touched by the

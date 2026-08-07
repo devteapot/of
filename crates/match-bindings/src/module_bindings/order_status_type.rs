@@ -13,6 +13,8 @@ pub enum OrderStatus {
     Completed,
 
     Cancelled,
+
+    Quarantined,
 }
 
 impl __sdk::InModule for OrderStatus {

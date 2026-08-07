@@ -2,12 +2,12 @@ use hex_core::{Axial, Cell, ForceComposition, MovementConfig, TerrainKind, groun
 use spacetimedb::{ReducerContext, Table};
 
 use crate::schema::{
-    CellState, CellTerrain, CommandReceipt, MatchConfig, MatchPhase, MatchState, ReceiptStatus,
-    SINGLETON_ID, TerrainClass,
+    CellState, CellTerrain, CommandReceipt, CommandWatermark, MatchConfig, MatchPhase, MatchState,
+    ReceiptStatus, SINGLETON_ID, TerrainClass,
 };
 use crate::schema::{
-    cell_state, cell_terrain, command_receipt, match_config, match_state, player_identity,
-    player_slot, static_edge_limit, transit_packet,
+    cell_state, cell_terrain, command_receipt, command_watermark, match_config, match_state,
+    player_identity, player_slot, static_edge_limit, transit_packet,
 };
 
 pub const BASIS_POINTS: u64 = 10_000;
@@ -95,12 +95,85 @@ pub const fn order_cell_key(order_id: u64, cell_id: u32) -> u128 {
     (order_id as u128) << 32 | cell_id as u128
 }
 
+/// Receipts newer than `watermark - RECEIPT_RETENTION_WINDOW` are retained per
+/// player; older rows are pruned on insert. The window only bounds how long
+/// receipt rows stay visible for client feedback — dedup correctness comes
+/// from the monotonic watermark, not from receipt existence.
+pub const RECEIPT_RETENTION_WINDOW: u64 = 128;
+
+/// Idempotency contract: clients allocate `client_command_id` monotonically
+/// per player (the client seeds `max + 1` from observed receipts) and reuse
+/// the same ID only when retrying the same command. Any ID at or below the
+/// player's high-water mark is therefore a duplicate by contract, which lets
+/// old receipt rows be pruned without breaking dedup. The receipt lookup
+/// remains as a fallback for databases created before the watermark existed.
 pub fn command_was_seen(ctx: &ReducerContext, player_id: u16, client_command_id: u64) -> bool {
+    let watermark = ctx
+        .db
+        .command_watermark()
+        .player_id()
+        .find(player_id)
+        .map(|row| row.highest_client_command_id);
+    if command_id_is_duplicate(watermark, client_command_id) {
+        return true;
+    }
     ctx.db
         .command_receipt()
         .receipt_key()
         .find(command_key(player_id, client_command_id))
         .is_some()
+}
+
+/// Pure dedup decision: a command ID is a duplicate exactly when the player
+/// already has a watermark at or above it. A player with no watermark row has
+/// seen nothing.
+pub fn command_id_is_duplicate(watermark: Option<u64>, client_command_id: u64) -> bool {
+    watermark.is_some_and(|mark| client_command_id <= mark)
+}
+
+/// Pure retention rule: receipts with `client_command_id` at or below the
+/// cutoff may be pruned. No cutoff exists until the watermark clears the
+/// retention window, so a player always keeps their most recent receipts.
+pub fn receipt_retention_cutoff(watermark: u64) -> Option<u64> {
+    watermark.checked_sub(RECEIPT_RETENTION_WINDOW)
+}
+
+fn advance_command_watermark(ctx: &ReducerContext, player_id: u16, client_command_id: u64) -> u64 {
+    match ctx.db.command_watermark().player_id().find(player_id) {
+        Some(mut row) => {
+            if client_command_id > row.highest_client_command_id {
+                row.highest_client_command_id = client_command_id;
+                ctx.db.command_watermark().player_id().update(row);
+                client_command_id
+            } else {
+                row.highest_client_command_id
+            }
+        }
+        None => {
+            ctx.db.command_watermark().insert(CommandWatermark {
+                player_id,
+                highest_client_command_id: client_command_id,
+            });
+            client_command_id
+        }
+    }
+}
+
+fn prune_player_receipts(ctx: &ReducerContext, player_id: u16, watermark: u64) {
+    let Some(cutoff) = receipt_retention_cutoff(watermark) else {
+        return;
+    };
+    let stale: Vec<u128> = ctx
+        .db
+        .command_receipt()
+        .receipt_by_player()
+        .filter(player_id)
+        .filter(|receipt| receipt.client_command_id <= cutoff)
+        .map(|receipt| receipt.receipt_key)
+        .collect();
+    for receipt_key in stale {
+        ctx.db.command_receipt().receipt_key().delete(receipt_key);
+    }
 }
 
 pub fn write_receipt(
@@ -142,6 +215,8 @@ pub fn write_receipt(
         message,
         logical_step,
     });
+    let watermark = advance_command_watermark(ctx, player_id, client_command_id);
+    prune_player_receipts(ctx, player_id, watermark);
     Ok(())
 }
 
@@ -291,4 +366,84 @@ pub fn allocated_infantry_at_cell(ctx: &ReducerContext, owner_player_id: u16, ce
         .filter(|packet| packet.owner_player_id == owner_player_id)
         .map(|packet| packet.infantry)
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_survives_receipt_pruning_via_the_watermark() {
+        // Simulate a long session: the player has issued 1,000 commands and
+        // every receipt older than the retention window has been pruned.
+        let watermark = 1_000_u64;
+        let cutoff = receipt_retention_cutoff(watermark).unwrap();
+        assert_eq!(cutoff, 1_000 - RECEIPT_RETENTION_WINDOW);
+
+        // Replays of long-pruned IDs are still duplicates even though their
+        // receipt rows are gone.
+        for pruned_id in [1, 2, cutoff] {
+            assert!(pruned_id <= cutoff, "these receipts were pruned");
+            assert!(command_id_is_duplicate(Some(watermark), pruned_id));
+        }
+        // Recent IDs inside the retained window are also duplicates.
+        assert!(command_id_is_duplicate(Some(watermark), cutoff + 1));
+        assert!(command_id_is_duplicate(Some(watermark), watermark));
+        // Fresh IDs above the watermark are accepted.
+        assert!(!command_id_is_duplicate(Some(watermark), watermark + 1));
+    }
+
+    #[test]
+    fn players_without_a_watermark_have_seen_nothing() {
+        assert!(!command_id_is_duplicate(None, 0));
+        assert!(!command_id_is_duplicate(None, 1));
+        assert!(command_id_is_duplicate(Some(0), 0));
+    }
+
+    #[test]
+    fn recent_receipts_are_never_pruned() {
+        // Until the watermark clears the window there is no cutoff at all.
+        assert_eq!(receipt_retention_cutoff(0), None);
+        assert_eq!(receipt_retention_cutoff(RECEIPT_RETENTION_WINDOW - 1), None);
+        assert_eq!(receipt_retention_cutoff(RECEIPT_RETENTION_WINDOW), Some(0));
+        // The most recent window of receipts always survives for feedback.
+        let watermark = 500_u64;
+        let cutoff = receipt_retention_cutoff(watermark).unwrap();
+        assert!(watermark - cutoff == RECEIPT_RETENTION_WINDOW);
+    }
+
+    #[test]
+    fn write_prune_replay_pipeline_keeps_dedup_without_receipt_rows() {
+        // Model the write_receipt → prune_player_receipts → command_was_seen
+        // pipeline without a database: each issued ID advances the watermark,
+        // receipts at or below the cutoff disappear, and replays of those
+        // pruned IDs remain duplicates via the watermark alone.
+        let mut watermark = None;
+        let mut receipts = std::collections::BTreeSet::<u64>::new();
+        for command_id in 1..=300_u64 {
+            assert!(
+                !command_id_is_duplicate(watermark, command_id),
+                "fresh ID {command_id} must be above watermark {watermark:?}"
+            );
+            watermark = Some(command_id);
+            receipts.insert(command_id);
+            if let Some(cutoff) = receipt_retention_cutoff(command_id) {
+                receipts.retain(|&id| id > cutoff);
+            }
+        }
+
+        let watermark = watermark.unwrap();
+        assert_eq!(watermark, 300);
+        let cutoff = receipt_retention_cutoff(watermark).unwrap();
+        assert!(receipts.iter().all(|&id| id > cutoff));
+        assert!(!receipts.contains(&1));
+        assert!(!receipts.contains(&cutoff));
+
+        // Receipt rows for the pruned IDs are gone, but dedup still holds.
+        for pruned_id in [1, cutoff / 2, cutoff] {
+            assert!(!receipts.contains(&pruned_id));
+            assert!(command_id_is_duplicate(Some(watermark), pruned_id));
+        }
+        assert!(!command_id_is_duplicate(Some(watermark), watermark + 1));
+    }
 }

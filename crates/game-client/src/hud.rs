@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::app::AppExit;
 use bevy::{
     picking::hover::Hovered,
     prelude::*,
@@ -6,9 +8,6 @@ use bevy::{
         Slider, SliderDragState, SliderRange, SliderThumb, SliderValue, TrackClick, ValueChange,
     },
 };
-
-#[cfg(not(target_arch = "wasm32"))]
-use bevy::app::AppExit;
 
 use crate::{
     interaction::{InteractionState, OrderMode},

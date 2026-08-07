@@ -207,8 +207,16 @@ the next subscription update.
 
 A receipt or stable order row keyed by `(player_id, client_command_id)` makes
 retries idempotent when a connection disappears after submission but before the
-client observes the transaction. Spawn selection, readiness controls, and
-rematches are outside the reducer surface.
+client observes the transaction. Command IDs are player-scoped and monotonic
+by client contract; the module keeps a private per-player high-water mark and
+treats any ID at or below it as a duplicate. That watermark, not receipt-row
+existence, carries dedup correctness, so receipt rows are retained only as a
+bounded recent feedback window per player (currently 128 commands) and older
+rows are pruned on insert. Terminal Completed/Cancelled orders and their
+source/destination rows are likewise pruned after a fixed feedback window
+(currently 2,400 steps); Quarantined orders are kept as durable operator
+records. Spawn selection, readiness controls, and rematches are outside the
+reducer surface.
 
 ## Deterministic simulation rules
 
@@ -315,13 +323,29 @@ one defender pool; strength and casualties remain conserved. Cancellation
 releases surviving packets where they physically are rather than rewinding
 captures.
 
+Contested-cell resolution is simultaneous across **all** attacking owners: the
+kernel allocates the defender pool proportionally over every valid attacking
+edge regardless of owner (largest-remainder rounding, attack-ID tie-break),
+so three-way contests need no module-side owner ordering. When the defender is
+eliminated, the capture rule is: the attacking owner with the largest total
+surviving committed strength at the cell captures, ties break toward the
+smaller owner ID; within the winning owner, the largest surviving front
+captures, ties break toward the smaller origin cell ID. Losing owners keep
+their survivors in place and contest the cell again next step. A malformed
+front (non-adjacent origin, impassable cliff, duplicated origin) is rejected
+individually — the remaining valid fronts still resolve, and the orders behind
+the rejected front are quarantined.
+
 ### Explicit strategic-front redistribution
 
 A strategic front is derived from directed deployable boundary edges of one
 complete owned traversable component. Hostile runs are labeled by opponent;
 neutral runs between hostile runs against the same opponent bridge those runs.
 Different opponents split hostile frontage. Neutral-facing edges are grouped by
-the ordered hostile context around each geometric perimeter cycle. Repeated
+the actual bounding hostile front **instances** around each geometric perimeter
+cycle — not merely by the bounding opponents' IDs — so geometrically
+disconnected neutral arcs that happen to sit between the same pair of opponent
+IDs stay separate fronts. Repeated
 contact with the same hostile front does not split the neutral frontage, while
 neutral sections bounded on opposite sides by different hostile fronts remain
 independent. Neutral bridge edges remain members of their neutral front, so
@@ -388,6 +412,20 @@ The important commitments are:
 
 Uncontested movement can later be collapsed into scheduled arrival events when doing so preserves congestion and interception semantics. The exact split between periodic active-set updates and calculated arrival events is a scaling experiment, not a V1 rule dependency.
 
+**Failure locality (quarantine).** A scheduled tick is one transaction, so an
+error that propagates out of the tick reducer rolls back and the interval
+schedule re-runs the identical deterministic state — an unrecoverable per-order
+invariant violation would otherwise freeze the match forever. When a violation
+is attributable to one order (broken per-order conservation, corrupt persisted
+geometry, a rejected combat front, a source-queue underflow), the tick instead
+quarantines that order: its packets are deleted with their strength conserved
+in place at the current physical cells, its source queues are zeroed, its
+private topology rows are removed, the order row is parked with the visible
+`Quarantined` status, and an `event=order.quarantine` error is logged. The rest
+of the tick proceeds. Truly global failures (logical-step counter overflow,
+kernel movement failure across orders, missing singleton state) still
+fail-stop the transaction.
+
 ## Map data, chunks, and supported sizes
 
 Maps are generated offline from a versioned generator and seed, validated, inspected, and baked into a curated library. Each map has a manifest containing dimensions or bounds, generator version, seed, content hash, spawn candidates, capturable-land mask, and environment metadata. The conquest denominator is fixed from the capturable mask at match initialization.
@@ -432,6 +470,16 @@ subscription for cell state / combat (full or spatial+local-owned by scale),
 active orders, routes/packets, mobilization, and
 command receipts. The SpacetimeDB client cache is the network-facing source of
 truth for the client.
+
+Full disclosure of gameplay state is intentional in V1: the design has no fog
+of war, so every gameplay-relevant table (ownership, orders, packets, routes,
+fronts, receipts) is public and readable by every client, and no per-player
+read authorization exists. Purely internal execution state — expansion wave
+topology and split cursors, garrison debt, retreat abandonments, the identity
+index, the lobby configurator record, command watermarks, static edge limits,
+and the scheduler row — is private only to cut subscription bandwidth and API
+surface, not as a security boundary. This posture must be revisited when fog
+of war is introduced.
 
 A narrow adapter advances the SpacetimeDB connection in the Bevy update loop as required by the selected SDK version. It translates inserted, updated, and deleted rows into ordered application events and dirty chunk/cell markers. Bevy systems consume those markers; rendering systems do not synchronously query the network and network callbacks do not directly mutate arbitrary ECS state.
 
