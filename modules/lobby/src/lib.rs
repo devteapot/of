@@ -137,6 +137,35 @@ fn active_lobby_for_identity(ctx: &ReducerContext, identity: Identity) -> Option
         })
 }
 
+fn delete_lobby_and_members(ctx: &ReducerContext, lobby_id: &str) {
+    let member_keys = ctx
+        .db
+        .lobby_member()
+        .iter()
+        .filter(|member| member.lobby_id == lobby_id)
+        .map(|member| member.member_key)
+        .collect::<Vec<_>>();
+    for key in member_keys {
+        ctx.db.lobby_member().member_key().delete(&key);
+    }
+    ctx.db.lobby().lobby_id().delete(lobby_id.to_owned());
+}
+
+/// Pure post-leave status decision. Empty lobbies are deleted rather than kept
+/// as Failed/Cancelled rows so membership cannot block future creates.
+fn status_after_member_leave(
+    status: LobbyStatus,
+    member_count_after: u16,
+) -> Result<LobbyStatus, ()> {
+    if member_count_after == 0 {
+        return Err(());
+    }
+    Ok(match status {
+        LobbyStatus::Full => LobbyStatus::Open,
+        other => other,
+    })
+}
+
 #[spacetimedb::reducer(init)]
 pub fn init(ctx: &ReducerContext) {
     ctx.db.control_config().insert(ControlConfig {
@@ -247,6 +276,39 @@ pub fn join_lobby(
 }
 
 #[spacetimedb::reducer]
+pub fn leave_lobby(ctx: &ReducerContext, lobby_id: String) -> Result<(), String> {
+    let mut lobby = ctx
+        .db
+        .lobby()
+        .lobby_id()
+        .find(&lobby_id)
+        .ok_or("lobby does not exist")?;
+    let key = member_key(&lobby_id, ctx.sender());
+    if ctx.db.lobby_member().member_key().find(&key).is_none() {
+        return Ok(());
+    }
+    ctx.db.lobby_member().member_key().delete(&key);
+
+    let member_count = lobby.member_count.saturating_sub(1);
+    match status_after_member_leave(lobby.status, member_count) {
+        Err(()) => {
+            // Last member left — including creator leaving a Pending/Provisioning
+            // lobby — so drop the row instead of leaving an orphan that blocks
+            // create_lobby via active membership.
+            delete_lobby_and_members(ctx, &lobby_id);
+            Ok(())
+        }
+        Ok(status) => {
+            lobby.member_count = member_count;
+            lobby.status = status;
+            lobby.updated_at_us = timestamp_us(ctx);
+            ctx.db.lobby().lobby_id().update(lobby);
+            Ok(())
+        }
+    }
+}
+
+#[spacetimedb::reducer]
 pub fn begin_provision(ctx: &ReducerContext, lobby_id: String) -> Result<(), String> {
     require_owner(ctx)?;
     let mut lobby = ctx
@@ -337,17 +399,7 @@ pub fn remove_inactive_lobby(ctx: &ReducerContext, lobby_id: String) -> Result<(
     if !matches!(lobby.status, LobbyStatus::Failed | LobbyStatus::Cancelled) {
         return Err("only failed or cancelled lobbies may be removed".to_owned());
     }
-    let member_keys = ctx
-        .db
-        .lobby_member()
-        .iter()
-        .filter(|member| member.lobby_id == lobby_id)
-        .map(|member| member.member_key)
-        .collect::<Vec<_>>();
-    for key in member_keys {
-        ctx.db.lobby_member().member_key().delete(&key);
-    }
-    ctx.db.lobby().lobby_id().delete(&lobby_id);
+    delete_lobby_and_members(ctx, &lobby_id);
     Ok(())
 }
 
@@ -367,5 +419,39 @@ mod tests {
         assert_eq!(clean_display_name("  Alice  ").unwrap(), "Alice");
         assert_eq!(clean_display_name(&"x".repeat(40)).unwrap().len(), 32);
         assert!(clean_display_name("   ").is_err());
+    }
+
+    #[test]
+    fn last_member_leave_deletes_for_every_live_status() {
+        for status in [
+            LobbyStatus::Pending,
+            LobbyStatus::Provisioning,
+            LobbyStatus::Open,
+            LobbyStatus::Full,
+            LobbyStatus::Failed,
+            LobbyStatus::Cancelled,
+        ] {
+            assert_eq!(status_after_member_leave(status, 0), Err(()));
+        }
+    }
+
+    #[test]
+    fn non_empty_leave_reopens_full_lobbies_only() {
+        assert_eq!(
+            status_after_member_leave(LobbyStatus::Full, 1),
+            Ok(LobbyStatus::Open)
+        );
+        assert_eq!(
+            status_after_member_leave(LobbyStatus::Open, 1),
+            Ok(LobbyStatus::Open)
+        );
+        assert_eq!(
+            status_after_member_leave(LobbyStatus::Pending, 1),
+            Ok(LobbyStatus::Pending)
+        );
+        assert_eq!(
+            status_after_member_leave(LobbyStatus::Provisioning, 1),
+            Ok(LobbyStatus::Provisioning)
+        );
     }
 }

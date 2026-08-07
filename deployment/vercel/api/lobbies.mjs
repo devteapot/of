@@ -194,6 +194,13 @@ export default async function handler(request, response) {
       return response.status(200).json({ lobby });
     }
 
+    if (body.action === "leave") {
+      const lobbyId = String(body.lobbyId ?? "");
+      await callReducer(LOBBY_DATABASE, "leave_lobby", [lobbyId], token);
+      const lobby = (await listLobbies()).find((candidate) => candidate.lobbyId === lobbyId);
+      return response.status(200).json({ lobby: lobby ?? null });
+    }
+
     return response.status(400).json({ error: "unknown_action" });
   } catch (error) {
     const status = Number(error.statusCode) || 500;
