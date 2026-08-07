@@ -997,7 +997,7 @@ fn update_hud(
 fn leave_match_after_victory(
     keyboard: Res<ButtonInput<KeyCode>>,
     view: Res<MatchView>,
-    mut app_exit: MessageWriter<AppExit>,
+    #[cfg(not(target_arch = "wasm32"))] mut app_exit: MessageWriter<AppExit>,
 ) {
     if !matches!(view.phase, MatchPhase::Victory(_)) || !keyboard.just_pressed(KeyCode::Escape) {
         return;
