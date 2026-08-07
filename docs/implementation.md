@@ -276,6 +276,13 @@ invalid state, and locked submission each replace that copy with their relevant
 instructions. `?` toggles the complete field manual. The right panel remains
 a compact map-view, inspector, and order summary.
 
+When authoritative state reports victory, a centered result overlay names the
+winner, distinguishes local victory from defeat, and records the resolving
+logical step. `Escape` returns web players to the lobby directory (where they
+can leave the lobby) and exits the native client. The directory captures a
+final member's provisioned match database before deleting its lobby row, then
+best-effort deletes the database without failing that completed leave.
+
 Input produces `ClientIntent`. The online transport invokes generated typed
 reducers, pumps SpacetimeDB frames, and rebuilds `MatchView` from subscribed
 authoritative tables. Stable command IDs and receipts make retry

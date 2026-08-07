@@ -1,4 +1,5 @@
 use bevy::{
+    app::AppExit,
     picking::hover::Hovered,
     prelude::*,
     ui::UiRect,
@@ -10,7 +11,7 @@ use bevy::{
 use crate::{
     interaction::{InteractionState, OrderMode},
     map_view::map_view_status_bundle,
-    model::{MatchView, ToastKind},
+    model::{MatchPhase, MatchView, ToastKind},
     network::{ClientIntent, NetworkSet},
 };
 
@@ -59,6 +60,13 @@ struct MobilizationLabel;
 struct MobilizationSlider;
 #[derive(Component)]
 struct MobilizationThumb;
+
+#[derive(Component)]
+struct ResultOverlay;
+#[derive(Component)]
+struct ResultTitle;
+#[derive(Component)]
+struct ResultDetails;
 
 #[derive(Component)]
 struct CommandContextTitle;
@@ -130,6 +138,7 @@ impl Plugin for HudPlugin {
                     update_hud.after(NetworkSet::Apply),
                     update_command_bar.after(update_hud),
                     update_slider_visuals.after(update_hud),
+                    leave_match_after_victory,
                 ),
             );
     }
@@ -155,6 +164,7 @@ fn spawn_hud(mut commands: Commands, view: Res<MatchView>) {
             spawn_bottom_bar(root, view.mobilization_target);
             spawn_toast(root);
             spawn_help(root);
+            spawn_result_overlay(root);
         });
 }
 
@@ -468,6 +478,51 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
     });
 }
 
+fn spawn_result_overlay(root: &mut ChildSpawnerCommands) {
+    root.spawn((
+        Name::new("Match result overlay"),
+        ResultOverlay,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            left: percent(50),
+            top: percent(50),
+            width: px(480),
+            padding: UiRect::all(px(24)),
+            border: UiRect::all(px(2)),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            row_gap: px(12),
+            ..default()
+        },
+        UiTransform::from_translation(Val2::percent(-50.0, -50.0)),
+        GlobalZIndex(60),
+        BackgroundColor(Color::srgba(0.025, 0.039, 0.049, 0.985)),
+        BorderColor::all(CYAN),
+        Pickable::IGNORE,
+    ))
+    .with_children(|overlay| {
+        overlay.spawn((
+            ResultTitle,
+            Text::new("MATCH COMPLETE"),
+            TextFont::from_font_size(24.0),
+            TextColor(CYAN),
+            Pickable::IGNORE,
+        ));
+        overlay.spawn((
+            ResultDetails,
+            Text::new(""),
+            TextFont::from_font_size(13.0),
+            TextColor(TEXT),
+            Node {
+                align_self: AlignSelf::Stretch,
+                ..default()
+            },
+            Pickable::IGNORE,
+        ));
+    });
+}
+
 fn section_title(value: &'static str) -> impl Bundle {
     (
         Text::new(value),
@@ -682,10 +737,13 @@ fn update_hud(
         Single<&mut Text, With<BottomStatus>>,
         Single<&mut Text, With<MobilizationLabel>>,
         Single<&mut Text, With<ToastText>>,
+        Single<&mut Text, With<ResultTitle>>,
+        Single<&mut Text, With<ResultDetails>>,
     )>,
     mut panels: ParamSet<(
         Single<(&mut Node, &mut BackgroundColor, &mut BorderColor), With<ToastRoot>>,
         Single<&mut Node, With<HelpPanel>>,
+        Single<(&mut Node, &mut BorderColor), With<ResultOverlay>>,
     )>,
     slider: Single<(Entity, &SliderValue), With<MobilizationSlider>>,
     mut selection_totals: Local<SelectionTotalsCache>,
@@ -902,6 +960,58 @@ fn update_hud(
         let mut toast_root = panels.p0();
         toast_root.0.display = Display::None;
     }
+
+    {
+        let mut overlay = panels.p2();
+        if let MatchPhase::Victory(winner) = view.phase {
+            let local_won = winner == u32::from(view.local_player);
+            overlay.0.display = Display::Flex;
+            overlay.1.set_all(if local_won { CYAN } else { CORAL });
+
+            let mut title = texts.p6();
+            set_text(
+                &mut title,
+                if local_won {
+                    "VICTORY CONFIRMED".to_owned()
+                } else {
+                    "MATCH COMPLETE".to_owned()
+                },
+            );
+
+            let mut details = texts.p7();
+            set_text(
+                &mut details,
+                format!(
+                    "WINNER       PLAYER {winner}\nLOCAL SEAT   PLAYER {}  //  {}\nCONQUEST    RESOLVED AT LOGICAL STEP {}\n\nESC  //  RETURN TO LOBBY DIRECTORY\nFROM THE DIRECTORY, SELECT LEAVE TO RETIRE THE LOBBY.",
+                    view.local_player,
+                    if local_won { "VICTORY" } else { "DEFEAT" },
+                    view.logical_step,
+                ),
+            );
+        } else {
+            overlay.0.display = Display::None;
+        }
+    }
+}
+
+fn leave_match_after_victory(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    view: Res<MatchView>,
+    mut app_exit: MessageWriter<AppExit>,
+) {
+    if !matches!(view.phase, MatchPhase::Victory(_)) || !keyboard.just_pressed(KeyCode::Escape) {
+        return;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let _ = window.location().set_href("/");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    app_exit.write(AppExit::Success);
 }
 
 fn update_slider_visuals(
