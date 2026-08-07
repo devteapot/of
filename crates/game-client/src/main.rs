@@ -54,6 +54,8 @@ fn main() {
                 title: format!("Hex RTS · V1 {}", config.mode_label()),
                 resolution: WindowResolution::new(1440, 900),
                 resizable: true,
+                canvas: Some("#game-canvas".to_owned()),
+                fit_canvas_to_parent: true,
                 ..default()
             }),
             ..default()

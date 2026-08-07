@@ -1,14 +1,14 @@
 # Technical Architecture
 
 Status: implemented V1 architecture baseline
-Last updated: 2026-08-04
+Last updated: 2026-08-07
 
 This document records the architecture commitments for the first playable version of the game. It deliberately separates those commitments from scaling questions that must be answered with measurements. Gameplay details live elsewhere; this document focuses on authority, state flow, code boundaries, rendering, persistence, and delivery order.
 
 ## V1 commitments
 
-- The game ships native desktop first with a Bevy client.
-- Platform-dependent code stays behind narrow adapters so the client and shared game logic remain viable for a later WebAssembly build.
+- The game ships a Bevy client for native desktop and WebAssembly/WebGPU.
+- Platform-dependent code stays behind narrow adapters for native and WebAssembly builds.
 - SpacetimeDB is the sole gameplay authority. Clients submit intentions and render subscribed state; they do not run an authoritative lockstep simulation or vote on state hashes.
 - Each match runs in its own logical SpacetimeDB database instance. This is isolation inside a SpacetimeDB host, not a requirement for one machine or process per match.
 - V1 starts with one manually provisioned development match database. A lobby database and external match orchestrator are added when concurrent public matches are needed.
@@ -41,12 +41,12 @@ receives authoritative subscription updates. Exact versions live in
 scripts reject a mismatched CLI or Rust compiler before publishing or
 regenerating the wire contract.
 
-The browser remains a later delivery target. Bevy supports web builds, but the
-native V1 transport persists credentials through the filesystem and has not yet
-been adapted or qualified for browsers. A future web pass must provide a
-browser credential store and re-run compile, graphics, networking, reconnect,
-download-size, and representative-map performance checks before browser support
-is claimed.
+The browser build uses Bevy's WebGPU backend and SpacetimeDB's browser transport.
+Connection setup is asynchronous and identity tokens are stored in browser
+`localStorage`, scoped by host, database, and profile. Native clients retain the
+filesystem-backed credential adapter. Browser compile coverage is part of the
+compatibility gate; representative browser graphics, reconnect, download-size,
+and map-performance measurements remain required before production release.
 
 Upgrade Bevy or SpacetimeDB intentionally on a dedicated branch, regenerate
 bindings, run migrations if required, and repeat native, web-compile,

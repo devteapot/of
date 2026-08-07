@@ -1,11 +1,14 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::{env, path::PathBuf};
 
 use bevy::prelude::Resource;
+#[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
 
 const DEFAULT_HOST: &str = "http://127.0.0.1:3000";
 const DEFAULT_DATABASE: &str = "of-match-dev";
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Parser, Debug)]
 #[command(
     name = "game-client",
@@ -49,6 +52,7 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_process() -> Self {
         let args = ClientArgs::parse();
         let preferred_player = args
@@ -85,6 +89,31 @@ impl ClientConfig {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_process() -> Self {
+        let preferred_player = browser_param("player")
+            .and_then(|value| value.parse().ok())
+            .filter(|player| (1..=500).contains(player))
+            .unwrap_or(1);
+        let profile =
+            browser_param("profile").unwrap_or_else(|| format!("player-{preferred_player}"));
+        let profile =
+            safe_profile(&profile).unwrap_or_else(|| format!("player-{preferred_player}"));
+
+        Self {
+            offline: browser_flag("offline"),
+            host: browser_param("host").unwrap_or_else(|| DEFAULT_HOST.to_owned()),
+            database: browser_param("database")
+                .or_else(|| browser_param("db"))
+                .unwrap_or_else(|| DEFAULT_DATABASE.to_owned()),
+            display_name: browser_param("name")
+                .unwrap_or_else(|| format!("Player {preferred_player}")),
+            preferred_player,
+            profile,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn token_path(&self) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -92,11 +121,17 @@ impl ClientConfig {
             .join(format!("client-{}.token", self.profile))
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn token_storage_key(&self) -> String {
+        format!("of.auth.{}.{}.{}", self.host, self.database, self.profile)
+    }
+
     pub const fn mode_label(&self) -> &'static str {
         if self.offline { "Offline" } else { "Online" }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn env_nonempty(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -104,12 +139,34 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn env_u16(key: &str) -> Option<u16> {
     env_nonempty(key)?.parse().ok()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn env_flag(name: &str) -> bool {
     env_nonempty(name).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_param(name: &str) -> Option<String> {
+    let search = web_sys::window()?.location().search().ok()?;
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    params
+        .get(name)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_flag(name: &str) -> bool {
+    browser_param(name).is_some_and(|value| {
         matches!(
             value.to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
