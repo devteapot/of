@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#05070a" />
+    <title>Hex RTS</title>
+    <link
+      data-trunk
+      rel="rust"
+      href="../Cargo.toml"
+      data-bin="game-client"
+      data-wasm-opt="s"
+    />
+    <style>
+      html,
+      body,
+      #game-shell,
+      #game-canvas {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      html,
+      body {
+        overflow: hidden;
+        background: #05070a;
+      }
+
+      #game-shell {
+        position: relative;
+      }
+
+      #game-canvas {
+        position: relative;
+        z-index: 1;
+        display: block;
+        outline: none;
+      }
+
+      #loading {
+        position: absolute;
+        inset: 0;
+        z-index: 0;
+        display: grid;
+        place-items: center;
+        color: #9fb2bd;
+        font: 500 14px/1.4 system-ui, sans-serif;
+        letter-spacing: 0.04em;
+      }
+    </style>
+  </head>
+  <body>
+    <main id="game-shell">
+      <div id="loading">Loading WebGPU client…</div>
+      <canvas id="game-canvas" tabindex="0"></canvas>
+    </main>
+    <script>
+      if (!navigator.gpu) {
+        document.getElementById("loading").textContent =
+          "This browser does not expose WebGPU. Use a current WebGPU-capable browser.";
+      }
+    </script>
+  </body>
+</html>

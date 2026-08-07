@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs, io,
-    path::Path,
-    process,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    fs, io,
+    path::Path,
+    process,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -585,6 +588,8 @@ impl PendingCommand {
 #[derive(Resource)]
 struct OnlineTransport {
     connection: Option<DbConnection>,
+    #[cfg(target_arch = "wasm32")]
+    pending_connection: Option<PendingConnection>,
     signals: Arc<SharedSignals>,
     config: ClientConfig,
     coordinate_to_id: BTreeMap<Axial, u32>,
@@ -625,6 +630,8 @@ impl OnlineTransport {
     fn new(config: ClientConfig) -> Self {
         Self {
             connection: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_connection: None,
             signals: Arc::default(),
             config,
             coordinate_to_id: BTreeMap::new(),
@@ -697,13 +704,25 @@ fn session_command_floor() -> u64 {
     const PROCESS_BITS: u32 = 20;
     const PROCESS_MASK: u64 = (1_u64 << PROCESS_BITS) - 1;
 
+    #[cfg(not(target_arch = "wasm32"))]
     let milliseconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX >> PROCESS_BITS)) as u64;
-    (milliseconds << PROCESS_BITS) | (u64::from(process::id()) & PROCESS_MASK)
+    #[cfg(target_arch = "wasm32")]
+    let milliseconds = (js_sys::Date::now() as u64).min(u64::MAX >> PROCESS_BITS);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let session_nonce = u64::from(process::id()) & PROCESS_MASK;
+    #[cfg(target_arch = "wasm32")]
+    let session_nonce = (js_sys::Math::random() * PROCESS_MASK as f64) as u64;
+
+    (milliseconds << PROCESS_BITS) | session_nonce
 }
+
+#[cfg(target_arch = "wasm32")]
+type PendingConnection = Arc<Mutex<Option<Result<DbConnection, String>>>>;
 
 pub struct OnlineTransportPlugin;
 
@@ -737,6 +756,11 @@ fn maintain_connection(
     mut view: ResMut<MatchView>,
 ) {
     if transport.connection.is_some() || transport.connection_disabled {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    if transport.pending_connection.is_some() {
+        poll_pending_connection(&mut transport, &mut view);
         return;
     }
     transport.reconnect_delay_seconds =
@@ -784,13 +808,12 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     clear_tactical_presentation(view);
     view.authority = AuthorityState::Connecting;
 
-    let token_path = transport.config.token_path();
-    let token = match load_token(&token_path) {
+    let token = match load_token(&transport.config) {
         Ok(token) => token,
         Err(error) => {
             view.push_log(format!(
-                "Could not read auth token {}: {error}",
-                token_path.display()
+                "Could not read auth token from {}: {error}",
+                credential_store_label(&transport.config)
             ));
             None
         }
@@ -800,7 +823,7 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
     let connect_signals = Arc::clone(&signals);
     let connect_error_signals = Arc::clone(&signals);
     let disconnect_signals = Arc::clone(&signals);
-    let token_path_for_callback = token_path.clone();
+    let credential_config = transport.config.clone();
     let preferred_player = transport.config.preferred_player;
     let display_name = transport.config.display_name.clone();
 
@@ -809,7 +832,7 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
         .with_database_name(transport.config.database.clone())
         .with_token(token)
         .on_connect(move |connection, _identity, private_token| {
-            if let Err(error) = save_token(&token_path_for_callback, private_token) {
+            if let Err(error) = save_token(&credential_config, private_token) {
                 connect_signals.push(LifecycleEvent::TokenWarning {
                     generation,
                     message: format!("Could not persist auth token: {error}"),
@@ -859,17 +882,52 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
             let reason =
                 error.map_or_else(|| "connection closed".to_owned(), |error| error.to_string());
             disconnect_signals.push(LifecycleEvent::Disconnected { generation, reason });
-        })
-        .build();
+        });
 
-    match connection {
+    #[cfg(not(target_arch = "wasm32"))]
+    finish_connection_setup(
+        transport,
+        view,
+        connection.build().map_err(|error| error.to_string()),
+    );
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pending: PendingConnection = Arc::new(Mutex::new(None));
+        let task_result = Arc::clone(&pending);
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = connection.build().await.map_err(|error| error.to_string());
+            if let Ok(mut slot) = task_result.lock() {
+                *slot = Some(result);
+            }
+        });
+        transport.pending_connection = Some(pending);
+        set_connecting_status(transport, view);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_pending_connection(transport: &mut OnlineTransport, view: &mut MatchView) {
+    let Some(pending) = transport.pending_connection.clone() else {
+        return;
+    };
+    let result = pending.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(result) = result {
+        transport.pending_connection = None;
+        finish_connection_setup(transport, view, result);
+    }
+}
+
+fn finish_connection_setup(
+    transport: &mut OnlineTransport,
+    view: &mut MatchView,
+    result: Result<DbConnection, String>,
+) {
+    match result {
         Ok(connection) => {
-            register_table_watchers(&connection, &signals);
+            register_table_watchers(&connection, &transport.signals);
             transport.connection = Some(connection);
-            view.latest_result = format!(
-                "Connecting to {} / {} as {}…",
-                transport.config.host, transport.config.database, transport.config.display_name
-            );
+            set_connecting_status(transport, view);
         }
         Err(error) => {
             transport.schedule_reconnect();
@@ -880,6 +938,13 @@ fn connect_to_spacetimedb(transport: &mut OnlineTransport, view: &mut MatchView)
             view.show_toast("SpacetimeDB connection failed", ToastKind::Rejection);
         }
     }
+}
+
+fn set_connecting_status(transport: &OnlineTransport, view: &mut MatchView) {
+    view.latest_result = format!(
+        "Connecting to {} / {} as {}…",
+        transport.config.host, transport.config.database, transport.config.display_name
+    );
 }
 
 fn disable_invalid_host(transport: &mut OnlineTransport, view: &mut MatchView, reason: &str) {
@@ -2891,18 +2956,26 @@ fn reducer_failure(result: Result<Result<(), String>, InternalError>) -> Option<
     }
 }
 
-fn load_token(path: &Path) -> io::Result<Option<String>> {
+#[cfg(not(target_arch = "wasm32"))]
+fn load_token(config: &ClientConfig) -> Result<Option<String>, String> {
+    let path = config.token_path();
     match fs::read_to_string(path) {
         Ok(token) => {
             let token = token.trim().to_owned();
             Ok((!token.is_empty()).then_some(token))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     }
 }
 
-fn save_token(path: &Path, token: &str) -> io::Result<()> {
+#[cfg(not(target_arch = "wasm32"))]
+fn save_token(config: &ClientConfig, token: &str) -> Result<(), String> {
+    save_token_file(&config.token_path(), token).map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_token_file(path: &Path, token: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2946,4 +3019,38 @@ fn save_token(path: &Path, token: &str) -> io::Result<()> {
     #[cfg(not(unix))]
     fs::write(path, token)?;
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_token(config: &ClientConfig) -> Result<Option<String>, String> {
+    let token = browser_storage()?
+        .get_item(&config.token_storage_key())
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(token.filter(|token| !token.trim().is_empty()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_token(config: &ClientConfig, token: &str) -> Result<(), String> {
+    browser_storage()?
+        .set_item(&config.token_storage_key(), token)
+        .map_err(|error| format!("{error:?}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_storage() -> Result<web_sys::Storage, String> {
+    web_sys::window()
+        .ok_or_else(|| "browser window is unavailable".to_owned())?
+        .local_storage()
+        .map_err(|error| format!("{error:?}"))?
+        .ok_or_else(|| "browser localStorage is unavailable".to_owned())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn credential_store_label(config: &ClientConfig) -> String {
+    config.token_path().display().to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn credential_store_label(config: &ClientConfig) -> String {
+    format!("browser localStorage ({})", config.token_storage_key())
 }

@@ -33,10 +33,10 @@ The exact control contract lives in
   pool, plus exact selected-order cancellation.
 - Height-aware movement, impassable cliffs, uphill combat penalties, edge
   frontage, casualties, capture, and disconnected pockets.
-- A native Bevy client with chunked 3D terrain, switchable soldier/civilian
-  shading and readable close-zoom totals, selection, route/front overlays, HUD,
-  inspector, previews, rejections, pressure-blended contested cells, and
-  reconnectable SpacetimeDB profiles.
+- A native and WebGPU-backed browser Bevy client with chunked 3D terrain,
+  switchable soldier/civilian shading and readable close-zoom totals, selection,
+  route/front overlays, HUD, inspector, previews, rejections, pressure-blended
+  contested cells, and reconnectable SpacetimeDB profiles.
 - An explicit offline fixture for fast interaction and rendering work.
 
 ## Pinned toolchain
@@ -65,6 +65,35 @@ The offline fixture needs no database and is useful for learning the controls:
 
 Offline commands resolve locally for presentation testing. Multiplayer,
 authoritative timing, combat, and persistence must be evaluated online.
+
+### Browser client
+
+The same client also builds for `wasm32-unknown-unknown` and renders through
+WebGPU. Install [Trunk](https://github.com/trunk-rs/trunk), then start the local
+web server:
+
+```bash
+cargo install trunk --version 0.21.14 --locked
+./scripts/run-web-client.sh
+```
+
+The development server intentionally uses an optimized build; unoptimized Bevy
+Wasm artifacts are too large and too slow for representative browser use.
+
+Open <http://127.0.0.1:8080/?offline=1> for the fixture, or use the online
+defaults at <http://127.0.0.1:8080/> after starting and publishing the local
+SpacetimeDB server. Browser settings are URL parameters: `offline`, `host`,
+`database` (or `db`), `player`, `name`, and `profile`. For example:
+
+```text
+http://127.0.0.1:8080/?player=2&name=Player%20Two&profile=player-two
+```
+
+Browser identity tokens are scoped by host, database, and profile in
+`localStorage`. Production deployments must use HTTPS/WSS to protect those
+credentials; WebGPU itself requires a secure context (localhost is allowed for
+local development). Run `trunk build` from `crates/game-client` to
+produce a deployable bundle in `target/web`.
 
 ## Local multiplayer match
 
@@ -239,6 +268,7 @@ Run the complete local check set with:
 cargo fmt --all -- --check
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy -p game-client --target wasm32-unknown-unknown -- -D warnings
 cargo test --manifest-path modules/match/Cargo.toml
 cargo clippy --manifest-path modules/match/Cargo.toml --all-targets -- -D warnings
 spacetime build --module-path modules/match
@@ -297,7 +327,8 @@ load is distributed; simulation is not).
   movement, combat, connectivity, redistribution, and Conquest rules.
 - `crates/worldgen` — deterministic map generation and validation.
 - `crates/match-bindings` — generated SpacetimeDB Rust wire contract.
-- `crates/game-client` — native Bevy rendering, input, UI, and transport.
+- `crates/game-client` — native/WebAssembly Bevy rendering, input, UI, and
+  transport.
 - `modules/match` — authoritative SpacetimeDB schema, reducers, and scheduler.
 - `tools/mapgen` — curated map generator/validator CLI.
 - `tools/match-e2e` — real-server two-client acceptance smoke test.

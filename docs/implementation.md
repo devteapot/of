@@ -322,9 +322,9 @@ selection-adjacent presentation from the new authoritative snapshot.
   no economic output to reduce and no army upkeep to pay. The recorded post-V1
   requirement is that soldiers impose both lost civilian labor and an explicit,
   ongoing economic burden.
-- Native desktop is the supported V1 target. Bevy can target the web, but the
-  filesystem-backed credential adapter and representative browser performance
-  have not been implemented or qualified.
+- Native desktop and WebAssembly/WebGPU compile targets are supported. The web
+  target uses `localStorage` credentials and asynchronous browser networking;
+  representative browser performance is not yet qualified for production.
 
 These are bounded omissions, not hidden placeholders. Candidate extensions and
 their dependencies are recorded in [future ideas](./future-ideas.md).

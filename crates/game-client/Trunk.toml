@@ -1,0 +1,10 @@
+[build]
+target = "web/index.html"
+dist = "../../target/web"
+release = true
+cargo_profile = "wasm-release"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+open = false

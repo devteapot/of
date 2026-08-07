@@ -3,18 +3,33 @@ name = "game-client"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Native Bevy client for the hex RTS"
+description = "Native and WebAssembly Bevy client for the hex RTS"
 
 [[bin]]
 name = "game-client"
 path = "src/main.rs"
 
 [dependencies]
-bevy = { workspace = true, features = ["3d", "ui", "x11"] }
-clap.workspace = true
+bevy = { workspace = true, features = ["3d", "ui"] }
 hex-core = { workspace = true }
 match-bindings = { path = "../match-bindings" }
 spacetimedb-sdk.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { workspace = true, features = ["x11"] }
+clap.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { workspace = true, features = ["webgpu"] }
+js-sys = "=0.3.103"
+spacetimedb-sdk = { workspace = true, features = ["browser"] }
+wasm-bindgen-futures = "=0.4.76"
+web-sys = { version = "=0.3.103", features = [
+    "Location",
+    "Storage",
+    "UrlSearchParams",
+    "Window",
+] }
 
 [lints]
 workspace = true
