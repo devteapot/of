@@ -11,7 +11,9 @@ This document records the architecture commitments for the first playable versio
 - Platform-dependent code stays behind narrow adapters for native and WebAssembly builds.
 - SpacetimeDB is the sole gameplay authority. Clients submit intentions and render subscribed state; they do not run an authoritative lockstep simulation or vote on state hashes.
 - Each match runs in its own logical SpacetimeDB database instance. This is isolation inside a SpacetimeDB host, not a requirement for one machine or process per match.
-- V1 starts with one manually provisioned development match database. A lobby database and external match orchestrator are added when concurrent public matches are needed.
+- Local development uses one manually provisioned match database. Production
+  uses a lobby control database plus a Vercel orchestrator that publishes one
+  logical SpacetimeDB database per user-created match.
 - One visible terrain hex is one authoritative gameplay cell. Terrain is static during a V1 match and is stored and rendered in chunks.
 - Troops are conserved aggregate strength, not individual infantry entities.
   Cluster waves, explicit front redistribution, Reshape, and combat operate on active
@@ -69,7 +71,10 @@ flowchart LR
     HC --> C2
     HC --> M
     MG["Offline map generator and validator"] -->|"versioned map chunks"| M
-    O["Future lobby and orchestrator"] -.->|"create, assign, archive"| M
+    L["Lobby control database"] -->|"assignments"| C1
+    L -->|"assignments"| C2
+    O["Vercel match orchestrator"] -->|"publish + configure"| M
+    L <--> O
 ```
 
 The client owns input, camera, rendering, local previews, interpolation, and UI. The match database owns player slots, authoritative terrain metadata, ownership, troop strength, orders, routing results, aggregate-flow progress, combat, and victory. The shared core contains deterministic rules used by both sides, but server execution always wins when a client preview differs.
@@ -90,11 +95,18 @@ lobby before the cluster conquest loop has been validated.
 
 ### Concurrent matches
 
-When concurrent sessions are required, add:
+Production publishes `modules/lobby` as `of-lobby`. The static lobby directory
+uses host-issued identities, calls the control reducers through a Vercel
+function, and receives a match database assignment. The Vercel orchestrator
+publishes the pinned match Wasm through SpacetimeDB's management HTTP API,
+configures the requested map and player count, and records the resulting
+`of-match-<lobby-id>` name in the control database. The browser preserves its
+host-issued token under the assigned match profile before loading the Bevy game.
 
-- a small control or lobby database containing accounts, queues, invitations, match assignments, module versions, and final results;
-- an external orchestrator that creates a logical match database from a pinned module version, initializes its map and settings, and gives both clients the database identity;
-- archival and retention policy for completed match databases.
+The control module stores lobby lifecycle, membership, assignments, the module
+owner used to authorize orchestration, and bounded provisioning failures.
+Archival and retention of completed match databases remain an operational
+follow-up; a live match database is never upgraded or cleared by the lobby path.
 
 A logical database per match gives independent state, scheduling, subscriptions, module-version pinning, failure scope, and cleanup. Many such databases may run on one SpacetimeDB host. A single giant multi-match schema is not the default because it couples memory pressure, upgrades, security filters, and failure impact across otherwise independent games.
 

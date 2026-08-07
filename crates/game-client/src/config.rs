@@ -5,8 +5,21 @@ use bevy::prelude::Resource;
 #[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
 
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_HOST: &str = "http://127.0.0.1:3000";
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_HOST: &str = match option_env!("OF_WEB_HOST") {
+    Some(host) => host,
+    None => "http://127.0.0.1:3000",
+};
+
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_DATABASE: &str = "of-match-dev";
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_DATABASE: &str = match option_env!("OF_WEB_DATABASE") {
+    Some(database) => database,
+    None => "of-match-dev",
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Parser, Debug)]

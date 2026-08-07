@@ -1,0 +1,14 @@
+[package]
+name = "lobby-module"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacetimedb = "=2.7.1"
+
+[lints.rust]
+unsafe_code = "forbid"
