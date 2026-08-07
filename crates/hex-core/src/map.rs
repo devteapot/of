@@ -40,7 +40,12 @@ impl TerrainKind {
 }
 
 /// Static and dynamic state at one authoritative gameplay hex.
+///
+/// Deserialization re-validates constructor invariants (capacity bounds and
+/// water-cell emptiness) so a snapshot cannot smuggle in a cell that
+/// API-built state could never contain.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawCell"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cell {
     pub coordinate: Axial,
@@ -53,6 +58,43 @@ pub struct Cell {
     pub civilian_capacity: u64,
     pub forces: ForceComposition,
     pub military_capacity: Strength,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RawCell {
+    coordinate: Axial,
+    terrain: TerrainKind,
+    elevation: i16,
+    capturable: bool,
+    habitable: bool,
+    owner: Option<PlayerId>,
+    civilian_population: u64,
+    civilian_capacity: u64,
+    forces: ForceComposition,
+    military_capacity: Strength,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawCell> for Cell {
+    type Error = String;
+
+    fn try_from(raw: RawCell) -> Result<Self, Self::Error> {
+        let cell = Self {
+            coordinate: raw.coordinate,
+            terrain: raw.terrain,
+            elevation: raw.elevation,
+            capturable: raw.capturable,
+            habitable: raw.habitable,
+            owner: raw.owner,
+            civilian_population: raw.civilian_population,
+            civilian_capacity: raw.civilian_capacity,
+            forces: raw.forces,
+            military_capacity: raw.military_capacity,
+        };
+        cell.validate()?;
+        Ok(cell)
+    }
 }
 
 impl Cell {
@@ -89,6 +131,39 @@ impl Cell {
             forces: ForceComposition::default(),
             military_capacity: 0,
         }
+    }
+
+    /// Rejects capacity overflows and water cells that carry land state.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.force() > self.military_capacity {
+            return Err(format!(
+                "cell {:?} force {} exceeds military capacity {}",
+                self.coordinate,
+                self.force(),
+                self.military_capacity
+            ));
+        }
+        if self.civilian_population > self.civilian_capacity {
+            return Err(format!(
+                "cell {:?} civilian population {} exceeds capacity {}",
+                self.coordinate, self.civilian_population, self.civilian_capacity
+            ));
+        }
+        if self.terrain == TerrainKind::Water
+            && (self.capturable
+                || self.habitable
+                || self.owner.is_some()
+                || self.military_capacity != 0
+                || self.force() != 0
+                || self.civilian_population != 0
+                || self.civilian_capacity != 0)
+        {
+            return Err(format!(
+                "water cell {:?} must be empty, unowned, and non-capturable",
+                self.coordinate
+            ));
+        }
+        Ok(())
     }
 
     pub const fn force(&self) -> Strength {
@@ -195,11 +270,53 @@ impl LogisticsConfig {
 }
 
 /// A deterministic map container. Ordered maps keep iteration stable everywhere.
+///
+/// Deserialization re-validates the constructor invariants: every cell must be
+/// keyed by its own coordinate and every edge-limit override must connect two
+/// existing cells, so a snapshot load can never diverge from API-built state.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawHexMap"))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HexMap {
     cells: BTreeMap<Axial, Cell>,
     edge_limits: BTreeMap<HexEdge, EdgeLimits>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RawHexMap {
+    cells: BTreeMap<Axial, Cell>,
+    edge_limits: BTreeMap<HexEdge, EdgeLimits>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawHexMap> for HexMap {
+    type Error = String;
+
+    fn try_from(raw: RawHexMap) -> Result<Self, Self::Error> {
+        for (&key, cell) in &raw.cells {
+            if key != cell.coordinate {
+                return Err(format!(
+                    "map cell keyed at {key:?} disagrees with its coordinate {:?}",
+                    cell.coordinate
+                ));
+            }
+        }
+        // `HexEdge` deserialization already enforced adjacency and canonical
+        // order; only endpoint existence remains map-level.
+        for edge in raw.edge_limits.keys() {
+            if !raw.cells.contains_key(&edge.a) || !raw.cells.contains_key(&edge.b) {
+                return Err(format!(
+                    "edge limits reference missing cells: {:?} and {:?}",
+                    edge.a, edge.b
+                ));
+            }
+        }
+        Ok(Self {
+            cells: raw.cells,
+            edge_limits: raw.edge_limits,
+        })
+    }
 }
 
 impl HexMap {
@@ -309,6 +426,142 @@ mod tests {
         assert!(map.set_edge_limits(a, b, narrow));
         assert_eq!(map.edge_limits(a, b, &config), Some(narrow));
         assert_eq!(map.edge_limits(b, a, &config), Some(narrow));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialized_maps_reject_key_and_edge_invariant_violations() {
+        let mut map = HexMap::new();
+        map.insert(Cell::ground(Axial::ZERO, 0, Some(1), 100));
+        map.insert(Cell::ground(Axial::new(1, 0), 0, Some(1), 100));
+        assert!(map.set_edge_limits(
+            Axial::ZERO,
+            Axial::new(1, 0),
+            EdgeLimits {
+                throughput: 5,
+                frontage: 6,
+            },
+        ));
+
+        // Round trip through the raw wire shape preserves valid state.
+        let raw = RawHexMap {
+            cells: map.cells.clone(),
+            edge_limits: map.edge_limits.clone(),
+        };
+        assert_eq!(HexMap::try_from(raw).unwrap(), map);
+
+        // A cell keyed away from its own coordinate is rejected.
+        let mut misfiled = map.cells.clone();
+        let stray = Cell::ground(Axial::new(5, 5), 0, Some(1), 100);
+        misfiled.insert(Axial::new(9, 9), stray);
+        let error = HexMap::try_from(RawHexMap {
+            cells: misfiled,
+            edge_limits: BTreeMap::new(),
+        })
+        .unwrap_err();
+        assert!(error.contains("disagrees"), "{error}");
+
+        // Edge limits over missing cells are rejected.
+        let dangling = HexEdge::new(Axial::new(7, 0), Axial::new(8, 0)).unwrap();
+        let error = HexMap::try_from(RawHexMap {
+            cells: map.cells.clone(),
+            edge_limits: BTreeMap::from([(
+                dangling,
+                EdgeLimits {
+                    throughput: 1,
+                    frontage: 1,
+                },
+            )]),
+        })
+        .unwrap_err();
+        assert!(error.contains("missing cells"), "{error}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialized_cells_reject_capacity_and_water_invariant_violations() {
+        let ground = Cell::ground(Axial::ZERO, 0, Some(1), 100);
+        let water = Cell::water(Axial::new(1, 0), 0);
+        assert_eq!(
+            Cell::try_from(RawCell {
+                coordinate: ground.coordinate,
+                terrain: ground.terrain,
+                elevation: ground.elevation,
+                capturable: ground.capturable,
+                habitable: ground.habitable,
+                owner: ground.owner,
+                civilian_population: ground.civilian_population,
+                civilian_capacity: ground.civilian_capacity,
+                forces: ground.forces,
+                military_capacity: ground.military_capacity,
+            })
+            .unwrap(),
+            ground
+        );
+        assert_eq!(
+            Cell::try_from(RawCell {
+                coordinate: water.coordinate,
+                terrain: water.terrain,
+                elevation: water.elevation,
+                capturable: water.capturable,
+                habitable: water.habitable,
+                owner: water.owner,
+                civilian_population: water.civilian_population,
+                civilian_capacity: water.civilian_capacity,
+                forces: water.forces,
+                military_capacity: water.military_capacity,
+            })
+            .unwrap(),
+            water
+        );
+
+        let over_force = Cell::try_from(RawCell {
+            coordinate: Axial::ZERO,
+            terrain: TerrainKind::Plains,
+            elevation: 0,
+            capturable: true,
+            habitable: true,
+            owner: Some(1),
+            civilian_population: 0,
+            civilian_capacity: 0,
+            forces: ForceComposition::infantry(101),
+            military_capacity: 100,
+        })
+        .unwrap_err();
+        assert!(over_force.contains("military capacity"), "{over_force}");
+
+        let over_civilians = Cell::try_from(RawCell {
+            coordinate: Axial::ZERO,
+            terrain: TerrainKind::Plains,
+            elevation: 0,
+            capturable: true,
+            habitable: true,
+            owner: Some(1),
+            civilian_population: 11,
+            civilian_capacity: 10,
+            forces: ForceComposition::default(),
+            military_capacity: 100,
+        })
+        .unwrap_err();
+        assert!(
+            over_civilians.contains("civilian population"),
+            "{over_civilians}"
+        );
+
+        let wet_garrison = Cell::try_from(RawCell {
+            coordinate: Axial::ZERO,
+            terrain: TerrainKind::Water,
+            elevation: 0,
+            capturable: false,
+            habitable: false,
+            owner: None,
+            civilian_population: 0,
+            civilian_capacity: 0,
+            forces: ForceComposition::infantry(1),
+            military_capacity: 1,
+        })
+        .unwrap_err();
+        assert!(wet_garrison.contains("water cell"), "{wet_garrison}");
     }
 
     #[test]

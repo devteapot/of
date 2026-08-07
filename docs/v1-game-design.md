@@ -268,10 +268,10 @@ V1 combat is aggregate and edge-based:
 - An attack occurs when force is directed through a traversable edge into neutral or enemy territory.
 - Only strength within the edge's combat frontage can participate at once.
 - Remaining attackers wait behind the active frontage and continue feeding the battle subject to throughput.
-- Defending force is local to its hex. When attacked through multiple edges, the same defenders cannot be counted at full strength against every edge.
+- Defending force is local to its hex. When attacked through multiple edges, the same defenders cannot be counted at full strength against every edge: defenders are split proportionally across all attacking edges, from every attacking player at once.
 - Uphill attackers receive a clear penalty.
 - Casualties remove force from the spatial-conservation total.
-- Ownership changes only after local resistance is overcome and occupying force can enter the destination within its capacity.
+- Ownership changes only after local resistance is overcome and occupying force can enter the destination within its capacity. When several players could capture the same cell in one step, the attacker with the largest surviving committed strength at that cell captures it (deterministic tie-breaks: smaller player ID, then smaller origin cell); the others keep their survivors in place and keep contesting.
 - Multiple attack edges should make encirclement valuable by creating additional frontage, without duplicating defending strength.
 - A cell always has one authoritative controller and one authoritative local
   infantry stack. Opposing forces remain on hostile edges until capture; V1

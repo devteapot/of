@@ -23,9 +23,9 @@ use match_bindings::{
     PlayerSlotTableAccess, ReceiptStatus, TerrainClass, TransferDestinationTableAccess,
     TransferOrder, TransferOrderTableAccess, TransferSourceTableAccess, TransitPacket,
     TransitPacketTableAccess, TransitRouteTableAccess, cancel_orders as _,
-    issue_attack_clusters as _, issue_expand_all as _, issue_expand_clusters as _,
-    issue_push_front as _, issue_reshape as _, join_match as _, set_mobilization_target as _,
-    start_match as _,
+    debug_break_order_conservation as _, enable_debug_harness as _, issue_attack_clusters as _,
+    issue_expand_all as _, issue_expand_clusters as _, issue_push_front as _, issue_reshape as _,
+    join_match as _, set_mobilization_target as _, start_match as _,
 };
 use spacetimedb_sdk::{DbContext, Identity, Table};
 
@@ -94,6 +94,13 @@ struct Args {
     /// Optional JSON report path for reconnect soak timings.
     #[arg(long)]
     reconnect_report: Option<PathBuf>,
+
+    /// Live quarantine integration: enable the private debug harness (lobby
+    /// only), force one attributable conservation fault, and assert the next
+    /// tick parks the order while the match keeps advancing. Requires a fresh
+    /// Lobby database; never run against of-match-dev.
+    #[arg(long, default_value_t = false)]
+    quarantine_live: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -239,6 +246,28 @@ impl Client {
             })
             .with_context(|| format!("send start_match for {}", self.label))?;
         wait_for_reducer(&rx, timeout, &format!("{} start_match", self.label))
+    }
+
+    fn enable_debug_harness(&self, timeout: Duration) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.conn
+            .reducers
+            .enable_debug_harness_then(move |_, result| {
+                let _ = tx.send(flatten_reducer_result(result));
+            })
+            .context("send enable_debug_harness")?;
+        wait_for_reducer(&rx, timeout, "enable_debug_harness")
+    }
+
+    fn debug_break_order_conservation(&self, order_id: u64, timeout: Duration) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.conn
+            .reducers
+            .debug_break_order_conservation_then(order_id, move |_, result| {
+                let _ = tx.send(flatten_reducer_result(result));
+            })
+            .context("send debug_break_order_conservation")?;
+        wait_for_reducer(&rx, timeout, "debug_break_order_conservation")
     }
 
     fn set_mobilization_target(
@@ -537,6 +566,14 @@ fn main() -> Result<()> {
             "--reconnect-only requires --reconnect-cycles > 0"
         );
     }
+    ensure!(
+        !(args.reconnect_only && args.quarantine_live),
+        "--reconnect-only and --quarantine-live are mutually exclusive"
+    );
+    ensure!(
+        args.database != "of-match-dev" || !args.quarantine_live,
+        "refusing --quarantine-live against of-match-dev; use an isolated database"
+    );
     let timeout = Duration::from_secs(args.timeout_secs);
     let poll = Duration::from_millis(args.poll_ms);
 
@@ -571,6 +608,24 @@ fn main() -> Result<()> {
 
     assert_slot_available_or_owned(&player_one, PLAYER_ONE, player_one.identity)?;
     assert_slot_available_or_owned(&player_one, PLAYER_TWO, player_two.identity)?;
+
+    if args.quarantine_live {
+        println!("quarantine-live: enabling private debug harness before any seat is claimed");
+        player_one.enable_debug_harness(timeout)?;
+        println!("[2/10] claiming player slots and waiting for a running match");
+        player_one.join_match(PLAYER_ONE, "E2E Player 1", timeout)?;
+        player_two.join_match(PLAYER_TWO, "E2E Player 2", timeout)?;
+        wait_for_slot(&player_one, PLAYER_ONE, player_one.identity, timeout, poll)?;
+        wait_for_slot(&player_one, PLAYER_TWO, player_two.identity, timeout, poll)?;
+        ensure_match_running(&player_one, timeout, poll)?;
+        run_quarantine_live_harness(&player_one, timeout, poll)?;
+        player_one.disconnect(timeout)?;
+        player_two.disconnect(timeout)?;
+        println!(
+            "PASS: live quarantine harness — order parked Quarantined, strength conserved, ticks continued"
+        );
+        return Ok(());
+    }
 
     println!("[2/10] claiming player slots and waiting for a running match");
     player_one.join_match(PLAYER_ONE, "E2E Player 1", timeout)?;
@@ -901,26 +956,24 @@ fn main() -> Result<()> {
         retasked_old_order.delivered_infantry > 0,
         "retasking did not settle any surviving strength on the old order"
     );
-    let uncaptured_after_retask = candidate
-        .lane_cells
-        .iter()
-        .copied()
-        .filter(|cell_id| {
-            player_one
-                .conn
-                .db
-                .cell_state()
-                .cell_id()
-                .find(cell_id)
-                .is_some_and(|cell| cell.owner_player_id != PLAYER_ONE)
-        })
-        .collect::<Vec<_>>();
-    ensure!(
-        uncaptured_after_retask.len() >= OBSERVED_CAPTURE_LAYERS,
-        "only {} lane cell(s) remained uncaptured after retasking; the live fixture advanced too far to prove replacement progression",
-        uncaptured_after_retask.len()
-    );
-    let replacement_capture_targets = uncaptured_after_retask[..OBSERVED_CAPTURE_LAYERS].to_vec();
+    // The original push keeps advancing while the idempotency check, the
+    // rejected retask, and the accepted retask round-trips complete. On a
+    // local server only a cell or two of the pre-issue lane snapshot is
+    // captured by then, but against remote hosts (Maincloud provisioned
+    // matches) several logical steps elapse per round-trip and the wave can
+    // overrun the whole snapshotted lane. The old fixed intersection with
+    // `candidate.lane_cells` then failed with "advanced too far" even though
+    // the replacement was progressing correctly. Deriving the remaining
+    // runway from the actual current map — continuing along the commanded
+    // direction past everything already captured — keeps the progression
+    // assertion meaningful at any latency.
+    let replacement_capture_targets = derive_remaining_lane_targets(
+        &player_one.conn,
+        PLAYER_ONE,
+        candidate.front_cell,
+        candidate.direction,
+        OBSERVED_CAPTURE_LAYERS,
+    )?;
 
     println!("[6/10] observing retasked progression, then cancelling the replacement push");
     let mut observed_packet_progress = false;
@@ -4444,6 +4497,73 @@ fn expected_occupation_garrison(terrain: &CellTerrain, cell: &CellState) -> u64 
         .min(cell.military_capacity)
 }
 
+/// Walks the commanded directional ray from the original front cell over the
+/// live map and returns the next `needed` still-neutral capturable lane cells.
+///
+/// Cells the wave already captured (now owned by `player_id`) are skipped
+/// instead of failing, so the expectation tracks however far the real match
+/// advanced between command round-trips. Elevation and terrain eligibility
+/// mirror `select_push_front_candidate`.
+fn derive_remaining_lane_targets(
+    conn: &DbConnection,
+    player_id: u16,
+    front_cell: u32,
+    direction: Axial,
+    needed: usize,
+) -> Result<Vec<u32>> {
+    let terrain_by_id: HashMap<u32, CellTerrain> = conn
+        .db
+        .cell_terrain()
+        .iter()
+        .map(|terrain| (terrain.cell_id, terrain))
+        .collect();
+    let cell_by_coordinate: HashMap<Axial, u32> = terrain_by_id
+        .values()
+        .map(|terrain| (Axial::new(terrain.q, terrain.r), terrain.cell_id))
+        .collect();
+    let front_terrain = terrain_by_id
+        .get(&front_cell)
+        .context("front cell terrain disappeared while re-deriving the lane")?;
+
+    let mut targets = Vec::new();
+    let mut previous_elevation = front_terrain.elevation;
+    let mut next_coordinate = Axial::new(front_terrain.q, front_terrain.r) + direction;
+    while targets.len() < needed {
+        let Some(&next_id) = cell_by_coordinate.get(&next_coordinate) else {
+            break;
+        };
+        let Some(next_terrain) = terrain_by_id.get(&next_id) else {
+            break;
+        };
+        let Some(next_state) = conn.db.cell_state().cell_id().find(&next_id) else {
+            break;
+        };
+        if !next_terrain.passable
+            || !next_terrain.capturable
+            || previous_elevation.abs_diff(next_terrain.elevation) > 1
+        {
+            break;
+        }
+        if next_state.owner_player_id == player_id {
+            // Already captured while the retask round-trips completed.
+        } else if next_state.owner_player_id == 0 && next_state.infantry == 0 {
+            targets.push(next_id);
+        } else {
+            break;
+        }
+        previous_elevation = next_terrain.elevation;
+        next_coordinate = next_coordinate + direction;
+    }
+    ensure!(
+        targets.len() >= needed,
+        "only {} neutral lane cell(s) remain along the push direction on the live map; \
+         the generated lane is exhausted, so this fixture cannot prove {needed} further \
+         capture layers",
+        targets.len()
+    );
+    Ok(targets)
+}
+
 fn lane_owners(conn: &DbConnection, lane_cells: &[u32]) -> Result<Vec<u16>> {
     lane_cells
         .iter()
@@ -4979,17 +5099,24 @@ fn assert_attack_stays_in_target_mask(
     outside_guard_cells: &BTreeSet<u32>,
     owners_before: &HashMap<u32, u16>,
 ) -> Result<bool> {
-    assert_order_conservation(order)?;
-    let packets = conn
-        .db
-        .transit_packet()
-        .iter()
-        .filter(|packet| packet.order_id == order.order_id)
-        .collect::<Vec<_>>();
+    // Prefer a same-logical-step coherent view: AttackClusters wave splits and
+    // finalize can update packets and the order row in one transaction, but the
+    // SDK may deliver those table callbacks across consecutive turns. Comparing
+    // a stale order row to fresh packets produced the flaky
+    // "80 in transit vs 69 packet infantry" failure.
+    let snapshot = stable_action_order_snapshot(conn, order)?;
+    assert_order_conservation_counters(
+        snapshot.committed_infantry,
+        snapshot.in_transit_infantry,
+        snapshot.delivered_infantry,
+        snapshot.casualty_infantry,
+        snapshot.logical_step,
+        order.order_id,
+    )?;
     let mut packet_total = 0_u64;
     let mut mask_activity = false;
-    for packet in packets {
-        let route = transit_packet_route(conn, &packet)?;
+    for packet in &snapshot.packets {
+        let route = transit_packet_route(conn, packet)?;
         packet_total = packet_total
             .checked_add(packet.infantry)
             .context("masked cluster-attack packet strength overflow")?;
@@ -5012,18 +5139,16 @@ fn assert_attack_stays_in_target_mask(
             mask_activity |= target_component.contains(&cell_id);
         }
     }
-    ensure!(
-        packet_total == order.in_transit_infantry,
-        "AttackClusters order {} reports {} in transit but exposes {packet_total} packet infantry",
-        order.order_id,
-        order.in_transit_infantry
-    );
+    if packet_total != snapshot.in_transit_infantry {
+        // Incomplete client-cache sync within the step — ask the caller to retry.
+        return Ok(false);
+    }
     let captures = owner_changes_for_player(conn, player_id, owners_before);
     ensure!(
         captures.is_subset(target_component),
         "AttackClusters acquired cells outside its immutable target component: captures={captures:?}, target_mask={target_component:?}"
     );
-    mask_activity |= !captures.is_empty() || order.casualty_infantry > 0;
+    mask_activity |= !captures.is_empty() || snapshot.casualty_infantry > 0;
     for &guard_cell in outside_guard_cells {
         let owner = conn
             .db
@@ -5056,6 +5181,146 @@ fn owner_changes_for_player(
         .collect()
 }
 
+fn total_infantry(conn: &DbConnection) -> u64 {
+    conn.db.cell_state().iter().map(|cell| cell.infantry).sum()
+}
+
+fn logical_step(conn: &DbConnection) -> Result<u64> {
+    Ok(conn
+        .db
+        .match_state()
+        .singleton_id()
+        .find(&SINGLETON_ID)
+        .context("match state missing during quarantine harness")?
+        .logical_step)
+}
+
+/// Live tick→quarantine→next-tick proof against a debug-harness-enabled match.
+fn run_quarantine_live_harness(client: &Client, timeout: Duration, poll: Duration) -> Result<()> {
+    println!("quarantine-live: stopping mobilization for a stable infantry baseline");
+    let mobilization_id = unused_command_id(&client.conn, PLAYER_ONE, COMMAND_ID_FLOOR)?;
+    client.set_mobilization_target(mobilization_id, 0, timeout)?;
+    wait_for_receipt(
+        client,
+        PLAYER_ONE,
+        mobilization_id,
+        "set_mobilization_target",
+        timeout,
+        poll,
+    )?;
+
+    let mut owned: Vec<(u32, u64, u64)> = client
+        .conn
+        .db
+        .cell_state()
+        .iter()
+        .filter(|cell| cell.owner_player_id == PLAYER_ONE && cell.infantry > 4)
+        .map(|cell| {
+            (
+                cell.cell_id,
+                cell.infantry,
+                cell.military_capacity.saturating_sub(cell.infantry),
+            )
+        })
+        .collect();
+    owned.sort_by_key(|(cell_id, infantry, _)| (std::cmp::Reverse(*infantry), *cell_id));
+    ensure!(
+        owned.len() >= 2,
+        "quarantine harness needs at least two owned cells with infantry"
+    );
+    let source = owned[0].0;
+    let target = owned
+        .iter()
+        .skip(1)
+        .find(|(_, _, headroom)| *headroom > 0)
+        .map(|(cell_id, _, _)| *cell_id)
+        .context("quarantine harness found no owned target with headroom")?;
+
+    println!("quarantine-live: issuing reshape {source} -> {target} as the quarantine victim");
+    let reshape_id = unused_command_id(&client.conn, PLAYER_ONE, mobilization_id + 1)?;
+    client.issue_reshape(reshape_id, &[source], &[target], &[], timeout)?;
+    let receipt = wait_for_receipt(
+        client,
+        PLAYER_ONE,
+        reshape_id,
+        "issue_reshape",
+        timeout,
+        poll,
+    )?;
+    ensure!(receipt.order_id != 0, "reshape did not persist an order");
+    let order_id = receipt.order_id;
+
+    let active = wait_until("active reshape with packets", timeout, poll, || {
+        let Some(order) = client.conn.db.transfer_order().order_id().find(&order_id) else {
+            return Ok(None);
+        };
+        let packets = client
+            .conn
+            .db
+            .transit_packet()
+            .iter()
+            .filter(|packet| packet.order_id == order_id)
+            .count();
+        Ok((order.status == OrderStatus::Active && packets > 0).then_some(order))
+    })?;
+    ensure!(
+        active.in_transit_infantry > 0,
+        "reshape never exposed in-transit infantry for the quarantine fault"
+    );
+
+    let infantry_before = total_infantry(&client.conn);
+    let step_before = logical_step(&client.conn)?;
+    println!(
+        "quarantine-live: injecting conservation fault into order {order_id} at step {step_before} \
+         (world infantry {infantry_before})"
+    );
+    client.debug_break_order_conservation(order_id, timeout)?;
+
+    let quarantined = wait_until("order quarantined by next ticks", timeout, poll, || {
+        let Some(order) = client.conn.db.transfer_order().order_id().find(&order_id) else {
+            return Ok(None);
+        };
+        Ok((order.status == OrderStatus::Quarantined).then_some(order))
+    })?;
+    ensure!(
+        quarantined.in_transit_infantry == 0
+            && !client
+                .conn
+                .db
+                .transit_packet()
+                .iter()
+                .any(|packet| packet.order_id == order_id),
+        "quarantined order retained live packet strength"
+    );
+
+    let infantry_after = total_infantry(&client.conn);
+    ensure!(
+        infantry_after == infantry_before,
+        "quarantine changed physical cell strength: before {infantry_before}, after {infantry_after}"
+    );
+
+    let step_after_quarantine = logical_step(&client.conn)?;
+    wait_until(
+        "match keeps ticking after quarantine",
+        timeout,
+        poll,
+        || {
+            let step = logical_step(&client.conn)?;
+            Ok((step >= step_after_quarantine.saturating_add(4)).then_some(step))
+        },
+    )?;
+    let step_final = logical_step(&client.conn)?;
+    ensure!(
+        step_final > step_before,
+        "logical_step did not advance after quarantine ({step_before} -> {step_final})"
+    );
+    println!(
+        "quarantine-live: order {order_id} Quarantined; infantry conserved at {infantry_after}; \
+         logical_step {step_before} -> {step_final}"
+    );
+    Ok(())
+}
+
 fn owner_snapshot(conn: &DbConnection) -> HashMap<u32, u16> {
     conn.db
         .cell_state()
@@ -5065,19 +5330,31 @@ fn owner_snapshot(conn: &DbConnection) -> HashMap<u32, u16> {
 }
 
 fn assert_order_conservation(order: &TransferOrder) -> Result<()> {
-    let accounted = order
-        .in_transit_infantry
-        .checked_add(order.delivered_infantry)
-        .and_then(|value| value.checked_add(order.casualty_infantry))
-        .context("transfer accounting overflow")?;
-    ensure!(
-        order.committed_infantry == accounted,
-        "order {} violates conservation: committed={}, in_transit={}, delivered={}, casualties={}",
-        order.order_id,
+    assert_order_conservation_counters(
         order.committed_infantry,
         order.in_transit_infantry,
         order.delivered_infantry,
-        order.casualty_infantry
+        order.casualty_infantry,
+        order.updated_step,
+        order.order_id,
+    )
+}
+
+fn assert_order_conservation_counters(
+    committed: u64,
+    in_transit: u64,
+    delivered: u64,
+    casualties: u64,
+    logical_step: u64,
+    order_id: u64,
+) -> Result<()> {
+    let accounted = in_transit
+        .checked_add(delivered)
+        .and_then(|value| value.checked_add(casualties))
+        .context("transfer accounting overflow")?;
+    ensure!(
+        committed == accounted,
+        "order {order_id} violates conservation at step {logical_step}: committed={committed}, in_transit={in_transit}, delivered={delivered}, casualties={casualties}"
     );
     Ok(())
 }

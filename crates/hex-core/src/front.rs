@@ -603,23 +603,20 @@ fn fronts_from_marked_cycle(cycle: &[(DirectedFrontEdge, BoundaryMark)]) -> Vec<
     fronts
 }
 
-/// Groups neutral edges by the hostile fronts encountered immediately before
-/// and after them around one geometric perimeter cycle.
+/// Groups neutral edges by the hostile front **instances** encountered
+/// immediately before and after them around one geometric perimeter cycle.
 ///
-/// The ordered pair matters: on a ring containing hostile fronts A and B, the
-/// neutral A→B section and the neutral B→A section are independent. Repeated
-/// A→A sections coalesce and may overlap the hostile A front as bridge edges.
+/// Bounding is by instance, not by opponent id: on a ring with the perimeter
+/// pattern A,N1,B,N2,A,N3,B,N4, the four neutral sections stay four
+/// independent fronts even though N1/N3 (and N2/N4) share the same bounding
+/// opponent ids. Same-opponent hostile runs separated only by neutral edges
+/// merge into one instance (mirroring the hostile H–Neutral–H bridging), so
+/// neutral sections interrupted only by repeated contact with the same
+/// hostile front still coalesce, and bridge edges may overlap that hostile
+/// front. Ignored markers never split a neutral section by themselves.
 fn neutral_fronts_from_marked_cycle(
     cycle: &[(DirectedFrontEdge, BoundaryMark)],
 ) -> Vec<StrategicFront> {
-    let hostile_positions = cycle
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (_, mark))| match mark {
-            BoundaryMark::Active(Some(opponent)) => Some((index, *opponent)),
-            BoundaryMark::Ignored | BoundaryMark::Active(None) => None,
-        })
-        .collect::<Vec<_>>();
     let neutral_edges = cycle
         .iter()
         .filter_map(|(edge, mark)| matches!(mark, BoundaryMark::Active(None)).then_some(*edge))
@@ -627,37 +624,131 @@ fn neutral_fronts_from_marked_cycle(
     if neutral_edges.is_empty() {
         return Vec::new();
     }
-    if hostile_positions.is_empty() {
+
+    // Maximal same-opponent hostile runs in cyclic order. Each run stores its
+    // edge indices in cyclic traversal order; the wrap run (crossing index 0)
+    // keeps its tail-then-head ordering.
+    let length = cycle.len();
+    let opponent_at = |index: usize| match cycle[index].1 {
+        BoundaryMark::Active(Some(opponent)) => Some(opponent),
+        BoundaryMark::Ignored | BoundaryMark::Active(None) => None,
+    };
+    let mut runs = Vec::<(u32, Vec<usize>)>::new();
+    for index in 0..length {
+        let Some(opponent) = opponent_at(index) else {
+            continue;
+        };
+        match runs.last_mut() {
+            Some((run_opponent, indices))
+                if *run_opponent == opponent
+                    && *indices.last().expect("runs are nonempty") + 1 == index =>
+            {
+                indices.push(index);
+            }
+            _ => runs.push((opponent, vec![index])),
+        }
+    }
+    if runs.is_empty() {
         return vec![StrategicFront {
             opponent: None,
             edges: neutral_edges,
         }];
     }
+    if runs.len() > 1
+        && runs[0].1[0] == 0
+        && *runs
+            .last()
+            .expect("runs are nonempty")
+            .1
+            .last()
+            .expect("runs are nonempty")
+            == length - 1
+        && runs[0].0 == runs.last().expect("runs are nonempty").0
+    {
+        let head = runs.remove(0);
+        runs.last_mut().expect("runs are nonempty").1.extend(head.1);
+    }
 
-    let mut edges_by_context = BTreeMap::<(u32, u32), Vec<DirectedFrontEdge>>::new();
+    // Union same-opponent runs whose separating gap is purely neutral: those
+    // runs bridge into one hostile front instance, so the neutral sections on
+    // both sides are bounded by the same instance.
+    let mut parent: Vec<usize> = (0..runs.len()).collect();
+    fn find(parent: &[usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            index = parent[index];
+        }
+        index
+    }
+    if runs.len() > 1 {
+        for run_index in 0..runs.len() {
+            let next_index = (run_index + 1) % runs.len();
+            if runs[run_index].0 != runs[next_index].0 {
+                continue;
+            }
+            let gap_start = (runs[run_index].1.last().expect("runs are nonempty") + 1) % length;
+            let gap_end = runs[next_index].1[0];
+            let mut cursor = gap_start;
+            let mut purely_neutral = true;
+            while cursor != gap_end {
+                if !matches!(cycle[cursor].1, BoundaryMark::Active(None)) {
+                    purely_neutral = false;
+                    break;
+                }
+                cursor = (cursor + 1) % length;
+            }
+            if purely_neutral {
+                let left = find(&parent, run_index);
+                let right = find(&parent, next_index);
+                let (root, child) = if left <= right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                parent[child] = root;
+            }
+        }
+    }
+
+    // Nearest hostile run before/after every cycle index, cyclically.
+    let mut run_at = vec![None::<usize>; length];
+    for (run_index, (_, indices)) in runs.iter().enumerate() {
+        for &index in indices {
+            run_at[index] = Some(run_index);
+        }
+    }
+    let mut next_run = vec![usize::MAX; length];
+    let mut carry = usize::MAX;
+    for scan in (0..length * 2).rev() {
+        let index = scan % length;
+        if let Some(run_index) = run_at[index] {
+            carry = run_index;
+        }
+        if scan < length {
+            next_run[index] = carry;
+        }
+    }
+    let mut previous_run = vec![usize::MAX; length];
+    let mut carry = usize::MAX;
+    for scan in 0..length * 2 {
+        let index = scan % length;
+        if let Some(run_index) = run_at[index] {
+            carry = run_index;
+        }
+        if scan >= length {
+            previous_run[index] = carry;
+        }
+    }
+
+    let mut edges_by_context = BTreeMap::<(usize, usize), Vec<DirectedFrontEdge>>::new();
     for (index, (edge, mark)) in cycle.iter().enumerate() {
         if !matches!(mark, BoundaryMark::Active(None)) {
             continue;
         }
-        let next_at = hostile_positions.partition_point(|(position, _)| *position <= index);
-        let previous_at = hostile_positions.partition_point(|(position, _)| *position < index);
-        let previous = if previous_at == 0 {
-            hostile_positions
-                .last()
-                .expect("hostile positions is nonempty")
-                .1
-        } else {
-            hostile_positions[previous_at - 1].1
-        };
-        let next = if next_at == hostile_positions.len() {
-            hostile_positions[0].1
-        } else {
-            hostile_positions[next_at].1
-        };
-        edges_by_context
-            .entry((previous, next))
-            .or_default()
-            .push(*edge);
+        let context = (
+            find(&parent, previous_run[index]),
+            find(&parent, next_run[index]),
+        );
+        edges_by_context.entry(context).or_default().push(*edge);
     }
 
     edges_by_context
@@ -1293,6 +1384,66 @@ mod tests {
         // Stable sort: numbered opponents before pure neutral.
         assert!(fronts[0].opponent.is_some());
         assert_eq!(fronts.last().map(|front| front.opponent), Some(None));
+    }
+
+    #[test]
+    fn disconnected_neutral_arcs_between_repeating_opponents_stay_independent() {
+        // Perimeter pattern A,N1,B,N2,A,N3,B,N4: bounding opponent ids repeat
+        // (both N1 and N3 sit between an A and a B run), but each neutral
+        // section is bounded by different hostile front instances and must
+        // remain independent.
+        let edge = |index: i32| DirectedFrontEdge {
+            source: Axial::ZERO,
+            target: Axial::new(index, -index),
+        };
+        let hostile =
+            |index: i32, opponent: u32| (edge(index), BoundaryMark::Active(Some(opponent)));
+        let neutral = |index: i32| (edge(index), BoundaryMark::Active(None));
+        let cycle = [
+            hostile(0, 1), // A
+            neutral(1),    // N1
+            hostile(2, 2), // B
+            neutral(3),    // N2
+            hostile(4, 1), // A again
+            neutral(5),    // N3
+            hostile(6, 2), // B again
+            neutral(7),    // N4
+        ];
+        let fronts = neutral_fronts_from_marked_cycle(&cycle);
+        assert_eq!(
+            fronts.len(),
+            4,
+            "each neutral section is bounded by distinct front instances: {fronts:?}"
+        );
+        let mut singles = fronts
+            .iter()
+            .map(|front| {
+                assert_eq!(front.opponent, None);
+                assert_eq!(front.edges.len(), 1, "{fronts:?}");
+                front.edges[0]
+            })
+            .collect::<Vec<_>>();
+        singles.sort_unstable();
+        assert_eq!(singles, vec![edge(1), edge(3), edge(5), edge(7)]);
+    }
+
+    #[test]
+    fn neutral_sections_touching_only_one_bridged_front_still_coalesce() {
+        // A,N1,A,N2: the two A runs bridge into one hostile front instance, so
+        // both neutral sections share the same bounding instance and merge.
+        let edge = |index: i32| DirectedFrontEdge {
+            source: Axial::ZERO,
+            target: Axial::new(index, -index),
+        };
+        let cycle = [
+            (edge(0), BoundaryMark::Active(Some(1))),
+            (edge(1), BoundaryMark::Active(None)),
+            (edge(2), BoundaryMark::Active(Some(1))),
+            (edge(3), BoundaryMark::Active(None)),
+        ];
+        let fronts = neutral_fronts_from_marked_cycle(&cycle);
+        assert_eq!(fronts.len(), 1, "{fronts:?}");
+        assert_eq!(fronts[0].edges, vec![edge(1), edge(3)]);
     }
 
     #[test]

@@ -15,9 +15,14 @@ pub mod combat_front_table;
 pub mod combat_front_type;
 pub mod command_receipt_table;
 pub mod command_receipt_type;
+pub mod command_watermark_type;
 pub mod configure_map_reducer;
 pub mod configure_match_reducer;
+pub mod debug_break_order_conservation_reducer;
+pub mod debug_harness_type;
+pub mod enable_debug_harness_reducer;
 pub mod expansion_garrison_debt_type;
+pub mod expansion_split_cursor_type;
 pub mod expansion_wave_type;
 pub mod issue_attack_clusters_reducer;
 pub mod issue_expand_all_reducer;
@@ -26,6 +31,7 @@ pub mod issue_front_rebalance_reducer;
 pub mod issue_push_front_reducer;
 pub mod issue_reshape_reducer;
 pub mod join_match_reducer;
+pub mod lobby_configurator_type;
 pub mod map_preset_type;
 pub mod match_config_table;
 pub mod match_config_type;
@@ -68,9 +74,14 @@ pub use combat_front_table::*;
 pub use combat_front_type::CombatFront;
 pub use command_receipt_table::*;
 pub use command_receipt_type::CommandReceipt;
+pub use command_watermark_type::CommandWatermark;
 pub use configure_map_reducer::configure_map;
 pub use configure_match_reducer::configure_match;
+pub use debug_break_order_conservation_reducer::debug_break_order_conservation;
+pub use debug_harness_type::DebugHarness;
+pub use enable_debug_harness_reducer::enable_debug_harness;
 pub use expansion_garrison_debt_type::ExpansionGarrisonDebt;
+pub use expansion_split_cursor_type::ExpansionSplitCursor;
 pub use expansion_wave_type::ExpansionWave;
 pub use issue_attack_clusters_reducer::issue_attack_clusters;
 pub use issue_expand_all_reducer::issue_expand_all;
@@ -79,6 +90,7 @@ pub use issue_front_rebalance_reducer::issue_front_rebalance;
 pub use issue_push_front_reducer::issue_push_front;
 pub use issue_reshape_reducer::issue_reshape;
 pub use join_match_reducer::join_match;
+pub use lobby_configurator_type::LobbyConfigurator;
 pub use map_preset_type::MapPreset;
 pub use match_config_table::*;
 pub use match_config_type::MatchConfig;
@@ -131,6 +143,10 @@ pub enum Reducer {
         preset: MapPreset,
         player_count: u16,
     },
+    DebugBreakOrderConservation {
+        order_id: u64,
+    },
+    EnableDebugHarness,
     IssueAttackClusters {
         client_command_id: u64,
         source_seed_cells: Vec<u32>,
@@ -192,6 +208,8 @@ impl __sdk::Reducer for Reducer {
             Reducer::CancelOrders { .. } => "cancel_orders",
             Reducer::ConfigureMap { .. } => "configure_map",
             Reducer::ConfigureMatch { .. } => "configure_match",
+            Reducer::DebugBreakOrderConservation { .. } => "debug_break_order_conservation",
+            Reducer::EnableDebugHarness => "enable_debug_harness",
             Reducer::IssueAttackClusters { .. } => "issue_attack_clusters",
             Reducer::IssueExpandAll { .. } => "issue_expand_all",
             Reducer::IssueExpandClusters { .. } => "issue_expand_clusters",
@@ -226,6 +244,14 @@ impl __sdk::Reducer for Reducer {
                 preset: preset.clone(),
                 player_count: player_count.clone(),
             }),
+            Reducer::DebugBreakOrderConservation { order_id } => __sats::bsatn::to_vec(
+                &debug_break_order_conservation_reducer::DebugBreakOrderConservationArgs {
+                    order_id: order_id.clone(),
+                },
+            ),
+            Reducer::EnableDebugHarness => {
+                __sats::bsatn::to_vec(&enable_debug_harness_reducer::EnableDebugHarnessArgs {})
+            }
             Reducer::IssueAttackClusters {
                 client_command_id,
                 source_seed_cells,

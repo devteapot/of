@@ -70,6 +70,10 @@ pub enum OrderStatus {
     Active,
     Completed,
     Cancelled,
+    /// The order hit an attributable invariant violation during a tick. Its
+    /// packets were retired with strength conserved in place and the order is
+    /// permanently parked; the rest of the match keeps running.
+    Quarantined,
 }
 
 #[derive(SpacetimeType, Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +107,30 @@ pub struct PlayerIdentity {
     pub identity: Identity,
     #[unique]
     pub player_id: u16,
+}
+
+/// The identity that configured the lobby. Recorded on the first successful
+/// `configure_match`/`configure_map`; only that identity may reconfigure, and
+/// only until the first player joins. Private: purely an authorization record.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = lobby_configurator)]
+pub struct LobbyConfigurator {
+    #[primary_key]
+    pub singleton_id: u8,
+    pub identity: Identity,
+}
+
+/// Per-player monotonic idempotency watermark for `client_command_id`.
+///
+/// Commands at or below the watermark are duplicates by contract, so
+/// `CommandReceipt` rows older than the bounded feedback window can be pruned
+/// without breaking dedup. Private: clients read receipts, never this row.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = command_watermark)]
+pub struct CommandWatermark {
+    #[primary_key]
+    pub player_id: u16,
+    pub highest_client_command_id: u64,
 }
 
 #[derive(Clone)]
@@ -414,14 +442,30 @@ pub struct ExpansionWave {
     pub order_id: u64,
     pub selected_cells: Vec<u32>,
     pub outside_depths: Vec<u16>,
-    /// Per-cell rotating remainder cursor for unbiased asynchronous splits.
-    pub split_cursors: Vec<u8>,
     /// Optional neutral click objective. Branch weights mildly favor children
     /// that move closer to this cell.
     pub focus_cell_id: Option<u32>,
     /// Immutable sorted enemy footprint for `AttackClusters`. Empty for both
     /// neutral expansion variants. Attack branches may never leave this mask.
     pub target_cells: Vec<u32>,
+}
+
+/// Sparse per-cell rotating remainder cursor for unbiased asynchronous wave
+/// splits. Kept out of [`ExpansionWave`] so per-branch cursor updates never
+/// rewrite the wave's large immutable depth field; rows exist only for cells
+/// whose cursor has rotated away from zero.
+#[derive(Clone)]
+#[spacetimedb::table(
+    accessor = expansion_split_cursor,
+    index(accessor = cursor_by_order, btree(columns = [order_id]))
+)]
+pub struct ExpansionSplitCursor {
+    /// `order_cell_key(order_id, cell_id)`.
+    #[primary_key]
+    pub cursor_key: u128,
+    pub order_id: u64,
+    pub cell_id: u32,
+    pub cursor: u8,
 }
 
 /// Sparse unpaid occupation garrison created by an Expand All capture.
@@ -468,4 +512,15 @@ pub struct SimulationSchedule {
     #[auto_inc]
     pub scheduled_id: u64,
     pub scheduled_at: ScheduleAt,
+}
+
+/// Private singleton that gates debug-only reducers used by the live quarantine
+/// integration harness. Production publish / lobby orchestration never inserts
+/// this row, so `debug_break_order_conservation` is unreachable in production.
+#[derive(Clone)]
+#[spacetimedb::table(accessor = debug_harness)]
+pub struct DebugHarness {
+    #[primary_key]
+    pub singleton_id: u8,
+    pub enabled: bool,
 }

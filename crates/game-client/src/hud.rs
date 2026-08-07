@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::app::AppExit;
 use bevy::{
     picking::hover::Hovered,
     prelude::*,

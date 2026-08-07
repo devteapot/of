@@ -12,12 +12,13 @@ use spacetimedb::{Identity, ReducerContext, ScheduleAt, Table};
 
 use crate::mapgen::regenerate_map;
 use crate::schema::{
-    DEFAULT_PLAYER_COUNT, MAX_PLAYER_COUNT, MIN_PLAYER_COUNT, MapPreset, MatchPhase,
-    MobilizationPolicy, PlayerIdentity, PlayerSlot, SINGLETON_ID, SimulationSchedule,
+    DEFAULT_PLAYER_COUNT, DebugHarness, LobbyConfigurator, MAX_PLAYER_COUNT, MIN_PLAYER_COUNT,
+    MapPreset, MatchPhase, MobilizationPolicy, OrderStatus, PlayerIdentity, PlayerSlot,
+    SINGLETON_ID, SimulationSchedule,
 };
 use crate::schema::{
-    match_config, match_state, mobilization_policy, player_identity, player_slot,
-    simulation_schedule,
+    debug_harness, lobby_configurator, match_config, match_state, mobilization_policy,
+    player_identity, player_slot, simulation_schedule, transfer_order,
 };
 
 fn timestamp_us(ctx: &ReducerContext) -> u64 {
@@ -49,7 +50,9 @@ pub fn configure_map(ctx: &ReducerContext, preset: MapPreset) -> Result<(), Stri
         .find(SINGLETON_ID)
         .ok_or("match config is missing")?
         .player_count;
-    regenerate_map(ctx, preset, preset.seed(), player_count, true)
+    regenerate_map(ctx, preset, preset.seed(), player_count, true)?;
+    record_lobby_configurator(ctx);
+    Ok(())
 }
 
 /// Configures map/player scale once without claiming a player slot. Every
@@ -63,7 +66,76 @@ pub fn configure_match(
     require_configurable_lobby(ctx)?;
     validate_player_count(player_count)?;
     configure_player_rows(ctx, player_count);
-    regenerate_map(ctx, preset, preset.seed(), player_count, true)
+    regenerate_map(ctx, preset, preset.seed(), player_count, true)?;
+    record_lobby_configurator(ctx);
+    Ok(())
+}
+
+/// Enables debug-only reducers for isolated integration harnesses.
+///
+/// Production publish and lobby orchestration never call this. The private
+/// `DebugHarness` row is the only gate; without it,
+/// `debug_break_order_conservation` rejects every caller.
+#[spacetimedb::reducer]
+pub fn enable_debug_harness(ctx: &ReducerContext) -> Result<(), String> {
+    require_configurable_lobby(ctx)?;
+    if let Some(mut row) = ctx.db.debug_harness().singleton_id().find(SINGLETON_ID) {
+        row.enabled = true;
+        ctx.db.debug_harness().singleton_id().update(row);
+    } else {
+        ctx.db.debug_harness().insert(DebugHarness {
+            singleton_id: SINGLETON_ID,
+            enabled: true,
+        });
+    }
+    Ok(())
+}
+
+fn require_debug_harness(ctx: &ReducerContext) -> Result<(), String> {
+    let enabled = ctx
+        .db
+        .debug_harness()
+        .singleton_id()
+        .find(SINGLETON_ID)
+        .is_some_and(|row| row.enabled);
+    if enabled {
+        Ok(())
+    } else {
+        Err("debug harness is disabled (production configs never enable it)".into())
+    }
+}
+
+/// Test-only: corrupt one active order's accounting so the next simulation
+/// tick's finalize pass quarantines it. Strength remains in physical cells;
+/// only the order counters are intentionally broken.
+#[spacetimedb::reducer]
+pub fn debug_break_order_conservation(ctx: &ReducerContext, order_id: u64) -> Result<(), String> {
+    require_debug_harness(ctx)?;
+    let mut order = ctx
+        .db
+        .transfer_order()
+        .order_id()
+        .find(order_id)
+        .ok_or_else(|| format!("unknown order {order_id}"))?;
+    if order.status != OrderStatus::Active {
+        return Err(format!(
+            "debug break requires an Active order, found {:?}",
+            order.status
+        ));
+    }
+    order.committed_infantry = order
+        .committed_infantry
+        .checked_add(1)
+        .ok_or_else(|| "debug break committed overflow".to_string())?;
+    order.updated_step = ctx
+        .db
+        .match_state()
+        .singleton_id()
+        .find(SINGLETON_ID)
+        .map(|state| state.logical_step)
+        .unwrap_or(order.updated_step);
+    ctx.db.transfer_order().order_id().update(order);
+    Ok(())
 }
 
 fn validate_player_count(player_count: u16) -> Result<(), String> {
@@ -100,25 +172,64 @@ fn require_configurable_lobby(ctx: &ReducerContext) -> Result<(), String> {
         .claimed_players
         > 0
         || ctx.db.player_identity().iter().next().is_some();
-    validate_lobby_configuration(phase, configuration_locked, any_player_joined)
-        .map_err(str::to_owned)
+    let sender_is_configurator = ctx
+        .db
+        .lobby_configurator()
+        .singleton_id()
+        .find(SINGLETON_ID)
+        .map(|row| row.identity == ctx.sender());
+    validate_lobby_configuration(
+        phase,
+        configuration_locked,
+        any_player_joined,
+        sender_is_configurator,
+    )
+    .map_err(str::to_owned)
 }
 
+/// Configure-griefing mitigation: the first successful configure records its
+/// identity, and only that identity may reconfigure, always only until the
+/// first player joins. Configuration is therefore no longer irrevocably
+/// one-shot — the identity that configured first (the production lobby
+/// orchestrator in the deployed flow) can correct a bad configuration
+/// instead of being locked out by its own lock flag, while every other
+/// identity is still rejected. Databases configured before the configurator
+/// record existed keep the old strict one-shot behavior
+/// (`sender_is_configurator == None`).
 fn validate_lobby_configuration(
     phase: MatchPhase,
     configuration_locked: bool,
     any_player_joined: bool,
+    sender_is_configurator: Option<bool>,
 ) -> Result<(), &'static str> {
     if phase != MatchPhase::Lobby {
         return Err("the match can only be configured in the lobby");
     }
-    if configuration_locked {
-        return Err("lobby configuration is already locked");
-    }
     if any_player_joined {
         return Err("the match must be configured before any player joins");
     }
+    if configuration_locked && sender_is_configurator != Some(true) {
+        return Err("lobby configuration is already locked by another identity");
+    }
     Ok(())
+}
+
+fn record_lobby_configurator(ctx: &ReducerContext) {
+    let identity = ctx.sender();
+    if let Some(mut row) = ctx
+        .db
+        .lobby_configurator()
+        .singleton_id()
+        .find(SINGLETON_ID)
+    {
+        row.identity = identity;
+        ctx.db.lobby_configurator().singleton_id().update(row);
+    } else {
+        ctx.db.lobby_configurator().insert(LobbyConfigurator {
+            singleton_id: SINGLETON_ID,
+            identity,
+        });
+    }
 }
 
 fn claim_player_slot(slot: &mut PlayerSlot, identity: Identity, now: u64) {
@@ -350,6 +461,16 @@ fn reconcile_claimed_players(ctx: &ReducerContext) -> Result<(), String> {
     Ok(())
 }
 
+/// Fresh slot claims are lobby-only. Reconnects of already-bound identities
+/// are resolved before this guard runs and remain allowed in every phase.
+fn validate_fresh_claim_phase(phase: MatchPhase) -> Result<(), &'static str> {
+    if phase == MatchPhase::Lobby {
+        Ok(())
+    } else {
+        Err("fresh player slots can only be claimed while the match is in the lobby")
+    }
+}
+
 fn apply_reconnect_to_slot(
     slot: &mut PlayerSlot,
     identity: Identity,
@@ -410,6 +531,14 @@ pub fn join_match(
         return Ok(());
     }
 
+    let phase = ctx
+        .db
+        .match_state()
+        .singleton_id()
+        .find(SINGLETON_ID)
+        .ok_or("match state is missing")?
+        .phase;
+    validate_fresh_claim_phase(phase).map_err(str::to_owned)?;
     let player_count = ctx
         .db
         .match_config()
@@ -614,16 +743,57 @@ mod tests {
     }
 
     #[test]
-    fn lobby_configuration_is_one_shot_without_requiring_a_slot_claim() {
-        assert!(validate_lobby_configuration(MatchPhase::Lobby, false, false).is_ok());
+    fn lobby_configuration_is_gated_without_requiring_a_slot_claim() {
+        assert!(validate_lobby_configuration(MatchPhase::Lobby, false, false, None).is_ok());
         assert_eq!(
-            validate_lobby_configuration(MatchPhase::Lobby, true, false),
-            Err("lobby configuration is already locked")
-        );
-        assert_eq!(
-            validate_lobby_configuration(MatchPhase::Lobby, false, true),
+            validate_lobby_configuration(MatchPhase::Lobby, false, true, None),
             Err("the match must be configured before any player joins")
         );
+        assert_eq!(
+            validate_lobby_configuration(MatchPhase::Running, false, false, Some(true)),
+            Err("the match can only be configured in the lobby")
+        );
+    }
+
+    #[test]
+    fn only_the_recorded_configurator_may_reconfigure_until_the_first_join() {
+        // The identity that configured first may reconfigure while nobody has
+        // joined yet.
+        assert!(validate_lobby_configuration(MatchPhase::Lobby, true, false, Some(true)).is_ok());
+        // Any other identity is rejected once the lobby is configured.
+        assert_eq!(
+            validate_lobby_configuration(MatchPhase::Lobby, true, false, Some(false)),
+            Err("lobby configuration is already locked by another identity")
+        );
+        // Legacy databases (locked without a configurator record) keep the
+        // strict one-shot behavior for everyone.
+        assert_eq!(
+            validate_lobby_configuration(MatchPhase::Lobby, true, false, None),
+            Err("lobby configuration is already locked by another identity")
+        );
+        // The first join ends the reconfiguration window even for the
+        // recorded configurator.
+        assert_eq!(
+            validate_lobby_configuration(MatchPhase::Lobby, true, true, Some(true)),
+            Err("the match must be configured before any player joins")
+        );
+    }
+
+    #[test]
+    fn fresh_slot_claims_are_lobby_only_but_reconnects_are_not_gated() {
+        assert!(validate_fresh_claim_phase(MatchPhase::Lobby).is_ok());
+        for phase in [MatchPhase::Running, MatchPhase::Completed] {
+            assert_eq!(
+                validate_fresh_claim_phase(phase),
+                Err("fresh player slots can only be claimed while the match is in the lobby")
+            );
+        }
+        // Reconnects bypass the guard entirely: join_match resolves an
+        // already-bound identity before the fresh-claim path runs, in every
+        // phase.
+        let recovered = recover_join_identity(Some(3), Some(3), IndexedSlotBinding::MatchesSender)
+            .expect("consistent binding");
+        assert!(recovered.is_some(), "reconnect resolves before the guard");
     }
 
     #[test]

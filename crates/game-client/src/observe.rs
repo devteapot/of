@@ -304,5 +304,6 @@ mod tests {
         state.note_frame_spike(41.0, 50.0, Some(20.0));
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.events[0].key, keys::PERF_FRAME_SPIKE);
+        assert!(state.events[0].detail.contains("frame_ms=40.00"));
     }
 }

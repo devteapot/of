@@ -7,7 +7,7 @@ use std::{
 use hex_core::{
     AttackFront, Axial, CombatConfig, EdgeLimits, HexMap, LogisticsConfig, MovementConfig,
     MovementIntent, MovementLimit, focus_branch_weight, movement_step, resolve_edge_combat,
-    weighted_branch_allocations_rotated,
+    select_capture, weighted_branch_allocations_rotated,
 };
 use spacetimedb::{ReducerContext, Table, log_stopwatch::LogStopwatch};
 
@@ -16,14 +16,14 @@ use crate::rules::{
     core_cell, edge_runtime_limits, order_cell_key, state, terrain,
 };
 use crate::schema::{
-    CellState, CombatFront, EXPANSION_AGGREGATE_ORIGIN, ExpansionGarrisonDebt, ExpansionWave,
-    MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus, TerrainClass, TransferOrder,
-    TransferSource, TransitPacket,
+    CellState, CombatFront, EXPANSION_AGGREGATE_ORIGIN, ExpansionGarrisonDebt,
+    ExpansionSplitCursor, ExpansionWave, MatchPhase, NEUTRAL_PLAYER, OrderKind, OrderStatus,
+    TerrainClass, TransferOrder, TransferSource, TransitPacket,
 };
 use crate::schema::{
-    cell_state as cell_state_table, combat_front, expansion_garrison_debt, expansion_wave,
-    match_state, mobilization_policy, player_state, retreat_abandonment, transfer_destination,
-    transfer_order, transfer_source, transit_packet, transit_route,
+    cell_state as cell_state_table, combat_front, expansion_garrison_debt, expansion_split_cursor,
+    expansion_wave, match_state, mobilization_policy, player_state, retreat_abandonment,
+    transfer_destination, transfer_order, transfer_source, transit_packet, transit_route,
 };
 
 /// Transaction-local packet index for one simulation step.
@@ -441,8 +441,8 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     }
     {
         let _phase_stopwatch = LogStopwatch::new("simulation_finalize");
+        finalize_orders(ctx, &mut packets, logical_step)?;
         packets.flush_source_queues(ctx);
-        finalize_orders(ctx, &packets, logical_step)?;
     }
 
     let config = config(ctx)?;
@@ -460,6 +460,10 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
         let _phase_stopwatch = LogStopwatch::new("simulation_population");
         population_step(ctx, logical_step, high_scale)?;
     }
+    if logical_step.is_multiple_of(ORDER_PRUNE_INTERVAL_STEPS) {
+        let _phase_stopwatch = LogStopwatch::new("simulation_prune");
+        prune_order_history(ctx, logical_step);
+    }
     if logical_step.is_multiple_of(40) {
         log::info!(
             target: "of",
@@ -471,11 +475,174 @@ pub fn advance_simulation(ctx: &ReducerContext) -> Result<bool, String> {
     Ok(state(ctx)?.phase == MatchPhase::Running)
 }
 
+/// How long terminal Completed/Cancelled orders (and their source and
+/// destination rows) remain visible for client feedback: 2,400 steps is ten
+/// minutes at the default 250 ms step. Quarantined orders are exempt — they
+/// are the operator-visible record of an invariant violation and are rare by
+/// construction.
+const ORDER_RETENTION_STEPS: u64 = 2_400;
+const ORDER_PRUNE_INTERVAL_STEPS: u64 = 40;
+
+fn prune_order_history(ctx: &ReducerContext, logical_step: u64) {
+    for status in [OrderStatus::Completed, OrderStatus::Cancelled] {
+        let stale: Vec<u64> = ctx
+            .db
+            .transfer_order()
+            .order_by_status()
+            .filter(status)
+            .filter(|order| order_history_is_prunable(order.updated_step, logical_step))
+            .map(|order| order.order_id)
+            .collect();
+        for order_id in stale {
+            let source_keys: Vec<_> = ctx
+                .db
+                .transfer_source()
+                .source_by_order()
+                .filter(order_id)
+                .map(|source| source.source_key)
+                .collect();
+            for key in source_keys {
+                ctx.db.transfer_source().source_key().delete(key);
+            }
+            let destination_keys: Vec<_> = ctx
+                .db
+                .transfer_destination()
+                .destination_by_order()
+                .filter(order_id)
+                .map(|destination| destination.destination_key)
+                .collect();
+            for key in destination_keys {
+                ctx.db.transfer_destination().destination_key().delete(key);
+            }
+            ctx.db.transfer_order().order_id().delete(order_id);
+        }
+    }
+}
+
+fn order_history_is_prunable(updated_step: u64, logical_step: u64) -> bool {
+    updated_step.saturating_add(ORDER_RETENTION_STEPS) < logical_step
+}
+
 fn is_expansion_wave_order(kind: OrderKind) -> bool {
     matches!(
         kind,
         OrderKind::ExpandAll | OrderKind::ExpandClusters | OrderKind::AttackClusters
     )
+}
+
+/// Permanently parks an order after an attributable invariant violation so a
+/// deterministic per-order failure cannot re-fail every scheduled tick and
+/// freeze the match.
+///
+/// Strength is conserved by construction: infantry always lives in
+/// `CellState` rows, and packets/sources are allocation metadata only.
+/// Deleting the order's packets releases its strength at the current physical
+/// cells; zeroing the source queues releases the not-yet-departed remainder
+/// at its origins. The order row is kept with `OrderStatus::Quarantined` (its
+/// last-known counters frozen) as the operator/player-visible record, and the
+/// failure is logged loudly.
+fn quarantine_order(
+    ctx: &ReducerContext,
+    packets: &mut PacketTickState,
+    order_id: u64,
+    reason: &str,
+    logical_step: u64,
+) {
+    log::error!(
+        target: "of",
+        "event=order.quarantine order_id={order_id} step={logical_step} reason={reason}"
+    );
+    let packet_keys: Vec<u64> = packets
+        .by_order(order_id)
+        .map(|packet| packet.packet_key)
+        .collect();
+    for packet_key in packet_keys {
+        packets.delete(ctx, &packet_key);
+    }
+    let source_cells = packets
+        .sources_by_order
+        .get(&order_id)
+        .cloned()
+        .unwrap_or_default();
+    for cell_id in source_cells {
+        if let Some(source) = packets.source_rows.get_mut(&(order_id, cell_id))
+            && source.queued_infantry != 0
+        {
+            source.queued_infantry = 0;
+            packets.dirty_sources.insert((order_id, cell_id));
+        }
+    }
+    if let Some(mut order) = ctx.db.transfer_order().order_id().find(order_id) {
+        order.status = OrderStatus::Quarantined;
+        order.in_transit_infantry = 0;
+        order.updated_step = logical_step;
+        ctx.db.transfer_order().order_id().update(order);
+    }
+    ctx.db.expansion_wave().order_id().delete(order_id);
+    clear_expansion_split_cursors(ctx, order_id);
+    let route_ids: Vec<_> = ctx
+        .db
+        .transit_route()
+        .route_by_order()
+        .filter(order_id)
+        .map(|route| route.route_id)
+        .collect();
+    for route_id in route_ids {
+        ctx.db.transit_route().route_id().delete(route_id);
+    }
+    let abandonment_keys: Vec<_> = ctx
+        .db
+        .retreat_abandonment()
+        .abandonment_by_order()
+        .filter(order_id)
+        .map(|abandonment| abandonment.abandonment_key)
+        .collect();
+    for key in abandonment_keys {
+        ctx.db.retreat_abandonment().abandonment_key().delete(key);
+    }
+}
+
+fn expansion_split_cursor_value(ctx: &ReducerContext, order_id: u64, cell_id: u32) -> u8 {
+    ctx.db
+        .expansion_split_cursor()
+        .cursor_key()
+        .find(order_cell_key(order_id, cell_id))
+        .map_or(0, |row| row.cursor)
+}
+
+fn set_expansion_split_cursor(ctx: &ReducerContext, order_id: u64, cell_id: u32, cursor: u8) {
+    let cursor_key = order_cell_key(order_id, cell_id);
+    if let Some(mut row) = ctx
+        .db
+        .expansion_split_cursor()
+        .cursor_key()
+        .find(cursor_key)
+    {
+        row.cursor = cursor;
+        ctx.db.expansion_split_cursor().cursor_key().update(row);
+    } else {
+        ctx.db
+            .expansion_split_cursor()
+            .insert(ExpansionSplitCursor {
+                cursor_key,
+                order_id,
+                cell_id,
+                cursor,
+            });
+    }
+}
+
+pub(crate) fn clear_expansion_split_cursors(ctx: &ReducerContext, order_id: u64) {
+    let keys: Vec<_> = ctx
+        .db
+        .expansion_split_cursor()
+        .cursor_by_order()
+        .filter(order_id)
+        .map(|row| row.cursor_key)
+        .collect();
+    for key in keys {
+        ctx.db.expansion_split_cursor().cursor_key().delete(key);
+    }
 }
 
 /// Neutral waves stop at later enemy ownership. Attack waves are constrained
@@ -499,27 +666,44 @@ fn stop_blocked_expand_edges(
 
     let mut blocked_packets = Vec::new();
     for order in expand_orders {
-        let wave = ctx
-            .db
-            .expansion_wave()
-            .order_id()
-            .find(order.order_id)
-            .ok_or_else(|| format!("wave order {} has no topology", order.order_id))?;
-        for packet in packets.by_order(order.order_id) {
-            let next_index = packet.route_index as usize + 1;
-            let Some(&next_cell) = packet.route.get(next_index) else {
-                continue;
-            };
-            if !expansion_edge_is_available(ctx, &order, &wave, packet.current_cell, next_cell)? {
-                blocked_packets.push(packet.clone());
-            }
+        match blocked_expand_packets_for_order(ctx, packets, &order) {
+            Ok(mut blocked) => blocked_packets.append(&mut blocked),
+            Err(error) => quarantine_order(ctx, packets, order.order_id, &error, logical_step),
         }
     }
     blocked_packets.sort_unstable_by_key(|packet| packet.packet_key);
     for packet in blocked_packets {
-        station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)?;
+        if let Err(error) =
+            station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)
+        {
+            quarantine_order(ctx, packets, packet.order_id, &error, logical_step);
+        }
     }
     Ok(())
+}
+
+fn blocked_expand_packets_for_order(
+    ctx: &ReducerContext,
+    packets: &PacketTickState,
+    order: &TransferOrder,
+) -> Result<Vec<TickPacket>, String> {
+    let wave = ctx
+        .db
+        .expansion_wave()
+        .order_id()
+        .find(order.order_id)
+        .ok_or_else(|| format!("wave order {} has no topology", order.order_id))?;
+    let mut blocked = Vec::new();
+    for packet in packets.by_order(order.order_id) {
+        let next_index = packet.route_index as usize + 1;
+        let Some(&next_cell) = packet.route.get(next_index) else {
+            continue;
+        };
+        if !expansion_edge_is_available(ctx, order, &wave, packet.current_cell, next_cell)? {
+            blocked.push(packet.clone());
+        }
+    }
+    Ok(blocked)
 }
 
 /// Formation and reshape routes are logistics-only. If ownership changes
@@ -545,20 +729,34 @@ fn stop_blocked_internal_edges(
     }
 
     let mut blocked_packets = Vec::new();
-    for (order_id, player_id, kind) in internal_orders {
+    let mut broken_orders = Vec::new();
+    'orders: for (order_id, player_id, kind) in internal_orders {
         for packet in packets.by_order(order_id) {
             let Some(&next_cell) = packet.route.get(packet.route_index as usize + 1) else {
                 continue;
             };
-            let next_owner = cell_state(ctx, next_cell)?.owner_player_id;
+            let next_owner = match cell_state(ctx, next_cell) {
+                Ok(next) => next.owner_player_id,
+                Err(error) => {
+                    broken_orders.push((order_id, error));
+                    continue 'orders;
+                }
+            };
             if internal_next_owner_is_blocked(kind, player_id, next_owner) {
                 blocked_packets.push(packet.clone());
             }
         }
     }
+    for (order_id, error) in broken_orders {
+        quarantine_order(ctx, packets, order_id, &error, logical_step);
+    }
     blocked_packets.sort_unstable_by_key(|packet| packet.packet_key);
     for packet in blocked_packets {
-        station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)?;
+        if let Err(error) =
+            station_packet_allocation(ctx, packets, &packet, packet.infantry, logical_step)
+        {
+            quarantine_order(ctx, packets, packet.order_id, &error, logical_step);
+        }
     }
     Ok(())
 }
@@ -584,37 +782,45 @@ fn branch_expand_waves(
         .filter(|order| is_expansion_wave_order(order.kind))
         .collect::<Vec<_>>();
     for order in orders {
-        let mut wave = ctx
-            .db
-            .expansion_wave()
-            .order_id()
-            .find(order.order_id)
-            .ok_or_else(|| format!("expand order {} has no topology", order.order_id))?;
-        let mut resting_by_cell = BTreeMap::<u32, Vec<TickPacket>>::new();
-        for packet in packets.by_order(order.order_id) {
-            if expansion_packet_is_resting(packet) {
-                resting_by_cell
-                    .entry(packet.current_cell)
-                    .or_default()
-                    .push(packet.clone());
-            }
+        if let Err(error) = branch_expand_wave_order(ctx, packets, &order, logical_step) {
+            quarantine_order(ctx, packets, order.order_id, &error, logical_step);
         }
-        let mut topology_changed = false;
-        for (cell_id, mut contributions) in resting_by_cell {
-            contributions.sort_unstable_by_key(|packet| packet.packet_key);
-            topology_changed |= branch_expand_node(
-                ctx,
-                packets,
-                &order,
-                &mut wave,
-                cell_id,
-                &contributions,
-                logical_step,
-            )?;
+    }
+    Ok(())
+}
+
+fn branch_expand_wave_order(
+    ctx: &ReducerContext,
+    packets: &mut PacketTickState,
+    order: &TransferOrder,
+    logical_step: u64,
+) -> Result<(), String> {
+    let wave = ctx
+        .db
+        .expansion_wave()
+        .order_id()
+        .find(order.order_id)
+        .ok_or_else(|| format!("expand order {} has no topology", order.order_id))?;
+    let mut resting_by_cell = BTreeMap::<u32, Vec<TickPacket>>::new();
+    for packet in packets.by_order(order.order_id) {
+        if expansion_packet_is_resting(packet) {
+            resting_by_cell
+                .entry(packet.current_cell)
+                .or_default()
+                .push(packet.clone());
         }
-        if topology_changed {
-            ctx.db.expansion_wave().order_id().update(wave);
-        }
+    }
+    for (cell_id, mut contributions) in resting_by_cell {
+        contributions.sort_unstable_by_key(|packet| packet.packet_key);
+        branch_expand_node(
+            ctx,
+            packets,
+            order,
+            &wave,
+            cell_id,
+            &contributions,
+            logical_step,
+        )?;
     }
     Ok(())
 }
@@ -629,15 +835,15 @@ fn branch_expand_node(
     ctx: &ReducerContext,
     packets: &mut PacketTickState,
     order: &TransferOrder,
-    wave: &mut ExpansionWave,
+    wave: &ExpansionWave,
     cell_id: u32,
     contributions: &[TickPacket],
     logical_step: u64,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let contributions =
         pay_expansion_garrison_debt(ctx, packets, order, cell_id, contributions, logical_step)?;
     if contributions.is_empty() {
-        return Ok(false);
+        return Ok(());
     }
 
     let children = expansion_children(ctx, wave, cell_id)?;
@@ -651,18 +857,14 @@ fn branch_expand_node(
                 logical_step,
             )?;
         }
-        return Ok(false);
+        return Ok(());
     }
 
     let amounts = contributions
         .iter()
         .map(|packet| packet.infantry)
         .collect::<Vec<_>>();
-    let cursor = wave
-        .split_cursors
-        .get(cell_id as usize)
-        .copied()
-        .ok_or_else(|| format!("expand split cursor is missing cell {cell_id}"))?;
+    let cursor = expansion_split_cursor_value(ctx, order.order_id, cell_id);
     let child_weights = expansion_child_weights(ctx, wave, cell_id, &children)?;
     let weighted =
         weighted_branch_allocations_rotated(&amounts, &child_weights, usize::from(cursor))
@@ -671,9 +873,8 @@ fn branch_expand_node(
     let next_cursor = weighted.next_cursor;
     let next_cursor =
         u8::try_from(next_cursor).map_err(|_| "expand child cursor exceeds u8".to_string())?;
-    let topology_changed = next_cursor != cursor;
-    if topology_changed {
-        wave.split_cursors[cell_id as usize] = next_cursor;
+    if next_cursor != cursor {
+        set_expansion_split_cursor(ctx, order.order_id, cell_id, next_cursor);
     }
     let mut stationed_by_contribution = vec![0_u64; contributions.len()];
     let mut outgoing = Vec::new();
@@ -716,7 +917,7 @@ fn branch_expand_node(
             logical_step,
         )?;
     }
-    Ok(topology_changed)
+    Ok(())
 }
 
 /// Pays only capture-scoped debt and only from this expansion's resting
@@ -1020,42 +1221,85 @@ fn population_step(
         if cell.civilian_capacity == 0 {
             continue;
         }
-        let previous_civilians = cell.civilians;
-        let previous_infantry = cell.infantry;
-        let missing = cell.civilian_capacity.saturating_sub(cell.civilians);
-        if missing > 0 {
-            let growth =
-                ((u128::from(missing) * u128::from(config.civilian_growth_bps)) / 10_000) as u64;
-            cell.civilians = cell.civilians.saturating_add(growth.max(1).min(missing));
-        }
-
-        let local_population = cell.civilians.saturating_add(cell.infantry);
-        let desired_infantry =
-            ((u128::from(local_population) * u128::from(target_bps)) / 10_000) as u64;
-        if cell.infantry < desired_infantry && !retreating_edge_cells.contains(&cell.cell_id) {
-            let reserved_capacity = reserved_recruitment_capacity(
-                &destination_reservations,
-                cell.owner_player_id,
-                cell.cell_id,
-            );
-            let recruit = desired_infantry
-                .saturating_sub(cell.infantry)
-                .min(config.mobilization_per_population_step)
-                .min(cell.civilians)
-                .min(recruitment_headroom(
-                    cell.military_capacity,
-                    cell.infantry,
-                    reserved_capacity,
-                ));
-            cell.civilians -= recruit;
-            cell.infantry += recruit;
-        }
-        if cell.civilians != previous_civilians || cell.infantry != previous_infantry {
+        let reserved_capacity = reserved_recruitment_capacity(
+            &destination_reservations,
+            cell.owner_player_id,
+            cell.cell_id,
+        );
+        let next = population_cell_transition(
+            cell.civilians,
+            cell.civilian_capacity,
+            cell.infantry,
+            cell.military_capacity,
+            config.civilian_growth_bps,
+            target_bps,
+            config.mobilization_per_population_step,
+            reserved_capacity,
+            retreating_edge_cells.contains(&cell.cell_id),
+        );
+        if next.civilians != cell.civilians || next.infantry != cell.infantry {
+            cell.civilians = next.civilians;
+            cell.infantry = next.infantry;
             cell.last_changed_step = logical_step;
             ctx.db.cell_state().cell_id().update(cell);
         }
     }
     Ok(())
+}
+
+/// One owned cell's population transition for one population interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PopulationTransition {
+    civilians: u64,
+    infantry: u64,
+}
+
+/// Pure population formula: civilians regrow toward capacity (basis-point
+/// share of the missing amount, minimum one), then mobilization converts
+/// civilians to infantry toward the target share, bounded by the per-step
+/// mobilization budget, available civilians, and unreserved military
+/// capacity headroom. Lowering the target never demobilizes. The transition
+/// conserves total population except for the explicit regrowth amount.
+#[allow(clippy::too_many_arguments)]
+fn population_cell_transition(
+    civilians: u64,
+    civilian_capacity: u64,
+    infantry: u64,
+    military_capacity: u64,
+    growth_bps: u32,
+    target_bps: u32,
+    mobilization_per_step: u64,
+    reserved_capacity: u64,
+    retreating: bool,
+) -> PopulationTransition {
+    let mut civilians = civilians;
+    let mut infantry = infantry;
+    let missing = civilian_capacity.saturating_sub(civilians);
+    if missing > 0 {
+        let growth = ((u128::from(missing) * u128::from(growth_bps)) / 10_000) as u64;
+        civilians = civilians.saturating_add(growth.max(1).min(missing));
+    }
+
+    let local_population = civilians.saturating_add(infantry);
+    let desired_infantry =
+        ((u128::from(local_population) * u128::from(target_bps)) / 10_000) as u64;
+    if infantry < desired_infantry && !retreating {
+        let recruit = desired_infantry
+            .saturating_sub(infantry)
+            .min(mobilization_per_step)
+            .min(civilians)
+            .min(recruitment_headroom(
+                military_capacity,
+                infantry,
+                reserved_capacity,
+            ));
+        civilians -= recruit;
+        infantry += recruit;
+    }
+    PopulationTransition {
+        civilians,
+        infantry,
+    }
 }
 
 fn active_retreat_abandonment_cells(ctx: &ReducerContext) -> BTreeSet<u32> {
@@ -1329,20 +1573,25 @@ fn move_friendly_packets(
         }
     }
     for (order_id, lane_anchor, direction) in capacity_stopped_lanes {
-        settle_stopped_sustained_lane(
+        if let Err(error) = settle_stopped_sustained_lane(
             ctx,
             packets,
             order_id,
             lane_anchor,
             direction,
             logical_step,
-        )?;
+        ) {
+            quarantine_order(ctx, packets, order_id, &error, logical_step);
+        }
     }
     for packet in capacity_stopped_packets.into_values() {
         // An upstream packet can merge into this key during the same pipeline
         // step. Retire the complete post-movement allocation at the blocked
         // choke, not only the amount present in the pre-step snapshot.
-        station_packet_allocation(ctx, packets, &packet, u64::MAX, logical_step)?;
+        if let Err(error) = station_packet_allocation(ctx, packets, &packet, u64::MAX, logical_step)
+        {
+            quarantine_order(ctx, packets, packet.order_id, &error, logical_step);
+        }
     }
     Ok(())
 }
@@ -1387,47 +1636,43 @@ fn resolve_combats(
             continue;
         }
         let defender = cell_state(ctx, target_cell)?;
-        let selected_attacker = if defender.owner_player_id == NEUTRAL_PLAYER {
-            attackers
+        // Every hostile owner engages simultaneously. The kernel allocates the
+        // defenders proportionally across all valid fronts and applies the
+        // documented multi-attacker capture rule; an owner who captured this
+        // cell earlier in the same pass is filtered out by the refresh above
+        // or by the defender-ownership check here.
+        let mut fronts = Vec::new();
+        for (&attacker, front_map) in &attackers {
+            if attacker == defender.owner_player_id {
+                continue;
+            }
+            for (&from_cell, front_packets) in front_map {
+                fronts.push(FrontPackets {
+                    attacker,
+                    from_cell,
+                    to_cell: target_cell,
+                    packets: front_packets.clone(),
+                });
+            }
+        }
+        if fronts.is_empty() {
+            continue;
+        }
+        // A cell has exactly one owner, so `from_cell` is unique across owners
+        // and doubles as the deterministic kernel attack ID.
+        fronts.sort_unstable_by_key(|front| front.from_cell);
+        if let Err(error) = resolve_target_combat(ctx, packets, defender, &fronts, logical_step) {
+            // The failure is attributable to this contested cell: quarantine
+            // every order that contributed a front so the remaining targets
+            // (and future ticks) keep resolving.
+            let order_ids: BTreeSet<u64> = fronts
                 .iter()
-                .max_by(|(left_player, left_fronts), (right_player, right_fronts)| {
-                    let left_strength = left_fronts
-                        .values()
-                        .flatten()
-                        .map(|packet| packet.infantry)
-                        .sum::<u64>();
-                    let right_strength = right_fronts
-                        .values()
-                        .flatten()
-                        .map(|packet| packet.infantry)
-                        .sum::<u64>();
-                    left_strength
-                        .cmp(&right_strength)
-                        .then_with(|| right_player.cmp(left_player))
-                })
-                .map(|(&player, _)| player)
-        } else {
-            attackers
-                .keys()
-                .copied()
-                .find(|attacker| *attacker != defender.owner_player_id)
-        };
-        let Some(attacker) = selected_attacker else {
-            continue;
-        };
-        let Some(front_map) = attackers.get(&attacker) else {
-            continue;
-        };
-        let fronts: Vec<_> = front_map
-            .iter()
-            .map(|(&from_cell, packets)| FrontPackets {
-                attacker,
-                from_cell,
-                to_cell: target_cell,
-                packets: packets.clone(),
-            })
-            .collect();
-        resolve_target_combat(ctx, packets, defender, fronts, logical_step)?;
+                .flat_map(|front| front.packets.iter().map(|packet| packet.order_id))
+                .collect();
+            for order_id in order_ids {
+                quarantine_order(ctx, packets, order_id, &error, logical_step);
+            }
+        }
     }
     Ok(())
 }
@@ -1465,18 +1710,31 @@ fn refresh_target_attackers(
     Ok(current)
 }
 
+/// Resolves one contested cell against every hostile front simultaneously.
+///
+/// Casualty allocation and the capture rule are owned by the kernel
+/// ([`resolve_edge_combat`]): defenders split proportionally over all valid
+/// fronts regardless of owner, and when the defender is eliminated the owner
+/// with the largest surviving committed strength captures (ties break toward
+/// the smaller owner ID, then the smaller origin cell ID). The module applies
+/// its minimum-one-casualty adjustment before re-running the capture
+/// selection over the adjusted survivors, so displayed numbers and the
+/// capture pick always agree.
+///
+/// Fronts rejected by the kernel (broken geometry) quarantine their
+/// contributing orders while the remaining valid fronts still resolve.
 fn resolve_target_combat(
     ctx: &ReducerContext,
     packets: &mut PacketTickState,
     mut defender: CellState,
-    fronts: Vec<FrontPackets>,
+    fronts: &[FrontPackets],
     logical_step: u64,
 ) -> Result<(), String> {
     let config = config(ctx)?;
     let target_coordinate = coordinate_for_cell(ctx, defender.cell_id)?;
     let target_terrain = terrain(ctx, defender.cell_id)?;
     let mut attacks = Vec::new();
-    for front in &fronts {
+    for front in fronts {
         let limits = edge_runtime_limits(ctx, front.from_cell, front.to_cell)?
             .ok_or_else(|| "combat route contains an impassable edge".to_string())?;
         attacks.push(AttackFront {
@@ -1503,34 +1761,65 @@ fn resolve_target_combat(
     )
     .map_err(|error| format!("combat resolution failed: {error:?}"))?;
 
+    // A rejected front means this order's persisted geometry violates the
+    // combat contract (non-adjacent origin, cliff, duplicated origin). That is
+    // attributable: park those orders and let the valid fronts resolve.
+    if !resolution.rejected.is_empty() {
+        let rejected_ids: BTreeMap<u64, _> = resolution
+            .rejected
+            .iter()
+            .map(|rejection| (rejection.id, rejection.reason))
+            .collect();
+        let mut rejected_orders = BTreeMap::new();
+        for front in fronts {
+            if let Some(reason) = rejected_ids.get(&u64::from(front.from_cell)) {
+                for packet in &front.packets {
+                    rejected_orders.insert(
+                        packet.order_id,
+                        format!(
+                            "combat front {}->{} rejected: {reason:?}",
+                            front.from_cell, front.to_cell
+                        ),
+                    );
+                }
+            }
+        }
+        for (order_id, reason) in rejected_orders {
+            quarantine_order(ctx, packets, order_id, &reason, logical_step);
+        }
+    }
+    let valid_fronts: Vec<&FrontPackets> = fronts
+        .iter()
+        .filter(|front| resolution.attacks.contains_key(&u64::from(front.from_cell)))
+        .collect();
+    if valid_fronts.is_empty() {
+        return Ok(());
+    }
+
     let total_engaged: u64 = resolution
         .attacks
         .values()
         .map(|outcome| outcome.engaged)
         .sum();
-    let extra_defender_casualty = u64::from(
-        defender.infantry > 0 && total_engaged > 0 && resolution.defender_casualties == 0,
+    let defender_casualties = minimum_casualty(
+        total_engaged > 0,
+        resolution.defender_casualties,
+        defender.infantry,
     );
-    let defender_casualties = resolution
-        .defender_casualties
-        .saturating_add(extra_defender_casualty)
-        .min(defender.infantry);
+    let extra_defender_casualty =
+        defender_casualties.saturating_sub(resolution.defender_casualties);
 
-    let mut surviving_by_front = BTreeMap::new();
-    for front in &fronts {
+    let mut adjusted_outcomes = resolution.attacks.clone();
+    for front in &valid_fronts {
         let outcome = resolution
             .attacks
             .get(&u64::from(front.from_cell))
             .ok_or_else(|| "combat omitted an attack front".to_string())?;
-        let extra_attacker = u64::from(
-            outcome.engaged > 0
-                && outcome.defense_allocated > 0
-                && outcome.attacker_casualties == 0,
+        let attacker_casualties = minimum_casualty(
+            outcome.engaged > 0 && outcome.defense_allocated > 0,
+            outcome.attacker_casualties,
+            outcome.offered,
         );
-        let attacker_casualties = outcome
-            .attacker_casualties
-            .saturating_add(extra_attacker)
-            .min(outcome.offered);
         apply_attacker_casualties(
             ctx,
             packets,
@@ -1538,14 +1827,15 @@ fn resolve_target_combat(
             attacker_casualties,
             logical_step,
         )?;
-        surviving_by_front.insert(
-            front.from_cell,
-            outcome.offered.saturating_sub(attacker_casualties),
-        );
+        if let Some(adjusted) = adjusted_outcomes.get_mut(&u64::from(front.from_cell)) {
+            adjusted.attacker_remaining = outcome.offered.saturating_sub(attacker_casualties);
+        }
         let limits = edge_runtime_limits(ctx, front.from_cell, front.to_cell)?
             .ok_or_else(|| "combat route became impassable".to_string())?;
         let front_defender_casualties = outcome.defender_casualties
-            + u64::from(extra_defender_casualty > 0 && front.from_cell == fronts[0].from_cell);
+            + u64::from(
+                extra_defender_casualty > 0 && front.from_cell == valid_fronts[0].from_cell,
+            );
         let front_key = format!("{}:{}:{}", front.attacker, front.from_cell, front.to_cell);
         let next_front = CombatFront {
             front_key: front_key.clone(),
@@ -1581,20 +1871,15 @@ fn resolve_target_combat(
     )?;
 
     if defender.infantry == 0 {
-        let capturing_front = surviving_by_front
-            .iter()
-            .filter(|(_, strength)| **strength > 0)
-            .max_by(|(left_cell, left_strength), (right_cell, right_strength)| {
-                left_strength
-                    .cmp(right_strength)
-                    .then_with(|| right_cell.cmp(left_cell))
-            })
-            .map(|(&cell, _)| cell);
-        if let Some(from_cell) = capturing_front {
-            let front = fronts
+        let (capturing_owner, capturing_front) = select_capture(&adjusted_outcomes);
+        if let (Some(owner), Some(front_id)) = (capturing_owner, capturing_front) {
+            let front = valid_fronts
                 .iter()
-                .find(|front| front.from_cell == from_cell)
+                .find(|front| u64::from(front.from_cell) == front_id)
                 .ok_or_else(|| "capturing front is missing".to_string())?;
+            if u32::from(front.attacker) != owner {
+                return Err("capture selection disagrees with its front owner".into());
+            }
             occupy_after_combat(ctx, packets, front, defender, logical_step)?;
         }
     }
@@ -1747,6 +2032,46 @@ fn record_expand_garrison_debt(
     Ok(())
 }
 
+/// Pure capture bookkeeping: the counter updates and the victory decision for
+/// one ownership change, independent of any database state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureAccounting {
+    /// Loser's counter after the change; `None` when the loser is neutral.
+    old_controlled: Option<u64>,
+    /// Winner's counter after the change; `None` when the winner is neutral.
+    new_controlled: Option<u64>,
+    /// True exactly when a non-neutral winner reaches `required_control`.
+    victory: bool,
+}
+
+fn capture_accounting(
+    old_owner: u16,
+    new_owner: u16,
+    old_controlled: u64,
+    new_controlled: u64,
+    required_control: u64,
+) -> Result<CaptureAccounting, String> {
+    let old_after = if old_owner == NEUTRAL_PLAYER {
+        None
+    } else {
+        Some(controlled_after_loss(old_controlled)?)
+    };
+    let new_after = if new_owner == NEUTRAL_PLAYER {
+        None
+    } else {
+        Some(
+            new_controlled
+                .checked_add(1)
+                .ok_or_else(|| "controlled-cell count overflow".to_string())?,
+        )
+    };
+    Ok(CaptureAccounting {
+        old_controlled: old_after,
+        new_controlled: new_after,
+        victory: new_after.is_some_and(|controlled| controlled >= required_control),
+    })
+}
+
 fn record_capture(
     ctx: &ReducerContext,
     cell_id: u32,
@@ -1768,39 +2093,77 @@ fn record_capture(
         .ownership_revision
         .checked_add(1)
         .ok_or_else(|| "ownership revision overflow".to_string())?;
-    if old_owner != NEUTRAL_PLAYER {
+    let old_controlled = if old_owner == NEUTRAL_PLAYER {
+        0
+    } else {
+        ctx.db
+            .player_state()
+            .player_id()
+            .find(old_owner)
+            .ok_or("captured player's state is missing")?
+            .controlled_cells
+    };
+    let new_controlled = if new_owner == NEUTRAL_PLAYER {
+        0
+    } else {
+        ctx.db
+            .player_state()
+            .player_id()
+            .find(new_owner)
+            .ok_or("capturing player's state is missing")?
+            .controlled_cells
+    };
+    let accounting = capture_accounting(
+        old_owner,
+        new_owner,
+        old_controlled,
+        new_controlled,
+        match_state.required_control,
+    )?;
+    if let Some(controlled) = accounting.old_controlled {
         let mut old_state = ctx
             .db
             .player_state()
             .player_id()
             .find(old_owner)
             .ok_or("captured player's state is missing")?;
-        old_state.controlled_cells = controlled_after_loss(old_state.controlled_cells)?;
+        old_state.controlled_cells = controlled;
         ctx.db.player_state().player_id().update(old_state);
     }
-    let controlled = if new_owner == NEUTRAL_PLAYER {
-        None
-    } else {
+    if let Some(controlled) = accounting.new_controlled {
         let mut new_state = ctx
             .db
             .player_state()
             .player_id()
             .find(new_owner)
             .ok_or("capturing player's state is missing")?;
-        new_state.controlled_cells = new_state
-            .controlled_cells
-            .checked_add(1)
-            .ok_or("controlled-cell count overflow")?;
-        let controlled = new_state.controlled_cells;
+        new_state.controlled_cells = controlled;
         ctx.db.player_state().player_id().update(new_state);
-        Some(controlled)
-    };
-    if controlled.is_some_and(|controlled| controlled >= match_state.required_control) {
+    }
+    if accounting.victory {
         match_state.phase = MatchPhase::Completed;
         match_state.winner_player_id = new_owner;
         match_state.completed_at_us = crate::timestamp_us(ctx);
     }
     ctx.db.match_state().singleton_id().update(match_state);
+
+    // Guard against the incremental counter drifting from real ownership.
+    // Callers update `CellState.owner_player_id` before recording the
+    // capture, and players can only own capturable cells, so an indexed
+    // recount of the winner's rows must equal the incremental counter.
+    #[cfg(debug_assertions)]
+    if let Some(controlled) = accounting.new_controlled {
+        let recounted = ctx
+            .db
+            .cell_state()
+            .state_by_owner()
+            .filter(new_owner)
+            .count() as u64;
+        debug_assert_eq!(
+            recounted, controlled,
+            "controlled_cells counter for player {new_owner} drifted from ownership recount"
+        );
+    }
     Ok(())
 }
 
@@ -1810,9 +2173,76 @@ fn controlled_after_loss(controlled_cells: u64) -> Result<u64, String> {
         .ok_or_else(|| "controlled-cell count underflow".to_owned())
 }
 
+/// Pure victory glue: when capture accounting reports victory, the match
+/// completes with `new_owner` as winner; otherwise the phase is unchanged.
+#[cfg(test)]
+fn match_state_after_capture(
+    phase: MatchPhase,
+    winner_player_id: u16,
+    new_owner: u16,
+    victory: bool,
+) -> (MatchPhase, u16) {
+    if victory {
+        (MatchPhase::Completed, new_owner)
+    } else {
+        (phase, winner_player_id)
+    }
+}
+
 const fn valid_owner(owner: u16, player_count: u16) -> bool {
     owner == NEUTRAL_PLAYER || (owner >= 1 && owner <= player_count)
 }
+
+/// Module min-casualty adjustment applied after the kernel resolution so a
+/// contested edge always shows at least one casualty on each engaged side.
+fn minimum_casualty(engaged: bool, casualties: u64, available: u64) -> u64 {
+    let extra = u64::from(engaged && casualties == 0 && available > 0);
+    casualties.saturating_add(extra).min(available)
+}
+
+/// Orders whose fronts the kernel rejected are attributable failures: park
+/// them while sibling valid fronts continue to resolve.
+#[cfg(test)]
+fn orders_for_rejected_fronts(
+    fronts: &[(u32, Vec<u64>)],
+    rejected_front_ids: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut orders = BTreeSet::new();
+    for &(from_cell, ref packet_orders) in fronts {
+        if rejected_front_ids.contains(&u64::from(from_cell)) {
+            orders.extend(packet_orders.iter().copied());
+        }
+    }
+    orders
+}
+
+/// Active orders participate in the tick; quarantined rows are parked and
+/// never re-enter movement/combat/finalize until an operator intervenes.
+#[cfg(test)]
+const fn order_participates_in_tick(status: OrderStatus) -> bool {
+    matches!(status, OrderStatus::Active)
+}
+
+/// Quarantined orders are exempt from the Completed/Cancelled retention prune
+/// so the operator-visible failure record survives.
+#[cfg(test)]
+const fn order_status_is_prunable_history(status: OrderStatus) -> bool {
+    matches!(status, OrderStatus::Completed | OrderStatus::Cancelled)
+}
+
+/// Named tick phases in the order `advance_simulation` executes them. Mid-tick
+/// quarantine of one order must not skip later phases for the remaining set.
+#[cfg(test)]
+const TICK_PHASES: &[&str] = &[
+    "packet_load",
+    "trim",
+    "branch",
+    "move",
+    "combat",
+    "finalize",
+    "population",
+    "prune",
+];
 
 fn advance_packet(
     ctx: &ReducerContext,
@@ -2391,8 +2821,16 @@ fn trim_all_overallocated_packets(
             if trim == 0 {
                 break;
             }
+            let order_id = packet.order_id;
             let lost = trim.min(packet.infantry);
-            reduce_packet_metadata(ctx, packet_state, packet, lost, logical_step, true)?;
+            if let Err(error) =
+                reduce_packet_metadata(ctx, packet_state, packet, lost, logical_step, true)
+            {
+                // Any residual over-allocation at this location is retried by
+                // the next tick's trim pass over post-quarantine state.
+                quarantine_order(ctx, packet_state, order_id, &error, logical_step);
+                break;
+            }
             trim -= lost;
         }
     }
@@ -2401,7 +2839,7 @@ fn trim_all_overallocated_packets(
 
 fn finalize_orders(
     ctx: &ReducerContext,
-    packets: &PacketTickState,
+    packets: &mut PacketTickState,
     logical_step: u64,
 ) -> Result<(), String> {
     let mut active_strength = BTreeMap::<u64, u64>::new();
@@ -2416,19 +2854,30 @@ fn finalize_orders(
         .collect();
     for mut order in orders {
         let in_transit = active_strength.get(&order.order_id).copied().unwrap_or(0);
-        let status = finalized_order_status(
+        let status = match finalized_order_status(
             order.committed_infantry,
             in_transit,
             order.delivered_infantry,
             order.casualty_infantry,
-        )
-        .map_err(|error| format!("order {} {error}", order.order_id))?;
+        ) {
+            Ok(status) => status,
+            Err(error) => {
+                // A per-order conservation violation is exactly the class of
+                // failure that used to freeze the match forever: the reducer
+                // rolled back and the scheduler re-ran the identical state.
+                // Park the offending order and let everything else continue.
+                let reason = format!("order {} {error}", order.order_id);
+                quarantine_order(ctx, packets, order.order_id, &reason, logical_step);
+                continue;
+            }
+        };
         let changed = order.in_transit_infantry != in_transit || order.status != status;
         if status == OrderStatus::Completed {
             order.in_transit_infantry = in_transit;
             order.status = status;
             complete_retreat_abandonments(ctx, packets, &order, logical_step)?;
             ctx.db.expansion_wave().order_id().delete(order.order_id);
+            clear_expansion_split_cursors(ctx, order.order_id);
             let route_ids = ctx
                 .db
                 .transit_route()
@@ -2811,7 +3260,6 @@ mod tests {
             order_id: 1,
             selected_cells: vec![2, 4],
             outside_depths: vec![u16::MAX, 1, u16::MAX, 2, u16::MAX],
-            split_cursors: vec![0; 5],
             focus_cell_id: None,
             target_cells: Vec::new(),
         };
@@ -3511,6 +3959,300 @@ mod tests {
         assert_eq!(
             controlled_after_loss(0),
             Err("controlled-cell count underflow".to_owned())
+        );
+    }
+
+    #[test]
+    fn capture_accounting_increments_and_decrements_both_counters() {
+        let taken_from_player = capture_accounting(2, 1, 10, 4, 100).unwrap();
+        assert_eq!(
+            taken_from_player,
+            CaptureAccounting {
+                old_controlled: Some(9),
+                new_controlled: Some(5),
+                victory: false,
+            }
+        );
+
+        let taken_from_neutral = capture_accounting(NEUTRAL_PLAYER, 1, 0, 4, 100).unwrap();
+        assert_eq!(taken_from_neutral.old_controlled, None);
+        assert_eq!(taken_from_neutral.new_controlled, Some(5));
+
+        let relinquished = capture_accounting(1, NEUTRAL_PLAYER, 4, 0, 3).unwrap();
+        assert_eq!(relinquished.old_controlled, Some(3));
+        assert_eq!(relinquished.new_controlled, None);
+    }
+
+    #[test]
+    fn victory_triggers_exactly_at_the_required_control_threshold() {
+        let below = capture_accounting(NEUTRAL_PLAYER, 1, 0, 98, 100).unwrap();
+        assert_eq!(below.new_controlled, Some(99));
+        assert!(!below.victory);
+
+        let exactly = capture_accounting(NEUTRAL_PLAYER, 1, 0, 99, 100).unwrap();
+        assert_eq!(exactly.new_controlled, Some(100));
+        assert!(exactly.victory);
+
+        let above = capture_accounting(2, 1, 5, 100, 100).unwrap();
+        assert_eq!(above.new_controlled, Some(101));
+        assert!(above.victory);
+    }
+
+    #[test]
+    fn neutral_captures_never_win_a_match_and_underflow_is_rejected() {
+        // Relinquishing to neutral can never produce a winner even when the
+        // "required control" is trivially low.
+        let to_neutral = capture_accounting(1, NEUTRAL_PLAYER, 4, u64::MAX, 0).unwrap();
+        assert!(!to_neutral.victory);
+
+        assert!(capture_accounting(1, 2, 0, 5, 100).is_err());
+        assert!(capture_accounting(1, 2, 5, u64::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn civilians_regrow_toward_capacity_with_a_minimum_of_one() {
+        // 200 bps of 50 missing civilians = 1 per interval.
+        let next = population_cell_transition(50, 100, 0, 100, 200, 0, 10, 0, false);
+        assert_eq!(
+            next,
+            PopulationTransition {
+                civilians: 51,
+                infantry: 0
+            }
+        );
+
+        // Tiny deficits still regrow by at least one, and never overshoot.
+        let almost_full = population_cell_transition(99, 100, 0, 100, 200, 0, 10, 0, false);
+        assert_eq!(almost_full.civilians, 100);
+        let full = population_cell_transition(100, 100, 0, 100, 200, 0, 10, 0, false);
+        assert_eq!(full.civilians, 100);
+    }
+
+    #[test]
+    fn mobilization_conserves_population_and_respects_every_bound() {
+        // 50% target of 100 population wants 50 infantry; the per-step budget
+        // caps conversion at 10 and total population is conserved (no growth:
+        // civilians already at capacity).
+        let next = population_cell_transition(100, 100, 0, 200, 200, 5_000, 10, 0, false);
+        assert_eq!(
+            next,
+            PopulationTransition {
+                civilians: 90,
+                infantry: 10
+            }
+        );
+        assert_eq!(next.civilians + next.infantry, 100);
+
+        // Military capacity headroom (including reservations) is respected.
+        let capped = population_cell_transition(100, 100, 47, 50, 200, 10_000, 100, 2, false);
+        assert_eq!(capped.infantry, 48);
+        assert_eq!(capped.civilians + capped.infantry, 147);
+
+        // Retreating edge cells never recruit.
+        let retreating = population_cell_transition(100, 100, 0, 200, 200, 5_000, 10, 0, true);
+        assert_eq!(retreating.infantry, 0);
+
+        // Rounding neither creates nor destroys population across a long run:
+        // each step's total change equals exactly the regrowth amount, which
+        // is bounded by the remaining civilian deficit.
+        let mut civilians = 73_u64;
+        let mut infantry = 9_u64;
+        for _ in 0..500 {
+            let before_total = civilians + infantry;
+            let deficit = 100 - civilians;
+            let next =
+                population_cell_transition(civilians, 100, infantry, 80, 150, 3_333, 7, 0, false);
+            let grown = next.civilians + next.infantry - before_total;
+            assert!(grown <= deficit, "growth is bounded by the deficit");
+            civilians = next.civilians;
+            infantry = next.infantry;
+            assert!(infantry <= 80, "military capacity is never exceeded");
+        }
+        // Deterministic fixed point: full civilian capacity plus the largest
+        // infantry count where the 33.33% target is already satisfied.
+        assert_eq!((civilians, infantry), (100, 49));
+    }
+
+    #[test]
+    fn lowering_the_mobilization_target_never_demobilizes() {
+        let mobilized = population_cell_transition(50, 100, 50, 200, 200, 0, 100, 0, false);
+        assert_eq!(mobilized.infantry, 50);
+        assert!(mobilized.civilians >= 50);
+
+        // Target of 10% wants 10 infantry but 50 are already mobilized: no
+        // conversion in either direction beyond regular regrowth.
+        let lowered = population_cell_transition(50, 100, 50, 200, 200, 1_000, 100, 0, false);
+        assert_eq!(lowered.infantry, 50);
+    }
+
+    #[test]
+    fn per_order_conservation_violations_map_to_quarantine_not_fail_stop() {
+        // The exact class of failure that used to freeze the match: an
+        // order's accounting no longer sums to its commitment. The finalize
+        // phase must classify this as attributable (quarantine) rather than
+        // propagate it out of the scheduled reducer.
+        let broken = finalized_order_status(100, 10, 50, 30);
+        assert!(broken.is_err(), "90 accounted of 100 committed must fail");
+        let overflow = finalized_order_status(100, u64::MAX, 1, 0);
+        assert!(overflow.is_err());
+
+        // Healthy orders keep their previous lifecycle transitions.
+        assert_eq!(
+            finalized_order_status(100, 0, 70, 30),
+            Ok(OrderStatus::Completed)
+        );
+        assert_eq!(
+            finalized_order_status(100, 10, 60, 30),
+            Ok(OrderStatus::Active)
+        );
+    }
+
+    #[test]
+    fn quarantined_orders_leave_the_tick_and_survive_history_prune() {
+        // Packet load and finalize only pull Active rows; a quarantined order
+        // therefore cannot re-enter movement/combat and re-fail the tick.
+        assert!(order_participates_in_tick(OrderStatus::Active));
+        assert!(!order_participates_in_tick(OrderStatus::Quarantined));
+        assert!(!order_participates_in_tick(OrderStatus::Completed));
+        assert!(!order_participates_in_tick(OrderStatus::Cancelled));
+
+        // Completed/Cancelled feedback rows age out; quarantined records are
+        // the operator-visible invariant failure and are never pruned by the
+        // retention pass.
+        assert!(order_status_is_prunable_history(OrderStatus::Completed));
+        assert!(order_status_is_prunable_history(OrderStatus::Cancelled));
+        assert!(!order_status_is_prunable_history(OrderStatus::Quarantined));
+        assert!(!order_status_is_prunable_history(OrderStatus::Active));
+        assert!(!order_history_is_prunable(100, 100 + ORDER_RETENTION_STEPS));
+        assert!(order_history_is_prunable(
+            100,
+            100 + ORDER_RETENTION_STEPS + 1
+        ));
+    }
+
+    #[test]
+    fn tick_phases_keep_finalize_population_and_prune_after_combat() {
+        // Mid-tick quarantine of one order must not skip later phases: the
+        // remaining orders still finalize, population still runs on cadence,
+        // and history prune still runs on its interval.
+        assert_eq!(
+            TICK_PHASES,
+            &[
+                "packet_load",
+                "trim",
+                "branch",
+                "move",
+                "combat",
+                "finalize",
+                "population",
+                "prune",
+            ]
+        );
+        let combat = TICK_PHASES
+            .iter()
+            .position(|phase| *phase == "combat")
+            .unwrap();
+        let finalize = TICK_PHASES
+            .iter()
+            .position(|phase| *phase == "finalize")
+            .unwrap();
+        let population = TICK_PHASES
+            .iter()
+            .position(|phase| *phase == "population")
+            .unwrap();
+        let prune = TICK_PHASES
+            .iter()
+            .position(|phase| *phase == "prune")
+            .unwrap();
+        assert!(combat < finalize && finalize < population && population < prune);
+    }
+
+    #[test]
+    fn rejected_fronts_quarantine_only_their_contributing_orders() {
+        let fronts = [(10_u32, vec![1_u64, 2]), (20, vec![3]), (30, vec![4, 5])];
+        let rejected = BTreeSet::from([10_u64, 30]);
+        let quarantined = orders_for_rejected_fronts(&fronts, &rejected);
+        assert_eq!(quarantined, BTreeSet::from([1, 2, 4, 5]));
+        // The sibling valid front's order is untouched and continues resolving.
+        assert!(!quarantined.contains(&3));
+    }
+
+    #[test]
+    fn module_min_casualty_adjustment_forces_one_on_engaged_sides() {
+        assert_eq!(minimum_casualty(true, 0, 50), 1);
+        assert_eq!(minimum_casualty(true, 7, 50), 7);
+        assert_eq!(minimum_casualty(false, 0, 50), 0);
+        assert_eq!(minimum_casualty(true, 0, 0), 0);
+        assert_eq!(minimum_casualty(true, 9, 5), 5);
+    }
+
+    #[test]
+    fn mixed_owner_kernel_capture_survives_module_min_casualty_adjustment() {
+        // Two owners attack one defender; after the module bumps sub-lethal
+        // attacker casualties by one, re-running select_capture must still
+        // pick the stronger surviving owner (mirrors resolve_target_combat).
+        let attacks = [
+            AttackFront {
+                id: 10,
+                attacker: 1,
+                from: Axial::new(1, 0),
+                from_elevation: 0,
+                offered: 20,
+                frontage: 25,
+            },
+            AttackFront {
+                id: 20,
+                attacker: 2,
+                from: Axial::new(0, 1),
+                from_elevation: 0,
+                offered: 40,
+                frontage: 25,
+            },
+        ];
+        let resolution =
+            resolve_edge_combat(Axial::ZERO, 30, 0, &attacks, &CombatConfig::default()).unwrap();
+        assert!(resolution.rejected.is_empty());
+        assert_eq!(resolution.defender_remaining, 0);
+        let mut adjusted = resolution.attacks.clone();
+        for outcome in adjusted.values_mut() {
+            let casualties = minimum_casualty(
+                outcome.engaged > 0 && outcome.defense_allocated > 0,
+                outcome.attacker_casualties,
+                outcome.offered,
+            );
+            outcome.attacker_remaining = outcome.offered.saturating_sub(casualties);
+        }
+        let (owner, front) = select_capture(&adjusted);
+        assert_eq!(owner, Some(2));
+        assert_eq!(front, Some(20));
+        // Default lethality already produces the same capture; the module
+        // re-run exists so a forced +1 casualty cannot flip the winner.
+        assert_eq!(owner, resolution.capturing_owner);
+        assert_eq!(front, resolution.capturing_front);
+    }
+
+    #[test]
+    fn victory_glue_completes_the_match_for_the_capturing_owner() {
+        let accounting = capture_accounting(NEUTRAL_PLAYER, 3, 0, 99, 100).unwrap();
+        assert!(accounting.victory);
+        assert_eq!(
+            match_state_after_capture(MatchPhase::Running, 0, 3, accounting.victory),
+            (MatchPhase::Completed, 3)
+        );
+
+        let short = capture_accounting(NEUTRAL_PLAYER, 3, 0, 50, 100).unwrap();
+        assert!(!short.victory);
+        assert_eq!(
+            match_state_after_capture(MatchPhase::Running, 0, 3, short.victory),
+            (MatchPhase::Running, 0)
+        );
+
+        // Relinquishing to neutral never completes the match.
+        let to_neutral = capture_accounting(1, NEUTRAL_PLAYER, 4, 0, 1).unwrap();
+        assert!(!to_neutral.victory);
+        assert_eq!(
+            match_state_after_capture(MatchPhase::Running, 0, NEUTRAL_PLAYER, to_neutral.victory),
+            (MatchPhase::Running, 0)
         );
     }
 }
