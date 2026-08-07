@@ -13,7 +13,7 @@ use match_bindings::{
     MatchPhase, MatchStateTableAccess, OrderStatus, PlayerSlotTableAccess, PlayerStateTableAccess,
     ReceiptStatus, TransferOrderTableAccess, TransitPacketTableAccess, configure_match as _,
     issue_attack_clusters as _, issue_expand_clusters as _, issue_front_rebalance as _,
-    join_match as _, set_mobilization_target as _,
+    join_match as _, set_mobilization_target as _, start_match as _,
 };
 use spacetimedb_sdk::{DbContext, Table};
 
@@ -143,6 +143,28 @@ impl Client {
                 self.conn
                     .reducers
                     .join_match_then(player, self.label.clone(), move |_, result| {
+                        let _ = tx.send(
+                            result
+                                .map_err(|error| error.to_string())
+                                .and_then(|inner| inner.map_err(|error| error.clone())),
+                        );
+                    })
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+            },
+            timeout,
+        )?;
+        result.map_err(anyhow::Error::msg)?;
+        Ok(rtt)
+    }
+
+    /// Starts a fully claimed lobby. Required after interactive lobby cutover —
+    /// seat claims no longer auto-enter Running.
+    pub fn start_match(&self, timeout: Duration) -> Result<Duration> {
+        let (rtt, result) = Self::call(
+            |tx| {
+                self.conn
+                    .reducers
+                    .start_match_then(move |_, result| {
                         let _ = tx.send(
                             result
                                 .map_err(|error| error.to_string())
