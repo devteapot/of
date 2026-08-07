@@ -5195,22 +5195,8 @@ fn logical_step(conn: &DbConnection) -> Result<u64> {
         .logical_step)
 }
 
-/// Live tick→quarantine→next-tick proof against a debug-harness-enabled match.
-fn run_quarantine_live_harness(client: &Client, timeout: Duration, poll: Duration) -> Result<()> {
-    println!("quarantine-live: stopping mobilization for a stable infantry baseline");
-    let mobilization_id = unused_command_id(&client.conn, PLAYER_ONE, COMMAND_ID_FLOOR)?;
-    client.set_mobilization_target(mobilization_id, 0, timeout)?;
-    wait_for_receipt(
-        client,
-        PLAYER_ONE,
-        mobilization_id,
-        "set_mobilization_target",
-        timeout,
-        poll,
-    )?;
-
-    let mut owned: Vec<(u32, u64, u64)> = client
-        .conn
+fn quarantine_reshape_pair(conn: &DbConnection) -> Result<(u32, u32)> {
+    let mut owned: Vec<(u32, u64, u64)> = conn
         .db
         .cell_state()
         .iter()
@@ -5235,21 +5221,15 @@ fn run_quarantine_live_harness(client: &Client, timeout: Duration, poll: Duratio
         .find(|(_, _, headroom)| *headroom > 0)
         .map(|(cell_id, _, _)| *cell_id)
         .context("quarantine harness found no owned target with headroom")?;
+    Ok((source, target))
+}
 
-    println!("quarantine-live: issuing reshape {source} -> {target} as the quarantine victim");
-    let reshape_id = unused_command_id(&client.conn, PLAYER_ONE, mobilization_id + 1)?;
-    client.issue_reshape(reshape_id, &[source], &[target], &[], timeout)?;
-    let receipt = wait_for_receipt(
-        client,
-        PLAYER_ONE,
-        reshape_id,
-        "issue_reshape",
-        timeout,
-        poll,
-    )?;
-    ensure!(receipt.order_id != 0, "reshape did not persist an order");
-    let order_id = receipt.order_id;
-
+fn wait_for_active_order_with_packets(
+    client: &Client,
+    order_id: u64,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<TransferOrder> {
     let active = wait_until("active reshape with packets", timeout, poll, || {
         let Some(order) = client.conn.db.transfer_order().order_id().find(&order_id) else {
             return Ok(None);
@@ -5267,15 +5247,17 @@ fn run_quarantine_live_harness(client: &Client, timeout: Duration, poll: Duratio
         active.in_transit_infantry > 0,
         "reshape never exposed in-transit infantry for the quarantine fault"
     );
+    Ok(active)
+}
 
-    let infantry_before = total_infantry(&client.conn);
-    let step_before = logical_step(&client.conn)?;
-    println!(
-        "quarantine-live: injecting conservation fault into order {order_id} at step {step_before} \
-         (world infantry {infantry_before})"
-    );
-    client.debug_break_order_conservation(order_id, timeout)?;
-
+fn assert_quarantine_conserved_and_ticking(
+    client: &Client,
+    order_id: u64,
+    infantry_before: u64,
+    step_before: u64,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
     let quarantined = wait_until("order quarantined by next ticks", timeout, poll, || {
         let Some(order) = client.conn.db.transfer_order().order_id().find(&order_id) else {
             return Ok(None);
@@ -5319,6 +5301,53 @@ fn run_quarantine_live_harness(client: &Client, timeout: Duration, poll: Duratio
          logical_step {step_before} -> {step_final}"
     );
     Ok(())
+}
+
+/// Live tick→quarantine→next-tick proof against a debug-harness-enabled match.
+fn run_quarantine_live_harness(client: &Client, timeout: Duration, poll: Duration) -> Result<()> {
+    println!("quarantine-live: stopping mobilization for a stable infantry baseline");
+    let mobilization_id = unused_command_id(&client.conn, PLAYER_ONE, COMMAND_ID_FLOOR)?;
+    client.set_mobilization_target(mobilization_id, 0, timeout)?;
+    wait_for_receipt(
+        client,
+        PLAYER_ONE,
+        mobilization_id,
+        "set_mobilization_target",
+        timeout,
+        poll,
+    )?;
+
+    let (source, target) = quarantine_reshape_pair(&client.conn)?;
+    println!("quarantine-live: issuing reshape {source} -> {target} as the quarantine victim");
+    let reshape_id = unused_command_id(&client.conn, PLAYER_ONE, mobilization_id + 1)?;
+    client.issue_reshape(reshape_id, &[source], &[target], &[], timeout)?;
+    let receipt = wait_for_receipt(
+        client,
+        PLAYER_ONE,
+        reshape_id,
+        "issue_reshape",
+        timeout,
+        poll,
+    )?;
+    ensure!(receipt.order_id != 0, "reshape did not persist an order");
+    let order_id = receipt.order_id;
+    wait_for_active_order_with_packets(client, order_id, timeout, poll)?;
+
+    let infantry_before = total_infantry(&client.conn);
+    let step_before = logical_step(&client.conn)?;
+    println!(
+        "quarantine-live: injecting conservation fault into order {order_id} at step {step_before} \
+         (world infantry {infantry_before})"
+    );
+    client.debug_break_order_conservation(order_id, timeout)?;
+    assert_quarantine_conserved_and_ticking(
+        client,
+        order_id,
+        infantry_before,
+        step_before,
+        timeout,
+        poll,
+    )
 }
 
 fn owner_snapshot(conn: &DbConnection) -> HashMap<u32, u16> {
