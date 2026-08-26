@@ -93,6 +93,14 @@ struct ClientArgs {
     /// Emit structured `[of.observe]` events to the log/console (env: `OF_OBSERVE`).
     #[arg(long)]
     observe: bool,
+
+    /// Write one offline-fixture PNG and exit. Native only.
+    #[arg(long, requires = "offline")]
+    screenshot: Option<PathBuf>,
+
+    /// Scene staged before `--screenshot` captures.
+    #[arg(long, requires = "screenshot", value_enum, default_value_t = ScreenshotScene::Idle)]
+    screenshot_scene: ScreenshotScene,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +109,15 @@ pub struct LayeredWorldOptions {
     pub height: u32,
     pub seed: u64,
     pub players: u16,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub enum ScreenshotScene {
+    #[default]
+    Idle,
+    ExpandHover,
+    AttackHover,
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -116,6 +133,10 @@ pub struct ClientConfig {
     pub auto_join: bool,
     /// Emit structured observe events to stderr / browser console.
     pub observe: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub screenshot_path: Option<std::path::PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub screenshot_scene: ScreenshotScene,
 }
 
 impl ClientConfig {
@@ -175,6 +196,8 @@ impl ClientConfig {
             profile,
             auto_join,
             observe: args.observe || env_flag("OF_OBSERVE"),
+            screenshot_path: args.screenshot,
+            screenshot_scene: args.screenshot_scene,
         }
     }
 

@@ -1061,6 +1061,7 @@ fn distribute_wave_strength(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn forecast_expand_wave(
     view: &MatchView,
     sources: &BTreeSet<Axial>,

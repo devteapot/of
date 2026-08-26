@@ -24,6 +24,8 @@ mod online;
 mod overlays;
 mod performance;
 mod population_outline;
+#[cfg(not(target_arch = "wasm32"))]
+mod screenshot;
 mod terrain;
 
 use bevy::{prelude::*, window::WindowResolution};
@@ -107,10 +109,10 @@ fn main() {
                 console_enabled: config.observe,
             },
         ))
-        .insert_resource(ClearColor(Color::srgb(0.018, 0.025, 0.031)))
+        .insert_resource(ClearColor(Color::srgb(0.28, 0.62, 0.86)))
         .insert_resource(GlobalAmbientLight {
-            color: Color::srgb(0.47, 0.56, 0.66),
-            brightness: 340.0,
+            color: Color::srgb(0.92, 0.78, 1.0),
+            brightness: 220.0,
             ..default()
         })
         .add_systems(Startup, (spawn_camera_and_light, spawn_terrain).chain())
@@ -129,6 +131,10 @@ fn main() {
         app.add_plugins(OfflineTransportPlugin);
     } else {
         app.add_plugins(OnlineTransportPlugin);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if config.screenshot_path.is_some() {
+        app.add_plugins(screenshot::OfflineScreenshotPlugin);
     }
     app.run();
 }

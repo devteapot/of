@@ -29,12 +29,18 @@ the command:
   still. The clicked hex is a focus, not a destination: closer/equal/farther
   branches receive mild 11/10/9 weights. The allocator gives every branch a positive
   baseline when the committed integer strength makes that possible.
+- Before that click, hovering valid unclaimed ground previews the same command:
+  participating perimeter cells are highlighted, 11/10/9 weights sit on those
+  branches, committed Share is labeled, and inland cells that contribute 0 are
+  dimmed. The hover does not change the dispatch, retask, or enter a ready mode.
 - Clicking an enemy hex dispatches **Attack Clusters** against that complete
   enemy traversable cluster. Every shared passable front between the selected
   sources and selected targets participates. Shift-click stages or toggles
   several complete enemy clusters without dispatching each one separately;
   Control-click removes a staged target, a plain enemy click adds it and submits
   the union, and `Enter` submits the staged union.
+- Hovering an enemy cluster previews the full target mask and the shared fronts
+  that will fire, again without dispatching.
 
 Attack does not retain one global direction. The authoritative order snapshots
 the target-cluster mask and branches from all initially shared fronts. Captured
@@ -116,6 +122,21 @@ disconnected source parts with no reachable target stay unchanged.
 selected clusters. Confirming stops only that explicit snapshot. `Escape`
 cancels a staged target, front rebalance, reshape, or stop preview; in idle mode
 it clears the cluster selection.
+
+## Compact command strip
+
+The bottom 52px strip is mode-switched. It never dumps the full grammar in one
+muted line:
+
+- Idle with no valid hover: cluster select (`C`) and the contextual click.
+  Shift/Control modifiers still work; they are not advertised until needed.
+- Share and `[` / `]` appear only while hovering a valid expand or attack
+  target, and in Front Rebalance / ready expand-attack states.
+- `T` appears only when exactly one complete cluster is selected and that
+  cluster has inland free infantry to reshape.
+- `X` appears only when live explicit orders intersect the selection.
+- `B` appears only when the selection is one complete cluster with at least two
+  strategic fronts.
 
 ## Deliberate V1 boundary
 

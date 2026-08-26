@@ -66,7 +66,9 @@ infantry, and action-committed infantry.
 Hovering or clicking valid neutral ground shows it as a focus, not a single-cell
 destination. The preview emphasizes all reachable neutral perimeter exits while
 using stronger arrows or intensity for branches approaching the focus and
-lighter treatment for equal/away branches.
+lighter treatment for equal/away branches. Branch weights `11` / `10` / `9` sit
+on those exits, committed Share is labeled, and inland cells that contribute 0
+are dimmed before the click.
 
 The presentation must avoid implying that the clicked hex alone will be filled.
 A short label such as “ALL PERIMETERS · FOCUS +q,-r · SHARE 40%” carries the
@@ -135,8 +137,9 @@ never promises a rewind, restored territory, or recovered casualties.
 
 The compact command strip switches between these states:
 
-1. **Idle / clusters selected** — contextual click hints, Share, `B`, `T`,
-   `X`, and selection keys.
+1. **Idle / clusters selected** — `C` and the contextual click. Share appears
+   only on a valid expand/attack hover; `B` only with two fronts; `T` only when
+   one cluster has inland free infantry; `X` only with live orders.
 2. **Attack targets staged** — target count, all shared fronts, LMB/Enter submit,
    Shift toggle, Control remove, Escape back.
 3. **Front Rebalance gesture** — source/target strategic fronts and release-to-preview.
@@ -199,9 +202,9 @@ yield cleanly to the authoritative snapshot.
 The first-run hint can fit in four lines:
 
 ```text
-C selects a whole owned cluster · Shift/Ctrl+C add/remove · Ctrl+A all
-LMB neutral expands all selected perimeters · LMB enemy attacks its cluster
-B then drag rebalances fronts · [ / ] Share · T reshape · X stop
+C selects a whole owned cluster · click after selecting
+Hover unclaimed: all perimeters, 11/10/9, Share · hover enemy: mask + fronts
+B then drag rebalances fronts when two exist · T reshape inland · X stop live orders
 ? opens the full field manual
 ```
 

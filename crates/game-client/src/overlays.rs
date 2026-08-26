@@ -8,25 +8,33 @@ use hex_core::{Axial, ChunkCoord};
 
 use crate::{
     camera::GameCamera,
-    geometry::{chunk_of, corner, edge_index_for_direction, world_center},
-    interaction::{InteractionState, OrderMode},
+    geometry::{
+        HEX_FILLET_ARC_POINTS, chunk_of, edge_index_for_direction, filleted_outline,
+        scaled_filleted_point, world_center,
+    },
+    interaction::{ContextualHover, InteractionState, OrderMode},
     model::{CellView, MatchView},
     terrain::TerrainChunk,
 };
 
-const SOURCE: Color = Color::srgb(0.44, 0.90, 0.94);
-const FRIENDLY: Color = Color::srgb(0.26, 0.78, 0.91);
-const HOSTILE: Color = Color::srgb(1.0, 0.39, 0.30);
-const AMBER: Color = Color::srgb(1.0, 0.69, 0.25);
-const RETASK: Color = Color::srgb(0.91, 0.54, 1.0);
-const BLOCKED: Color = Color::srgba(0.83, 0.35, 0.24, 0.72);
-const BRUSH_VALID: Color = Color::srgba(0.96, 0.98, 1.0, 0.92);
-const BRUSH_SELECTED: Color = Color::srgba(0.44, 0.90, 0.94, 0.92);
-const BRUSH_RETASK: Color = Color::srgba(0.91, 0.54, 1.0, 0.92);
-const BRUSH_BLOCKED: Color = Color::srgba(1.0, 0.69, 0.25, 0.88);
-const BRUSH_FOREIGN: Color = Color::srgba(1.0, 0.34, 0.24, 0.88);
-const BRUSH_OFF_MAP: Color = Color::srgba(0.48, 0.57, 0.61, 0.78);
-const SHAPE_TARGET: Color = Color::srgb(0.54, 0.94, 0.56);
+const SOURCE: Color = Color::srgb(0.18, 0.98, 0.92);
+const FRIENDLY: Color = Color::srgb(0.32, 0.94, 1.0);
+const HOSTILE: Color = Color::srgb(1.0, 0.28, 0.46);
+const AMBER: Color = Color::srgb(1.0, 0.82, 0.18);
+const RETASK: Color = Color::srgb(0.94, 0.42, 1.0);
+const BLOCKED: Color = Color::srgba(1.0, 0.32, 0.28, 0.82);
+const BRUSH_VALID: Color = Color::srgba(1.0, 0.98, 0.55, 0.94);
+const BRUSH_SELECTED: Color = Color::srgba(0.18, 0.98, 0.92, 0.94);
+const BRUSH_RETASK: Color = Color::srgba(0.94, 0.42, 1.0, 0.94);
+const BRUSH_BLOCKED: Color = Color::srgba(1.0, 0.78, 0.18, 0.90);
+const BRUSH_FOREIGN: Color = Color::srgba(1.0, 0.32, 0.42, 0.90);
+const BRUSH_OFF_MAP: Color = Color::srgba(0.62, 0.48, 0.92, 0.78);
+const SHAPE_TARGET: Color = Color::srgb(0.42, 1.0, 0.48);
+const INLAND: Color = Color::srgba(0.18, 0.12, 0.28, 0.62);
+const HOVER: Color = Color::srgb(1.0, 1.0, 1.0);
+const WEIGHT_TOWARD: Color = Color::srgb(1.0, 0.96, 0.22);
+const WEIGHT_EQUAL: Color = Color::srgb(1.0, 0.72, 0.18);
+const WEIGHT_AWAY: Color = Color::srgb(0.92, 0.48, 0.16);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrushCategory {
@@ -73,6 +81,7 @@ fn draw_world_overlays(
     mut gizmos: Gizmos,
 ) {
     let needs_visible_cells = interaction.has_selection()
+        || interaction.hovered.is_some()
         || !interaction.attack_targets.is_empty()
         || !interaction.preview.front_edges.is_empty()
         || !interaction.preview.wave_depth.is_empty()
@@ -80,7 +89,10 @@ fn draw_world_overlays(
         || !interaction.preview.delta_by_cell.is_empty()
         || !interaction.preview.component_routes.is_empty()
         || !interaction.preview.projected_sources.is_empty()
-        || !interaction.preview.excluded.is_empty();
+        || !interaction.preview.excluded.is_empty()
+        || !interaction.preview.inland.is_empty()
+        || !interaction.preview.hover_targets.is_empty()
+        || interaction.preview.contextual_hover != ContextualHover::None;
     scratch.cells.clear();
     if needs_visible_cells {
         append_visible_cell_coordinates(&visible, &chunks, &mut scratch.cells);
@@ -106,6 +118,7 @@ fn draw_world_overlays(
     }
     draw_blocked_cells(&view, &visible, &chunks, &mut gizmos);
     draw_selection(&view, &interaction, &scratch.cells, &mut gizmos);
+    draw_hover_cell(&view, &interaction, &mut gizmos);
     draw_preview(
         &view,
         &interaction,
@@ -378,9 +391,22 @@ fn draw_region_perimeter(
         };
         let center = point(cell, style.lift);
         let color = color_for(cell);
+        let mut exposed = [false; 6];
         for (direction, neighbor) in coordinate.neighbors().into_iter().enumerate() {
             if perimeter_edge_is_exposed(selection, neighbor) {
-                draw_hex_edge(gizmos, center, direction, style.scale, color);
+                exposed[edge_index_for_direction(direction)] = true;
+            }
+        }
+        for edge in 0..6 {
+            if exposed[edge] {
+                draw_filleted_hex_edge(
+                    gizmos,
+                    center,
+                    edge,
+                    style.scale,
+                    color,
+                    exposed[(edge + 5) % 6],
+                );
             }
         }
     }
@@ -390,6 +416,183 @@ fn perimeter_edge_is_exposed(selection: &BTreeSet<Axial>, neighbor: Axial) -> bo
     !selection.contains(&neighbor)
 }
 
+fn draw_hover_cell(view: &MatchView, interaction: &InteractionState, gizmos: &mut Gizmos) {
+    let Some(hovered) = interaction.hovered else {
+        return;
+    };
+    let Some(cell) = view.cell(hovered) else {
+        return;
+    };
+    draw_hex(gizmos, point(cell, 0.18), 1.04, HOVER);
+}
+
+fn draw_inland_cells(
+    view: &MatchView,
+    interaction: &InteractionState,
+    visible_cells: &[Axial],
+    gizmos: &mut Gizmos,
+) {
+    if interaction.preview.inland.is_empty() {
+        return;
+    }
+    for coordinate in visible_cells {
+        if !interaction.preview.inland.contains(coordinate) {
+            continue;
+        }
+        let Some(cell) = view.cell(*coordinate) else {
+            continue;
+        };
+        draw_hex(gizmos, point(cell, 0.08), 0.72, INLAND);
+        draw_segmented_hex(gizmos, point(cell, 0.10), 0.88, INLAND, 0.28);
+    }
+}
+
+fn draw_participating_perimeter(
+    view: &MatchView,
+    interaction: &InteractionState,
+    visible_cells: &[Axial],
+    gizmos: &mut Gizmos,
+) {
+    if !matches!(
+        interaction.preview.contextual_hover,
+        ContextualHover::Expand | ContextualHover::Attack
+    ) {
+        return;
+    }
+    let participating = interaction
+        .preview
+        .front_edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    if participating.is_empty() {
+        return;
+    }
+    draw_region_perimeter(
+        view,
+        &participating,
+        visible_cells,
+        PerimeterStyle {
+            lift: 0.20,
+            scale: 0.78,
+        },
+        |_| SOURCE,
+        gizmos,
+    );
+    for coordinate in visible_cells
+        .iter()
+        .filter(|coordinate| participating.contains(coordinate))
+    {
+        let Some(cell) = view.cell(*coordinate) else {
+            continue;
+        };
+        draw_hex(gizmos, point(cell, 0.16), 0.58, SOURCE);
+    }
+}
+
+fn draw_focus_marker(view: &MatchView, interaction: &InteractionState, gizmos: &mut Gizmos) {
+    let Some(focus) = interaction.preview.focus else {
+        return;
+    };
+    let Some(cell) = view.cell(focus) else {
+        return;
+    };
+    let center = point(cell, 0.22);
+    draw_hex(gizmos, center, 1.08, AMBER);
+    gizmos
+        .sphere(center + Vec3::Y * 0.08, 0.12, AMBER)
+        .resolution(5);
+}
+
+fn draw_branch_weight_labels(
+    view: &MatchView,
+    interaction: &InteractionState,
+    visible_chunks: &BTreeSet<ChunkCoord>,
+    gizmos: &mut Gizmos,
+) {
+    for edge in &interaction.preview.front_edges {
+        let Some(&weight) = interaction
+            .preview
+            .branch_weights
+            .get(&(edge.source, edge.target))
+        else {
+            continue;
+        };
+        if !edge_touches_visible_chunk(visible_chunks, edge.source, edge.target) {
+            continue;
+        }
+        let (Some(source), Some(target)) = (view.cell(edge.source), view.cell(edge.target)) else {
+            continue;
+        };
+        let label_at = point(source, 0.28).lerp(point(target, 0.28), 0.58);
+        draw_weight_digits(gizmos, label_at, weight, branch_weight_color(weight));
+    }
+}
+
+fn branch_weight_color(weight: u8) -> Color {
+    match weight {
+        11 => WEIGHT_TOWARD,
+        10 => WEIGHT_EQUAL,
+        _ => WEIGHT_AWAY,
+    }
+}
+
+/// Tiny 7-segment digits so 11/10/9 sit on the branch without a font atlas.
+fn draw_weight_digits(gizmos: &mut Gizmos, origin: Vec3, weight: u8, color: Color) {
+    let glyphs = match weight {
+        11 => [Some(1), Some(1)],
+        10 => [Some(1), Some(0)],
+        9 => [None, Some(9)],
+        _ => return,
+    };
+    let width = 0.09;
+    let gap = 0.04;
+    let start_x = -((glyphs.iter().flatten().count() as f32 - 1.0) * (width + gap) * 0.5);
+    for (index, glyph) in glyphs.into_iter().flatten().enumerate() {
+        let offset = Vec3::new(start_x + index as f32 * (width + gap), 0.0, 0.0);
+        draw_seven_segment(gizmos, origin + offset, width, 0.16, glyph, color);
+    }
+}
+
+fn draw_seven_segment(
+    gizmos: &mut Gizmos,
+    origin: Vec3,
+    width: f32,
+    height: f32,
+    digit: u8,
+    color: Color,
+) {
+    let half_w = width * 0.5;
+    let half_h = height * 0.5;
+    let top_left = origin + Vec3::new(-half_w, 0.0, -half_h);
+    let top_right = origin + Vec3::new(half_w, 0.0, -half_h);
+    let mid_left = origin + Vec3::new(-half_w, 0.0, 0.0);
+    let mid_right = origin + Vec3::new(half_w, 0.0, 0.0);
+    let bottom_left = origin + Vec3::new(-half_w, 0.0, half_h);
+    let bottom_right = origin + Vec3::new(half_w, 0.0, half_h);
+    let segments = match digit {
+        0 => [true, true, true, true, true, true, false],
+        1 => [false, true, true, false, false, false, false],
+        9 => [true, true, true, true, false, true, true],
+        _ => return,
+    };
+    // A, B, C, D, E, F, G
+    let lines = [
+        (top_left, top_right),
+        (top_right, mid_right),
+        (mid_right, bottom_right),
+        (bottom_left, bottom_right),
+        (bottom_left, mid_left),
+        (top_left, mid_left),
+        (mid_left, mid_right),
+    ];
+    for (on, (start, end)) in segments.into_iter().zip(lines) {
+        if on {
+            gizmos.line(start, end, color);
+        }
+    }
+}
+
 fn draw_preview(
     view: &MatchView,
     interaction: &InteractionState,
@@ -397,9 +600,32 @@ fn draw_preview(
     visible_chunks: &BTreeSet<ChunkCoord>,
     gizmos: &mut Gizmos,
 ) {
+    draw_inland_cells(view, interaction, visible_cells, gizmos);
+    draw_participating_perimeter(view, interaction, visible_cells, gizmos);
     draw_push_front_edges(view, interaction, visible_chunks, gizmos);
-    if matches!(interaction.mode, OrderMode::ExpandAllPreview) {
+    if matches!(interaction.mode, OrderMode::ExpandAllPreview)
+        || matches!(
+            interaction.preview.contextual_hover,
+            ContextualHover::Expand
+        )
+    {
         draw_expand_wave(view, interaction, visible_cells, gizmos);
+        draw_focus_marker(view, interaction, gizmos);
+        draw_branch_weight_labels(view, interaction, visible_chunks, gizmos);
+    }
+
+    if !interaction.preview.hover_targets.is_empty() {
+        draw_region_perimeter(
+            view,
+            &interaction.preview.hover_targets,
+            visible_cells,
+            PerimeterStyle {
+                lift: 0.17,
+                scale: 0.90,
+            },
+            |_| HOSTILE,
+            gizmos,
+        );
     }
 
     if !interaction.preview.heatmap.is_empty() {
@@ -567,17 +793,41 @@ fn draw_push_front_edges(
         else {
             continue;
         };
-        let color = push_front_edge_color(view.local_player, target.owner);
+        let color = interaction
+            .preview
+            .branch_weights
+            .get(&(edge.source, edge.target))
+            .copied()
+            .map_or_else(
+                || push_front_edge_color(view.local_player, target.owner),
+                branch_weight_color,
+            );
         let source_point = point(source, 0.155);
         let target_point = point(target, 0.155);
         draw_hex_edge(gizmos, source_point, direction, 1.025, color);
-        gizmos
-            .arrow(
-                source_point.lerp(target_point, 0.24),
-                source_point.lerp(target_point, 0.76),
-                color,
-            )
-            .with_tip_length(0.17);
+        let lanes: u32 = interaction
+            .preview
+            .branch_weights
+            .get(&(edge.source, edge.target))
+            .copied()
+            .map_or(1, |weight| match weight {
+                11 => 3,
+                10 => 2,
+                _ => 1,
+            });
+        let along = target_point - source_point;
+        let side = Vec3::new(-along.z, 0.0, along.x).normalize_or_zero() * 0.05;
+        let start = lanes.saturating_sub(1) as f32 * -0.5;
+        for lane in 0..lanes {
+            let offset = side * (start + lane as f32);
+            gizmos
+                .arrow(
+                    source_point.lerp(target_point, 0.24) + offset,
+                    source_point.lerp(target_point, 0.76) + offset,
+                    color,
+                )
+                .with_tip_length(0.17);
+        }
     }
 }
 
@@ -699,19 +949,49 @@ fn point(cell: &CellView, lift: f32) -> Vec3 {
 }
 
 fn draw_hex(gizmos: &mut Gizmos, center: Vec3, scale: f32, color: Color) {
-    let points = (0..6).map(|index| {
-        let full = corner(center, index, center.y);
-        center + (full - center) * scale
-    });
+    let points = filleted_outline(center, center.y)
+        .into_iter()
+        .map(|point| scaled_filleted_point(center, point, scale));
     gizmos.lineloop(points, color);
 }
 
 fn draw_hex_edge(gizmos: &mut Gizmos, center: Vec3, direction: usize, scale: f32, color: Color) {
-    let start_corner = edge_index_for_direction(direction);
-    let end_corner = (start_corner + 1) % 6;
-    let start = center + (corner(center, start_corner, center.y) - center) * scale;
-    let end = center + (corner(center, end_corner, center.y) - center) * scale;
-    gizmos.line(start, end, color);
+    draw_filleted_hex_edge(
+        gizmos,
+        center,
+        edge_index_for_direction(direction),
+        scale,
+        color,
+        false,
+    );
+}
+
+fn draw_filleted_hex_edge(
+    gizmos: &mut Gizmos,
+    center: Vec3,
+    edge: usize,
+    scale: f32,
+    color: Color,
+    include_start_fillet: bool,
+) {
+    let ring = filleted_outline(center, center.y);
+    let start_idx = edge * HEX_FILLET_ARC_POINTS + HEX_FILLET_ARC_POINTS - 1;
+    let end_idx = ((edge + 1) % 6) * HEX_FILLET_ARC_POINTS;
+    gizmos.line(
+        scaled_filleted_point(center, ring[start_idx], scale),
+        scaled_filleted_point(center, ring[end_idx], scale),
+        color,
+    );
+    if include_start_fillet {
+        let base = edge * HEX_FILLET_ARC_POINTS;
+        for sample in 0..HEX_FILLET_ARC_POINTS - 1 {
+            gizmos.line(
+                scaled_filleted_point(center, ring[base + sample], scale),
+                scaled_filleted_point(center, ring[base + sample + 1], scale),
+                color,
+            );
+        }
+    }
 }
 
 fn draw_segmented_hex(
@@ -721,11 +1001,12 @@ fn draw_segmented_hex(
     color: Color,
     segment_fraction: f32,
 ) {
-    for direction in 0..6 {
-        let start_corner = edge_index_for_direction(direction);
-        let end_corner = (start_corner + 1) % 6;
-        let start = center + (corner(center, start_corner, center.y) - center) * scale;
-        let end = center + (corner(center, end_corner, center.y) - center) * scale;
+    let ring = filleted_outline(center, center.y);
+    for edge in 0..6 {
+        let start_idx = edge * HEX_FILLET_ARC_POINTS + HEX_FILLET_ARC_POINTS - 1;
+        let end_idx = ((edge + 1) % 6) * HEX_FILLET_ARC_POINTS;
+        let start = scaled_filleted_point(center, ring[start_idx], scale);
+        let end = scaled_filleted_point(center, ring[end_idx], scale);
         let middle = start.lerp(end, 0.5);
         let half = segment_fraction.clamp(0.05, 0.95) * 0.5;
         gizmos.line(start.lerp(middle, 1.0 - half), middle, color);
@@ -894,6 +1175,15 @@ mod tests {
         assert_eq!(push_front_edge_color(1, Some(1)), FRIENDLY);
         assert_eq!(push_front_edge_color(1, None), AMBER);
         assert_eq!(push_front_edge_color(1, Some(2)), HOSTILE);
+    }
+
+    #[test]
+    fn branch_weight_colors_keep_11_10_9_distinct() {
+        assert_eq!(branch_weight_color(11), WEIGHT_TOWARD);
+        assert_eq!(branch_weight_color(10), WEIGHT_EQUAL);
+        assert_eq!(branch_weight_color(9), WEIGHT_AWAY);
+        assert_ne!(branch_weight_color(11), branch_weight_color(10));
+        assert_ne!(branch_weight_color(10), branch_weight_color(9));
     }
 
     #[test]

@@ -9,15 +9,15 @@ use crate::{
     model::{MatchPhase, MatchView},
 };
 
-const SCRIM: Color = Color::srgba(0.008, 0.014, 0.018, 0.88);
-const CARD: Color = Color::srgba(0.035, 0.052, 0.064, 0.985);
-const FIELD: Color = Color::srgb(0.055, 0.078, 0.092);
-const LINE: Color = Color::srgba(0.42, 0.58, 0.65, 0.55);
-const TEXT: Color = Color::srgb(0.88, 0.93, 0.95);
-const MUTED: Color = Color::srgb(0.57, 0.68, 0.72);
-const CYAN: Color = Color::srgb(0.40, 0.87, 0.91);
-const ACTIVE: Color = Color::srgb(0.10, 0.31, 0.35);
-const DISABLED: Color = Color::srgb(0.075, 0.085, 0.09);
+const SCRIM: Color = Color::srgba(0.10, 0.04, 0.18, 0.88);
+const CARD: Color = Color::srgba(0.14, 0.05, 0.24, 0.985);
+const FIELD: Color = Color::srgb(0.22, 0.08, 0.32);
+const LINE: Color = Color::srgba(1.0, 0.42, 0.78, 0.58);
+const TEXT: Color = Color::srgb(1.0, 0.97, 0.92);
+const MUTED: Color = Color::srgb(0.92, 0.78, 0.98);
+const CYAN: Color = Color::srgb(0.22, 0.98, 0.92);
+const ACTIVE: Color = Color::srgb(0.22, 0.12, 0.42);
+const DISABLED: Color = Color::srgb(0.12, 0.08, 0.14);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LobbyMapPreset {

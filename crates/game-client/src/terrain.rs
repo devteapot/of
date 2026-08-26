@@ -13,7 +13,11 @@ use bevy::{
 use hex_core::{Axial, ChunkCoord, TerrainKind};
 
 use crate::{
-    geometry::{COLUMN_FLOOR, cell_top, corner, edge_index_for_direction, world_center},
+    geometry::{
+        COLUMN_FLOOR, HEX_FILLET_ARC_POINTS, HEX_LIP_ARC_POINTS, HEX_LIP_RADIUS, HEX_OUTLINE_LEN,
+        cell_top, edge_index_for_direction, filleted_outline, hex_lip_normal, hex_lip_point,
+        world_center,
+    },
     map_view::{MapViewMode, normalized_cell_value, normalized_soldier_strength},
     model::{CellView, ContestedCellView, MatchView},
 };
@@ -258,8 +262,9 @@ pub fn spawn_terrain(
 ) {
     let material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
-        perceptual_roughness: 0.96,
+        perceptual_roughness: 0.18,
         metallic: 0.0,
+        reflectance: 0.72,
         ..default()
     });
     commands.insert_resource(TerrainMaterial(material.clone()));
@@ -466,60 +471,92 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
     let top_y = cell_top(cell.elevation, cell.is_water());
     let center = world_center(cell.coordinate, cell.elevation, cell.is_water());
     let top_color = cell_color(cell, view.contested_cells.get(&cell.coordinate), mode);
+    let outline = filleted_outline(center, top_y);
+    let inner = std::array::from_fn::<_, HEX_OUTLINE_LEN, _>(|index| {
+        hex_lip_point(center, outline[index], top_y, 0.0)
+    });
 
     let center_index = builder.vertex(cell.coordinate, center, Vec3::Y, top_color, 1.0);
-    let top_corners = std::array::from_fn::<_, 6, _>(|index| {
-        builder.vertex(
-            cell.coordinate,
-            corner(center, index, top_y),
-            Vec3::Y,
-            top_color,
-            1.0,
-        )
+    let rim = std::array::from_fn::<_, HEX_OUTLINE_LEN, _>(|index| {
+        builder.vertex(cell.coordinate, inner[index], Vec3::Y, top_color, 1.0)
     });
-    for index in 0..6 {
-        let next = (index + 1) % 6;
+    for index in 0..HEX_OUTLINE_LEN {
+        let next = (index + 1) % HEX_OUTLINE_LEN;
         // Clockwise winding in XZ points the normal toward +Y.
-        builder.triangle(
-            cell.coordinate,
-            center_index,
-            top_corners[next],
-            top_corners[index],
-        );
+        builder.triangle(cell.coordinate, center_index, rim[next], rim[index]);
     }
 
+    let mut neighbor_top = [COLUMN_FLOOR; 6];
     for (direction, neighbor_coord) in cell.coordinate.neighbors().into_iter().enumerate() {
-        let neighbor_top = view.cell(neighbor_coord).map_or(COLUMN_FLOOR, |neighbor| {
-            cell_top(neighbor.elevation, neighbor.is_water())
-        });
-        let bottom_y = if neighbor_top + 0.015 < top_y {
-            neighbor_top.max(COLUMN_FLOOR)
+        neighbor_top[edge_index_for_direction(direction)] =
+            view.cell(neighbor_coord).map_or(COLUMN_FLOOR, |neighbor| {
+                cell_top(neighbor.elevation, neighbor.is_water())
+            });
+    }
+
+    let lip = std::array::from_fn::<_, HEX_OUTLINE_LEN, _>(|index| {
+        std::array::from_fn::<_, HEX_LIP_ARC_POINTS, _>(|sample| {
+            let t = sample as f32 / (HEX_LIP_ARC_POINTS - 1) as f32;
+            let position = hex_lip_point(center, outline[index], top_y, t);
+            let normal = hex_lip_normal(center, outline[index], t);
+            let shade_factor = 1.0 - t * 0.08;
+            builder.vertex(
+                cell.coordinate,
+                position,
+                normal,
+                shade(top_color, shade_factor),
+                shade_factor,
+            )
+        })
+    });
+    for index in 0..HEX_OUTLINE_LEN {
+        let next = (index + 1) % HEX_OUTLINE_LEN;
+        for sample in 0..HEX_LIP_ARC_POINTS - 1 {
+            let d = lip[index][sample];
+            let c = lip[next][sample];
+            let a = lip[index][sample + 1];
+            let b = lip[next][sample + 1];
+            builder.triangle(cell.coordinate, a, c, b);
+            builder.triangle(cell.coordinate, a, d, c);
+        }
+    }
+
+    for index in 0..HEX_OUTLINE_LEN {
+        let next = (index + 1) % HEX_OUTLINE_LEN;
+        let vertex = index / HEX_FILLET_ARC_POINTS;
+        let along_arc = index % HEX_FILLET_ARC_POINTS;
+        let facing_top = if along_arc == HEX_FILLET_ARC_POINTS - 1 {
+            neighbor_top[vertex]
+        } else {
+            neighbor_top[(vertex + 5) % 6].min(neighbor_top[vertex])
+        };
+        let bottom_y = if facing_top + 0.015 < top_y {
+            facing_top.max(COLUMN_FLOOR)
         } else {
             (top_y - 0.065).max(COLUMN_FLOOR)
         };
-        if bottom_y >= top_y {
+        let wall_top_y = top_y - HEX_LIP_RADIUS;
+        if bottom_y >= wall_top_y {
             continue;
         }
 
-        let edge = edge_index_for_direction(direction);
-        let next = (edge + 1) % 6;
-        let top_a = corner(center, edge, top_y);
-        let top_b = corner(center, next, top_y);
-        let bottom_a = corner(center, edge, bottom_y);
-        let bottom_b = corner(center, next, bottom_y);
+        let top_a = hex_lip_point(center, outline[index], top_y, 1.0);
+        let top_b = hex_lip_point(center, outline[next], top_y, 1.0);
+        let bottom_a = Vec3::new(top_a.x, bottom_y, top_a.z);
+        let bottom_b = Vec3::new(top_b.x, bottom_y, top_b.z);
         let normal = Vec3::new(
             (top_a.x + top_b.x) * 0.5 - center.x,
             0.0,
             (top_a.z + top_b.z) * 0.5 - center.z,
         )
         .normalize();
-        let depth = ((top_y - bottom_y) / 2.4).clamp(0.0, 1.0);
-        let side_shade = 0.52 - depth * 0.12;
+        let depth = ((wall_top_y - bottom_y) / 2.4).clamp(0.0, 1.0);
+        let side_shade = 0.78 - depth * 0.10;
         let side_color = shade(top_color, side_shade);
         let a = builder.vertex(cell.coordinate, bottom_a, normal, side_color, side_shade);
         let b = builder.vertex(cell.coordinate, bottom_b, normal, side_color, side_shade);
-        let c = builder.vertex(cell.coordinate, top_b, normal, shade(top_color, 0.68), 0.68);
-        let d = builder.vertex(cell.coordinate, top_a, normal, shade(top_color, 0.68), 0.68);
+        let c = builder.vertex(cell.coordinate, top_b, normal, shade(top_color, 0.92), 0.92);
+        let d = builder.vertex(cell.coordinate, top_a, normal, shade(top_color, 0.92), 0.92);
         builder.triangle(cell.coordinate, a, c, b);
         builder.triangle(cell.coordinate, a, d, c);
     }
@@ -559,9 +596,9 @@ fn recolor_chunk_mesh(
 fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapViewMode) -> [f32; 4] {
     let base = if cell.is_water() {
         if cell.lake {
-            Color::srgb(0.075, 0.27, 0.31)
+            Color::srgb(0.18, 0.78, 0.92)
         } else {
-            Color::srgb(0.055, 0.16, 0.21)
+            Color::srgb(0.08, 0.46, 0.86)
         }
     } else {
         match cell.owner {
@@ -584,12 +621,12 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
     if cell.river && cell.is_land() {
         linear = mix_linear_rgba(
             linear,
-            LinearRgba::from(Color::srgb(0.055, 0.34, 0.43)),
-            0.46,
+            LinearRgba::from(Color::srgb(0.12, 0.72, 0.95)),
+            0.38,
         );
     }
     let intensity = match mode {
-        MapViewMode::Overview => 0.42,
+        MapViewMode::Overview => 0.35,
         MapViewMode::Soldiers => normalized_soldier_strength(
             cell.infantry
                 .saturating_add(contest.map_or(0, |contest| contest.attacker_strength)),
@@ -598,11 +635,11 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
     };
     let terrain_light = match cell.terrain {
         TerrainKind::Plains => 1.0,
-        TerrainKind::Hills => 0.92,
-        TerrainKind::Mountain => 0.80,
-        TerrainKind::Water => 0.82,
+        TerrainKind::Hills => 0.94,
+        TerrainKind::Mountain => 0.88,
+        TerrainKind::Water => 0.90,
     };
-    let ownership_readability = 0.58 + intensity * 0.68;
+    let ownership_readability = 0.78 + intensity * 0.20;
     linear.red = (linear.red * ownership_readability * terrain_light + intensity * 0.035).min(1.0);
     linear.green =
         (linear.green * ownership_readability * terrain_light + intensity * 0.045).min(1.0);
@@ -611,14 +648,14 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
 }
 
 const PLAYER_PALETTE: [(f32, f32, f32); 8] = [
-    (0.06, 0.48, 0.58),
-    (0.76, 0.24, 0.16),
-    (0.50, 0.32, 0.78),
-    (0.75, 0.62, 0.12),
-    (0.20, 0.62, 0.30),
-    (0.86, 0.34, 0.62),
-    (0.25, 0.43, 0.86),
-    (0.72, 0.43, 0.18),
+    (0.12, 0.82, 0.94),
+    (1.00, 0.28, 0.42),
+    (0.72, 0.38, 1.00),
+    (1.00, 0.86, 0.16),
+    (0.28, 0.94, 0.42),
+    (1.00, 0.42, 0.78),
+    (0.28, 0.52, 1.00),
+    (1.00, 0.55, 0.16),
 ];
 
 fn player_color(player: u32) -> Option<Color> {
@@ -632,8 +669,8 @@ fn player_color(player: u32) -> Option<Color> {
     // Golden-ratio hue walk keeps neighbors visually distinct without a table.
     let index = player - 1;
     let hue = ((index as f32) * 0.618_034).fract();
-    let saturation = 0.55 + 0.25 * (((index * 3) % 5) as f32 / 4.0);
-    let lightness = 0.42 + 0.16 * (((index * 5) % 4) as f32 / 3.0);
+    let saturation = 0.72 + 0.18 * (((index * 3) % 5) as f32 / 4.0);
+    let lightness = 0.52 + 0.12 * (((index * 5) % 4) as f32 / 3.0);
     Some(hsl_color(hue, saturation, lightness))
 }
 
@@ -655,10 +692,10 @@ fn hsl_color(hue: f32, saturation: f32, lightness: f32) -> Color {
 
 fn terrain_color(terrain: TerrainKind) -> Color {
     match terrain {
-        TerrainKind::Plains => Color::srgb(0.39, 0.43, 0.30),
-        TerrainKind::Hills => Color::srgb(0.42, 0.38, 0.25),
-        TerrainKind::Mountain => Color::srgb(0.36, 0.35, 0.31),
-        TerrainKind::Water => Color::srgb(0.055, 0.16, 0.21),
+        TerrainKind::Plains => Color::srgb(0.55, 0.92, 0.32),
+        TerrainKind::Hills => Color::srgb(0.98, 0.72, 0.22),
+        TerrainKind::Mountain => Color::srgb(0.78, 0.62, 0.94),
+        TerrainKind::Water => Color::srgb(0.08, 0.46, 0.86),
     }
 }
 
@@ -752,6 +789,29 @@ mod tests {
     }
 
     #[test]
+    fn player_and_terrain_colors_stay_saturated_for_the_plastic_look() {
+        let chroma = |color: Color| {
+            let [r, g, b, _] = LinearRgba::from(color).to_f32_array();
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            max - min
+        };
+        for player in 1..=8 {
+            assert!(
+                chroma(player_color(player).expect("palette")) > 0.25,
+                "player {player} is too gray for the plastic pass"
+            );
+        }
+        assert!(chroma(terrain_color(TerrainKind::Plains)) > 0.20);
+        assert!(chroma(terrain_color(TerrainKind::Hills)) > 0.20);
+        let overview = cell_color(&test_cell(0, 0, 100), None, MapViewMode::Overview);
+        assert!(
+            overview[..3].iter().sum::<f32>() > 0.9,
+            "overview hexes should stay bright: {overview:?}"
+        );
+    }
+
+    #[test]
     fn every_supported_player_has_a_distinct_color() {
         let colors = (1..=8)
             .map(|player| player_color(player).expect("supported player color"))
@@ -764,8 +824,8 @@ mod tests {
         assert!(player_color(500).is_some());
         assert!(player_color(501).is_none());
         // Curated first-eight palette stays pinned.
-        assert_eq!(player_color(1), Some(Color::srgb(0.06, 0.48, 0.58)));
-        assert_eq!(player_color(2), Some(Color::srgb(0.76, 0.24, 0.16)));
+        assert_eq!(player_color(1), Some(Color::srgb(0.12, 0.82, 0.94)));
+        assert_eq!(player_color(2), Some(Color::srgb(1.00, 0.28, 0.42)));
     }
 
     #[test]
@@ -919,15 +979,26 @@ mod tests {
     fn contested_soldier_shading_includes_attacker_pressure() {
         let cell = test_cell(25, 0, 100);
         let uncontested = cell_color(&cell, None, MapViewMode::Soldiers);
-        let contest = ContestedCellView {
+        let contest = |attacker_strength| ContestedCellView {
             controller_player: PLAYER_ONE,
             attacker_player: PLAYER_TWO,
-            attacker_strength: 75,
+            attacker_strength,
             attacker_share: 0.75,
         };
-        let contested = cell_color(&cell, Some(&contest), MapViewMode::Soldiers);
+        let hue_only = cell_color(&cell, Some(&contest(0)), MapViewMode::Soldiers);
+        let with_pressure = cell_color(&cell, Some(&contest(75)), MapViewMode::Soldiers);
 
-        assert!(contested[..3].iter().sum::<f32>() > uncontested[..3].iter().sum::<f32>());
+        assert!(
+            hue_only
+                .iter()
+                .zip(uncontested)
+                .any(|(left, right)| (*left - right).abs() > 1.0e-6),
+            "attacker share should still tint the cell: {hue_only:?} vs {uncontested:?}"
+        );
+        assert!(
+            with_pressure[..3].iter().sum::<f32>() > hue_only[..3].iter().sum::<f32>(),
+            "added attacker infantry should raise soldier intensity at the same mix: {with_pressure:?} vs {hue_only:?}"
+        );
     }
 
     #[test]
