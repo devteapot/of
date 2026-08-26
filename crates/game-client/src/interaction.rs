@@ -413,6 +413,11 @@ fn visible_push_drag(start: Option<Vec2>, current: Option<Vec2>) -> bool {
         .is_some_and(|(start, current)| start.distance(current) >= PUSH_DRAG_THRESHOLD_PIXELS)
 }
 
+/// Screenshot / fixture helper: skip live picking and keep this hover.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Clone, Copy, Debug)]
+pub(crate) struct ForcedMapHover(pub Option<Axial>);
+
 #[derive(Resource, Debug)]
 pub struct InteractionState {
     pub hovered: Option<Axial>,
@@ -567,7 +572,24 @@ fn update_hovered_cell(
     chunks: Query<&TerrainChunk>,
     mut ray_cast: MeshRayCast,
     mut interaction: ResMut<InteractionState>,
+    #[cfg(not(target_arch = "wasm32"))] forced_hover: Option<Res<ForcedMapHover>>,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(forced) = forced_hover.as_deref() {
+        match forced.0 {
+            None => {
+                interaction.hovered = None;
+                interaction.cursor_world = None;
+            }
+            Some(coordinate) => {
+                let plane = axial_to_plane(coordinate);
+                interaction.hovered = Some(coordinate);
+                interaction.last_map_hovered = Some(coordinate);
+                interaction.cursor_world = Some(Vec3::new(plane.x, 0.5, plane.y));
+            }
+        }
+        return;
+    }
     let pointer_over_ui = pointers.iter().any(|pointer| {
         pointer
             .get_nearest_hit()

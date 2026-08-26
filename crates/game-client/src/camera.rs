@@ -27,6 +27,12 @@ impl Default for CameraRig {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn look_at_world(rig: &mut CameraRig, transform: &mut Transform, focus: Vec3) {
+    rig.focus = focus;
+    *transform = rig_transform(rig);
+}
+
 pub fn spawn_camera_and_light(mut commands: Commands) {
     let rig = CameraRig::default();
     let transform = rig_transform(&rig);

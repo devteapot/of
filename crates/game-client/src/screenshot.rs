@@ -7,13 +7,15 @@ use bevy::{
 use hex_core::Axial;
 
 use crate::{
+    camera::{CameraRig, GameCamera, look_at_world},
     config::{ClientConfig, ScreenshotScene},
-    interaction::InteractionState,
+    geometry::axial_to_plane,
+    interaction::{ForcedMapHover, InteractionState},
     model::{MatchView, PLAYER_ONE, PLAYER_TWO},
 };
 
-const WARMUP: u32 = 40;
-const SETTLE: u32 = 18;
+const WARMUP: u32 = 48;
+const SETTLE: u32 = 24;
 
 #[derive(Resource, Debug)]
 struct CapturePlan {
@@ -48,10 +50,20 @@ fn stage_and_capture(
     mut plan: ResMut<CapturePlan>,
     mut interaction: ResMut<InteractionState>,
     mut view: ResMut<MatchView>,
+    camera: Option<Single<(&mut CameraRig, &mut Transform, &mut Projection), With<GameCamera>>>,
 ) {
     plan.frames = plan.frames.saturating_add(1);
     if !plan.staged && plan.frames >= WARMUP {
-        stage_scene(&mut view, &mut interaction, plan.scene);
+        let focus = stage_scene(&mut commands, &mut view, &mut interaction, plan.scene);
+        if let Some(camera) = camera {
+            let (mut rig, mut transform, mut projection) = camera.into_inner();
+            look_at_world(&mut rig, &mut transform, focus);
+            if !matches!(plan.scene, ScreenshotScene::Idle)
+                && let Projection::Orthographic(orthographic) = &mut *projection
+            {
+                orthographic.scale = 0.52;
+            }
+        }
         plan.staged = true;
     }
     if plan.staged && !plan.requested && plan.frames >= WARMUP + SETTLE {
@@ -82,51 +94,59 @@ fn drain_exit(
     }
 }
 
-fn stage_scene(view: &mut MatchView, interaction: &mut InteractionState, scene: ScreenshotScene) {
+fn stage_scene(
+    commands: &mut Commands,
+    view: &mut MatchView,
+    interaction: &mut InteractionState,
+    scene: ScreenshotScene,
+) -> Vec3 {
     match scene {
         ScreenshotScene::Idle => {
-            interaction.hovered = None;
             interaction.sources.clear();
             interaction.source_revision = interaction.source_revision.wrapping_add(1);
             interaction.invalidate_preview();
+            commands.insert_resource(ForcedMapHover(None));
+            Vec3::new(0.0, 0.45, 0.0)
         }
         ScreenshotScene::ExpandHover => {
-            let seed = Axial::new(-8, 0);
-            let cluster = owned_cluster(view, seed);
-            let focus = cluster
-                .iter()
-                .flat_map(|coordinate| coordinate.neighbors())
-                .find(|neighbor| {
-                    view.cell(*neighbor)
-                        .is_some_and(|cell| cell.owner.is_none() && view.is_capturable(*neighbor))
-                })
-                .unwrap_or(Axial::new(-4, 0));
-            interaction.sources = cluster;
-            interaction.hovered = Some(focus);
-            interaction.last_map_hovered = Some(focus);
+            let focus = Axial::new(-4, 0);
+            let seed = Axial::new(-5, 0);
+            interaction.sources = owned_cluster(view, seed);
             interaction.source_revision = interaction.source_revision.wrapping_add(1);
             interaction.invalidate_preview();
+            commands.insert_resource(ForcedMapHover(Some(focus)));
+            world_focus(view, focus)
         }
         ScreenshotScene::AttackHover => {
+            let inland = Axial::new(4, 0);
             let contact = Axial::new(5, 0);
             let enemy = Axial::new(6, 0);
-            if let Some(cell) = view.cells.get_mut(&contact) {
-                cell.owner = Some(PLAYER_ONE);
-                cell.infantry = cell.military_capacity.min(40);
-            }
-            if let Some(cell) = view.cells.get_mut(&enemy) {
+            claim_screenshot_cell(view, inland, PLAYER_ONE, 40);
+            claim_screenshot_cell(view, contact, PLAYER_ONE, 40);
+            if let Some(cell) = view.cell_mut(enemy) {
                 cell.owner = Some(PLAYER_TWO);
             }
-            view.ownership_revision = view.ownership_revision.wrapping_add(1);
-            view.planning_revision = view.planning_revision.wrapping_add(1);
-            view.cell_state_revision = view.cell_state_revision.wrapping_add(1);
-            interaction.sources = BTreeSet::from([contact]);
-            interaction.hovered = Some(enemy);
-            interaction.last_map_hovered = Some(enemy);
+            view.mark_ownership_changed();
+            interaction.sources = BTreeSet::from([inland, contact]);
             interaction.source_revision = interaction.source_revision.wrapping_add(1);
             interaction.invalidate_preview();
+            commands.insert_resource(ForcedMapHover(Some(enemy)));
+            world_focus(view, contact)
         }
     }
+}
+
+fn claim_screenshot_cell(view: &mut MatchView, coordinate: Axial, owner: u32, infantry: u64) {
+    if let Some(cell) = view.cell_mut(coordinate) {
+        cell.owner = Some(owner);
+        cell.infantry = cell.military_capacity.min(infantry);
+    }
+}
+
+fn world_focus(view: &MatchView, coordinate: Axial) -> Vec3 {
+    let plane = axial_to_plane(coordinate);
+    let elevation = view.cell(coordinate).map_or(1, |cell| cell.elevation);
+    Vec3::new(plane.x, 0.45 + f32::from(elevation) * 0.18, plane.y)
 }
 
 fn owned_cluster(view: &MatchView, seed: Axial) -> BTreeSet<Axial> {
