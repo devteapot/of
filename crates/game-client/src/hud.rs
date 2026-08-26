@@ -612,7 +612,7 @@ fn command_bar_copy(
             format!(
                 "{} TARGET HEX{}  ·  SHARE {:>3}%{contextual_status}",
                 interaction.attack_targets.len(),
-                plural(interaction.attack_targets.len()),
+                hex_plural(interaction.attack_targets.len()),
                 interaction.amount_percent,
             ),
             "Shift+LMB toggle cluster  ·  Ctrl+LMB remove  ·  [ / ] Share  ·  LMB/Enter dispatch union  ·  Esc cancel".to_owned(),
@@ -662,7 +662,7 @@ fn command_bar_copy(
             format!(
                 "{} DESTINATION HEX{}  ·  BRUSH {}x{}+{}  ·  FREE TROOPS  ·  ONE CLUSTER",
                 interaction.shape_targets.len(),
-                plural(interaction.shape_targets.len()),
+                hex_plural(interaction.shape_targets.len()),
                 interaction.brush.width(),
                 interaction.brush.height(),
                 interaction.brush.rings(),
@@ -684,7 +684,7 @@ fn command_bar_copy(
                 format!(
                     "{} DESTINATION HEX{}  ·  FIT {} / CAP {}  ·  EXACT",
                     interaction.shape_targets.len(),
-                    plural(interaction.shape_targets.len()),
+                    hex_plural(interaction.shape_targets.len()),
                     interaction.preview.reshape_destination_strength,
                     interaction.preview.destination_capacity,
                 )
@@ -734,7 +734,7 @@ fn idle_command_bar_copy(
         ContextualHover::Attack if valid_hover => format!(
             "TARGET MASK  ·  {} HEX{}  ·  SHARE {:>3}%  ·  {} FRONT{}{contextual_status}",
             interaction.preview.hover_targets.len(),
-            plural(interaction.preview.hover_targets.len()),
+            hex_plural(interaction.preview.hover_targets.len()),
             interaction.amount_percent,
             interaction.preview.front_edges.len(),
             plural(interaction.preview.front_edges.len()),
@@ -1139,6 +1139,10 @@ const fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "S" }
 }
 
+const fn hex_plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "ES" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,7 +1201,7 @@ mod tests {
         let (_, summary, hints) = command_bar_copy(&interaction, HudContext::Idle);
 
         assert!(summary.contains("TARGET MASK"));
-        assert!(summary.contains("2 HEXS"));
+        assert!(summary.contains("2 HEXES"));
         assert!(summary.contains("SHARE  30%"));
         assert!(summary.contains("1 FRONT"));
         assert!(hints.contains("[ / ] Share"));
