@@ -8,6 +8,11 @@ pub const HEX_FILLET_RADIUS: f32 = HEX_RADIUS * 0.16;
 /// Samples along each vertex arc, including both tangent endpoints.
 pub const HEX_FILLET_ARC_POINTS: usize = 3;
 pub const HEX_OUTLINE_LEN: usize = 6 * HEX_FILLET_ARC_POINTS;
+/// Quarter-circle from the flat top onto the vertical wall. Smaller than the
+/// plan fillet so the column still reads as a step, not a pebble.
+pub const HEX_LIP_RADIUS: f32 = HEX_RADIUS * 0.06;
+/// Samples along the top-to-side lip, including both endpoints.
+pub const HEX_LIP_ARC_POINTS: usize = 3;
 pub const ELEVATION_STEP: f32 = 0.36;
 pub const SEA_LEVEL: f32 = 0.02;
 pub const COLUMN_FLOOR: f32 = -0.42;
@@ -96,6 +101,26 @@ pub fn scaled_filleted_point(center: Vec3, point: Vec3, scale: f32) -> Vec3 {
     center + (point - center) * scale
 }
 
+/// `t = 0` is the inset top rim; `t = 1` is the outer wall just below the top.
+/// The column base is not rounded.
+pub fn hex_lip_point(center: Vec3, outline: Vec3, top_y: f32, t: f32) -> Vec3 {
+    let outward = hex_lip_outward(center, outline);
+    let radius = HEX_LIP_RADIUS;
+    let focus = Vec3::new(outline.x, top_y, outline.z) - outward * radius - Vec3::Y * radius;
+    let theta = t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+    focus + outward * radius * theta.sin() + Vec3::Y * radius * theta.cos()
+}
+
+pub fn hex_lip_normal(center: Vec3, outline: Vec3, t: f32) -> Vec3 {
+    let outward = hex_lip_outward(center, outline);
+    let theta = t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+    (outward * theta.sin() + Vec3::Y * theta.cos()).normalize_or_zero()
+}
+
+fn hex_lip_outward(center: Vec3, outline: Vec3) -> Vec3 {
+    Vec3::new(outline.x - center.x, 0.0, outline.z - center.z).normalize_or_zero()
+}
+
 fn fillet_arc_point(focus: Vec3, start: Vec3, end: Vec3, t: f32) -> Vec3 {
     let from = Vec2::new(start.x - focus.x, start.z - focus.z);
     let to = Vec2::new(end.x - focus.x, end.z - focus.z);
@@ -181,6 +206,30 @@ mod tests {
     fn fillet_radius_is_a_small_fraction_of_the_hex() {
         assert!((HEX_FILLET_RADIUS - HEX_RADIUS * 0.16).abs() < f32::EPSILON);
         assert!((HEX_FILLET_RADIUS - 0.1152).abs() < 1.0e-4);
+        assert!((HEX_LIP_RADIUS - HEX_RADIUS * 0.06).abs() < f32::EPSILON);
+        assert!((HEX_LIP_RADIUS - 0.0432).abs() < 1.0e-4);
+        const {
+            assert!(HEX_LIP_RADIUS < HEX_FILLET_RADIUS);
+        }
+    }
+
+    #[test]
+    fn lip_rounds_the_top_edge_and_leaves_the_column_base() {
+        let center = world_center(Axial::ZERO, 1, false);
+        let outline = filleted_outline(center, center.y);
+        let rim = outline[0];
+        let inner = hex_lip_point(center, rim, center.y, 0.0);
+        let outer = hex_lip_point(center, rim, center.y, 1.0);
+        let mid = hex_lip_point(center, rim, center.y, 0.5);
+
+        assert!((inner.y - center.y).abs() < 1.0e-5);
+        assert!((outer.y - (center.y - HEX_LIP_RADIUS)).abs() < 1.0e-5);
+        assert!(mid.y < inner.y && mid.y > outer.y);
+        let inner_r = Vec2::new(inner.x - center.x, inner.z - center.z).length();
+        let outer_r = Vec2::new(outer.x - center.x, outer.z - center.z).length();
+        assert!(inner_r + HEX_LIP_RADIUS * 0.5 < outer_r);
+        assert!((outer.x - rim.x).abs() < 1.0e-5 && (outer.z - rim.z).abs() < 1.0e-5);
+        assert!(COLUMN_FLOOR < outer.y);
     }
 
     #[test]

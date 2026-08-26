@@ -14,8 +14,9 @@ use hex_core::{Axial, ChunkCoord, TerrainKind};
 
 use crate::{
     geometry::{
-        COLUMN_FLOOR, HEX_FILLET_ARC_POINTS, HEX_OUTLINE_LEN, cell_top, edge_index_for_direction,
-        filleted_outline, world_center,
+        COLUMN_FLOOR, HEX_FILLET_ARC_POINTS, HEX_LIP_ARC_POINTS, HEX_LIP_RADIUS, HEX_OUTLINE_LEN,
+        cell_top, edge_index_for_direction, filleted_outline, hex_lip_normal, hex_lip_point,
+        world_center,
     },
     map_view::{MapViewMode, normalized_cell_value, normalized_soldier_strength},
     model::{CellView, ContestedCellView, MatchView},
@@ -471,10 +472,13 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
     let center = world_center(cell.coordinate, cell.elevation, cell.is_water());
     let top_color = cell_color(cell, view.contested_cells.get(&cell.coordinate), mode);
     let outline = filleted_outline(center, top_y);
+    let inner = std::array::from_fn::<_, HEX_OUTLINE_LEN, _>(|index| {
+        hex_lip_point(center, outline[index], top_y, 0.0)
+    });
 
     let center_index = builder.vertex(cell.coordinate, center, Vec3::Y, top_color, 1.0);
     let rim = std::array::from_fn::<_, HEX_OUTLINE_LEN, _>(|index| {
-        builder.vertex(cell.coordinate, outline[index], Vec3::Y, top_color, 1.0)
+        builder.vertex(cell.coordinate, inner[index], Vec3::Y, top_color, 1.0)
     });
     for index in 0..HEX_OUTLINE_LEN {
         let next = (index + 1) % HEX_OUTLINE_LEN;
@@ -488,6 +492,33 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
             view.cell(neighbor_coord).map_or(COLUMN_FLOOR, |neighbor| {
                 cell_top(neighbor.elevation, neighbor.is_water())
             });
+    }
+
+    let lip = std::array::from_fn::<_, HEX_OUTLINE_LEN, _>(|index| {
+        std::array::from_fn::<_, HEX_LIP_ARC_POINTS, _>(|sample| {
+            let t = sample as f32 / (HEX_LIP_ARC_POINTS - 1) as f32;
+            let position = hex_lip_point(center, outline[index], top_y, t);
+            let normal = hex_lip_normal(center, outline[index], t);
+            let shade_factor = 1.0 - t * 0.08;
+            builder.vertex(
+                cell.coordinate,
+                position,
+                normal,
+                shade(top_color, shade_factor),
+                shade_factor,
+            )
+        })
+    });
+    for index in 0..HEX_OUTLINE_LEN {
+        let next = (index + 1) % HEX_OUTLINE_LEN;
+        for sample in 0..HEX_LIP_ARC_POINTS - 1 {
+            let d = lip[index][sample];
+            let c = lip[next][sample];
+            let a = lip[index][sample + 1];
+            let b = lip[next][sample + 1];
+            builder.triangle(cell.coordinate, a, c, b);
+            builder.triangle(cell.coordinate, a, d, c);
+        }
     }
 
     for index in 0..HEX_OUTLINE_LEN {
@@ -504,12 +535,13 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
         } else {
             (top_y - 0.065).max(COLUMN_FLOOR)
         };
-        if bottom_y >= top_y {
+        let wall_top_y = top_y - HEX_LIP_RADIUS;
+        if bottom_y >= wall_top_y {
             continue;
         }
 
-        let top_a = outline[index];
-        let top_b = outline[next];
+        let top_a = hex_lip_point(center, outline[index], top_y, 1.0);
+        let top_b = hex_lip_point(center, outline[next], top_y, 1.0);
         let bottom_a = Vec3::new(top_a.x, bottom_y, top_a.z);
         let bottom_b = Vec3::new(top_b.x, bottom_y, top_b.z);
         let normal = Vec3::new(
@@ -518,7 +550,7 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
             (top_a.z + top_b.z) * 0.5 - center.z,
         )
         .normalize();
-        let depth = ((top_y - bottom_y) / 2.4).clamp(0.0, 1.0);
+        let depth = ((wall_top_y - bottom_y) / 2.4).clamp(0.0, 1.0);
         let side_shade = 0.78 - depth * 0.10;
         let side_color = shade(top_color, side_shade);
         let a = builder.vertex(cell.coordinate, bottom_a, normal, side_color, side_shade);
