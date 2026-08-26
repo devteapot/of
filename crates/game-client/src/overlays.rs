@@ -8,7 +8,10 @@ use hex_core::{Axial, ChunkCoord};
 
 use crate::{
     camera::GameCamera,
-    geometry::{chunk_of, corner, edge_index_for_direction, world_center},
+    geometry::{
+        HEX_FILLET_ARC_POINTS, chunk_of, edge_index_for_direction, filleted_outline,
+        scaled_filleted_point, world_center,
+    },
     interaction::{ContextualHover, InteractionState, OrderMode},
     model::{CellView, MatchView},
     terrain::TerrainChunk,
@@ -388,9 +391,22 @@ fn draw_region_perimeter(
         };
         let center = point(cell, style.lift);
         let color = color_for(cell);
+        let mut exposed = [false; 6];
         for (direction, neighbor) in coordinate.neighbors().into_iter().enumerate() {
             if perimeter_edge_is_exposed(selection, neighbor) {
-                draw_hex_edge(gizmos, center, direction, style.scale, color);
+                exposed[edge_index_for_direction(direction)] = true;
+            }
+        }
+        for edge in 0..6 {
+            if exposed[edge] {
+                draw_filleted_hex_edge(
+                    gizmos,
+                    center,
+                    edge,
+                    style.scale,
+                    color,
+                    exposed[(edge + 5) % 6],
+                );
             }
         }
     }
@@ -933,19 +949,49 @@ fn point(cell: &CellView, lift: f32) -> Vec3 {
 }
 
 fn draw_hex(gizmos: &mut Gizmos, center: Vec3, scale: f32, color: Color) {
-    let points = (0..6).map(|index| {
-        let full = corner(center, index, center.y);
-        center + (full - center) * scale
-    });
+    let points = filleted_outline(center, center.y)
+        .into_iter()
+        .map(|point| scaled_filleted_point(center, point, scale));
     gizmos.lineloop(points, color);
 }
 
 fn draw_hex_edge(gizmos: &mut Gizmos, center: Vec3, direction: usize, scale: f32, color: Color) {
-    let start_corner = edge_index_for_direction(direction);
-    let end_corner = (start_corner + 1) % 6;
-    let start = center + (corner(center, start_corner, center.y) - center) * scale;
-    let end = center + (corner(center, end_corner, center.y) - center) * scale;
-    gizmos.line(start, end, color);
+    draw_filleted_hex_edge(
+        gizmos,
+        center,
+        edge_index_for_direction(direction),
+        scale,
+        color,
+        false,
+    );
+}
+
+fn draw_filleted_hex_edge(
+    gizmos: &mut Gizmos,
+    center: Vec3,
+    edge: usize,
+    scale: f32,
+    color: Color,
+    include_start_fillet: bool,
+) {
+    let ring = filleted_outline(center, center.y);
+    let start_idx = edge * HEX_FILLET_ARC_POINTS + HEX_FILLET_ARC_POINTS - 1;
+    let end_idx = ((edge + 1) % 6) * HEX_FILLET_ARC_POINTS;
+    gizmos.line(
+        scaled_filleted_point(center, ring[start_idx], scale),
+        scaled_filleted_point(center, ring[end_idx], scale),
+        color,
+    );
+    if include_start_fillet {
+        let base = edge * HEX_FILLET_ARC_POINTS;
+        for sample in 0..HEX_FILLET_ARC_POINTS - 1 {
+            gizmos.line(
+                scaled_filleted_point(center, ring[base + sample], scale),
+                scaled_filleted_point(center, ring[base + sample + 1], scale),
+                color,
+            );
+        }
+    }
 }
 
 fn draw_segmented_hex(
@@ -955,11 +1001,12 @@ fn draw_segmented_hex(
     color: Color,
     segment_fraction: f32,
 ) {
-    for direction in 0..6 {
-        let start_corner = edge_index_for_direction(direction);
-        let end_corner = (start_corner + 1) % 6;
-        let start = center + (corner(center, start_corner, center.y) - center) * scale;
-        let end = center + (corner(center, end_corner, center.y) - center) * scale;
+    let ring = filleted_outline(center, center.y);
+    for edge in 0..6 {
+        let start_idx = edge * HEX_FILLET_ARC_POINTS + HEX_FILLET_ARC_POINTS - 1;
+        let end_idx = ((edge + 1) % 6) * HEX_FILLET_ARC_POINTS;
+        let start = scaled_filleted_point(center, ring[start_idx], scale);
+        let end = scaled_filleted_point(center, ring[end_idx], scale);
         let middle = start.lerp(end, 0.5);
         let half = segment_fraction.clamp(0.05, 0.95) * 0.5;
         gizmos.line(start.lerp(middle, 1.0 - half), middle, color);

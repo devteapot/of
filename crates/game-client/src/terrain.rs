@@ -13,7 +13,10 @@ use bevy::{
 use hex_core::{Axial, ChunkCoord, TerrainKind};
 
 use crate::{
-    geometry::{COLUMN_FLOOR, cell_top, corner, edge_index_for_direction, world_center},
+    geometry::{
+        COLUMN_FLOOR, HEX_FILLET_ARC_POINTS, HEX_OUTLINE_LEN, cell_top, edge_index_for_direction,
+        filleted_outline, world_center,
+    },
     map_view::{MapViewMode, normalized_cell_value, normalized_soldier_strength},
     model::{CellView, ContestedCellView, MatchView},
 };
@@ -467,34 +470,37 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
     let top_y = cell_top(cell.elevation, cell.is_water());
     let center = world_center(cell.coordinate, cell.elevation, cell.is_water());
     let top_color = cell_color(cell, view.contested_cells.get(&cell.coordinate), mode);
+    let outline = filleted_outline(center, top_y);
 
     let center_index = builder.vertex(cell.coordinate, center, Vec3::Y, top_color, 1.0);
-    let top_corners = std::array::from_fn::<_, 6, _>(|index| {
-        builder.vertex(
-            cell.coordinate,
-            corner(center, index, top_y),
-            Vec3::Y,
-            top_color,
-            1.0,
-        )
+    let rim = std::array::from_fn::<_, HEX_OUTLINE_LEN, _>(|index| {
+        builder.vertex(cell.coordinate, outline[index], Vec3::Y, top_color, 1.0)
     });
-    for index in 0..6 {
-        let next = (index + 1) % 6;
+    for index in 0..HEX_OUTLINE_LEN {
+        let next = (index + 1) % HEX_OUTLINE_LEN;
         // Clockwise winding in XZ points the normal toward +Y.
-        builder.triangle(
-            cell.coordinate,
-            center_index,
-            top_corners[next],
-            top_corners[index],
-        );
+        builder.triangle(cell.coordinate, center_index, rim[next], rim[index]);
     }
 
+    let mut neighbor_top = [COLUMN_FLOOR; 6];
     for (direction, neighbor_coord) in cell.coordinate.neighbors().into_iter().enumerate() {
-        let neighbor_top = view.cell(neighbor_coord).map_or(COLUMN_FLOOR, |neighbor| {
-            cell_top(neighbor.elevation, neighbor.is_water())
-        });
-        let bottom_y = if neighbor_top + 0.015 < top_y {
-            neighbor_top.max(COLUMN_FLOOR)
+        neighbor_top[edge_index_for_direction(direction)] =
+            view.cell(neighbor_coord).map_or(COLUMN_FLOOR, |neighbor| {
+                cell_top(neighbor.elevation, neighbor.is_water())
+            });
+    }
+
+    for index in 0..HEX_OUTLINE_LEN {
+        let next = (index + 1) % HEX_OUTLINE_LEN;
+        let vertex = index / HEX_FILLET_ARC_POINTS;
+        let along_arc = index % HEX_FILLET_ARC_POINTS;
+        let facing_top = if along_arc == HEX_FILLET_ARC_POINTS - 1 {
+            neighbor_top[vertex]
+        } else {
+            neighbor_top[(vertex + 5) % 6].min(neighbor_top[vertex])
+        };
+        let bottom_y = if facing_top + 0.015 < top_y {
+            facing_top.max(COLUMN_FLOOR)
         } else {
             (top_y - 0.065).max(COLUMN_FLOOR)
         };
@@ -502,12 +508,10 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
             continue;
         }
 
-        let edge = edge_index_for_direction(direction);
-        let next = (edge + 1) % 6;
-        let top_a = corner(center, edge, top_y);
-        let top_b = corner(center, next, top_y);
-        let bottom_a = corner(center, edge, bottom_y);
-        let bottom_b = corner(center, next, bottom_y);
+        let top_a = outline[index];
+        let top_b = outline[next];
+        let bottom_a = Vec3::new(top_a.x, bottom_y, top_a.z);
+        let bottom_b = Vec3::new(top_b.x, bottom_y, top_b.z);
         let normal = Vec3::new(
             (top_a.x + top_b.x) * 0.5 - center.x,
             0.0,
