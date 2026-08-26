@@ -258,8 +258,9 @@ pub fn spawn_terrain(
 ) {
     let material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
-        perceptual_roughness: 0.96,
+        perceptual_roughness: 0.18,
         metallic: 0.0,
+        reflectance: 0.72,
         ..default()
     });
     commands.insert_resource(TerrainMaterial(material.clone()));
@@ -514,12 +515,12 @@ fn push_cell(builder: &mut ChunkMeshBuilder, view: &MatchView, cell: &CellView, 
         )
         .normalize();
         let depth = ((top_y - bottom_y) / 2.4).clamp(0.0, 1.0);
-        let side_shade = 0.52 - depth * 0.12;
+        let side_shade = 0.78 - depth * 0.10;
         let side_color = shade(top_color, side_shade);
         let a = builder.vertex(cell.coordinate, bottom_a, normal, side_color, side_shade);
         let b = builder.vertex(cell.coordinate, bottom_b, normal, side_color, side_shade);
-        let c = builder.vertex(cell.coordinate, top_b, normal, shade(top_color, 0.68), 0.68);
-        let d = builder.vertex(cell.coordinate, top_a, normal, shade(top_color, 0.68), 0.68);
+        let c = builder.vertex(cell.coordinate, top_b, normal, shade(top_color, 0.92), 0.92);
+        let d = builder.vertex(cell.coordinate, top_a, normal, shade(top_color, 0.92), 0.92);
         builder.triangle(cell.coordinate, a, c, b);
         builder.triangle(cell.coordinate, a, d, c);
     }
@@ -559,9 +560,9 @@ fn recolor_chunk_mesh(
 fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapViewMode) -> [f32; 4] {
     let base = if cell.is_water() {
         if cell.lake {
-            Color::srgb(0.075, 0.27, 0.31)
+            Color::srgb(0.18, 0.78, 0.92)
         } else {
-            Color::srgb(0.055, 0.16, 0.21)
+            Color::srgb(0.08, 0.46, 0.86)
         }
     } else {
         match cell.owner {
@@ -584,12 +585,12 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
     if cell.river && cell.is_land() {
         linear = mix_linear_rgba(
             linear,
-            LinearRgba::from(Color::srgb(0.055, 0.34, 0.43)),
-            0.46,
+            LinearRgba::from(Color::srgb(0.12, 0.72, 0.95)),
+            0.38,
         );
     }
     let intensity = match mode {
-        MapViewMode::Overview => 0.42,
+        MapViewMode::Overview => 0.35,
         MapViewMode::Soldiers => normalized_soldier_strength(
             cell.infantry
                 .saturating_add(contest.map_or(0, |contest| contest.attacker_strength)),
@@ -598,11 +599,11 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
     };
     let terrain_light = match cell.terrain {
         TerrainKind::Plains => 1.0,
-        TerrainKind::Hills => 0.92,
-        TerrainKind::Mountain => 0.80,
-        TerrainKind::Water => 0.82,
+        TerrainKind::Hills => 0.94,
+        TerrainKind::Mountain => 0.88,
+        TerrainKind::Water => 0.90,
     };
-    let ownership_readability = 0.58 + intensity * 0.68;
+    let ownership_readability = 0.78 + intensity * 0.20;
     linear.red = (linear.red * ownership_readability * terrain_light + intensity * 0.035).min(1.0);
     linear.green =
         (linear.green * ownership_readability * terrain_light + intensity * 0.045).min(1.0);
@@ -611,14 +612,14 @@ fn cell_color(cell: &CellView, contest: Option<&ContestedCellView>, mode: MapVie
 }
 
 const PLAYER_PALETTE: [(f32, f32, f32); 8] = [
-    (0.06, 0.48, 0.58),
-    (0.76, 0.24, 0.16),
-    (0.50, 0.32, 0.78),
-    (0.75, 0.62, 0.12),
-    (0.20, 0.62, 0.30),
-    (0.86, 0.34, 0.62),
-    (0.25, 0.43, 0.86),
-    (0.72, 0.43, 0.18),
+    (0.12, 0.82, 0.94),
+    (1.00, 0.28, 0.42),
+    (0.72, 0.38, 1.00),
+    (1.00, 0.86, 0.16),
+    (0.28, 0.94, 0.42),
+    (1.00, 0.42, 0.78),
+    (0.28, 0.52, 1.00),
+    (1.00, 0.55, 0.16),
 ];
 
 fn player_color(player: u32) -> Option<Color> {
@@ -632,8 +633,8 @@ fn player_color(player: u32) -> Option<Color> {
     // Golden-ratio hue walk keeps neighbors visually distinct without a table.
     let index = player - 1;
     let hue = ((index as f32) * 0.618_034).fract();
-    let saturation = 0.55 + 0.25 * (((index * 3) % 5) as f32 / 4.0);
-    let lightness = 0.42 + 0.16 * (((index * 5) % 4) as f32 / 3.0);
+    let saturation = 0.72 + 0.18 * (((index * 3) % 5) as f32 / 4.0);
+    let lightness = 0.52 + 0.12 * (((index * 5) % 4) as f32 / 3.0);
     Some(hsl_color(hue, saturation, lightness))
 }
 
@@ -655,10 +656,10 @@ fn hsl_color(hue: f32, saturation: f32, lightness: f32) -> Color {
 
 fn terrain_color(terrain: TerrainKind) -> Color {
     match terrain {
-        TerrainKind::Plains => Color::srgb(0.39, 0.43, 0.30),
-        TerrainKind::Hills => Color::srgb(0.42, 0.38, 0.25),
-        TerrainKind::Mountain => Color::srgb(0.36, 0.35, 0.31),
-        TerrainKind::Water => Color::srgb(0.055, 0.16, 0.21),
+        TerrainKind::Plains => Color::srgb(0.55, 0.92, 0.32),
+        TerrainKind::Hills => Color::srgb(0.98, 0.72, 0.22),
+        TerrainKind::Mountain => Color::srgb(0.78, 0.62, 0.94),
+        TerrainKind::Water => Color::srgb(0.08, 0.46, 0.86),
     }
 }
 
@@ -752,6 +753,29 @@ mod tests {
     }
 
     #[test]
+    fn player_and_terrain_colors_stay_saturated_for_the_plastic_look() {
+        let chroma = |color: Color| {
+            let [r, g, b, _] = LinearRgba::from(color).to_f32_array();
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            max - min
+        };
+        for player in 1..=8 {
+            assert!(
+                chroma(player_color(player).expect("palette")) > 0.25,
+                "player {player} is too gray for the plastic pass"
+            );
+        }
+        assert!(chroma(terrain_color(TerrainKind::Plains)) > 0.20);
+        assert!(chroma(terrain_color(TerrainKind::Hills)) > 0.20);
+        let overview = cell_color(&test_cell(0, 0, 100), None, MapViewMode::Overview);
+        assert!(
+            overview[..3].iter().sum::<f32>() > 0.9,
+            "overview hexes should stay bright: {overview:?}"
+        );
+    }
+
+    #[test]
     fn every_supported_player_has_a_distinct_color() {
         let colors = (1..=8)
             .map(|player| player_color(player).expect("supported player color"))
@@ -764,8 +788,8 @@ mod tests {
         assert!(player_color(500).is_some());
         assert!(player_color(501).is_none());
         // Curated first-eight palette stays pinned.
-        assert_eq!(player_color(1), Some(Color::srgb(0.06, 0.48, 0.58)));
-        assert_eq!(player_color(2), Some(Color::srgb(0.76, 0.24, 0.16)));
+        assert_eq!(player_color(1), Some(Color::srgb(0.12, 0.82, 0.94)));
+        assert_eq!(player_color(2), Some(Color::srgb(1.00, 0.28, 0.42)));
     }
 
     #[test]
@@ -919,15 +943,26 @@ mod tests {
     fn contested_soldier_shading_includes_attacker_pressure() {
         let cell = test_cell(25, 0, 100);
         let uncontested = cell_color(&cell, None, MapViewMode::Soldiers);
-        let contest = ContestedCellView {
+        let contest = |attacker_strength| ContestedCellView {
             controller_player: PLAYER_ONE,
             attacker_player: PLAYER_TWO,
-            attacker_strength: 75,
+            attacker_strength,
             attacker_share: 0.75,
         };
-        let contested = cell_color(&cell, Some(&contest), MapViewMode::Soldiers);
+        let hue_only = cell_color(&cell, Some(&contest(0)), MapViewMode::Soldiers);
+        let with_pressure = cell_color(&cell, Some(&contest(75)), MapViewMode::Soldiers);
 
-        assert!(contested[..3].iter().sum::<f32>() > uncontested[..3].iter().sum::<f32>());
+        assert!(
+            hue_only
+                .iter()
+                .zip(uncontested)
+                .any(|(left, right)| (*left - right).abs() > 1.0e-6),
+            "attacker share should still tint the cell: {hue_only:?} vs {uncontested:?}"
+        );
+        assert!(
+            with_pressure[..3].iter().sum::<f32>() > hue_only[..3].iter().sum::<f32>(),
+            "added attacker infantry should raise soldier intensity at the same mix: {with_pressure:?} vs {hue_only:?}"
+        );
     }
 
     #[test]

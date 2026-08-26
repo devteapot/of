@@ -37,10 +37,12 @@ settle, complete, or are explicitly stopped.
    and multiple disconnected selections.
 3. Keep selection coherent when clusters grow, merge, or split.
 4. Show neutral clicks as a focus on all-perimeter expansion, not a precise
-   destination. Communicate stronger toward/equal/away branch weighting without
-   hiding weak-side expansion.
+   destination. Hover-before-click must make participating perimeters, 11/10/9
+   branch weights, committed Share, and inland-zero unmistakable. Communicate
+   stronger toward/equal/away branch weighting without hiding weak-side
+   expansion.
 5. Highlight the entire enemy cluster under the pointer and every shared source
-   front.
+   front before the attack click.
 6. Support Shift staging/toggling and Control removal of several complete enemy
    target clusters.
 7. Display one persisted Share for expansion, attack, and Front Rebalance;
@@ -60,13 +62,17 @@ settle, complete, or are explicitly stopped.
 14. Adjust the global mobilization target separately from Share. Lowering it
     stops future conversion but does not demobilize existing infantry.
 15. Use a compact keybind-first contextual strip and a `?` field manual, not a
-    persistent button for every command.
+    persistent button for every command. Idle shows `C` and click; Share, `B`,
+    `T`, and `X` appear only in the states where they apply.
 
 ## Context states
 
 The control strip must have distinct copy for:
 
-- idle selection and contextual click;
+- idle selection and contextual click (`C` + click only until a hover or live
+  context makes Share / `B` / `T` / `X` relevant);
+- hover-before-click expand (perimeters, 11/10/9, Share, inland dim) and attack
+  (full target mask plus firing fronts);
 - staged enemy targets;
 - Front Rebalance source/target gesture;
 - Reshape drawing and ready preview;

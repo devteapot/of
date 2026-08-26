@@ -10,19 +10,19 @@ use bevy::{
 };
 
 use crate::{
-    interaction::{InteractionState, OrderMode},
+    interaction::{ContextualHover, InteractionState, OrderMode},
     map_view::map_view_status_bundle,
     model::{MatchPhase, MatchView, ToastKind},
     network::{ClientIntent, NetworkSet},
 };
 
-const PANEL: Color = Color::srgba(0.035, 0.052, 0.064, 0.96);
-const PANEL_SOFT: Color = Color::srgba(0.055, 0.078, 0.092, 0.94);
-const LINE: Color = Color::srgba(0.42, 0.58, 0.65, 0.48);
-const TEXT: Color = Color::srgb(0.88, 0.93, 0.95);
-const MUTED: Color = Color::srgb(0.57, 0.68, 0.72);
-const CYAN: Color = Color::srgb(0.40, 0.87, 0.91);
-const CORAL: Color = Color::srgb(1.0, 0.40, 0.32);
+const PANEL: Color = Color::srgba(0.12, 0.05, 0.22, 0.94);
+const PANEL_SOFT: Color = Color::srgba(0.18, 0.07, 0.28, 0.92);
+const LINE: Color = Color::srgba(1.0, 0.42, 0.78, 0.58);
+const TEXT: Color = Color::srgb(1.0, 0.97, 0.92);
+const MUTED: Color = Color::srgb(0.92, 0.78, 0.98);
+const CYAN: Color = Color::srgb(0.22, 0.98, 0.92);
+const CORAL: Color = Color::srgb(1.0, 0.32, 0.48);
 
 const FIELD_MANUAL: &str = concat!(
     "CLUSTER SELECTION\n",
@@ -276,7 +276,7 @@ fn spawn_command_bar(root: &mut ChildSpawnerCommands) {
             ));
             context.spawn((
                 CommandContextSummary,
-                Text::new("LMB neutral expand  ·  LMB enemy attack  ·  ? manual"),
+                Text::new("C cluster  ·  click after selecting  ·  ? manual"),
                 TextFont::from_font_size(9.5),
                 TextColor(MUTED),
                 Pickable::IGNORE,
@@ -285,9 +285,7 @@ fn spawn_command_bar(root: &mut ChildSpawnerCommands) {
 
         bar.spawn((
             CommandKeyHints,
-            Text::new(
-                "C cluster  ·  Shift/Ctrl+C multi  ·  Ctrl+A all  ·  B rebalance fronts  ·  [ / ] Share  ·  T reshape  ·  X stop",
-            ),
+            Text::new("C cluster"),
             TextFont::from_font_size(10.0),
             TextColor(TEXT),
             Node {
@@ -371,7 +369,7 @@ fn spawn_bottom_bar(root: &mut ChildSpawnerCommands, mobilization: f32) {
                     border_radius: BorderRadius::MAX,
                     ..default()
                 },
-                BackgroundColor(Color::srgb(0.10, 0.16, 0.18)),
+                BackgroundColor(Color::srgb(0.28, 0.10, 0.42)),
                 Pickable::IGNORE,
             ));
             slider
@@ -401,7 +399,7 @@ fn spawn_bottom_bar(root: &mut ChildSpawnerCommands, mobilization: f32) {
                             ..default()
                         },
                         BackgroundColor(CYAN),
-                        BorderColor::all(Color::srgb(0.84, 0.98, 1.0)),
+                        BorderColor::all(Color::srgb(1.0, 0.92, 0.55)),
                         Pickable::IGNORE,
                     ));
                 });
@@ -465,7 +463,7 @@ fn spawn_help(root: &mut ChildSpawnerCommands) {
             ..default()
         },
         GlobalZIndex(40),
-        BackgroundColor(Color::srgba(0.025, 0.039, 0.049, 0.985)),
+        BackgroundColor(Color::srgba(0.10, 0.04, 0.18, 0.985)),
         BorderColor::all(CYAN),
     ))
     .with_children(|help| {
@@ -498,7 +496,7 @@ fn spawn_result_overlay(root: &mut ChildSpawnerCommands) {
         },
         UiTransform::from_translation(Val2::percent(-50.0, -50.0)),
         GlobalZIndex(60),
-        BackgroundColor(Color::srgba(0.025, 0.039, 0.049, 0.985)),
+        BackgroundColor(Color::srgba(0.10, 0.04, 0.18, 0.985)),
         BorderColor::all(CYAN),
         Pickable::IGNORE,
     ))
@@ -608,18 +606,7 @@ fn command_bar_copy(
         }
     };
     match context {
-        HudContext::Idle => (
-            format!(
-                "SELECTED CLUSTERS  //  {} CELL{}",
-                interaction.sources.len(),
-                plural(interaction.sources.len())
-            ),
-            format!(
-                "SHARE {:>3}%  ·  LMB neutral expand  ·  LMB enemy attack{contextual_status}  ·  ? manual",
-                interaction.amount_percent,
-            ),
-            "C cluster  ·  Shift/Ctrl+C multi  ·  Ctrl+A all  ·  B rebalance fronts  ·  [ / ] Share  ·  T reshape  ·  X stop".to_owned(),
-        ),
+        HudContext::Idle => idle_command_bar_copy(interaction, &contextual_status),
         HudContext::AttackTargets => (
             "ATTACK CLUSTERS  //  TARGETS".to_owned(),
             format!(
@@ -724,6 +711,59 @@ fn command_bar_copy(
             "The selection and pending command remain stable until the response arrives".to_owned(),
         ),
     }
+}
+
+fn idle_command_bar_copy(
+    interaction: &InteractionState,
+    contextual_status: &str,
+) -> (String, String, String) {
+    let title = format!(
+        "SELECTED CLUSTERS  //  {} CELL{}",
+        interaction.sources.len(),
+        plural(interaction.sources.len())
+    );
+    let valid_hover = interaction.preview.invalid_reason.is_none();
+    let summary = match interaction.preview.contextual_hover {
+        ContextualHover::Expand if valid_hover => {
+            let focus = interaction.preview.focus.unwrap_or(hex_core::Axial::ZERO);
+            format!(
+                "ALL PERIMETERS  ·  FOCUS {:+},{:+}  ·  SHARE {:>3}%{contextual_status}",
+                focus.q, focus.r, interaction.amount_percent
+            )
+        }
+        ContextualHover::Attack if valid_hover => format!(
+            "TARGET MASK  ·  {} HEX{}  ·  SHARE {:>3}%  ·  {} FRONT{}{contextual_status}",
+            interaction.preview.hover_targets.len(),
+            plural(interaction.preview.hover_targets.len()),
+            interaction.amount_percent,
+            interaction.preview.front_edges.len(),
+            plural(interaction.preview.front_edges.len()),
+        ),
+        _ if interaction.sources.is_empty() => {
+            format!("C cluster  ·  click after selecting{contextual_status}  ·  ? manual")
+        }
+        _ => format!(
+            "C cluster  ·  click unclaimed expand  ·  click enemy attack{contextual_status}  ·  ? manual"
+        ),
+    };
+    let mut hints = vec!["C cluster".to_owned()];
+    if matches!(
+        interaction.preview.contextual_hover,
+        ContextualHover::Expand | ContextualHover::Attack
+    ) && valid_hover
+    {
+        hints.push("[ / ] Share".to_owned());
+    }
+    if interaction.preview.show_rebalance_hint {
+        hints.push("B rebalance".to_owned());
+    }
+    if interaction.preview.show_reshape_hint {
+        hints.push("T reshape".to_owned());
+    }
+    if interaction.preview.show_stop_hint {
+        hints.push("X stop".to_owned());
+    }
+    (title, summary, hints.join("  ·  "))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -952,7 +992,7 @@ fn update_hud(
                 ToastKind::Success => Color::srgb(0.41, 0.86, 0.58),
                 ToastKind::Rejection => CORAL,
             };
-            toast_root.1.0 = Color::srgba(0.035, 0.052, 0.064, 0.98);
+            toast_root.1.0 = Color::srgba(0.12, 0.05, 0.22, 0.98);
             toast_root.2.set_all(accent);
         }
         let mut toast_text = texts.p5();
@@ -1024,7 +1064,7 @@ fn update_slider_visuals(
 ) {
     thumb.0.left = percent(slider.1.thumb_position(slider.0.0) * 100.0);
     thumb.1.0 = if slider.2.get() || slider.3.dragging {
-        Color::srgb(0.66, 0.98, 1.0)
+        Color::srgb(0.72, 1.0, 0.55)
     } else {
         CYAN
     };
@@ -1097,4 +1137,101 @@ fn set_text(text: &mut Text, value: String) {
 
 const fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "S" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interaction::InteractionState;
+    use hex_core::Axial;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn idle_strip_is_cluster_and_click_without_the_full_grammar() {
+        let interaction = InteractionState::default();
+        let (_, summary, hints) = command_bar_copy(&interaction, HudContext::Idle);
+
+        assert_eq!(hints, "C cluster");
+        assert!(summary.contains("C cluster"));
+        assert!(summary.contains("click"));
+        assert!(
+            !summary.contains("SHARE"),
+            "Share must wait for a valid hover: {summary}"
+        );
+        assert!(!hints.contains('B'));
+        assert!(!hints.contains('T'));
+        assert!(!hints.contains('X'));
+        assert!(!hints.contains("Share"));
+        assert!(!hints.contains("Ctrl+A"));
+    }
+
+    #[test]
+    fn idle_strip_shows_share_only_on_valid_expand_hover() {
+        let mut interaction = InteractionState::default();
+        interaction.sources = BTreeSet::from([Axial::ZERO]);
+        interaction.amount_percent = 40;
+        interaction.preview.contextual_hover = ContextualHover::Expand;
+        interaction.preview.focus = Some(Axial::new(2, -1));
+        let (_, summary, hints) = command_bar_copy(&interaction, HudContext::Idle);
+
+        assert!(summary.contains("ALL PERIMETERS"));
+        assert!(summary.contains("FOCUS +2,-1"));
+        assert!(summary.contains("SHARE  40%"));
+        assert!(hints.contains("[ / ] Share"));
+        assert!(!hints.contains("T reshape"));
+        assert!(!hints.contains("X stop"));
+        assert!(!hints.contains("B rebalance"));
+    }
+
+    #[test]
+    fn idle_strip_shows_attack_mask_and_share_on_enemy_hover() {
+        let mut interaction = InteractionState::default();
+        interaction.sources = BTreeSet::from([Axial::ZERO]);
+        interaction.amount_percent = 30;
+        interaction.preview.contextual_hover = ContextualHover::Attack;
+        interaction.preview.hover_targets = BTreeSet::from([Axial::new(1, 0), Axial::new(2, 0)]);
+        interaction.preview.front_edges = vec![hex_core::DirectedFrontEdge {
+            source: Axial::ZERO,
+            target: Axial::new(1, 0),
+        }];
+        let (_, summary, hints) = command_bar_copy(&interaction, HudContext::Idle);
+
+        assert!(summary.contains("TARGET MASK"));
+        assert!(summary.contains("2 HEXS"));
+        assert!(summary.contains("SHARE  30%"));
+        assert!(summary.contains("1 FRONT"));
+        assert!(hints.contains("[ / ] Share"));
+    }
+
+    #[test]
+    fn idle_strip_gates_t_x_and_b_on_live_context() {
+        let mut interaction = InteractionState::default();
+        interaction.sources = BTreeSet::from([Axial::ZERO]);
+        interaction.preview.show_reshape_hint = true;
+        interaction.preview.show_stop_hint = true;
+        interaction.preview.show_rebalance_hint = true;
+        let (_, _, hints) = command_bar_copy(&interaction, HudContext::Idle);
+
+        assert!(hints.contains("C cluster"));
+        assert!(hints.contains("T reshape"));
+        assert!(hints.contains("X stop"));
+        assert!(hints.contains("B rebalance"));
+        assert!(
+            !hints.contains("Share"),
+            "Share stays hover-gated even when other keys appear: {hints}"
+        );
+    }
+
+    #[test]
+    fn invalid_hover_does_not_advertise_share() {
+        let mut interaction = InteractionState::default();
+        interaction.sources = BTreeSet::from([Axial::ZERO]);
+        interaction.preview.contextual_hover = ContextualHover::Expand;
+        interaction.preview.invalid_reason =
+            Some("Eligible perimeter cells have no visible infantry to request");
+        let (_, summary, hints) = command_bar_copy(&interaction, HudContext::Idle);
+
+        assert!(!hints.contains("Share"));
+        assert!(!summary.contains("ALL PERIMETERS"));
+    }
 }

@@ -45,10 +45,10 @@ pub fn spawn_camera_and_light(mut commands: Commands) {
     ));
 
     commands.spawn((
-        Name::new("Graybox sun"),
+        Name::new("Plastic key light"),
         DirectionalLight {
-            color: Color::srgb(1.0, 0.92, 0.78),
-            illuminance: 13_500.0,
+            color: Color::srgb(1.0, 0.94, 0.82),
+            illuminance: 22_000.0,
             shadow_maps_enabled: false,
             ..default()
         },

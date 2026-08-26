@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bevy::{picking::pointer::PointerInteraction, prelude::*};
 use hex_core::{
-    Axial, DirectedFrontEdge, FrontSelectionError, StrategicExterior, selected_directional_routes,
-    selected_front_edges, strategic_front_index_for_seed, strategic_fronts,
+    Axial, DirectedFrontEdge, FrontSelectionError, StrategicExterior, StrategicFront,
+    focus_branch_weight, selected_directional_routes, selected_front_edges,
+    strategic_front_index_for_seed, strategic_fronts,
 };
 
 use crate::{
@@ -12,13 +13,14 @@ use crate::{
     model::{MatchView, OrderSelectionProjectionError, ProjectedOrderSelection, ToastKind},
     network::{
         ClientIntent, ExpandWaveError, MAX_WAVE_PREVIEW_RINGS, NetworkSet, ServerUpdate,
-        arc_push_routes, forecast_attack_wave, forecast_expand_wave, projected_shape_distribution,
-        push_edge_is_eligible, resolve_projected_push_front,
+        arc_push_routes, forecast_attack_wave, forecast_expand_wave_toward,
+        projected_shape_distribution, push_edge_is_eligible, resolve_projected_push_front,
     },
     terrain::TerrainChunk,
 };
 
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct OrderPreview {
     /// One aggregated reinforcement corridor for every independently
     /// traversable Push component. Rendering one representative route per
@@ -54,6 +56,27 @@ pub struct OrderPreview {
     pub reshape_outside_strength: u64,
     pub component_bottlenecks: Vec<(Axial, Axial)>,
     pub invalid_reason: Option<&'static str>,
+    /// Idle look-ahead for the contextual click under the pointer. This is
+    /// presentation only: it does not enter a ready/preview mode or change
+    /// what the subsequent click dispatches.
+    pub contextual_hover: ContextualHover,
+    pub focus: Option<Axial>,
+    pub branch_weights: BTreeMap<(Axial, Axial), u8>,
+    /// Selected cells that will contribute 0 to the hovered expand/attack.
+    pub inland: BTreeSet<Axial>,
+    /// Complete enemy cluster under an idle attack hover.
+    pub hover_targets: BTreeSet<Axial>,
+    pub show_reshape_hint: bool,
+    pub show_rebalance_hint: bool,
+    pub show_stop_hint: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContextualHover {
+    #[default]
+    None,
+    Expand,
+    Attack,
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +296,7 @@ struct OrderPreviewKey {
     state_revision: u64,
     topology_revision: u64,
     retask_revision: u64,
+    hover: Option<Axial>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,6 +502,11 @@ impl InteractionState {
 
     pub fn has_selection(&self) -> bool {
         !self.sources.is_empty() || !self.retask_handles.is_empty()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn invalidate_preview(&mut self) {
+        self.preview_key = None;
     }
 
     pub fn push_direction(&self) -> Option<Axial> {
@@ -1816,13 +1845,18 @@ fn order_preview_key(view: &MatchView, interaction: &InteractionState) -> Option
         mode,
         shape_revision: interaction.shape_revision,
         attack_revision: interaction.attack_revision,
-        state_revision: if matches!(interaction.mode, OrderMode::Idle) {
+        state_revision: if matches!(interaction.mode, OrderMode::Idle)
+            && interaction.hovered.is_none()
+        {
             view.ownership_revision
         } else {
             view.planning_revision
         },
         topology_revision: view.chunk_index_revision,
         retask_revision: view.retask_revision,
+        hover: matches!(interaction.mode, OrderMode::Idle)
+            .then_some(interaction.hovered)
+            .flatten(),
     })
 }
 
@@ -2134,13 +2168,14 @@ fn build_expand_all_preview(
         preview.invalid_reason = Some("Expand Perimeter sources are no longer available");
         return;
     };
-    build_projected_expand_all_preview(view, &projection, commitment_percent, preview);
+    build_projected_expand_all_preview(view, &projection, commitment_percent, None, preview);
 }
 
 fn build_projected_expand_all_preview(
     view: &MatchView,
     projection: &ProjectedOrderSelection,
     commitment_percent: u8,
+    focus: Option<Axial>,
     preview: &mut OrderPreview,
 ) {
     let selected = &projection.cells;
@@ -2170,11 +2205,12 @@ fn build_projected_expand_all_preview(
         return;
     }
 
-    let forecast = match forecast_expand_wave(
+    let forecast = match forecast_expand_wave_toward(
         view,
         &sources,
         &projection.affected_strength_by_cell,
         commitment_percent,
+        focus,
         MAX_WAVE_PREVIEW_RINGS,
     ) {
         Ok(forecast) => forecast,
@@ -2195,6 +2231,7 @@ fn build_projected_expand_all_preview(
     preview.wave_depth = forecast.reached_depth;
     preview.wave_truncated = forecast.truncated;
     preview.strength_upper_bound = forecast.strength_upper_bound;
+    record_expand_branch_preview(preview, &projection.cells, focus);
     if preview.strength_upper_bound == 0 {
         preview.invalid_reason =
             Some("Eligible perimeter cells have no visible infantry to request");
@@ -2208,6 +2245,137 @@ fn build_projected_expand_all_preview(
     let outside_depth = preview.wave_depth.values().copied().max().unwrap_or(0);
     preview.eta_seconds =
         u32::try_from(u64::from(outside_depth).saturating_mul(2)).unwrap_or(u32::MAX);
+}
+
+fn record_expand_branch_preview(
+    preview: &mut OrderPreview,
+    selected: &BTreeSet<Axial>,
+    focus: Option<Axial>,
+) {
+    preview.focus = focus;
+    preview.branch_weights.clear();
+    if let Some(focus) = focus {
+        for edge in &preview.front_edges {
+            preview.branch_weights.insert(
+                (edge.source, edge.target),
+                focus_branch_weight(edge.source, edge.target, focus),
+            );
+        }
+    }
+    let participating = preview
+        .front_edges
+        .iter()
+        .map(|edge| edge.source)
+        .collect::<BTreeSet<_>>();
+    preview.inland = selected.difference(&participating).copied().collect();
+}
+
+fn build_idle_contextual_preview(
+    view: &MatchView,
+    interaction: &InteractionState,
+    projection: &ProjectedOrderSelection,
+    preview: &mut OrderPreview,
+) {
+    if interaction.sources.is_empty() {
+        return;
+    }
+    let Some(hovered) = interaction.hovered else {
+        return;
+    };
+    let Some(cell) = view.cell(hovered) else {
+        return;
+    };
+    if cell.owner.is_none() && view.is_capturable(hovered) {
+        build_projected_expand_all_preview(
+            view,
+            projection,
+            interaction.amount_percent,
+            Some(hovered),
+            preview,
+        );
+        if preview.invalid_reason.is_none() {
+            preview.contextual_hover = ContextualHover::Expand;
+        }
+        return;
+    }
+    if cell.owner.is_none_or(|owner| owner == view.local_player) || !view.is_capturable(hovered) {
+        return;
+    }
+    let cluster = enemy_owned_cluster(view, hovered);
+    if cluster.is_empty() {
+        return;
+    }
+    build_attack_clusters_preview(
+        view,
+        projection,
+        &cluster,
+        interaction.amount_percent,
+        preview,
+    );
+    preview.hover_targets.clone_from(&cluster);
+    if preview.invalid_reason.is_none() {
+        preview.contextual_hover = ContextualHover::Attack;
+        let participating = preview
+            .front_edges
+            .iter()
+            .map(|edge| edge.source)
+            .collect::<BTreeSet<_>>();
+        preview.inland = projection
+            .cells
+            .difference(&participating)
+            .copied()
+            .collect();
+    }
+}
+
+fn fill_cluster_command_hints(
+    view: &MatchView,
+    interaction: &InteractionState,
+    preview: &mut OrderPreview,
+) {
+    preview.show_stop_hint = !stop_order_ids(view, interaction).is_empty();
+    preview.show_rebalance_hint = selected_complete_component(view, interaction)
+        .is_some_and(|component| front_rebalance_component_error(view, &component).is_ok());
+    preview.show_reshape_hint = selected_owned_cluster_count(view, &interaction.sources) == 1
+        && selected_cluster_has_inland_free_infantry(view, interaction);
+}
+
+fn selected_cluster_has_inland_free_infantry(
+    view: &MatchView,
+    interaction: &InteractionState,
+) -> bool {
+    let Some(component) = selected_complete_component(view, interaction) else {
+        return false;
+    };
+    inland_cells_of_component(view, &component)
+        .iter()
+        .any(|coordinate| {
+            let infantry = view.cell(*coordinate).map_or(0, |cell| cell.infantry);
+            let active = view
+                .retask_projection
+                .active_strength_by_cell
+                .get(coordinate)
+                .copied()
+                .unwrap_or(0)
+                .min(infantry);
+            infantry > active
+        })
+}
+
+fn inland_cells_of_component(view: &MatchView, component: &BTreeSet<Axial>) -> BTreeSet<Axial> {
+    let Ok(fronts) = strategic_fronts(component.iter().copied(), |_, target| {
+        strategic_exterior_for_view(view, target)
+    }) else {
+        return BTreeSet::new();
+    };
+    if fronts.is_empty() {
+        return BTreeSet::new();
+    }
+    let perimeter = fronts
+        .iter()
+        .flat_map(StrategicFront::source_cells)
+        .collect::<BTreeSet<_>>();
+    component.difference(&perimeter).copied().collect()
 }
 
 fn selected_reachability_to_front(
@@ -2447,8 +2615,12 @@ fn rebuild_order_preview(view: &MatchView, interaction: &mut InteractionState) {
             view,
             &projection,
             interaction.amount_percent,
+            None,
             &mut preview,
         ),
+        OrderMode::Idle => {
+            build_idle_contextual_preview(view, interaction, &projection, &mut preview);
+        }
         OrderMode::ReshapeDrawing | OrderMode::ReshapePreview => {
             build_projected_shape_preview(
                 view,
@@ -2458,9 +2630,9 @@ fn rebuild_order_preview(view: &MatchView, interaction: &mut InteractionState) {
             );
         }
         OrderMode::StopPreview { order_ids } => build_stop_preview(view, order_ids, &mut preview),
-        OrderMode::Idle => {}
         OrderMode::Submitting { .. } => unreachable!("submitting previews return before rebuild"),
     }
+    fill_cluster_command_hints(view, interaction, &mut preview);
     interaction.preview = preview;
     interaction.preview_key = Some(key);
 }
@@ -4620,6 +4792,209 @@ mod tests {
         assert_eq!(preview.front_edges.len(), 2);
         assert_eq!(preview.strength_upper_bound, 20);
         assert!(preview.excluded.is_empty());
+    }
+
+    #[test]
+    fn idle_neutral_hover_previews_perimeter_weights_share_and_inland() {
+        let inland = Axial::ZERO;
+        let selected = hex_disk(1).into_iter().collect::<BTreeSet<_>>();
+        let focus = Axial::new(2, 0);
+        let mut view = MatchView::connecting(1);
+        for coordinate in hex_disk(2) {
+            let owner = selected.contains(&coordinate).then_some(1);
+            let infantry = if coordinate == inland { 80 } else { 20 };
+            view.cells
+                .insert(coordinate, preview_cell(coordinate, owner, infantry, 0));
+        }
+        view.rebuild_chunk_index();
+
+        let mut interaction = InteractionState {
+            hovered: Some(focus),
+            sources: selected.clone(),
+            amount_percent: 50,
+            ..Default::default()
+        };
+        rebuild_order_preview(&view, &mut interaction);
+
+        assert_eq!(
+            interaction.preview.contextual_hover,
+            ContextualHover::Expand
+        );
+        assert_eq!(interaction.preview.focus, Some(focus));
+        assert_eq!(interaction.preview.invalid_reason, None);
+        assert!(interaction.preview.inland.contains(&inland));
+        assert!(
+            !interaction
+                .preview
+                .front_edges
+                .iter()
+                .any(|edge| edge.source == inland)
+        );
+        let participating = interaction
+            .preview
+            .front_edges
+            .iter()
+            .map(|edge| edge.source)
+            .collect::<BTreeSet<_>>();
+        assert!(!participating.is_empty());
+        assert!(selected.is_superset(&participating));
+        let weights = interaction
+            .preview
+            .branch_weights
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(weights, BTreeSet::from([9, 10, 11]));
+        assert!(
+            interaction
+                .preview
+                .branch_weights
+                .iter()
+                .any(|(&(source, target), &weight)| {
+                    weight == 11 && focus_branch_weight(source, target, focus) == 11
+                })
+        );
+        assert_eq!(
+            interaction.preview.strength_upper_bound,
+            participating
+                .iter()
+                .map(|coordinate| {
+                    view.cell(*coordinate).map_or(0, |cell| cell.infantry) * 50 / 100
+                })
+                .sum::<u64>()
+        );
+        assert!(
+            interaction.preview.show_reshape_hint,
+            "a complete cluster with inland free infantry should advertise Reshape"
+        );
+    }
+
+    #[test]
+    fn idle_enemy_hover_previews_the_full_mask_and_firing_fronts() {
+        let source = Axial::ZERO;
+        let enemy_a = Axial::new(1, 0);
+        let enemy_b = Axial::new(2, 0);
+        let inland = Axial::new(-1, 0);
+        let mut view = MatchView::connecting(1);
+        for cell in [
+            preview_cell(inland, Some(1), 40, 0),
+            preview_cell(source, Some(1), 40, 0),
+            preview_cell(enemy_a, Some(2), 20, 0),
+            preview_cell(enemy_b, Some(2), 20, 0),
+        ] {
+            view.cells.insert(cell.coordinate, cell);
+        }
+        view.rebuild_chunk_index();
+
+        let mut interaction = InteractionState {
+            hovered: Some(enemy_a),
+            sources: BTreeSet::from([inland, source]),
+            amount_percent: 50,
+            ..Default::default()
+        };
+        rebuild_order_preview(&view, &mut interaction);
+
+        assert_eq!(
+            interaction.preview.contextual_hover,
+            ContextualHover::Attack
+        );
+        assert_eq!(
+            interaction.preview.hover_targets,
+            BTreeSet::from([enemy_a, enemy_b])
+        );
+        assert_eq!(
+            interaction.preview.front_edges,
+            vec![DirectedFrontEdge {
+                source,
+                target: enemy_a
+            }]
+        );
+        assert!(interaction.preview.inland.contains(&inland));
+        assert!(!interaction.preview.inland.contains(&source));
+        assert_eq!(interaction.preview.strength_upper_bound, 20);
+        assert!(interaction.preview.branch_weights.is_empty());
+    }
+
+    #[test]
+    fn idle_hover_on_owned_ground_does_not_invent_a_contextual_preview() {
+        let source = Axial::ZERO;
+        let mut view = MatchView::connecting(1);
+        view.cells
+            .insert(source, preview_cell(source, Some(1), 40, 0));
+        view.rebuild_chunk_index();
+        let mut interaction = InteractionState {
+            hovered: Some(source),
+            sources: BTreeSet::from([source]),
+            ..Default::default()
+        };
+        rebuild_order_preview(&view, &mut interaction);
+
+        assert_eq!(interaction.preview.contextual_hover, ContextualHover::None);
+        assert!(interaction.preview.front_edges.is_empty());
+        assert!(interaction.preview.hover_targets.is_empty());
+        assert!(!interaction.preview.show_reshape_hint);
+    }
+
+    #[test]
+    fn idle_hints_show_stop_only_with_live_orders_and_b_only_with_two_fronts() {
+        let inland = Axial::ZERO;
+        let west = Axial::new(-1, 0);
+        let east = Axial::new(1, 0);
+        let enemy = Axial::new(2, 0);
+        let open_west = Axial::new(-2, 0);
+        let mut view = MatchView::connecting(1);
+        for cell in [
+            preview_cell(inland, Some(1), 50, 0),
+            preview_cell(west, Some(1), 20, 0),
+            preview_cell(east, Some(1), 20, 0),
+            preview_cell(enemy, Some(2), 20, 0),
+            preview_cell(open_west, None, 0, 0),
+        ] {
+            view.cells.insert(cell.coordinate, cell);
+        }
+        view.rebuild_chunk_index();
+        let sources = BTreeSet::from([inland, west, east]);
+        let mut interaction = InteractionState {
+            sources: sources.clone(),
+            ..Default::default()
+        };
+        rebuild_order_preview(&view, &mut interaction);
+        assert!(
+            interaction.preview.show_rebalance_hint,
+            "neutral west + hostile east should be two strategic fronts"
+        );
+        assert!(interaction.preview.show_reshape_hint);
+        assert!(!interaction.preview.show_stop_hint);
+
+        view.set_retask_projection(RetaskProjection {
+            handle_orders: BTreeMap::new(),
+            active_order_ids: BTreeSet::from([9]),
+            order_source_cells: BTreeMap::from([(9, BTreeSet::from([east]))]),
+            order_strength_by_cell: BTreeMap::from([(9, BTreeMap::from([(east, 10)]))]),
+            active_strength_by_cell: BTreeMap::from([(east, 10)]),
+            destination_reservations_by_order: BTreeMap::new(),
+            destination_claims_by_order: BTreeMap::new(),
+        });
+        interaction.preview_key = None;
+        rebuild_order_preview(&view, &mut interaction);
+        assert!(interaction.preview.show_stop_hint);
+
+        let mut single = InteractionState {
+            sources: BTreeSet::from([Axial::new(4, 0)]),
+            ..Default::default()
+        };
+        view.cells.insert(
+            Axial::new(4, 0),
+            preview_cell(Axial::new(4, 0), Some(1), 30, 0),
+        );
+        view.cells
+            .insert(Axial::new(5, 0), preview_cell(Axial::new(5, 0), None, 0, 0));
+        view.rebuild_chunk_index();
+        rebuild_order_preview(&view, &mut single);
+        assert!(
+            !single.preview.show_reshape_hint,
+            "a one-cell cluster has no inland reserve"
+        );
     }
 
     #[test]

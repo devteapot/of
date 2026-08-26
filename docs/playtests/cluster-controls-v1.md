@@ -26,7 +26,7 @@ participant did and understood, and attach relevant evidence.
 
 | Field | Check |
 | --- | --- |
-| Procedure | Select an owned cluster, hover then click neutral terrain from a cluster with multiple eligible exits. Ask the player what will happen before and after dispatch. |
+| Procedure | Select an owned cluster, hover then click neutral terrain from a cluster with multiple eligible exits. Confirm the hover preview (participating perimeters, 11/10/9 weights, Share, inland dim) before asking the player what will happen after dispatch. |
 | Expected observation | The player identifies the clicked hex as a weighted focus and expects expansion from all eligible selected perimeters, rather than a single-cell movement destination. |
 | Pass | The participant explains or acts on the all-perimeter behavior without corrective coaching. |
 | Fail | The participant expects only the clicked cell to receive troops or regards outcomes on other branches as a bug. |
