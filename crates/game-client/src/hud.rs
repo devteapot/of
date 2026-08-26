@@ -276,7 +276,7 @@ fn spawn_command_bar(root: &mut ChildSpawnerCommands) {
             ));
             context.spawn((
                 CommandContextSummary,
-                Text::new("C cluster  ·  click after selecting  ·  ? manual"),
+                Text::new("click after selecting  ·  ? manual"),
                 TextFont::from_font_size(9.5),
                 TextColor(MUTED),
                 Pickable::IGNORE,
@@ -740,11 +740,11 @@ fn idle_command_bar_copy(
             plural(interaction.preview.front_edges.len()),
         ),
         _ if interaction.sources.is_empty() => {
-            format!("C cluster  ·  click after selecting{contextual_status}  ·  ? manual")
+            format!("click after selecting{contextual_status}  ·  ? manual")
         }
-        _ => format!(
-            "C cluster  ·  click unclaimed expand  ·  click enemy attack{contextual_status}  ·  ? manual"
-        ),
+        _ => {
+            format!("click unclaimed expand  ·  click enemy attack{contextual_status}  ·  ? manual")
+        }
     };
     let mut hints = vec!["C cluster".to_owned()];
     if matches!(
@@ -1156,8 +1156,17 @@ mod tests {
         let (_, summary, hints) = command_bar_copy(&interaction, HudContext::Idle);
 
         assert_eq!(hints, "C cluster");
-        assert!(summary.contains("C cluster"));
+        assert!(
+            !summary.contains("C cluster"),
+            "cluster belongs in the hint column once, not the summary: {summary}"
+        );
         assert!(summary.contains("click"));
+        let combined = format!("{summary} {hints}");
+        assert_eq!(
+            combined.matches("C cluster").count(),
+            1,
+            "idle must name cluster once: {combined}"
+        );
         assert!(
             !summary.contains("SHARE"),
             "Share must wait for a valid hover: {summary}"
