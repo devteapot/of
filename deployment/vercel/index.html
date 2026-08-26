@@ -3,36 +3,37 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#071014" />
+    <meta name="theme-color" content="#1a0a2e" />
     <title>OnlyFronts · Lobbies</title>
     <style>
       :root {
         color-scheme: dark;
         font-family: Inter, ui-sans-serif, system-ui, sans-serif;
-        background: #071014;
-        color: #e4eff1;
+        /* Bevy lobby.rs: SCRIM / TEXT */
+        background: #1a0a2e;
+        color: #fff7eb;
       }
       * { box-sizing: border-box; }
-      body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 15% 0%, #12333a, #071014 44%); }
+      body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 15% 0%, #381f6b, #1a0a2e 44%); }
       main { width: min(960px, calc(100% - 32px)); margin: 0 auto; padding: 64px 0; }
       header { display: flex; justify-content: space-between; gap: 24px; align-items: end; margin-bottom: 28px; }
       h1 { margin: 0; font-size: clamp(34px, 7vw, 72px); line-height: .9; letter-spacing: -.06em; }
-      .eyebrow { color: #65dce4; font: 700 12px/1 monospace; letter-spacing: .16em; margin-bottom: 12px; }
-      .status { color: #91aeb3; max-width: 380px; text-align: right; }
-      .panel { border: 1px solid #29464c; background: rgba(8, 24, 29, .9); padding: 20px; }
+      .eyebrow { color: #38faeb; font: 700 12px/1 monospace; letter-spacing: .16em; margin-bottom: 12px; }
+      .status { color: #ebc7fa; max-width: 380px; text-align: right; }
+      .panel { border: 1px solid rgba(255, 107, 199, .58); background: rgba(36, 13, 61, .985); padding: 20px; }
       form { display: grid; grid-template-columns: 1.4fr 1fr .7fr auto; gap: 12px; margin-bottom: 24px; }
-      label { display: grid; gap: 7px; color: #91aeb3; font: 700 11px/1 monospace; letter-spacing: .1em; }
-      input, select, button { min-height: 44px; border: 1px solid #365960; background: #0c2026; color: #eef7f8; padding: 0 13px; font: inherit; }
-      button { cursor: pointer; border-color: #55c8d1; color: #8de7ed; font-weight: 750; }
-      button:hover:not(:disabled) { background: #12383e; }
-      button:disabled { cursor: not-allowed; opacity: .4; }
+      label { display: grid; gap: 7px; color: #ebc7fa; font: 700 11px/1 monospace; letter-spacing: .1em; }
+      input, select, button { min-height: 44px; border: 1px solid rgba(255, 107, 199, .58); background: #381452; color: #fff7eb; padding: 0 13px; font: inherit; }
+      button { cursor: pointer; border-color: rgba(255, 107, 199, .58); color: #38faeb; font-weight: 750; }
+      button:hover:not(:disabled) { background: #381f6b; }
+      button:disabled { cursor: not-allowed; opacity: .4; background: #1f1424; }
       .list { display: grid; gap: 10px; }
-      .empty { padding: 36px; color: #759399; text-align: center; border: 1px dashed #29464c; }
-      .lobby { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 18px; border: 1px solid #29464c; padding: 16px; background: #091a1f; }
+      .empty { padding: 36px; color: #ebc7fa; text-align: center; border: 1px dashed rgba(255, 107, 199, .58); }
+      .lobby { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 18px; border: 1px solid rgba(255, 107, 199, .58); padding: 16px; background: #381452; }
       .lobby h2 { margin: 0 0 7px; font-size: 17px; }
-      .meta { color: #86a4a9; font: 12px/1.6 monospace; text-transform: uppercase; }
-      .names { color: #bfd0d3; font-size: 13px; margin-top: 5px; }
-      .error { color: #ff9c91; }
+      .meta { color: #ebc7fa; font: 12px/1.6 monospace; text-transform: uppercase; }
+      .names { color: #fff7eb; font-size: 13px; margin-top: 5px; }
+      .error { color: #ff527a; }
       @media (max-width: 720px) {
         main { padding-top: 34px; }
         header { display: block; }

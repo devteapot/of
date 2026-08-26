@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
-    <meta name="theme-color" content="#05070a" />
+    <meta name="theme-color" content="#1a0a2e" />
     <title>OnlyFronts</title>
     <link
       data-trunk
@@ -28,7 +28,8 @@
       html,
       body {
         overflow: hidden;
-        background: #05070a;
+        /* Bevy lobby.rs: SCRIM, with ACTIVE highlight so first paint matches the HUD */
+        background: radial-gradient(circle at 15% 0%, #381f6b, #1a0a2e 44%);
       }
 
       #game-shell {
@@ -48,7 +49,7 @@
         z-index: 0;
         display: grid;
         place-items: center;
-        color: #9fb2bd;
+        color: #ebc7fa;
         font: 500 14px/1.4 system-ui, sans-serif;
         letter-spacing: 0.04em;
       }
